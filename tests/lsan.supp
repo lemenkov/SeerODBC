@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+# SPDX-License-Identifier: CC0-1.0
+
+# LeakSanitizer suppressions for OpenSSL 3's process-global state.
+#
+# OpenSSL keeps the implicitly-fetched cipher method (from EVP_*Init_ex) and the
+# loaded providers in library-global structures that are released only in an
+# atexit handler. On some OpenSSL builds (e.g. Ubuntu's libcrypto.so.3) LSan runs
+# its leak check before that handler and reports them as leaks; on others (e.g.
+# Fedora's OpenSSL 3.5) the cleanup runs first and nothing is reported.
+#
+# These are one-time library globals, not driver leaks: aes_cbc/des_cbc free every
+# EVP_CIPHER_CTX (src/tns/auth.c), and the legacy+default providers are loaded once
+# via pthread_once and intentionally never unloaded (they must stay active for the
+# session's lifetime). Both roots below match any frame in the allocation stack, so
+# they cover the direct + indirect allocations beneath them without suppressing a
+# leak that originates in our own code.
+leak:OSSL_PROVIDER_try_load
+leak:EVP_CIPHER_fetch

@@ -6,6 +6,14 @@
 # harness through the Driver Manager) and fuzz harnesses land under
 # tests/odbc/ and tests/fuzz/ as those layers come online.
 
+# Point LeakSanitizer at the OpenSSL-globals suppressions file for every test run
+# (harmless in a non-sanitized build - LSAN_OPTIONS is ignored there). Default so
+# a plain `meson test` picks it up, keeping local and CI results identical.
+add_test_setup('seer',
+  is_default : true,
+  env : ['LSAN_OPTIONS=suppressions=' + (meson.current_source_dir() / 'lsan.supp')],
+)
+
 test_reader = executable('test_reader',
   'unit/test_reader.c',
   dependencies : [seertns_dep],

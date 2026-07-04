@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+# SPDX-License-Identifier: CC0-1.0
+
+name: Tests
+
+on:
+  push:
+    branches: [master]
+    # Docs-only changes don't affect the driver, so skip the (expensive, live-
+    # Oracle) runs when nothing outside these paths changed. A commit that also
+    # touches code still runs — the filter only skips when every changed file
+    # matches.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSES/**'
+  pull_request:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSES/**'
+
+# Cancel a superseded run when a new commit is pushed to the same ref, so rapid
+# pushes don't stack up and exhaust the Actions concurrency/usage budget.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Offline build + unit tests, once plainly and once under ASan/UBSan. Needs no
+  # database: the live meson tests self-gate (exit 77 = skip) without SEER_TEST_*,
+  # so `meson test` here exercises only the offline protocol-core + ODBC-shim unit
+  # tests. The sanitizer leg brings the previously-manual `build-asan` run into CI.
+  build:
+    name: Build + unit (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            sanitize: none
+          - name: asan+ubsan
+            sanitize: address,undefined
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config libssl-dev unixodbc-dev
+      - name: Configure
+        run: meson setup build -Db_sanitize=${{ matrix.sanitize }}
+      - name: Compile
+        run: meson compile -C build
+      - name: Unit tests
+        run: meson test -C build --print-errorlogs
+
+  # Integration tests against a real Oracle server, run across the three public
+  # tiers via redistributable gvenzl images: 11g (:1521/XE), 21c (:1521/XEPDB1)
+  # and 23ai Free (:1521/FREEPDB1). (10g and 9i can't ship to public CI — 10g's
+  # image isn't redistributable and 9i needs an old kernel/glibc — so they stay
+  # local, driven by tests/odbc/run-matrix.sh.) fail-fast is off so a flake on one
+  # DB doesn't cancel the others; a generous --shm-size keeps the memory-fragile
+  # 21c/23ai containers from OOM-stalling under the suite.
+  integration:
+    name: Integration (${{ matrix.db.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        db:
+          - name: "Oracle XE 11g"
+            image: "gvenzl/oracle-xe:11-slim"
+            service: "XE"
+          - name: "Oracle XE 21c"
+            image: "gvenzl/oracle-xe:21-slim"
+            service: "XEPDB1"
+          - name: "Oracle 23ai Free"
+            image: "gvenzl/oracle-free:23-slim"
+            service: "FREEPDB1"
+    services:
+      oracle:
+        image: ${{ matrix.db.image }}
+        env:
+          ORACLE_PASSWORD: oracle
+          APP_USER: pyo
+          APP_USER_PASSWORD: pyo123
+        ports:
+          - 1521:1521
+        # The gvenzl image ships healthcheck.sh; wait for first-boot setup
+        # (slower on 21c) before the test step. --shm-size gives the 21c/23ai
+        # instances enough shared memory to run the full suite without OOM.
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 40
+          --health-start-period 90s
+          --shm-size=2g
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config libssl-dev unixodbc-dev
+      - name: Build the driver + tests
+        run: |
+          meson setup build
+          meson compile -C build
+      # The driver .so path is baked into test_integration (-DSEER_DRIVER_PATH),
+      # so the Driver Manager loads it by absolute path from the DRIVER= connect
+      # string — no odbcinst.ini registration needed. The four live tests activate
+      # once SEER_TEST_* is set; DBA-only features (proxy auth, DRCP) self-skip
+      # because the pyo app user isn't privileged.
+      - name: Run integration suite against ${{ matrix.db.name }}
+        env:
+          # 127.0.0.1, not "localhost" — the DM/driver connects over IPv4 and a
+          # localhost->::1 resolution would miss the IPv4-published service port.
+          SEER_TEST_HOST: 127.0.0.1
+          SEER_TEST_PORT: "1521"
+          SEER_TEST_SERVICE: ${{ matrix.db.service }}
+          SEER_TEST_USER: pyo
+          SEER_TEST_PASS: pyo123
+        run: |
+          meson test -C build --print-errorlogs \
+            'odbc integration' \
+            'two-phase commit (live)' \
+            'object bind (live)' \
+            'advanced queuing (live)'
