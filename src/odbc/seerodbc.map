@@ -1,0 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* Linker version script: the driver exports ONLY the ODBC entry points.
+ * Everything else - the protocol core, OpenSSL, libc helpers - is local and
+ * invisible to the Driver Manager and the host process. */
+SEERODBC_1.0 {
+  global:
+    SQL*;
+  local:
+    *;
+};

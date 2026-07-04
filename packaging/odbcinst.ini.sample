@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+; Sample driver registration for unixODBC.
+; Install the driver, then register it:  odbcinst -i -d -f packaging/odbcinst.ini.sample
+;
+; [section name]   -> the driver name applications reference
+; Driver=          -> path to the installed libseerodbc.so
+
+[SeerODBC]
+Description = Clean-room ODBC driver for Oracle Database
+Driver      = /usr/lib64/libseerodbc.so
+; Threading   = 1
+; FileUsage   = 0
+
+; ---------------------------------------------------------------------------
+; A matching DSN goes in odbcinst's odbc.ini (system) or ~/.odbc.ini (user):
+;
+; [myoracle]
+; Driver      = SeerODBC
+; Host        = db.example.com
+; Port        = 1521
+; Service     = XE
+; ; UID / PWD may be given here or at connect time

@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+option('with_tls',
+  type : 'boolean', value : true,
+  description : 'TLS transport (Oracle TCPS) and crypto primitives via OpenSSL')
+
+option('build_tools',
+  type : 'boolean', value : true,
+  description : 'Build the freeoracle CLI (direct TNS client, no ODBC)')
+
+option('build_tests',
+  type : 'boolean', value : true,
+  description : 'Build the test suite')

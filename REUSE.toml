@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+# SPDX-License-Identifier: CC0-1.0
+
+version = 1
+
+# NOTICE is a plain legal-notice text file (Apache convention) that shouldn't
+# carry an inline SPDX comment; its licensing is declared here rather than in a
+# .license sidecar.
+[[annotations]]
+path = "NOTICE"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 Peter Lemenkov and the SeerODBC contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# GitHub issue / PR templates: their bodies render into the filed issue/PR, so an
+# inline SPDX comment would leak into that text. Declare their (trivial-config)
+# licensing here instead of inline.
+[[annotations]]
+path = [
+    ".github/ISSUE_TEMPLATE/bug_report.md",
+    ".github/ISSUE_TEMPLATE/feature_request.md",
+    ".github/pull_request_template.md",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 Peter Lemenkov and the SeerODBC contributors"
+SPDX-License-Identifier = "CC0-1.0"

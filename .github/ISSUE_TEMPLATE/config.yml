@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+# SPDX-License-Identifier: CC0-1.0
+
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/lemenkov/SeerODBC/security/advisories/new
+    about: Please report security issues privately, not as a public issue. See SECURITY.md.

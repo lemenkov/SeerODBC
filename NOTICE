@@ -1,0 +1,16 @@
+SeerODBC
+Copyright 2026 Peter Lemenkov and the SeerODBC contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product is a clean-room implementation. It implements the ODBC
+interface specification (a published Microsoft standard) and speaks the
+Oracle TNS/TTC wire protocol, which is reverse-engineered from public
+references and the project's own packet captures. It contains no Oracle
+source code and no code copied from any other ODBC driver. See
+CONTRIBUTING.md for the clean-room development rules.
+
+"Oracle" is a registered trademark of Oracle Corporation. This project is
+not affiliated with, endorsed by, or sponsored by Oracle Corporation. The
+name is used only nominatively, to describe the database this driver
+connects to.

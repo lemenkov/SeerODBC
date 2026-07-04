@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+#
+# SPDX-License-Identifier: CC0-1.0
+
+# Build directories
+/build/
+/builddir/
+/_build/
+/build-asan/
+/build-fuzz/
+
+# Compiled objects / artifacts
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Tooling
+compile_commands.json
+.cache/
+.ccls-cache/
+.claude/
+
+# Editor cruft
+*.swp
+*~
+.idea/
+.vscode/
