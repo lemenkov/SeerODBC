@@ -96,6 +96,12 @@ if build_driver
   )
   test('type conversion', test_convert)
 
+  test_odbcini = executable('test_odbcini',
+    'unit/test_odbcini.c',
+    dependencies : [odbc_pure_dep],
+  )
+  test('odbc.ini reader', test_odbcini)
+
   # Driver-level integration test: through the Driver Manager against a live
   # server. Self-gating - exits 77 (skip) unless SEER_TEST_HOST/SERVICE/USER are
   # set, so it is harmless in an offline `meson test`. The driver .so to load is
