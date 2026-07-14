@@ -18,12 +18,12 @@ odbc_sources = files(
   'unicode.c',
 )
 
-# Pure, connection-free logic (SQL preprocessing + the type-conversion matrix),
-# in a static library so the offline unit tests can link it directly. Folded
-# into the shim below; these symbols stay internal (the version script exports
-# only SQL*).
+# Pure, connection-free logic (SQL preprocessing, the type-conversion matrix,
+# and the odbc.ini reader), in a static library so the offline unit tests can
+# link it directly. Folded into the shim below; these symbols stay internal (the
+# version script exports only SQL*).
 odbc_pure = static_library('seerodbcpure',
-  files('sqlprep.c', 'convert.c'),
+  files('sqlprep.c', 'convert.c', 'odbcini.c'),
   include_directories : include_directories('.'),
   dependencies : [common_dep],
 )
@@ -35,8 +35,9 @@ odbc_pure_dep = declare_dependency(
 
 odbc_map = meson.current_source_dir() / 'seerodbc.map'
 
-# libodbcinst provides SQLGetPrivateProfileString (DSN lookup in odbc.ini).
-odbcinst_dep = cc.find_library('odbcinst', required : true)
+# No libodbcinst / libiodbcinst: odbcini.c reads odbc.ini itself, so the driver
+# has no run-time dependency on either Driver Manager's instlib and loads
+# identically under unixODBC and iODBC.
 
 # Export only the SQL* symbols (version script). This keeps the protocol
 # core and OpenSSL symbols out of the host process's dynamic symbol table -
@@ -44,7 +45,7 @@ odbcinst_dep = cc.find_library('odbcinst', required : true)
 seerodbc_lib = shared_library('seerodbc',
   odbc_sources,
   include_directories : include_directories('.'),
-  dependencies : [seertns_dep, common_dep, odbcinst_dep, odbc_pure_dep],
+  dependencies : [seertns_dep, common_dep, odbc_pure_dep],
   # -Bsymbolic: a *W wrapper that calls an ANSI SQL* function must reach OUR
   # definition, not the Driver Manager's identically-named global symbol (which
   # would get our internal handle and reject it). Bind intra-library references

@@ -1,9 +1,10 @@
 /* Connection establishment: SQLConnect / SQLDriverConnect / SQLDisconnect.
  *
- * SQLConnect resolves the DSN's HOST/PORT/SERVICE from odbc.ini (via the
- * Driver Manager's SQLGetPrivateProfileString); SQLDriverConnect parses those
- * same keywords from the connection string. Both build SeerConnParams and call
- * seer_connect(), stashing the SeerConn on the DBC handle.
+ * SQLConnect resolves the DSN's HOST/PORT/SERVICE from odbc.ini (via our own
+ * odbcini.c reader, not the Driver Manager's SQLGetPrivateProfileString, so the
+ * driver depends on no instlib); SQLDriverConnect parses those same keywords
+ * from the connection string. Both build SeerConnParams and call seer_connect(),
+ * stashing the SeerConn on the DBC handle.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -13,10 +14,9 @@
 #include <string.h>
 #include <strings.h>
 
-#include <odbcinst.h>
-
 #include "log.h"
 #include "odbc_internal.h"
+#include "odbcini.h"
 #include "sqlprep.h"
 
 /* Opt-in protocol logging for debugging the driver under a Driver Manager,
@@ -66,11 +66,13 @@ static char *conn_str_get(const char *cs, const char *key)
     return NULL;
 }
 
-/* Read a DSN attribute from odbc.ini; returns malloc'd value or NULL. */
+/* Read a DSN attribute from odbc.ini; returns malloc'd value or NULL. Uses our
+ * own reader (odbcini.c) rather than the Driver Manager's
+ * SQLGetPrivateProfileString, so the driver needs no libodbcinst/libiodbcinst. */
 static char *dsn_get(const char *dsn, const char *key)
 {
     char buf[512];
-    int n = SQLGetPrivateProfileString(dsn, key, "", buf, sizeof buf, "odbc.ini");
+    int n = seer_get_private_profile_string(dsn, key, "", buf, sizeof buf, "odbc.ini");
     if (n <= 0)
         return NULL;
     return odbc_strndup(buf, (SQLSMALLINT)n);
