@@ -269,6 +269,28 @@ static void check_zero_length_columns(SQLHDBC dbc)
   }
 }
 
+/* A UROWID holding a physical rowid (tag 01) renders exactly like the ROWID it
+ * is, so it can be fed back into WHERE ROWID = ?. */
+static void check_urowid_physical(SQLHDBC dbc)
+{
+  const char *name = "UROWID of a physical rowid renders as ROWID";
+  char u[64], r[64], err[256];
+  if (!SQL_SUCCEEDED(exec_scalar(dbc, "SELECT CAST(ROWID AS UROWID) FROM " TBL " WHERE ROWNUM = 1",
+                                 u, sizeof u, err, sizeof err)) ||
+      !SQL_SUCCEEDED(exec_scalar(dbc, "SELECT ROWIDTOCHAR(ROWID) FROM " TBL " WHERE ROWNUM = 1", r,
+                                 sizeof r, err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  if (strcmp(u, r) == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "urowid='%s' rowid='%s'", u, r);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1680,6 +1702,7 @@ int main(void)
   if (check_dml(dbc)) {
     check_transaction(dbc);
     check_fetch_in_txn(dbc);
+    check_urowid_physical(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);

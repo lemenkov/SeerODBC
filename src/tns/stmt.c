@@ -363,6 +363,22 @@ static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
   const uint8_t *p = seer_reader_bytes(r, (size_t)nbytes);
   if (p == NULL)
     return SEER_EPROTO;
+  /* Tag 01: a physical rowid held in a UROWID - object ub4, file ub2, block
+   * ub4, slot ub2 (big-endian) - rendered as the 18-char ROWID it is, so it
+   * matches ROWIDTOCHAR() and works in WHERE ROWID = ?. Tag 02 (logical, an
+   * IOT row) keeps the '*'-prefixed base64 form. */
+  if (p[0] == 0x01 && nbytes == 13) {
+    uint32_t obj = (uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | p[4];
+    uint32_t file = (uint32_t)p[5] << 8 | p[6];
+    uint32_t blk = (uint32_t)p[7] << 24 | (uint32_t)p[8] << 16 | (uint32_t)p[9] << 8 | p[10];
+    uint32_t slot = (uint32_t)p[11] << 8 | p[12];
+    char rid[18];
+    rowid_b64(obj, 6, rid);
+    rowid_b64(file, 3, rid + 6);
+    rowid_b64(blk, 6, rid + 9);
+    rowid_b64(slot, 3, rid + 15);
+    return cell_set_bytes(cell, rid, sizeof rid, false);
+  }
   SeerWriter w;
   if (!seer_writer_init(&w, (size_t)nbytes * 2))
     return SEER_ENOMEM;
