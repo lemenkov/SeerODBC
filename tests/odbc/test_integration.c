@@ -531,6 +531,41 @@ static void check_returning_failure_recovers(SQLHDBC dbc)
   }
 }
 
+/* An IN OUT parameter carries the application's value in, and the block's
+ * result back out. */
+static void check_inout_param(SQLHDBC dbc)
+{
+  const char *name = "IN OUT parameter keeps its input value";
+  char err[256] = "";
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE OR REPLACE PROCEDURE seer_inout (s IN OUT VARCHAR2, "
+                             "n IN OUT NUMBER) AS BEGIN s := s || '-x'; n := n + 1; END;",
+                             err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  char s[64] = "abc";
+  SQLINTEGER n = 41;
+  SQLLEN sind = SQL_NTS, nind = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 60, 0, s, sizeof s,
+                   &sind);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &n, 0, &nind);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"BEGIN seer_inout(?, ?); END;", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP PROCEDURE seer_inout", err + strlen(err), 1);
+  if (SQL_SUCCEEDED(rc) && strcmp(s, "abc-x") == 0 && n == 42)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "s='%s' n=%d %s", s, (int)n, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1949,6 +1984,7 @@ int main(void)
     check_long_bind_order(dbc);
     check_array_null_last_row(dbc);
     check_returning_failure_recovers(dbc);
+    check_inout_param(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);

@@ -2081,6 +2081,20 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
   return store_bind(stmt, param, oac_type, oac_size, oac_charset, oac_flag, true, rxd, rxd_len);
 }
 
+SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size)
+{
+  if (stmt == NULL || param < 1 || param > stmt->npbinds || stmt->pbinds[param - 1].oac_type == 0)
+    return SEER_EPARAM;
+  SeerBind *b = &stmt->pbinds[param - 1];
+  b->is_out = true;
+  /* Room for the returned value, which can outgrow the value sent in; only
+   * the variable-width types size by value (NUMBER / DATE / ... are fixed). */
+  bool variable = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_RAW;
+  if (variable && max_size > 0 && (uint32_t)max_size > b->oac_size)
+    b->oac_size = (uint32_t)max_size;
+  return SEER_OK;
+}
+
 /* Free every stored bind (all positions, all iterations). */
 static void free_binds(SeerStmt *s)
 {
