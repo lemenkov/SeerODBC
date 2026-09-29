@@ -207,6 +207,119 @@ static void check_transaction(SQLHDBC dbc)
   }
 }
 
+/* A query run while a transaction is open must still return every row. The
+ * server reports call_status 2 (transaction in progress) rather than 1 in the
+ * OER then, so the fetch loop must keep going on the cursor, not on that flag. */
+static void check_fetch_in_txn(SQLHDBC dbc)
+{
+  const char *name = "fetch all rows inside an open transaction";
+  char err[256];
+  SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+  exec_do(dbc, "INSERT INTO " TBL " VALUES (98, 'txnopen')", err, sizeof err);
+  SQLHSTMT st;
+  long n = 0;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"SELECT level FROM dual CONNECT BY level <= 250", SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    while (SQL_SUCCEEDED(SQLFetch(st)))
+      n++;
+  else
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
+  SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+  if (n == 250)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "fetched %ld rows, want 250 %s", n, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
+/* A column the server describes with data length 0 (a bare NULL, '', or a
+ * DECODE with no match) carries no bytes on the wire and is always NULL; the
+ * columns after it must still decode. */
+static void check_zero_length_columns(SQLHDBC dbc)
+{
+  const char *name = "zero-length columns (NULL / '' / DECODE miss)";
+  SQLHSTMT st;
+  char err[256] = "", tail[32] = "";
+  SQLLEN i1 = 0, i2 = 0, i3 = 0, it = 0;
+  char b[8];
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"SELECT NULL, '', DECODE(3, 1, 'one'), 'tail' FROM dual", SQL_NTS);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, b, sizeof b, &i1)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, b, sizeof b, &i2)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 3, SQL_C_CHAR, b, sizeof b, &i3)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 4, SQL_C_CHAR, tail, sizeof tail, &it));
+  if (!ok)
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ok && i1 == SQL_NULL_DATA && i2 == SQL_NULL_DATA && i3 == SQL_NULL_DATA &&
+      strcmp(tail, "tail") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "ind=%ld/%ld/%ld tail='%s' %s", (long)i1, (long)i2, (long)i3, tail, err);
+    fail(name, m);
+  }
+}
+
+/* A CURSOR(...) column (nested cursor, type 102) has its own row form - a
+ * length byte, an inline describe and a ub2 cursor id. ODBC has no nested
+ * cursor type, so the driver reports it as NULL; what matters is that the
+ * columns after it still decode and the cursor is not leaked. */
+static void check_nested_cursor_column(SQLHDBC dbc)
+{
+  const char *name = "nested CURSOR() column";
+  SQLHSTMT st;
+  char err[256] = "", tail[32] = "";
+  SQLLEN ic = 0, it = 0;
+  char b[8];
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"SELECT CURSOR(SELECT 1 FROM dual), 'tail' FROM dual", SQL_NTS);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, b, sizeof b, &ic)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, tail, sizeof tail, &it));
+  if (!ok)
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ok && ic == SQL_NULL_DATA && strcmp(tail, "tail") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "ind=%ld tail='%s' %s", (long)ic, tail, err);
+    fail(name, m);
+  }
+}
+
+/* A UROWID holding a physical rowid (tag 01) renders exactly like the ROWID it
+ * is, so it can be fed back into WHERE ROWID = ?. */
+static void check_urowid_physical(SQLHDBC dbc)
+{
+  const char *name = "UROWID of a physical rowid renders as ROWID";
+  char u[64], r[64], err[256];
+  if (!SQL_SUCCEEDED(exec_scalar(dbc, "SELECT CAST(ROWID AS UROWID) FROM " TBL " WHERE ROWNUM = 1",
+                                 u, sizeof u, err, sizeof err)) ||
+      !SQL_SUCCEEDED(exec_scalar(dbc, "SELECT ROWIDTOCHAR(ROWID) FROM " TBL " WHERE ROWNUM = 1", r,
+                                 sizeof r, err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  if (strcmp(u, r) == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "urowid='%s' rowid='%s'", u, r);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1610,12 +1723,16 @@ int main(void)
   printf("  connected, DBMS version %s\n", ver[0] ? ver : "(unknown)");
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
+  check_zero_length_columns(dbc);
+  check_nested_cursor_column(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");
   check_bind(dbc);
   if (check_dml(dbc)) {
     check_transaction(dbc);
+    check_fetch_in_txn(dbc);
+    check_urowid_physical(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);

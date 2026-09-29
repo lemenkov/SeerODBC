@@ -32,12 +32,25 @@
 
 #define PREFETCH_ROWS 100
 
+/* Types whose row value has its own framing even when the describe reports a
+ * zero data length (LONG / LONG RAW chunked, UROWID, a nested REF CURSOR). For
+ * every other type a zero data length means "no bytes, always NULL". */
+static bool has_own_row_encoding(uint8_t type)
+{
+  return type == ORA_TYPE_LONG || type == ORA_TYPE_LONGRAW || type == ORA_TYPE_UROWID ||
+         type == ORA_TYPE_REFCURSOR;
+}
+
 typedef struct {
   char *name;
   uint8_t ora_type;
   uint16_t charset;
   uint8_t null_ok;
   uint32_t max_size;
+  /* Described with a zero data length (a bare NULL / '' / DECODE miss): the
+   * row carries no bytes at all for it - not even an empty DALC - and its
+   * value is always NULL. Default false = read the value as usual. */
+  bool zero_len;
   char *annotations; /* 23ai: "name=value\n..." serialized map, or NULL */
   /* SQL OBJECT (ADT, type 109) columns: the object type's identity, and its
    * attribute layout (Oracle type per attribute) once resolved/cached. */
@@ -350,6 +363,22 @@ static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
   const uint8_t *p = seer_reader_bytes(r, (size_t)nbytes);
   if (p == NULL)
     return SEER_EPROTO;
+  /* Tag 01: a physical rowid held in a UROWID - object ub4, file ub2, block
+   * ub4, slot ub2 (big-endian) - rendered as the 18-char ROWID it is, so it
+   * matches ROWIDTOCHAR() and works in WHERE ROWID = ?. Tag 02 (logical, an
+   * IOT row) keeps the '*'-prefixed base64 form. */
+  if (p[0] == 0x01 && nbytes == 13) {
+    uint32_t obj = (uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | p[4];
+    uint32_t file = (uint32_t)p[5] << 8 | p[6];
+    uint32_t blk = (uint32_t)p[7] << 24 | (uint32_t)p[8] << 16 | (uint32_t)p[9] << 8 | p[10];
+    uint32_t slot = (uint32_t)p[11] << 8 | p[12];
+    char rid[18];
+    rowid_b64(obj, 6, rid);
+    rowid_b64(file, 3, rid + 6);
+    rowid_b64(blk, 6, rid + 9);
+    rowid_b64(slot, 3, rid + 15);
+    return cell_set_bytes(cell, rid, sizeof rid, false);
+  }
   SeerWriter w;
   if (!seer_writer_init(&w, (size_t)nbytes * 2))
     return SEER_ENOMEM;
@@ -615,10 +644,10 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     if (fv >= TTC_FIELD_VERSION_12_2)
       (void)seer_reader_u8(r); /* scale: a raw sb1 on 12c+ */
     else
-      (void)seer_dec_sb4(r); /* scale: variable on 11g */
-    (void)seer_dec_sb4(r);   /* buffer size */
-    (void)seer_dec_sb4(r);   /* max array elems */
-    (void)seer_dec_sb4(r);   /* cont flags */
+      (void)seer_dec_sb4(r);            /* scale: variable on 11g */
+    int64_t data_len = seer_dec_sb4(r); /* buffer size (data length) */
+    (void)seer_dec_sb4(r);              /* max array elems */
+    (void)seer_dec_sb4(r);              /* cont flags */
     int64_t oidlen = seer_dec_sb4(r);
     if (oidlen > 0)
       seer_skip_chunked(r);
@@ -743,6 +772,7 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     cols[i].charset = (uint16_t)charset;
     cols[i].null_ok = null_ok;
     cols[i].max_size = (uint32_t)(max_size < 0 ? 0 : max_size);
+    cols[i].zero_len = data_len == 0 && !has_own_row_encoding(type);
 
     if (!seer_reader_ok(r)) {
       goto fail;
@@ -782,23 +812,42 @@ static SeerStatus parse_dcb(SeerReader *r, SeerStmt *stmt)
   return SEER_OK;
 }
 
-/* A REF CURSOR OUT value (§6.5): a length byte, an inline describe, the nested
- * cursor id, and an indicator. Stash the describe + cursor id; the cursor is
- * drained into the statement result set after execute. */
-static SeerStatus parse_refcursor_out(SeerReader *r, SeerStmt *stmt)
+/* A cursor value: a length byte, an inline describe, and the nested cursor id.
+ * A REF CURSOR OUT bind (§6.5) follows it with a per-value indicator; a nested
+ * CURSOR(...) column in a row does not - there the next byte is the following
+ * row's token, so reading an indicator would swallow it. */
+static SeerStatus read_cursor_value(SeerReader *r, int fv, bool indicator, SeerColumn **out_cols,
+                                    int *out_ncols, int64_t *out_id)
 {
   (void)seer_reader_u8(r); /* value length */
   SeerColumn *cols = NULL;
   int ncols = 0;
-  SeerStatus st = parse_describe_body(r, stmt->conn->field_version, &cols, &ncols);
+  SeerStatus st = parse_describe_body(r, fv, &cols, &ncols);
   if (st != SEER_OK)
     return st;
   int64_t cursor_id = seer_dec_sb4(r); /* nested cursor id */
-  (void)seer_reader_u8(r);             /* per-value indicator */
+  if (indicator)
+    (void)seer_reader_u8(r);
   if (!seer_reader_ok(r)) {
     free_columns(cols, ncols);
     return SEER_EPROTO;
   }
+  *out_cols = cols;
+  *out_ncols = ncols;
+  *out_id = cursor_id;
+  return SEER_OK;
+}
+
+/* A REF CURSOR OUT value: stash the describe + cursor id; the cursor is drained
+ * into the statement result set after execute. */
+static SeerStatus parse_refcursor_out(SeerReader *r, SeerStmt *stmt)
+{
+  SeerColumn *cols = NULL;
+  int ncols = 0;
+  int64_t cursor_id = 0;
+  SeerStatus st = read_cursor_value(r, stmt->conn->field_version, true, &cols, &ncols, &cursor_id);
+  if (st != SEER_OK)
+    return st;
   if (stmt->refcursor_cols != NULL)
     free_columns(stmt->refcursor_cols, stmt->refcursor_ncols);
   stmt->refcursor_cols = cols;
@@ -1021,6 +1070,25 @@ static SeerStatus parse_rxd(SeerReader *r, SeerStmt *stmt, const uint8_t *bv, si
         goto fail;
       }
       continue; /* cell filled in the resolve pass */
+    }
+
+    if (stmt->cols[i].zero_len)
+      continue; /* no bytes on the wire; the cell stays NULL */
+
+    if (type == ORA_TYPE_REFCURSOR) {
+      /* A nested CURSOR(...) column. ODBC has no nested-cursor type, so the
+       * cell is reported as NULL; the server opened a cursor for it, which is
+       * queued to close so it doesn't leak. */
+      SeerColumn *ncols_desc = NULL;
+      int nn = 0;
+      int64_t cid = 0;
+      if (read_cursor_value(r, stmt->conn->field_version, false, &ncols_desc, &nn, &cid) != SEER_OK)
+        goto fail;
+      free_columns(ncols_desc, nn);
+      SeerConn *c = stmt->conn;
+      if (cid > 0 && c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0]))
+        c->close_cursors[c->n_close++] = (int)cid;
+      continue;
     }
 
     SeerStatus st = decode_cell(r, &stmt->cols[i], &row[i]);
@@ -2908,13 +2976,25 @@ static void free_implicit(SeerStmt *stmt)
   stmt->implicit_pos = 0;
 }
 
+/* True while a query's cursor still has rows to hand out. "More rows" is the
+ * absence of the end-of-fetch code (ORA-01403) on a cursor that described a
+ * result set - NOT the OER call_status, which is a flag word (1 with
+ * autocommit on, 2 while a transaction is open, 5 after PL/SQL): gating on
+ * call_status == 1 silently stopped after the first batch inside a
+ * transaction. Requiring described columns keeps DML (which also carries a
+ * cursor handle) from ever being sent a FETCH. */
+static bool more_rows_pending(const SeerStmt *stmt, int64_t cursor_id, int64_t err_code)
+{
+  return stmt->ncols > 0 && cursor_id != 0 && err_code != 1403;
+}
+
 /* Fetch every remaining row of stmt->cursor_id into stmt->rows (one FETCH is
- * always issued, then more while the server reports rows pending). */
+ * always issued, then more while the cursor has rows pending). */
 static SeerStatus fetch_all_rows(SeerStmt *stmt)
 {
   SeerWriter w;
-  OerResult rc = {.call_status = 1}; /* prime: fetch at least once */
-  while (rc.call_status == 1 && stmt->cursor_id != 0 && rc.err_code != 1403) {
+  OerResult rc = {0}; /* prime: fetch at least once */
+  while (more_rows_pending(stmt, stmt->cursor_id, rc.err_code)) {
     SeerStatus st = build_fetch(stmt, &w);
     if (st != SEER_OK)
       return st;
@@ -2936,7 +3016,6 @@ static SeerStatus fetch_all_rows(SeerStmt *stmt)
       seer_log(SEER_LOG_ERROR, "stmt: fetch failed (ORA-%05ld)", (long)f.err_code);
       return SEER_EDB;
     }
-    rc.call_status = f.err_code == 1403 ? 0 : f.call_status;
     rc.err_code = f.err_code;
   }
   return SEER_OK;
@@ -3127,6 +3206,7 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   col->ora_type = data_type;
   col->charset = (uint16_t)charset;
   col->max_size = (uint32_t)(max_len < 0 ? 0 : max_len);
+  col->zero_len = max_len == 0 && !has_own_row_encoding(data_type);
   col->null_ok = null_ok;
   col->n_obj_attrs = 0;
   return SEER_OK;
@@ -3215,6 +3295,12 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
               free(locv);
           }
           continue;
+        }
+        if (stmt->cols[ci].zero_len) {
+          /* MaxLen 0: no value bytes, only the NULL indicator 81 01. */
+          if (seer_reader_remaining(&r) >= 2 && r.buf[r.pos] == 0x81)
+            r.pos += 2;
+          continue; /* cell stays NULL */
         }
         uint8_t *val = NULL;
         size_t vlen = 0;
@@ -4117,8 +4203,8 @@ retry_exec:
   if (!sql_is_cacheable(stmt->sql))
     stmt_cache_flush(stmt->conn);
 
-  /* Fetch more while the server reports rows pending. */
-  while (oer.call_status == 1 && oer.cursor_id != 0 && oer.err_code != 1403) {
+  /* Fetch more while the cursor has rows pending. */
+  while (more_rows_pending(stmt, oer.cursor_id, oer.err_code)) {
     seer_log(SEER_LOG_DEBUG, "stmt: issuing FETCH on cursor %ld", (long)oer.cursor_id);
     st = build_fetch(stmt, &w);
     if (st != SEER_OK)
@@ -4139,7 +4225,6 @@ retry_exec:
       seer_log(SEER_LOG_ERROR, "stmt: fetch failed (ORA-%05ld)", (long)more.err_code);
       return SEER_EDB;
     }
-    oer.call_status = more.err_code == 1403 ? 0 : more.call_status;
     oer.err_code = more.err_code;
   }
 
