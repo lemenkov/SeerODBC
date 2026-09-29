@@ -32,12 +32,25 @@
 
 #define PREFETCH_ROWS 100
 
+/* Types whose row value has its own framing even when the describe reports a
+ * zero data length (LONG / LONG RAW chunked, UROWID, a nested REF CURSOR). For
+ * every other type a zero data length means "no bytes, always NULL". */
+static bool has_own_row_encoding(uint8_t type)
+{
+  return type == ORA_TYPE_LONG || type == ORA_TYPE_LONGRAW || type == ORA_TYPE_UROWID ||
+         type == ORA_TYPE_REFCURSOR;
+}
+
 typedef struct {
   char *name;
   uint8_t ora_type;
   uint16_t charset;
   uint8_t null_ok;
   uint32_t max_size;
+  /* Described with a zero data length (a bare NULL / '' / DECODE miss): the
+   * row carries no bytes at all for it - not even an empty DALC - and its
+   * value is always NULL. Default false = read the value as usual. */
+  bool zero_len;
   char *annotations; /* 23ai: "name=value\n..." serialized map, or NULL */
   /* SQL OBJECT (ADT, type 109) columns: the object type's identity, and its
    * attribute layout (Oracle type per attribute) once resolved/cached. */
@@ -615,10 +628,10 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     if (fv >= TTC_FIELD_VERSION_12_2)
       (void)seer_reader_u8(r); /* scale: a raw sb1 on 12c+ */
     else
-      (void)seer_dec_sb4(r); /* scale: variable on 11g */
-    (void)seer_dec_sb4(r);   /* buffer size */
-    (void)seer_dec_sb4(r);   /* max array elems */
-    (void)seer_dec_sb4(r);   /* cont flags */
+      (void)seer_dec_sb4(r);            /* scale: variable on 11g */
+    int64_t data_len = seer_dec_sb4(r); /* buffer size (data length) */
+    (void)seer_dec_sb4(r);              /* max array elems */
+    (void)seer_dec_sb4(r);              /* cont flags */
     int64_t oidlen = seer_dec_sb4(r);
     if (oidlen > 0)
       seer_skip_chunked(r);
@@ -743,6 +756,7 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     cols[i].charset = (uint16_t)charset;
     cols[i].null_ok = null_ok;
     cols[i].max_size = (uint32_t)(max_size < 0 ? 0 : max_size);
+    cols[i].zero_len = data_len == 0 && !has_own_row_encoding(type);
 
     if (!seer_reader_ok(r)) {
       goto fail;
@@ -1022,6 +1036,9 @@ static SeerStatus parse_rxd(SeerReader *r, SeerStmt *stmt, const uint8_t *bv, si
       }
       continue; /* cell filled in the resolve pass */
     }
+
+    if (stmt->cols[i].zero_len)
+      continue; /* no bytes on the wire; the cell stays NULL */
 
     SeerStatus st = decode_cell(r, &stmt->cols[i], &row[i]);
     if (st != SEER_OK)
@@ -3138,6 +3155,7 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   col->ora_type = data_type;
   col->charset = (uint16_t)charset;
   col->max_size = (uint32_t)(max_len < 0 ? 0 : max_len);
+  col->zero_len = max_len == 0 && !has_own_row_encoding(data_type);
   col->null_ok = null_ok;
   col->n_obj_attrs = 0;
   return SEER_OK;
@@ -3226,6 +3244,12 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
               free(locv);
           }
           continue;
+        }
+        if (stmt->cols[ci].zero_len) {
+          /* MaxLen 0: no value bytes, only the NULL indicator 81 01. */
+          if (seer_reader_remaining(&r) >= 2 && r.buf[r.pos] == 0x81)
+            r.pos += 2;
+          continue; /* cell stays NULL */
         }
         uint8_t *val = NULL;
         size_t vlen = 0;

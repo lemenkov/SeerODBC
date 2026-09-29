@@ -84,6 +84,31 @@ static void check_select_scalar(void)
   }
 }
 
+static void check_zero_length_columns(void)
+{
+  /* A bare NULL / '' is described with MaxLen 0 and the row carries only the
+   * NULL indicator (81 01) for it - no value bytes; the next column must still
+   * decode. */
+  const char *name = "zero-length columns (NULL / '')";
+  SeerStmt *s = NULL;
+  const char *a = NULL, *b = NULL, *t = NULL;
+  int na = 0, nb = 0, nt = 0, ok = 0;
+  if (seer_stmt_prepare(C, "SELECT NULL, '', 'tail' FROM dual", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK &&
+      seer_stmt_get_string(s, 0, &a, &na) == SEER_OK &&
+      seer_stmt_get_string(s, 1, &b, &nb) == SEER_OK &&
+      seer_stmt_get_string(s, 2, &t, &nt) == SEER_OK)
+    ok = na && nb && !nt && t && strcmp(t, "tail") == 0;
+  if (ok)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "null=%d/%d tail='%s'", na, nb, t ? t : "(none)");
+    fail(name, m);
+  }
+  seer_stmt_close(s);
+}
+
 static void check_select_table(void)
 {
   /* A dictionary view: VARCHAR + NUMBER, multiple rows, real NOT-NULL columns
@@ -556,6 +581,7 @@ int main(void)
   }
 
   check_select_scalar();
+  check_zero_length_columns();
   check_select_table();
   check_nullability();
   check_null_fetch();

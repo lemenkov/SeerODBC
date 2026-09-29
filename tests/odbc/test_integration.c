@@ -238,6 +238,37 @@ static void check_fetch_in_txn(SQLHDBC dbc)
   }
 }
 
+/* A column the server describes with data length 0 (a bare NULL, '', or a
+ * DECODE with no match) carries no bytes on the wire and is always NULL; the
+ * columns after it must still decode. */
+static void check_zero_length_columns(SQLHDBC dbc)
+{
+  const char *name = "zero-length columns (NULL / '' / DECODE miss)";
+  SQLHSTMT st;
+  char err[256] = "", tail[32] = "";
+  SQLLEN i1 = 0, i2 = 0, i3 = 0, it = 0;
+  char b[8];
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"SELECT NULL, '', DECODE(3, 1, 'one'), 'tail' FROM dual", SQL_NTS);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, b, sizeof b, &i1)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, b, sizeof b, &i2)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 3, SQL_C_CHAR, b, sizeof b, &i3)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 4, SQL_C_CHAR, tail, sizeof tail, &it));
+  if (!ok)
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ok && i1 == SQL_NULL_DATA && i2 == SQL_NULL_DATA && i3 == SQL_NULL_DATA &&
+      strcmp(tail, "tail") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "ind=%ld/%ld/%ld tail='%s' %s", (long)i1, (long)i2, (long)i3, tail, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1641,6 +1672,7 @@ int main(void)
   printf("  connected, DBMS version %s\n", ver[0] ? ver : "(unknown)");
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
+  check_zero_length_columns(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");
