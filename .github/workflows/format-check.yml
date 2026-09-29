@@ -9,7 +9,12 @@ on:
     paths:
       - 'src/**/*.c'
       - 'src/**/*.h'
+      - 'include/**/*.h'
       - 'tests/**/*.c'
+      - 'tests/**/*.h'
+      - 'tools/**/*.c'
+      - 'tools/**/*.h'
+      - '.clang-format'
       - '.github/workflows/format-check.yml'
 
 jobs:
@@ -23,4 +28,7 @@ jobs:
       - name: Clang Format Github Action
         uses: RafikFarhad/clang-format-github-action@v7
         with:
-          sources: "src/**/*.h,src/**/*.c,tests/**/*.c"
+          # The action defaults to style=LLVM, which silently ignores the
+          # repository's .clang-format; `file` makes clang-format use it.
+          style: file
+          sources: "src/**/*.c,src/**/*.h,include/**/*.h,tests/**/*.c,tests/**/*.h,tools/**/*.c,tools/**/*.h"

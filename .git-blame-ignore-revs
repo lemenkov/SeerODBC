@@ -8,3 +8,6 @@
 
 # style: adopt clang-format
 61a19dbb74953572c0ab90ce77ea0b2c61e8e217
+
+# style: clang-format the public header and freeoracle
+24220b97f5dcf2e5671661f34667c8b09f715f37
