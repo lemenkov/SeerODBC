@@ -201,6 +201,7 @@ typedef struct {
   int64_t err_code;
   int64_t cursor_id;
   int64_t row_count; /* "current row number" - DML affected rows on 11g */
+  bool flush_binds;  /* the server asked for a TTI_FOB echo (see seer_ttc_recv) */
 } OerResult;
 
 /* ----------------------------------------------------------- value decode */
@@ -1592,6 +1593,14 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
     case TTI_STA:
       got_oer = true; /* treat as terminal */
       break;
+    case TTI_FOB:
+      /* Flush-out-binds request: a failing DML RETURNING. 10g/11g send it as a
+       * whole message (answered in seer_ttc_recv); 12c+ can send it after an
+       * RXD in the same message. Stop here - the caller echoes it and reads
+       * the real (error) response that follows. */
+      oer->flush_binds = true;
+      got_oer = true;
+      break;
     case TTI_END_OF_RESPONSE:
       /* EOR framing (§32/#155): the per-response terminator. It normally
        * trails the OER/STA (which already ended the loop), but treat it as
@@ -2072,6 +2081,20 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
   return store_bind(stmt, param, oac_type, oac_size, oac_charset, oac_flag, true, rxd, rxd_len);
 }
 
+SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size)
+{
+  if (stmt == NULL || param < 1 || param > stmt->npbinds || stmt->pbinds[param - 1].oac_type == 0)
+    return SEER_EPARAM;
+  SeerBind *b = &stmt->pbinds[param - 1];
+  b->is_out = true;
+  /* Room for the returned value, which can outgrow the value sent in; only
+   * the variable-width types size by value (NUMBER / DATE / ... are fixed). */
+  bool variable = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_RAW;
+  if (variable && max_size > 0 && (uint32_t)max_size > b->oac_size)
+    b->oac_size = (uint32_t)max_size;
+  return SEER_OK;
+}
+
 /* Free every stored bind (all positions, all iterations). */
 static void free_binds(SeerStmt *s)
 {
@@ -2165,21 +2188,48 @@ SeerStatus seer_stmt_batch_error(SeerStmt *stmt, size_t i, unsigned *row, unsign
 /* Statement class - drives the execute options, All8 array, and long-max. */
 typedef enum { STMT_SELECT, STMT_BLOCK, STMT_CHANGE } StmtKind;
 
-/* Classify by the leading keyword: SELECT/WITH are queries, BEGIN/DECLARE are
- * anonymous PL/SQL blocks, everything else (DML, DDL) is a "change". */
-static StmtKind classify_sql(const char *sql)
+/* Skip what can precede a statement's first keyword: whitespace, `--` and
+ * block comments, PL/SQL `<<labels>>`, and the opening parentheses of a
+ * "(SELECT ...)". The first keyword decides the execute options, so hiding it
+ * behind a comment misclassified the statement. */
+static const char *sql_first_keyword(const char *p)
 {
-  const char *p = sql;
-  while (*p != '\0' && isspace((unsigned char)*p))
-    p++;
-  while (*p == '(') { /* "(SELECT ...)" */
-    p++;
+  for (;;) {
     while (*p != '\0' && isspace((unsigned char)*p))
       p++;
+    if (p[0] == '-' && p[1] == '-') {
+      while (*p != '\0' && *p != '\n')
+        p++;
+    } else if (p[0] == '/' && p[1] == '*') {
+      const char *e = strstr(p + 2, "*/");
+      p = e ? e + 2 : p + strlen(p);
+    } else if (p[0] == '<' && p[1] == '<') {
+      const char *e = strstr(p + 2, ">>");
+      p = e ? e + 2 : p + strlen(p);
+    } else if (*p == '(') {
+      p++;
+    } else {
+      return p;
+    }
   }
-  if (strncasecmp(p, "SELECT", 6) == 0 || strncasecmp(p, "WITH", 4) == 0)
+}
+
+static bool starts_with_word(const char *p, const char *kw)
+{
+  size_t n = strlen(kw);
+  return strncasecmp(p, kw, n) == 0 && !isalnum((unsigned char)p[n]) && p[n] != '_';
+}
+
+/* Classify by the leading keyword: SELECT/WITH are queries; BEGIN/DECLARE
+ * blocks and CALL are PL/SQL (a CALL ... INTO's target is an ordinary OUT
+ * bind - read as DML RETURNING, the client sent no value and the call hung);
+ * everything else (DML, DDL) is a "change". */
+static StmtKind classify_sql(const char *sql)
+{
+  const char *p = sql_first_keyword(sql);
+  if (starts_with_word(p, "SELECT") || starts_with_word(p, "WITH"))
     return STMT_SELECT;
-  if (strncasecmp(p, "BEGIN", 5) == 0 || strncasecmp(p, "DECLARE", 7) == 0)
+  if (starts_with_word(p, "BEGIN") || starts_with_word(p, "DECLARE") || starts_with_word(p, "CALL"))
     return STMT_BLOCK;
   return STMT_CHANGE;
 }
@@ -2190,21 +2240,12 @@ static StmtKind classify_sql(const char *sql)
  * actually re-run the DDL. */
 static bool sql_is_cacheable(const char *sql)
 {
-  const char *p = sql;
-  while (*p != '\0' && isspace((unsigned char)*p))
-    p++;
-  while (*p == '(') {
-    p++;
-    while (*p != '\0' && isspace((unsigned char)*p))
-      p++;
-  }
+  const char *p = sql_first_keyword(sql);
   static const char *const kw[] = {"SELECT", "WITH",  "INSERT", "UPDATE",
                                    "DELETE", "MERGE", "BEGIN",  "DECLARE"};
-  for (size_t i = 0; i < sizeof kw / sizeof kw[0]; i++) {
-    size_t n = strlen(kw[i]);
-    if (strncasecmp(p, kw[i], n) == 0 && !isalnum((unsigned char)p[n]) && p[n] != '_')
+  for (size_t i = 0; i < sizeof kw / sizeof kw[0]; i++)
+    if (starts_with_word(p, kw[i]))
       return true;
-  }
   return false;
 }
 
@@ -4242,8 +4283,29 @@ retry_exec:
    * fresh parse does. */
   st = parse_response(stmt, resp, rlen, stmt->reuse_cursor == 0, &oer);
   free(resp);
+  resp = NULL;
   if (st != SEER_OK)
     return st;
+  /* The server asked to flush out-binds (a failing DML RETURNING): echo the
+   * TTI_FOB and read the real response behind it - the statement's error. */
+  for (int asked = 0; oer.flush_binds; asked++) {
+    if (asked == 3) {
+      seer_log(SEER_LOG_ERROR, "stmt: server keeps asking to flush out-binds");
+      return SEER_EPROTO;
+    }
+    const uint8_t fob = TTI_FOB;
+    st = seer_ttc_send(stmt->conn, &fob, 1);
+    if (st == SEER_OK)
+      st = seer_ttc_recv(stmt->conn, &resp, &rlen);
+    if (st != SEER_OK)
+      return st;
+    oer = (OerResult){0};
+    st = parse_response(stmt, resp, rlen, false, &oer);
+    free(resp);
+    resp = NULL;
+    if (st != SEER_OK)
+      return st;
+  }
 
   seer_log(SEER_LOG_DEBUG, "stmt: exec OER call_status=%ld err=%ld cursor=%ld rows=%zu",
            (long)oer.call_status, (long)oer.err_code, (long)oer.cursor_id, stmt->nrows);
@@ -4275,8 +4337,9 @@ retry_exec:
   stmt->affected = (long)oer.row_count;
 
   /* A DDL (non-cacheable) statement can invalidate other cached cursors; drop
-   * the cache so none is reused stale after an object is recreated. */
-  if (!sql_is_cacheable(stmt->sql))
+   * the cache so none is reused stale after an object is recreated. A PL/SQL
+   * block can run DDL too (EXECUTE IMMEDIATE), so it flushes the same way. */
+  if (!sql_is_cacheable(stmt->sql) || classify_sql(stmt->sql) == STMT_BLOCK)
     stmt_cache_flush(stmt->conn);
 
   /* Fetch more while the cursor has rows pending. */

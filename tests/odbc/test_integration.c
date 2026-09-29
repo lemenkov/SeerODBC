@@ -498,6 +498,153 @@ static void check_typed_null(SQLHDBC dbc)
   }
 }
 
+/* A DML RETURNING statement that fails gets a flush-out-binds request (a lone
+ * TTI_FOB byte) before its error; the client must echo it, or the server
+ * keeps waiting and the NEXT statement fails with ORA-03137 / ORA-00600. */
+static void check_returning_failure_recovers(SQLHDBC dbc)
+{
+  const char *name = "failing DML RETURNING, then the connection still works";
+  char err[256] = "", out[32] = "";
+  exec_do(dbc, "DROP TABLE seer_fob", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_fob (id NUMBER NOT NULL)", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  SQLINTEGER ret = 0;
+  SQLLEN rind = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &ret, 0, &rind);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"INSERT INTO seer_fob (id) VALUES (NULL) RETURNING id INTO ?", SQL_NTS);
+  char first[256] = "";
+  diag_text(SQL_HANDLE_STMT, st, first, sizeof first);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLRETURN rc2 = exec_scalar(dbc, "SELECT 5 FROM dual", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_fob", err, sizeof err);
+  if (!SQL_SUCCEEDED(rc) && strstr(first, "01400") && SQL_SUCCEEDED(rc2) && strcmp(out, "5") == 0)
+    pass(name);
+  else {
+    char m[600];
+    snprintf(m, sizeof m, "rc=%d first='%s' next='%s' %s", rc, first, out, err);
+    fail(name, m);
+  }
+}
+
+/* An IN OUT parameter carries the application's value in, and the block's
+ * result back out. */
+static void check_inout_param(SQLHDBC dbc)
+{
+  const char *name = "IN OUT parameter keeps its input value";
+  char err[256] = "";
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE OR REPLACE PROCEDURE seer_inout (s IN OUT VARCHAR2, "
+                             "n IN OUT NUMBER) AS BEGIN s := s || '-x'; n := n + 1; END;",
+                             err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  char s[64] = "abc";
+  SQLINTEGER n = 41;
+  SQLLEN sind = SQL_NTS, nind = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 60, 0, s, sizeof s,
+                   &sind);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &n, 0, &nind);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"BEGIN seer_inout(?, ?); END;", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP PROCEDURE seer_inout", err + strlen(err), 1);
+  if (SQL_SUCCEEDED(rc) && strcmp(s, "abc-x") == 0 && n == 42)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "s='%s' n=%d %s", s, (int)n, err);
+    fail(name, m);
+  }
+}
+
+/* The statement kind decides the execute options, so a leading comment or a
+ * PL/SQL label must not hide it: a commented SELECT is still a query, a
+ * commented / labelled block and a CALL ... INTO are PL/SQL (whose OUT binds
+ * are ordinary binds - read as DML RETURNING, the call hung). */
+static void check_statement_kind(SQLHDBC dbc)
+{
+  const char *name = "leading comments / labels / CALL keep the statement kind";
+  char out[32] = "", err[256] = "", m[400] = "";
+  int ok = 1;
+  static const struct {
+    const char *sql, *want;
+  } q[] = {{"-- a comment\nSELECT 5 FROM dual", "5"}, {"/* c */ SELECT 6 FROM dual", "6"}};
+  for (size_t i = 0; i < sizeof q / sizeof q[0] && ok; i++) {
+    out[0] = '\0';
+    if (!SQL_SUCCEEDED(exec_scalar(dbc, q[i].sql, out, sizeof out, err, sizeof err)) ||
+        strcmp(out, q[i].want) != 0) {
+      snprintf(m, sizeof m, "'%s' -> '%s' %s", q[i].sql, out, err);
+      ok = 0;
+    }
+  }
+  exec_do(dbc, "CREATE OR REPLACE FUNCTION seer_nine RETURN NUMBER AS BEGIN RETURN 9; END;", err,
+          sizeof err);
+  static const struct {
+    const char *sql;
+    int want;
+  } b[] = {{"/* c */ BEGIN ? := 7; END;", 7},
+           {"<<lbl>> BEGIN ? := 8; END;", 8},
+           {"CALL seer_nine() INTO ?", 9}};
+  for (size_t i = 0; i < sizeof b / sizeof b[0] && ok; i++) {
+    SQLINTEGER v = 0;
+    SQLLEN ind = 0;
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &v, 0, &ind);
+    SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)b[i].sql, SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (!SQL_SUCCEEDED(rc) || v != b[i].want) {
+      snprintf(m, sizeof m, "'%s' -> %d %s", b[i].sql, (int)v, SQL_SUCCEEDED(rc) ? "" : err);
+      ok = 0;
+    }
+  }
+  exec_do(dbc, "DROP FUNCTION seer_nine", err, sizeof err);
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* A PL/SQL block can run DDL (EXECUTE IMMEDIATE), so it invalidates cached
+ * cursors like DDL does: re-running a cached INSERT after a block recreated
+ * its table must work against the new table. */
+static void check_cache_after_block_ddl(SQLHDBC dbc)
+{
+  const char *name = "statement cache after a block that recreates a table";
+  char err[256] = "", out[32] = "";
+  exec_do(dbc, "DROP TABLE seer_cachet", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_cachet (a NUMBER)", err, sizeof err);
+  SQLRETURN r1 = exec_do(dbc, "INSERT INTO seer_cachet VALUES (1)", err, sizeof err);
+  exec_do(dbc,
+          "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_cachet'; "
+          "EXECUTE IMMEDIATE 'CREATE TABLE seer_cachet (a NUMBER, b NUMBER DEFAULT 2)'; END;",
+          err, sizeof err);
+  SQLRETURN r2 = exec_do(dbc, "INSERT INTO seer_cachet (a) VALUES (1)", err, sizeof err);
+  SQLRETURN r3 = exec_do(dbc, "INSERT INTO seer_cachet VALUES (1)", err, sizeof err);
+  exec_scalar(dbc, "SELECT COUNT(*) || ':' || SUM(b) FROM seer_cachet", out, sizeof out, err,
+              sizeof err);
+  exec_do(dbc, "DROP TABLE seer_cachet", err, sizeof err);
+  /* the second plain INSERT must now fail (2 columns, 1 value): ORA-00947 */
+  if (SQL_SUCCEEDED(r1) && SQL_SUCCEEDED(r2) && !SQL_SUCCEEDED(r3) && strcmp(out, "1:2") == 0)
+    pass(name);
+  else {
+    char m[300];
+    snprintf(m, sizeof m, "r1=%d r2=%d r3=%d rows='%s'", r1, r2, r3, out);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1905,6 +2052,7 @@ int main(void)
   check_nested_cursor_column(dbc);
   check_length_boundaries(dbc);
   check_typed_null(dbc);
+  check_statement_kind(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");
@@ -1915,6 +2063,9 @@ int main(void)
     check_urowid_physical(dbc);
     check_long_bind_order(dbc);
     check_array_null_last_row(dbc);
+    check_returning_failure_recovers(dbc);
+    check_inout_param(dbc);
+    check_cache_after_block_ddl(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);

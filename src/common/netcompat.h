@@ -84,12 +84,35 @@ static inline ptrdiff_t seer_sock_recv(seer_socket_t s, void *buf, size_t len)
 #endif
 }
 
+/* A send on a socket the peer has reset must fail with EPIPE, never raise
+ * SIGPIPE: that would kill the application hosting the driver. MSG_NOSIGNAL
+ * where the platform has it; macOS/BSD set SO_NOSIGPIPE on the socket instead
+ * (see seer_sock_nosigpipe). */
+#if !defined(_WIN32) && defined(MSG_NOSIGNAL)
+#define SEER_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define SEER_SEND_FLAGS 0
+#endif
+
 static inline ptrdiff_t seer_sock_send(seer_socket_t s, const void *buf, size_t len)
 {
 #ifdef _WIN32
   return send(s, (const char *)buf, (int)len, 0);
 #else
-  return send(s, buf, len, 0);
+  return send(s, buf, len, SEER_SEND_FLAGS);
+#endif
+}
+
+/* Stop writes on `s` from raising SIGPIPE where that is a socket option
+ * (macOS/BSD SO_NOSIGPIPE - it also covers writes OpenSSL makes on the
+ * socket). A no-op elsewhere. */
+static inline void seer_sock_nosigpipe(seer_socket_t s)
+{
+#if defined(SO_NOSIGPIPE)
+  int one = 1;
+  (void)setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#else
+  (void)s;
 #endif
 }
 

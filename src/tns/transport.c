@@ -17,6 +17,61 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+/* OpenSSL writes to the socket itself, so MSG_NOSIGNAL can't reach those
+ * writes; a peer reset would raise SIGPIPE and kill the host application.
+ * Where SO_NOSIGPIPE exists (macOS/BSD) the socket option covers it. Elsewhere
+ * block SIGPIPE on this thread around OpenSSL's writes and swallow one raised
+ * meanwhile (the approach libcurl takes), so the write just fails with EPIPE. */
+#if !defined(_WIN32) && !defined(SO_NOSIGPIPE)
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+
+typedef struct {
+  sigset_t old;
+  bool had_pending;
+} SigpipeGuard;
+
+static void sigpipe_block(SigpipeGuard *g)
+{
+  sigset_t set, pend;
+  sigemptyset(&set);
+  sigaddset(&set, SIGPIPE);
+  sigemptyset(&pend);
+  sigpending(&pend);
+  g->had_pending = sigismember(&pend, SIGPIPE) == 1;
+  pthread_sigmask(SIG_BLOCK, &set, &g->old);
+}
+
+static void sigpipe_restore(SigpipeGuard *g)
+{
+  if (!g->had_pending) {
+    sigset_t set, pend;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    sigemptyset(&pend);
+    sigpending(&pend);
+    if (sigismember(&pend, SIGPIPE) == 1) {
+      const struct timespec zero = {0, 0};
+      while (sigtimedwait(&set, NULL, &zero) < 0 && errno == EINTR)
+        ;
+    }
+  }
+  pthread_sigmask(SIG_SETMASK, &g->old, NULL);
+}
+#else
+typedef int SigpipeGuard;
+static void sigpipe_block(SigpipeGuard *g)
+{
+  (void)g;
+}
+static void sigpipe_restore(SigpipeGuard *g)
+{
+  (void)g;
+}
+#endif
+
 #define DEFAULT_TIMEOUT_MS 30000
 
 struct SeerTransport {
@@ -58,6 +113,7 @@ static seer_socket_t connect_one(const struct addrinfo *ai, int timeout_ms)
   seer_socket_t fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
   if (fd == SEER_INVALID_SOCKET)
     return SEER_INVALID_SOCKET;
+  seer_sock_nosigpipe(fd);
 
   if (seer_sock_set_nonblocking(fd, 1) != 0) {
     seer_closesocket(fd);
@@ -190,7 +246,13 @@ SeerStatus seer_transport_start_tls(SeerTransport *t, const char *sni_host, cons
   }
 
   int rc;
-  while ((rc = SSL_connect(ssl)) != 1) {
+  SigpipeGuard g;
+  for (;;) {
+    sigpipe_block(&g);
+    rc = SSL_connect(ssl);
+    sigpipe_restore(&g);
+    if (rc == 1)
+      break;
     int e = SSL_get_error(ssl, rc);
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
       continue; /* blocking fd: retry */
@@ -211,7 +273,10 @@ void seer_transport_close(SeerTransport *t)
   if (t == NULL)
     return;
   if (t->ssl != NULL) {
+    SigpipeGuard g;
+    sigpipe_block(&g);
     SSL_shutdown(t->ssl);
+    sigpipe_restore(&g);
     SSL_free(t->ssl);
   }
   if (t->ctx != NULL)
@@ -230,7 +295,10 @@ SeerStatus seer_transport_write_all(SeerTransport *t, const void *buf, size_t le
   size_t off = 0;
   while (off < len) {
     if (t->ssl != NULL) {
+      SigpipeGuard g;
+      sigpipe_block(&g);
       int n = SSL_write(t->ssl, p + off, (int)(len - off));
+      sigpipe_restore(&g);
       if (n <= 0) {
         int e = SSL_get_error(t->ssl, n);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)

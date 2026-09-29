@@ -89,6 +89,16 @@ test_stubs = executable('test_stubs',
 )
 test('sharding + cqn stubs', test_stubs)
 
+# A write to a socket the peer has closed must fail, not raise SIGPIPE and kill
+# the host application (MSG_NOSIGNAL / SO_NOSIGPIPE). POSIX-only: socketpair.
+if host_machine.system() != 'windows'
+  test_sigpipe = executable('test_sigpipe',
+    'unit/test_sigpipe.c',
+    dependencies : [common_dep],
+  )
+  test('no SIGPIPE on a closed peer', test_sigpipe)
+endif
+
 # Live two-phase-commit (XA/TPC) test against the core API. Self-gating: exits 77
 # (skip) unless SEER_TEST_HOST/SERVICE/USER are set, so it is a no-op offline.
 test_tpc = executable('test_tpc',

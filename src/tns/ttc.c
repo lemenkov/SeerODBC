@@ -197,11 +197,11 @@ void seer_cancel(SeerConn *c)
   seer_packet_send(c->t, TNS_PT_MARKER, interrupt, sizeof interrupt);
 }
 
-/* Receive a complete TTC message, reassembling across TNS_DATA packets. Each
+/* Receive one complete TTC message, reassembling across TNS_DATA packets. Each
  * packet carries 2 data-flag bytes that are stripped; the server signals "more
  * fragments follow" by sizing a packet to exactly SDU-37 or SDU-81 (§1.3).
  * *out is malloc'd; caller frees. */
-SeerStatus seer_ttc_recv(SeerConn *c, uint8_t **out, size_t *outlen)
+static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
 {
   *out = NULL;
   *outlen = 0;
@@ -279,6 +279,34 @@ SeerStatus seer_ttc_recv(SeerConn *c, uint8_t **out, size_t *outlen)
   *out = acc.buf;
   *outlen = acc.len;
   return SEER_OK;
+}
+
+/* Receive a TTC response. A message that is nothing but TTI_FOB is not a
+ * response but a request: a DML statement with a RETURNING clause that FAILS
+ * makes the server ask the client to flush its out-binds, and it then waits for
+ * the same single byte back before sending the real error. Answer it (a
+ * bounded number of times, so a server that never stops asking ends the call)
+ * and return the response behind it. Left unanswered, the server stays in the
+ * previous call and the NEXT statement fails with ORA-03137 (ORA-00600 on
+ * 10g). */
+SeerStatus seer_ttc_recv(SeerConn *c, uint8_t **out, size_t *outlen)
+{
+  for (int asked = 0;; asked++) {
+    SeerStatus st = recv_message(c, out, outlen);
+    if (st != SEER_OK || *outlen != 1 || (*out)[0] != TTI_FOB)
+      return st;
+    free(*out);
+    *out = NULL;
+    *outlen = 0;
+    if (asked == 3) {
+      seer_log(SEER_LOG_ERROR, "ttc: server keeps asking to flush out-binds");
+      return SEER_EPROTO;
+    }
+    const uint8_t fob = TTI_FOB;
+    st = seer_ttc_send(c, &fob, 1);
+    if (st != SEER_OK)
+      return st;
+  }
 }
 
 /* -------------------------------------------------- request pipelining (§32) */

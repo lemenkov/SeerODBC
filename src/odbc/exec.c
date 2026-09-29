@@ -279,6 +279,17 @@ static SQLRETURN apply_params(OdbcStmt *s)
     }
     if (p->bound && (p->io_type == SQL_PARAM_OUTPUT || p->io_type == SQL_PARAM_INPUT_OUTPUT)) {
       int sz = (p->column_size > 0) ? (int)p->column_size : (int)p->buflen;
+      /* IN OUT: send the application's value in, then mark it OUT (binding it
+       * as a pure OUT sent a NULL, so the procedure never saw the input). */
+      if (p->io_type == SQL_PARAM_INPUT_OUTPUT && p->sql_type != SQL_REFCURSOR) {
+        SQLLEN ind = p->indicator ? *p->indicator : SQL_NTS;
+        SeerStatus st = bind_one_value(s->core, param, p->c_type, p->sql_type, p->buf, ind);
+        if (st == SEER_OK)
+          st = seer_stmt_bind_set_inout(s->core, param, sz);
+        if (st != SEER_OK)
+          return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
+        continue;
+      }
       seer_stmt_bind_out(s->core, param, ora_type_for_sql(p->sql_type), sz);
       continue;
     }

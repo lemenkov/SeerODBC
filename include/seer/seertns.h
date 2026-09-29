@@ -348,6 +348,11 @@ SeerStatus seer_stmt_out_array_get(SeerStmt *stmt, int param, int index, const c
  * 12 DATE, 23 RAW, 101 BINARY_DOUBLE) and max byte size. After execute its
  * value is read with seer_stmt_out_data. */
 SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_size);
+/* Turn an already-bound input parameter into IN OUT: its value is sent in and
+ * the block's result comes back in the same place (read it with
+ * seer_stmt_out_data). `max_size` reserves room for a VARCHAR / RAW result
+ * longer than the value sent. Bind the input value first. */
+SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size);
 
 /* Retrieve a captured OUT parameter value (valid after execute). */
 SeerStatus seer_stmt_out_data(SeerStmt *stmt, int param, const void **data, size_t *len,
