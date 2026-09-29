@@ -15,9 +15,11 @@
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -712,6 +714,89 @@ static void check_returning_truncation(SQLHDBC dbc)
   else {
     char m[200];
     snprintf(m, sizeof m, "rc=%d state='%s' value='%s' ind=%ld", rc, state, v, (long)vind);
+    fail(name, m);
+  }
+}
+
+/* ALTER SESSION SET CURRENT_SCHEMA / EDITION make 11g report the change as
+ * key/value pairs in the execute's RPA; the response must still parse and the
+ * session carry on. */
+static void check_alter_session_state(SQLHDBC dbc, int has_editions)
+{
+  const char *name = "ALTER SESSION SET CURRENT_SCHEMA / EDITION";
+  char err[256] = "", sql[160], out[64] = "", user[64] = "";
+  /* The session's own user, from the server, as a plain identifier. */
+  exec_scalar(dbc, "SELECT USER FROM dual", user, sizeof user, err, sizeof err);
+  for (const char *c = user; *c; c++)
+    if (!isalnum((unsigned char)*c) && *c != '_' && *c != '$' && *c != '#')
+      user[0] = '\0';
+  if (!user[0]) {
+    skip(name, "no usable session user");
+    return;
+  }
+  snprintf(sql, sizeof sql, "ALTER SESSION SET CURRENT_SCHEMA = %s", user);
+  SQLRETURN r1 = exec_do(dbc, sql, err, sizeof err);
+  char e1[256];
+  snprintf(e1, sizeof e1, "%s", err);
+  /* Editions arrived in 11.2; on 10g the statement is refused, and the
+   * session's recursive SQL then fails (ORA-00604) - so only ask 11.2+. */
+  char e2[256] = "";
+  SQLRETURN r2 = has_editions ? exec_do(dbc, "ALTER SESSION SET EDITION = ORA$BASE", e2, sizeof e2)
+                              : SQL_SUCCESS;
+  SQLRETURN r3 = exec_scalar(dbc, "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual", out,
+                             sizeof out, err, sizeof err);
+  if (SQL_SUCCEEDED(r1) && SQL_SUCCEEDED(r3) && strcasecmp(out, user) == 0 &&
+      (SQL_SUCCEEDED(r2) || strstr(e2, "ORA-")))
+    pass(name);
+  else {
+    char m[700];
+    snprintf(m, sizeof m, "r1=%d(%s) r2=%d(%s) r3=%d schema='%s' %s", r1, e1, r2, e2, r3, out, err);
+    fail(name, m);
+  }
+}
+
+/* v$session.OSUSER (SYS_CONTEXT OS_USER) is the operating-system account
+ * running the client, not the database user. */
+static void check_os_user(SQLHDBC dbc)
+{
+  const char *name = "OS user reported to the server";
+  char out[128] = "", err[256] = "";
+  const char *me = getenv("USER");
+  if (me == NULL || !me[0])
+    me = getenv("LOGNAME");
+  if (me == NULL || !me[0]) {
+    skip(name, "no USER / LOGNAME in the environment");
+    return;
+  }
+  exec_scalar(dbc, "SELECT SYS_CONTEXT('USERENV', 'OS_USER') FROM dual", out, sizeof out, err,
+              sizeof err);
+  if (strcmp(out, me) == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' want '%s' %s", out, me, err);
+    fail(name, m);
+  }
+}
+
+/* A statement that fails still leaves the server a cursor, which must be
+ * closed: 500 failing statements on one connection (more than a typical
+ * OPEN_CURSORS of 300) must not exhaust the session's cursors (ORA-01000). */
+static void check_failed_statements_close_cursors(SQLHDBC dbc)
+{
+  const char *name = "failed statements don't leak server cursors";
+  char err[256] = "", out[32] = "";
+  for (int i = 0; i < 500; i++) {
+    char sql[64];
+    snprintf(sql, sizeof sql, "SELECT %d FROM seer_no_such_table", i);
+    exec_do(dbc, sql, err, sizeof err);
+  }
+  if (SQL_SUCCEEDED(exec_scalar(dbc, "SELECT 5 FROM dual", out, sizeof out, err, sizeof err)) &&
+      strcmp(out, "5") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "after 500 failures: '%s' %s", out, err);
     fail(name, m);
   }
 }
@@ -2124,6 +2209,9 @@ int main(void)
   check_length_boundaries(dbc);
   check_typed_null(dbc);
   check_statement_kind(dbc);
+  check_alter_session_state(dbc, strcmp(ver, "11.02") >= 0);
+  check_os_user(dbc);
+  check_failed_statements_close_cursors(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");

@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <pwd.h>
+#endif
 
 /* ---------------------------------------------------------- static messages */
 
@@ -690,6 +693,26 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
   char pid[16];
   snprintf(pid, sizeof pid, "%ld", (long)getpid());
 
+  /* AUTH_SID is the operating-system account running the client - the server
+   * shows it as v$session.OSUSER / SYS_CONTEXT('USERENV','OS_USER') - not the
+   * database user (seerdb/seerdb@dd06c5d). */
+  char osuser[128] = "";
+#ifndef _WIN32
+  struct passwd pw, *pwres = NULL;
+  char pwbuf[1024];
+  if (getpwuid_r(geteuid(), &pw, pwbuf, sizeof pwbuf, &pwres) == 0 && pwres != NULL &&
+      pwres->pw_name != NULL)
+    snprintf(osuser, sizeof osuser, "%s", pwres->pw_name);
+#endif
+  if (!osuser[0]) {
+    const char *e = getenv("USER");
+    if (e == NULL || !e[0])
+      e = getenv("LOGNAME");
+    if (e == NULL || !e[0])
+      e = getenv("USERNAME"); /* Windows */
+    snprintf(osuser, sizeof osuser, "%s", (e != NULL && e[0]) ? e : "unknown");
+  }
+
   static const char APP[] = "seerodbc";
 
   if (!seer_writer_init(w, 256))
@@ -718,7 +741,7 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
   seer_enc_kv(w, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0);
   seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0);
   seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0);
-  seer_enc_kv(w, "AUTH_SID", 8, user, ulen, 0);
+  seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0);
 
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);

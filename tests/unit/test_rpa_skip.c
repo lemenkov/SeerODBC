@@ -41,8 +41,34 @@ static const char *FV27_SELECT42 =
     "0000040101010e010102057b0000010200030000000000000000000000000300010100"
     "00000002057b0101010300194f52412d30313430333a206e6f206461746120666f756e640a";
 
+/* A live 11.2 XE reply to `ALTER SESSION SET CURRENT_SCHEMA = SYSTEM`
+ * (seerdb tests/captures/alter_session_current_schema_11g.hexdump): its RPA
+ * carries, after the al8o4l words, a transaction-id length, TWO session-state
+ * key/value pairs (the schema name under keyword 168, its id under 169) and a
+ * registration length - then the status. Skipping only zero bytes after the
+ * words stopped on the pair data and reported "unexpected response token". */
+static const char *ALTER_SESSION_11G =
+    "08010603c140830001020102000000010201060653595354454d0001a8000104040000000501a90004010501060000"
+    "00000102002a0000000000000000000000000900010100000000";
+
+static void check_alter_session_11g(void)
+{
+  static uint8_t buf[256];
+  size_t len = unhex(ALTER_SESSION_11G, buf);
+  int ncols = -1;
+  int64_t err = -1;
+  SeerStatus st = seer_test_parse_execute_response(buf, len, 6, &ncols, &err);
+  if (st != SEER_OK || err != 0) {
+    fprintf(stderr, "FAIL: 11g ALTER SESSION reply: st=%d err=%lld (want OK, 0)\n", st,
+            (long long)err);
+    assert(0);
+  }
+  printf("rpa_skip: 11g RPA key/value pairs consumed (OER=0)\n");
+}
+
 int main(void)
 {
+  check_alter_session_11g();
   static uint8_t buf[512];
   size_t len = unhex(FV27_SELECT42, buf);
 
