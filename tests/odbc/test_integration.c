@@ -755,6 +755,30 @@ static void check_alter_session_state(SQLHDBC dbc, int has_editions)
   }
 }
 
+/* v$session.OSUSER (SYS_CONTEXT OS_USER) is the operating-system account
+ * running the client, not the database user. */
+static void check_os_user(SQLHDBC dbc)
+{
+  const char *name = "OS user reported to the server";
+  char out[128] = "", err[256] = "";
+  const char *me = getenv("USER");
+  if (me == NULL || !me[0])
+    me = getenv("LOGNAME");
+  if (me == NULL || !me[0]) {
+    skip(name, "no USER / LOGNAME in the environment");
+    return;
+  }
+  exec_scalar(dbc, "SELECT SYS_CONTEXT('USERENV', 'OS_USER') FROM dual", out, sizeof out, err,
+              sizeof err);
+  if (strcmp(out, me) == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' want '%s' %s", out, me, err);
+    fail(name, m);
+  }
+}
+
 /* A statement that fails still leaves the server a cursor, which must be
  * closed: 500 failing statements on one connection (more than a typical
  * OPEN_CURSORS of 300) must not exhaust the session's cursors (ORA-01000). */
@@ -2186,6 +2210,7 @@ int main(void)
   check_typed_null(dbc);
   check_statement_kind(dbc);
   check_alter_session_state(dbc, strcmp(ver, "11.02") >= 0);
+  check_os_user(dbc);
   check_failed_statements_close_cursors(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
