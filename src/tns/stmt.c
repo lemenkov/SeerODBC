@@ -644,8 +644,8 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     uint8_t type = seer_reader_u8(r);
     (void)seer_reader_u8(r); /* flags     */
     (void)seer_reader_u8(r); /* precision */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      (void)seer_reader_u8(r); /* scale: a raw sb1 on 12c+ */
+    if (fv >= TTC_FIELD_VERSION_12_1)
+      (void)seer_reader_u8(r); /* scale: a raw sb1 from 12.1 */
     else
       (void)seer_dec_sb4(r);            /* scale: variable on 11g */
     int64_t data_len = seer_dec_sb4(r); /* buffer size (data length) */
@@ -1369,12 +1369,17 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
   free(msgs);
 
   /* 12c+ extends the OER before the trailing message: an extended error number
-   * + rowcount (12.1+), then a SQL type + server checksum (20.1+). Skipping
-   * these by field version keeps the message DALC aligned. */
+   * + rowcount (12.1+, by the negotiated version), then a SQL type + server
+   * checksum - which a 21c+ server sends to every session, so that pair follows
+   * the version the SERVER advertised, not the negotiated one
+   * (seerdb/seerdb@e513309). Read by the negotiated version, a session capped
+   * below 20.1 took the SQL type for the message length and lost every error's
+   * text. */
   if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
     (void)seer_dec_sb4(r); /* extended error number */
     (void)seer_dec_sb4(r); /* extended rowcount (ub8) */
-    if (stmt->conn->field_version >= TTC_FIELD_VERSION_20_1) {
+    if (stmt->conn->server_field_version >= TTC_FIELD_VERSION_20_1 ||
+        stmt->conn->field_version >= TTC_FIELD_VERSION_20_1) {
       (void)seer_dec_sb4(r); /* SQL type */
       (void)seer_dec_sb4(r); /* server checksum */
     }
@@ -1763,7 +1768,7 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
 static SeerStatus encode_chr(const uint8_t *data, size_t n, uint8_t fv, uint8_t **out,
                              size_t *outlen)
 {
-  bool new_form = fv >= TTC_FIELD_VERSION_12_2;
+  bool new_form = fv >= TTC_FIELD_VERSION_12_1;
   /* A plain length byte covers 1..252: 0xFD (253), 0xFE (chunked) and 0xFF
    * (NULL) are markers, so a 253-byte value inline reads as a marker. */
   size_t inline_max = new_form ? 252 : 64;
@@ -2309,12 +2314,14 @@ static bool sql_is_cacheable(const char *sql)
 /* Emit one OAC bind descriptor. The 12c+ form (oracledb _write_column_metadata)
  * is differently shaped from 11g's encode_token_raw - a USE_INDICATORS flag
  * byte, a ub8 cont-flag, OID/version, the charset as a ub2 with its csfrm, a LOB
- * prefetch length and a trailing oaccolid - and an 11g-shaped OAC to a 12c
- * server is rejected (ORA-03115). */
+ * prefetch length and (12.2+ only) a trailing oaccolid - and an 11g-shaped OAC to
+ * a 12c server is rejected (ORA-03115). The 12c shape starts at 12.1; only the
+ * oaccolid waits for 12.2: a 12.1 session sent it answers ORA-03106, one sent
+ * the 11g shape ORA-03120 (seerdb/seerdb@50f0a83). */
 static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint32_t flag,
                      uint32_t charset)
 {
-  if (fv >= TTC_FIELD_VERSION_12_2) {
+  if (fv >= TTC_FIELD_VERSION_12_1) {
     uint32_t bind_charset;
     uint8_t csfrm;
     if (charset == 0) {
@@ -2340,7 +2347,8 @@ static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint
     seer_enc_sb4(w, bind_charset); /* charset id (ub2) */
     seer_writer_u8(w, csfrm);      /* character set form */
     seer_enc_sb4(w, 0);            /* LOB prefetch length */
-    seer_enc_sb4(w, 0);            /* oaccolid */
+    if (fv >= TTC_FIELD_VERSION_12_2)
+      seer_enc_sb4(w, 0); /* oaccolid */
     return;
   }
   uint8_t form_of_use = (charset == 2000) ? 2 : 1; /* AL16UTF16 => 2 */
@@ -2397,7 +2405,7 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
    * al8pidmlrc iteration count below; the server then returns one row count per
    * iteration in the response RPA. */
   bool dml_rowcounts = stmt->want_dml_rowcounts && kind == STMT_CHANGE && iters > 1 &&
-                       stmt->conn->field_version >= TTC_FIELD_VERSION_12_2;
+                       stmt->conn->field_version >= TTC_FIELD_VERSION_12_1;
 
   uint32_t lmax = (kind == STMT_SELECT) ? 0xFFFFFFFFu : 0u;
   uint32_t all8[13] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -2475,11 +2483,13 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     for (int i = 0; i < 5; i++)
       seer_writer_u8(w, 0); /* .. reg_lsb..msb */
 
-  /* 12c+ OALL8 carries the al8pidmlrc block, the al8sqlsig / SQL-id slot, and
-   * (12.2_EXT1+) chunk-id pointers - all null for us - and length-prefixes the
-   * SQL. Without these the server reads the al8i4 array at the wrong offset
-   * and rejects the call (ORA-03120). */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_2) {
+  /* 12c+ OALL8 carries the al8pidmlrc block (12.1+), the al8sqlsig / SQL-id
+   * slot (12.2+), and (12.2_EXT1+) chunk-id pointers - all null for us - and
+   * length-prefixes the SQL (12.1+). Without these the server reads the al8i4
+   * array at the wrong offset and rejects the call (ORA-03120); gating the
+   * whole tail on 12.2 sent a 12.1 session the 11g shape
+   * (seerdb/seerdb@50f0a83). */
+  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
     if (dml_rowcounts) {
       /* al8pidmlrc: pointer(1) + ub4 (1 + iteration count) + 1. */
       seer_writer_u8(w, 1);
@@ -2489,8 +2499,9 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
       for (int i = 0; i < 3; i++)
         seer_writer_u8(w, 0); /* al8pidmlrc    */
     }
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
+    if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_2)
+      for (int i = 0; i < 5; i++)
+        seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
     if (stmt->conn->field_version > TTC_FIELD_VERSION_12_2)
       for (int i = 0; i < 2; i++)
         seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */

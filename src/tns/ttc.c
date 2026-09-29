@@ -989,6 +989,7 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   }
   conn->req_boundaries = req_bnd; /* §35: explicit request-boundary support */
   conn->max_string_size = str32k ? 32767 : 4000;
+  conn->server_field_version = server_fv;
   seer_log(SEER_LOG_DEBUG, "ttc: server max string size %u", conn->max_string_size);
   /* Advertise up to TTC_FIELD_VERSION_MAX (the biggest version whose data path
    * is complete); SEER_MAX_FV overrides it. The server negotiates down: we use

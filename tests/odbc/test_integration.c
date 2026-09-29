@@ -817,6 +817,12 @@ static void check_json_server_forms(SQLHDBC dbc)
     skip(name, err[0] ? err : "no native JSON");
     return;
   }
+  if (out[0] && strspn(out, "0123456789ABCDEF") == strlen(out)) {
+    /* Below 21c's field version the server returns JSON as a BLOB (hex), not
+     * an OSON image - nothing to decode at this protocol level. */
+    skip(name, "native JSON not surfaced at this protocol level");
+    return;
+  }
   size_t as = strspn(out + (out[0] == '{' && out[1] == '"' ? 2 : 0), "A");
   if (as != 256 || !strstr(out, ":6700")) {
     snprintf(m, sizeof m, "long name: got %zu A's in '%.60s...'", as, out);
