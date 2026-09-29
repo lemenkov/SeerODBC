@@ -34,6 +34,11 @@ struct SeerConn {
    * else 4000. A bind declared larger is "LONG-class" (sent after the row's
    * other values in a SQL statement). */
   uint32_t max_string_size;
+  /* The field version the server advertised (compile caps), as opposed to the
+   * negotiated field_version. Some fields follow the server's release: 21c+
+   * sends the OER's SQL type + checksum to every session, even one that
+   * negotiated a lower version. */
+  uint8_t server_field_version;
   uint8_t session_state;
   bool in_request;
   /* End-of-response framing (§32/#155): the accept advertised it (flags2 bit),

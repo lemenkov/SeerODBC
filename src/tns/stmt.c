@@ -1369,12 +1369,17 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
   free(msgs);
 
   /* 12c+ extends the OER before the trailing message: an extended error number
-   * + rowcount (12.1+), then a SQL type + server checksum (20.1+). Skipping
-   * these by field version keeps the message DALC aligned. */
+   * + rowcount (12.1+, by the negotiated version), then a SQL type + server
+   * checksum - which a 21c+ server sends to every session, so that pair follows
+   * the version the SERVER advertised, not the negotiated one
+   * (seerdb/seerdb@e513309). Read by the negotiated version, a session capped
+   * below 20.1 took the SQL type for the message length and lost every error's
+   * text. */
   if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
     (void)seer_dec_sb4(r); /* extended error number */
     (void)seer_dec_sb4(r); /* extended rowcount (ub8) */
-    if (stmt->conn->field_version >= TTC_FIELD_VERSION_20_1) {
+    if (stmt->conn->server_field_version >= TTC_FIELD_VERSION_20_1 ||
+        stmt->conn->field_version >= TTC_FIELD_VERSION_20_1) {
       (void)seer_dec_sb4(r); /* SQL type */
       (void)seer_dec_sb4(r); /* server checksum */
     }
