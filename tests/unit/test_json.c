@@ -36,8 +36,44 @@ static void bad(const char *in)
   free(oson);
 }
 
+/* The encoder's field-name table: hash bytes (FNV-1a, low byte) and names in
+ * hash order, as a 23ai server writes them (seerdb PROTOCOL.md §17.0d). Our
+ * header: 6-byte magic, ub1 name count, ub2 name-segment size, ub2 tree size,
+ * 2 reserved bytes, then the hash array, the ub2 offsets, the <len><name>s. */
+static void check_fname_table(const char *doc, const char *want_names, const char *want_hashes)
+{
+  uint8_t *img = NULL;
+  size_t n = 0;
+  assert(seer_json_to_oson(doc, &img, &n) == SEER_OK);
+  int count = img[6];
+  const uint8_t *hash = img + 13;
+  const uint8_t *seg = hash + 3 * count;
+  char names[256] = "", hashes[256] = "";
+  for (int i = 0; i < count; i++) {
+    size_t off = (size_t)hash[count + 2 * i] << 8 | hash[count + 2 * i + 1];
+    snprintf(names + strlen(names), sizeof names - strlen(names), "%s%.*s", i ? "," : "",
+             (int)seg[off], (const char *)seg + off + 1);
+    snprintf(hashes + strlen(hashes), sizeof hashes - strlen(hashes), "%s%02x", i ? " " : "",
+             hash[i]);
+  }
+  if (strcmp(names, want_names) != 0 || strcmp(hashes, want_hashes) != 0) {
+    fprintf(stderr, "FAIL %s: names '%s' hashes '%s' (want '%s' / '%s')\n", doc, names, hashes,
+            want_names, want_hashes);
+    assert(0);
+  }
+  char *back = NULL; /* and it still decodes to the same document */
+  assert(seer_decode_oson(img, n, &back) == SEER_OK);
+  free(back);
+  free(img);
+}
+
 int main(void)
 {
+  check_fname_table("{\"a\":1}", "a", "2c");
+  check_fname_table("{\"b\":1,\"a\":2}", "a,b", "2c e5");
+  check_fname_table("{\"outer\":{\"inner\":{\"deep\":\"v\"}},\"arr\":[{\"k\":1}]}",
+                    "arr,inner,deep,outer,k", "18 27 6f 74 ea");
+
   /* scalars */
   rt("42", "42");
   rt("-7", "-7");

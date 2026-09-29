@@ -322,10 +322,18 @@ int main(void)
         skip(name, "JSON column type / ASSM tablespace not available");
       else
         fail(name, er ? er : "bind/exec");
-    } else if (readback_has(c, "SELECT doc FROM seerjb", "alice", "30")) {
-      pass(name);
-    } else {
+    } else if (!readback_has(c, "SELECT doc FROM seerjb", "alice", "30")) {
       fail(name, "readback mismatch");
+    } else if (!readback_has(c,
+                             "SELECT JSON_VALUE(doc, '$.name') FROM seerjb "
+                             "WHERE JSON_EXISTS(doc, '$.n')",
+                             "alice", "alice")) {
+      /* The server finds fields through the image's hash array: an image with
+       * zeroed hashes / unsorted names reads back as text but no path query
+       * ever matches it. */
+      fail(name, "JSON_EXISTS / JSON_VALUE don't find the bound document's fields");
+    } else {
+      pass(name);
     }
     run(c, "DROP TABLE seerjb");
   }

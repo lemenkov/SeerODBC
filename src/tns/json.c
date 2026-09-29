@@ -442,12 +442,17 @@ typedef struct {
   int ok;
 } Fnames;
 
-/* Return the 1-based field id for a key, assigning a new one in first-seen order. */
+/* Return the 1-based field id for a key, adding it to the table if new. The
+ * ids are final only after sort_fnames() has put the table in hash order. */
 static int fid(Fnames *f, const char *name, size_t len)
 {
   for (int i = 0; i < f->count; i++)
     if (f->lens[i] == len && memcmp(f->names[i], name, len) == 0)
       return i + 1;
+  if (len > 0xFF) { /* the short-name form stores a one-byte length */
+    f->ok = 0;
+    return 1;
+  }
   if (f->count >= 0xFF) {
     f->ok = 0;
     return 1;
@@ -484,6 +489,46 @@ static void collect_fnames(const JsonNode *j, Fnames *f)
     for (size_t i = 0; i < j->n; i++)
       collect_fnames(j->kids[i], f);
   }
+}
+
+/* A field name's hash-array byte: the low byte of FNV-1a (32-bit) over the
+ * name's UTF-8 bytes. */
+static uint8_t fname_hash(const char *name, size_t len)
+{
+  uint32_t h = 0x811C9DC5u;
+  for (size_t i = 0; i < len; i++) {
+    h ^= (uint8_t)name[i];
+    h *= 0x01000193u;
+  }
+  return (uint8_t)(h & 0xFF);
+}
+
+/* Order the field-name table as the server indexes it: by hash byte, then
+ * length, then bytes. The hash array is load-bearing - with zeros, or names in
+ * document order, a document we store round-trips as text but JSON_EXISTS /
+ * JSON_VALUE / path predicates never find its fields (seerdb/seerdb@0f5044a).
+ * Field ids are positions in this order, so it is fixed before any is used. */
+static int fname_cmp(const Fnames *f, int a, int b)
+{
+  uint8_t ha = fname_hash(f->names[a], f->lens[a]), hb = fname_hash(f->names[b], f->lens[b]);
+  if (ha != hb)
+    return ha < hb ? -1 : 1;
+  if (f->lens[a] != f->lens[b])
+    return f->lens[a] < f->lens[b] ? -1 : 1;
+  return memcmp(f->names[a], f->names[b], f->lens[a]);
+}
+
+static void sort_fnames(Fnames *f)
+{
+  for (int i = 1; i < f->count; i++) /* insertion sort: at most 255 names */
+    for (int j = i; j > 0 && fname_cmp(f, j - 1, j) > 0; j--) {
+      char *tn = f->names[j];
+      size_t tl = f->lens[j];
+      f->names[j] = f->names[j - 1];
+      f->lens[j] = f->lens[j - 1];
+      f->names[j - 1] = tn;
+      f->lens[j - 1] = tl;
+    }
 }
 
 /* ---- OSON encoder ------------------------------------------------------- */
@@ -630,6 +675,7 @@ SeerStatus seer_json_to_oson(const char *json_text, uint8_t **out, size_t *outle
   /* Container root: collect field names, then header + segments + tree. */
   Fnames f = {.ok = 1};
   collect_fnames(root, &f);
+  sort_fnames(&f);
   if (!f.ok) {
     free(f.names);
     free(f.lens);
@@ -693,7 +739,7 @@ SeerStatus seer_json_to_oson(const char *json_text, uint8_t **out, size_t *outle
     seer_writer_u8(&w, 0);
     seer_writer_u8(&w, 0); /* reserved */
     for (int i = 0; i < f.count; i++)
-      seer_writer_u8(&w, 0); /* hash array */
+      seer_writer_u8(&w, fname_hash(f.names[i], f.lens[i])); /* hash array */
     for (int i = 0; i < f.count; i++) {
       seer_writer_u8(&w, (uint8_t)(offs[i] >> 8));
       seer_writer_u8(&w, (uint8_t)(offs[i] & 0xFF));
