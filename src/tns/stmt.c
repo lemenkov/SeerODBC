@@ -4868,13 +4868,17 @@ void seer_stmt_close(SeerStmt *stmt)
    * re-parse. The describe columns move with it. (A full cache evicts + closes
    * its oldest cursor.) Done after the rows are freed - that loop needs ncols. */
   SeerConn *c = stmt->conn;
-  if (c != NULL && c->authenticated && stmt->cursor_id > 0 && stmt->sql != NULL) {
+  /* A statement closed before it executed may still hold a parsed cursor - taken
+   * taken from the statement cache at prepare - which goes back the same way
+   * (it used to be dropped without a close, leaking the server cursor). */
+  int keep_cursor = stmt->cursor_id > 0 ? stmt->cursor_id : stmt->reuse_cursor;
+  if (c != NULL && c->authenticated && keep_cursor > 0 && stmt->sql != NULL) {
     if (sql_is_cacheable(stmt->sql)) {
-      stmt_cache_put(c, stmt->sql, stmt->cursor_id, stmt->cols, stmt->ncols);
+      stmt_cache_put(c, stmt->sql, keep_cursor, stmt->cols, stmt->ncols);
       stmt->cols = NULL; /* moved to the cache; don't free */
       stmt->ncols = 0;
     } else if (c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0])) {
-      c->close_cursors[c->n_close++] = stmt->cursor_id; /* DDL etc: just close */
+      c->close_cursors[c->n_close++] = keep_cursor; /* DDL etc: just close */
     }
   }
   free_columns(stmt->cols, stmt->ncols);
