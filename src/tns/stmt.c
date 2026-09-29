@@ -2479,7 +2479,15 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
      * bind ahead of another bind lost the row. */
     uint32_t max_str = stmt->conn->max_string_size ? stmt->conn->max_string_size : 4000;
     int passes = (kind == STMT_BLOCK) ? 1 : 2;
-    for (int it = 0; it < iters; it++) {
+    /* A DML RETURNING whose every bind is a return bind has no input row: the
+     * request carries no TTI_RXD at all (the iteration count rides in
+     * al8i4[1]). An empty one drew ORA-03146 on 12c+, and on 11g left the
+     * server out of step so it dropped the session on the next call. */
+    int n_in = 0;
+    for (int i = 0; i < nb; i++)
+      if (!(stmt->returning && stmt->pbinds[i].is_out))
+        n_in++;
+    for (int it = 0; it < iters && n_in > 0; it++) {
       seer_writer_u8(w, TTI_RXD);
       for (int pass = 0; pass < passes; pass++) {
         for (int i = 0; i < nb; i++) {
