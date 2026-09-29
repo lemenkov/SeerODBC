@@ -801,6 +801,48 @@ static void check_failed_statements_close_cursors(SQLHDBC dbc)
   }
 }
 
+/* Two OSON image forms only a server writes: version 3 (a field name over
+ * 255 bytes gets a second name segment) and a `COMPRESS HIGH` column (relative
+ * child offsets, objects sharing another's field ids). Each decodes to the
+ * document that went in. Skipped where the server lacks the syntax. */
+static void check_json_server_forms(SQLHDBC dbc)
+{
+  const char *name = "JSON: long field names and compressed columns";
+  char out[600] = "", err[256] = "", m[800] = "";
+  SQLRETURN rc = exec_scalar(dbc,
+                             "SELECT JSON_OBJECT(RPAD('A', 256, 'A') VALUE 6700 RETURNING JSON) "
+                             "FROM dual",
+                             out, sizeof out, err, sizeof err);
+  if (!SQL_SUCCEEDED(rc)) {
+    skip(name, err[0] ? err : "no native JSON");
+    return;
+  }
+  size_t as = strspn(out + (out[0] == '{' && out[1] == '"' ? 2 : 0), "A");
+  if (as != 256 || !strstr(out, ":6700")) {
+    snprintf(m, sizeof m, "long name: got %zu A's in '%.60s...'", as, out);
+    fail(name, m);
+    return;
+  }
+  exec_do(dbc, "DROP TABLE seer_jcomp", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE TABLE seer_jcomp (j JSON) JSON (j) STORE AS (COMPRESS HIGH)",
+                             err, sizeof err))) {
+    pass(name); /* long names verified; compressed JSON storage not offered here */
+    return;
+  }
+  exec_do(dbc, "INSERT INTO seer_jcomp VALUES ('[{\"a\":1,\"b\":\"x\"},{\"a\":2,\"b\":\"y\"}]')",
+          err, sizeof err);
+  out[0] = '\0';
+  exec_scalar(dbc, "SELECT j FROM seer_jcomp", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_jcomp", err, sizeof err);
+  if (strcmp(out, "[{\"a\":1,\"b\":\"x\"},{\"a\":2,\"b\":\"y\"}]") == 0)
+    pass(name);
+  else {
+    snprintf(m, sizeof m, "compressed: got '%s' %s", out, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1215,6 +1257,10 @@ static void check_json(SQLHDBC dbc)
                              out, sizeof out, err, sizeof err);
   if (!SQL_SUCCEEDED(rc)) {
     skip(name, err[0] ? err : "no native JSON type");
+    return;
+  }
+  if (!out[0]) { /* 18c has no JSON type: its JSON() yields NULL (DUMP says so) */
+    skip(name, "server's JSON() returns NULL (no native JSON type)");
     return;
   }
   if (strstr(out, "\"n\":42") && strstr(out, "\"s\":\"hi\"") && strstr(out, "\"b\":true"))
@@ -2251,6 +2297,7 @@ int main(void)
   check_boolean(dbc);
   check_vector(dbc);
   check_json(dbc);
+  check_json_server_forms(dbc);
   check_returning(dbc);
   check_medium_bind(dbc);
   check_large_bind(dbc);
