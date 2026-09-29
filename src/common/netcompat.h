@@ -23,41 +23,47 @@
 #include <stdint.h>
 
 #ifdef _WIN32
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 typedef SOCKET seer_socket_t;
-#  define SEER_INVALID_SOCKET  INVALID_SOCKET
-#  define seer_closesocket     closesocket
-#  define seer_poll            WSAPoll
+#define SEER_INVALID_SOCKET INVALID_SOCKET
+#define seer_closesocket closesocket
+#define seer_poll WSAPoll
 typedef WSAPOLLFD seer_pollfd;
 
 /* Nonblocking connect() reports "in progress" as WSAEWOULDBLOCK, not EINPROGRESS. */
-#  define SEER_EINTR           WSAEINTR
-#  define SEER_EINPROGRESS     WSAEWOULDBLOCK
+#define SEER_EINTR WSAEINTR
+#define SEER_EINPROGRESS WSAEWOULDBLOCK
 
-static inline int seer_sock_errno(void) { return WSAGetLastError(); }
+static inline int seer_sock_errno(void)
+{
+  return WSAGetLastError();
+}
 
 #else /* POSIX */
-#  include <errno.h>
-#  include <fcntl.h>
-#  include <netdb.h>
-#  include <poll.h>
-#  include <sys/socket.h>
-#  include <sys/time.h>
-#  include <sys/types.h>
-#  include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 typedef int seer_socket_t;
-#  define SEER_INVALID_SOCKET  (-1)
-#  define seer_closesocket     close
-#  define seer_poll            poll
+#define SEER_INVALID_SOCKET (-1)
+#define seer_closesocket close
+#define seer_poll poll
 typedef struct pollfd seer_pollfd;
 
-#  define SEER_EINTR           EINTR
-#  define SEER_EINPROGRESS     EINPROGRESS
+#define SEER_EINTR EINTR
+#define SEER_EINPROGRESS EINPROGRESS
 
-static inline int seer_sock_errno(void) { return errno; }
+static inline int seer_sock_errno(void)
+{
+  return errno;
+}
 #endif
 
 /*
@@ -72,18 +78,18 @@ int seer_net_init(void);
 static inline ptrdiff_t seer_sock_recv(seer_socket_t s, void *buf, size_t len)
 {
 #ifdef _WIN32
-    return recv(s, buf, (int)len, 0);
+  return recv(s, buf, (int)len, 0);
 #else
-    return recv(s, buf, len, 0);
+  return recv(s, buf, len, 0);
 #endif
 }
 
 static inline ptrdiff_t seer_sock_send(seer_socket_t s, const void *buf, size_t len)
 {
 #ifdef _WIN32
-    return send(s, (const char *)buf, (int)len, 0);
+  return send(s, (const char *)buf, (int)len, 0);
 #else
-    return send(s, buf, len, 0);
+  return send(s, buf, len, 0);
 #endif
 }
 
@@ -91,14 +97,14 @@ static inline ptrdiff_t seer_sock_send(seer_socket_t s, const void *buf, size_t 
 static inline int seer_sock_set_nonblocking(seer_socket_t s, int nonblocking)
 {
 #ifdef _WIN32
-    u_long v = nonblocking ? 1u : 0u;
-    return ioctlsocket(s, FIONBIO, &v) == 0 ? 0 : -1;
+  u_long v = nonblocking ? 1u : 0u;
+  return ioctlsocket(s, FIONBIO, &v) == 0 ? 0 : -1;
 #else
-    int fl = fcntl(s, F_GETFL, 0);
-    if (fl < 0)
-        return -1;
-    fl = nonblocking ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
-    return fcntl(s, F_SETFL, fl) < 0 ? -1 : 0;
+  int fl = fcntl(s, F_GETFL, 0);
+  if (fl < 0)
+    return -1;
+  fl = nonblocking ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
+  return fcntl(s, F_SETFL, fl) < 0 ? -1 : 0;
 #endif
 }
 
@@ -107,34 +113,34 @@ static inline int seer_sock_set_nonblocking(seer_socket_t s, int nonblocking)
 static inline void seer_sock_set_io_timeout(seer_socket_t s, int timeout_ms)
 {
 #ifdef _WIN32
-    DWORD tv = (DWORD)timeout_ms;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
+  DWORD tv = (DWORD)timeout_ms;
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv);
 #else
-    struct timeval tv = {
-        .tv_sec  = timeout_ms / 1000,
-        .tv_usec = (timeout_ms % 1000) * 1000,
-    };
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+  struct timeval tv = {
+      .tv_sec = timeout_ms / 1000,
+      .tv_usec = (timeout_ms % 1000) * 1000,
+  };
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 #endif
 }
 
 /* Read the pending socket error (SO_ERROR) into *out. Returns 0 / -1. */
 static inline int seer_sock_so_error(seer_socket_t s, int *out)
 {
-    int err = 0;
+  int err = 0;
 #ifdef _WIN32
-    int len = (int)sizeof err;
-    if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0)
-        return -1;
+  int len = (int)sizeof err;
+  if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0)
+    return -1;
 #else
-    socklen_t len = sizeof err;
-    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) != 0)
-        return -1;
+  socklen_t len = sizeof err;
+  if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) != 0)
+    return -1;
 #endif
-    *out = err;
-    return 0;
+  *out = err;
+  return 0;
 }
 
 #endif /* SEER_NETCOMPAT_H */

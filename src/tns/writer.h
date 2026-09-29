@@ -18,10 +18,10 @@
 #include <stdint.h>
 
 typedef struct {
-    uint8_t *buf;
-    size_t   len;    /* bytes written so far */
-    size_t   cap;    /* allocated capacity */
-    bool     error;  /* latched on allocation failure */
+  uint8_t *buf;
+  size_t len; /* bytes written so far */
+  size_t cap; /* allocated capacity */
+  bool error; /* latched on allocation failure */
 } SeerWriter;
 
 /* Initialise with an initial capacity hint (0 is allowed). Returns false and
@@ -34,12 +34,12 @@ void seer_writer_free(SeerWriter *w);
 /* True while no allocation has failed. */
 static inline bool seer_writer_ok(const SeerWriter *w)
 {
-    return !w->error;
+  return !w->error;
 }
 
 void seer_writer_u8(SeerWriter *w, uint8_t v);
-void seer_writer_u16(SeerWriter *w, uint16_t v);  /* big-endian */
-void seer_writer_u32(SeerWriter *w, uint32_t v);  /* big-endian */
+void seer_writer_u16(SeerWriter *w, uint16_t v); /* big-endian */
+void seer_writer_u32(SeerWriter *w, uint32_t v); /* big-endian */
 void seer_writer_bytes(SeerWriter *w, const void *p, size_t n);
 
 /* Overwrite two bytes already written at `off` with a big-endian u16. Used to

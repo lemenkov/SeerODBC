@@ -16,21 +16,23 @@ static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK wsa_startup(PINIT_ONCE once, PVOID param, PVOID *context)
 {
-    (void)once; (void)param; (void)context;
-    WSADATA wsadata;
-    return WSAStartup(MAKEWORD(2, 2), &wsadata) == 0 ? TRUE : FALSE;
+  (void)once;
+  (void)param;
+  (void)context;
+  WSADATA wsadata;
+  return WSAStartup(MAKEWORD(2, 2), &wsadata) == 0 ? TRUE : FALSE;
 }
 
 int seer_net_init(void)
 {
-    return InitOnceExecuteOnce(&g_wsa_once, wsa_startup, NULL, NULL) ? 0 : -1;
+  return InitOnceExecuteOnce(&g_wsa_once, wsa_startup, NULL, NULL) ? 0 : -1;
 }
 
 #else /* POSIX: the sockets API needs no process-wide init. */
 
 int seer_net_init(void)
 {
-    return 0;
+  return 0;
 }
 
 #endif

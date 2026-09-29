@@ -13,23 +13,22 @@
 
 int main(void)
 {
-    /* Sharding (§37): seer_connect rejects a non-empty key up front, before any
-     * network I/O, so this is a pure offline check (the host is never dialled). */
-    SeerConn *c = NULL;
-    SeerConnParams p = { .host = "unused.invalid", .service_name = "X",
-                         .shardingkey = "region=west" };
-    assert(seer_connect(&p, &c) == SEER_ENOTIMPL);
-    assert(c == NULL);
+  /* Sharding (§37): seer_connect rejects a non-empty key up front, before any
+   * network I/O, so this is a pure offline check (the host is never dialled). */
+  SeerConn *c = NULL;
+  SeerConnParams p = {.host = "unused.invalid", .service_name = "X", .shardingkey = "region=west"};
+  assert(seer_connect(&p, &c) == SEER_ENOTIMPL);
+  assert(c == NULL);
 
-    SeerConnParams sp = { .host = "unused.invalid", .service_name = "X",
-                          .supershardingkey = "tenant=42" };
-    assert(seer_connect(&sp, &c) == SEER_ENOTIMPL);
-    assert(c == NULL);
+  SeerConnParams sp = {
+      .host = "unused.invalid", .service_name = "X", .supershardingkey = "tenant=42"};
+  assert(seer_connect(&sp, &c) == SEER_ENOTIMPL);
+  assert(c == NULL);
 
-    /* CQN (§38): the subscribe/unsubscribe stubs always report unsupported. */
-    assert(seer_subscribe(NULL) == SEER_ENOTIMPL);
-    assert(seer_unsubscribe(NULL) == SEER_ENOTIMPL);
+  /* CQN (§38): the subscribe/unsubscribe stubs always report unsupported. */
+  assert(seer_subscribe(NULL) == SEER_ENOTIMPL);
+  assert(seer_unsubscribe(NULL) == SEER_ENOTIMPL);
 
-    printf("stubs: sharding + CQN reject cleanly (SEER_ENOTIMPL)\n");
-    return 0;
+  printf("stubs: sharding + CQN reject cleanly (SEER_ENOTIMPL)\n");
+  return 0;
 }

@@ -14,33 +14,33 @@
 #include "seer/seertns.h"
 
 /* Oracle TNS data-type numbers we recognise (subset). */
-#define ORA_TYPE_VARCHAR       1
-#define ORA_TYPE_NUMBER        2
-#define ORA_TYPE_VARNUM        6   /* NUMBER return/define request (9i fv2) */
-#define ORA_TYPE_LONG          8
-#define ORA_TYPE_RID          11   /* physical ROWID (column wire type)   */
-#define ORA_TYPE_DATE         12
-#define ORA_TYPE_RAW          23
-#define ORA_TYPE_LONGRAW      24
-#define ORA_TYPE_CHAR         96
-#define ORA_TYPE_BFLOAT      100
-#define ORA_TYPE_BDOUBLE     101
-#define ORA_TYPE_REFCURSOR   102
-#define ORA_TYPE_ROWID       104   /* extended ROWID descriptor (-> RID)  */
-#define ORA_TYPE_ADT         109   /* SQL OBJECT / collection (ADT)       */
-#define ORA_TYPE_REF         111   /* REF (opaque object reference)       */
-#define ORA_TYPE_CLOB        112
-#define ORA_TYPE_BLOB        113
-#define ORA_TYPE_BFILE       114
-#define ORA_TYPE_JSON        119
-#define ORA_TYPE_VECTOR      127
-#define ORA_TYPE_TIMESTAMP   180
+#define ORA_TYPE_VARCHAR 1
+#define ORA_TYPE_NUMBER 2
+#define ORA_TYPE_VARNUM 6 /* NUMBER return/define request (9i fv2) */
+#define ORA_TYPE_LONG 8
+#define ORA_TYPE_RID 11 /* physical ROWID (column wire type)   */
+#define ORA_TYPE_DATE 12
+#define ORA_TYPE_RAW 23
+#define ORA_TYPE_LONGRAW 24
+#define ORA_TYPE_CHAR 96
+#define ORA_TYPE_BFLOAT 100
+#define ORA_TYPE_BDOUBLE 101
+#define ORA_TYPE_REFCURSOR 102
+#define ORA_TYPE_ROWID 104 /* extended ROWID descriptor (-> RID)  */
+#define ORA_TYPE_ADT 109   /* SQL OBJECT / collection (ADT)       */
+#define ORA_TYPE_REF 111   /* REF (opaque object reference)       */
+#define ORA_TYPE_CLOB 112
+#define ORA_TYPE_BLOB 113
+#define ORA_TYPE_BFILE 114
+#define ORA_TYPE_JSON 119
+#define ORA_TYPE_VECTOR 127
+#define ORA_TYPE_TIMESTAMP 180
 #define ORA_TYPE_TIMESTAMPTZ 181
 #define ORA_TYPE_INTERVAL_YM 182
 #define ORA_TYPE_INTERVAL_DS 183
-#define ORA_TYPE_UROWID      208
+#define ORA_TYPE_UROWID 208
 #define ORA_TYPE_TIMESTAMPLTZ 231
-#define ORA_TYPE_BOOLEAN     252
+#define ORA_TYPE_BOOLEAN 252
 
 /* Decode an Oracle NUMBER (§11.1) to a decimal string in `out` (a buffer of
  * `outsz` bytes; 192 is ample for the full NUMBER range). */

@@ -19,14 +19,14 @@
 /* Read the full content of the LOB named by `locator` (loclen bytes). On
  * SEER_OK, *out is a malloc'd buffer of *outlen bytes (may be 0 for an empty
  * LOB); caller frees. */
-SeerStatus seer_lob_read(SeerConn *conn, const uint8_t *locator, size_t loclen,
-                         uint8_t **out, size_t *outlen);
+SeerStatus seer_lob_read(SeerConn *conn, const uint8_t *locator, size_t loclen, uint8_t **out,
+                         size_t *outlen);
 
 /* Read the content of an external BFILE named by its (RXD-captured) `locator`.
  * Unlike a persistent LOB this needs an explicit FILE_OPEN -> READ ->
  * FILE_CLOSE sequence over TTI_LOBOPS (PROTOCOL.md §19.8). On SEER_OK *out is a
  * malloc'd buffer of *outlen raw file bytes; caller frees. */
-SeerStatus seer_bfile_read(SeerConn *conn, const uint8_t *locator, size_t loclen,
-                           uint8_t **out, size_t *outlen);
+SeerStatus seer_bfile_read(SeerConn *conn, const uint8_t *locator, size_t loclen, uint8_t **out,
+                           size_t *outlen);
 
 #endif /* SEER_TNS_LOB_H */

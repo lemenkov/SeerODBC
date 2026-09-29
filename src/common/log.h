@@ -7,10 +7,10 @@
 #define SEER_COMMON_LOG_H
 
 typedef enum {
-    SEER_LOG_ERROR = 0,
-    SEER_LOG_WARN,
-    SEER_LOG_INFO,
-    SEER_LOG_DEBUG,
+  SEER_LOG_ERROR = 0,
+  SEER_LOG_WARN,
+  SEER_LOG_INFO,
+  SEER_LOG_DEBUG,
 } SeerLogLevel;
 
 void seer_log_set_level(SeerLogLevel level);
@@ -21,9 +21,9 @@ void seer_log_set_level(SeerLogLevel level);
  * check formats against the matching "gnu_printf" archetype. Elsewhere the plain
  * "printf" archetype is correct. */
 #if defined(__MINGW32__)
-#  define SEER_PRINTF_ARCHETYPE gnu_printf
+#define SEER_PRINTF_ARCHETYPE gnu_printf
 #else
-#  define SEER_PRINTF_ARCHETYPE printf
+#define SEER_PRINTF_ARCHETYPE printf
 #endif
 
 void seer_log(SeerLogLevel level, const char *fmt, ...)

@@ -26,29 +26,29 @@
 #define TNS_HEADER_LEN 8
 
 typedef enum {
-    TNS_PT_CONNECT   = 1,
-    TNS_PT_ACCEPT    = 2,
-    TNS_PT_ACK       = 3,
-    TNS_PT_REFUSE    = 4,
-    TNS_PT_REDIRECT  = 5,
-    TNS_PT_DATA      = 6,
-    TNS_PT_NULL      = 7,
-    TNS_PT_ABORT     = 9,
-    TNS_PT_RESEND    = 11,
-    TNS_PT_MARKER    = 12,
-    TNS_PT_ATTENTION = 13,
-    TNS_PT_CONTROL   = 14,
+  TNS_PT_CONNECT = 1,
+  TNS_PT_ACCEPT = 2,
+  TNS_PT_ACK = 3,
+  TNS_PT_REFUSE = 4,
+  TNS_PT_REDIRECT = 5,
+  TNS_PT_DATA = 6,
+  TNS_PT_NULL = 7,
+  TNS_PT_ABORT = 9,
+  TNS_PT_RESEND = 11,
+  TNS_PT_MARKER = 12,
+  TNS_PT_ATTENTION = 13,
+  TNS_PT_CONTROL = 14,
 } TnsPacketType;
 
 /* Frame `payload` as a TNS packet of `type` and write it. payload_len must
  * leave room for the 8-byte header within a 16-bit total length. */
-SeerStatus seer_packet_send(SeerTransport *t, uint8_t type,
-                            const void *payload, size_t payload_len);
+SeerStatus seer_packet_send(SeerTransport *t, uint8_t type, const void *payload,
+                            size_t payload_len);
 
 /* Read one TNS packet. On SEER_OK, *out_type is the packet type and *out_body
  * is a malloc'd copy of the body (everything after the 8-byte header), of
  * length *out_len. *out_body is NULL when the body is empty. Caller frees. */
-SeerStatus seer_packet_recv(SeerTransport *t, uint8_t *out_type,
-                            uint8_t **out_body, size_t *out_len);
+SeerStatus seer_packet_recv(SeerTransport *t, uint8_t *out_type, uint8_t **out_body,
+                            size_t *out_len);
 
 #endif /* SEER_TNS_PACKET_H */
