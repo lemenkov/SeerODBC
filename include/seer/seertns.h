@@ -390,6 +390,12 @@ SeerStatus seer_stmt_batch_error(SeerStmt *stmt, size_t i, unsigned *row, unsign
                                  const char **message);
 
 SeerStatus seer_stmt_execute(SeerStmt *stmt);
+/* Describe a prepared query's result columns without executing it (a
+ * parse-only round trip; binds need not be set). Afterwards seer_stmt_num_cols
+ * and the column accessors report them; seer_stmt_execute then parses and
+ * describes afresh as usual. A no-op for a statement that is not a
+ * query, one already described or executed, and on 9i. */
+SeerStatus seer_stmt_describe(SeerStmt *stmt);
 
 /* Advance to the next row. SEER_OK if a row is now current, SEER_ENODATA when
  * the result set is exhausted. */

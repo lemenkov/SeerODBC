@@ -911,6 +911,73 @@ static void check_object_lob_attrs(SQLHDBC dbc)
   }
 }
 
+/* SQLNumResultCols / SQLDescribeCol between SQLPrepare and SQLExecute: the
+ * driver describes the prepared query with a parse-only round trip (many tools
+ * build their result binding this way). Executing afterwards must still give
+ * the right rows; a prepared DML reports no columns and must not run; a bad
+ * statement reports its error at describe time. */
+static void check_describe_before_execute(SQLHDBC dbc)
+{
+  const char *name = "describe after SQLPrepare, before SQLExecute";
+  char err[256] = "", m[400] = "";
+  SQLHSTMT st;
+  SQLSMALLINT ncols = -1, nlen = 0, dtype = 0;
+  SQLCHAR cname[64] = "";
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLPrepare(
+      st, (SQLCHAR *)"SELECT 42 AS answer, 'x' AS letter FROM dual WHERE 1 = ?", SQL_NTS);
+  SQLRETURN r1 = SQLNumResultCols(st, &ncols);
+  SQLRETURN r2 = SQLDescribeCol(st, 2, cname, sizeof cname, &nlen, &dtype, NULL, NULL, NULL);
+  SQLINTEGER one = 1;
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &one, 0, NULL);
+  char v[16] = "";
+  SQLLEN vi = 0;
+  SQLRETURN r3 = SQLExecute(st);
+  if (SQL_SUCCEEDED(r3) && SQL_SUCCEEDED(SQLFetch(st)))
+    SQLGetData(st, 1, SQL_C_CHAR, v, sizeof v, &vi);
+  else
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(r1) && ncols == 2 && SQL_SUCCEEDED(r2) &&
+           strcasecmp((char *)cname, "LETTER") == 0 && strcmp(v, "42") == 0;
+  if (!ok)
+    snprintf(m, sizeof m, "prep=%d ncols=%d(%d) col2='%s'(%d) exec=%d value='%s' %s", rc, ncols, r1,
+             cname, r2, r3, v, err);
+
+  /* a prepared DML: no columns, and describing it doesn't run it */
+  if (ok) {
+    exec_do(dbc, "DROP TABLE seer_desc", err, sizeof err);
+    exec_do(dbc, "CREATE TABLE seer_desc (n NUMBER)", err, sizeof err);
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLPrepare(st, (SQLCHAR *)"INSERT INTO seer_desc VALUES (1)", SQL_NTS);
+    ncols = -1;
+    SQLNumResultCols(st, &ncols);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    char cnt[16] = "";
+    exec_scalar(dbc, "SELECT COUNT(*) FROM seer_desc", cnt, sizeof cnt, err, sizeof err);
+    exec_do(dbc, "DROP TABLE seer_desc", err, sizeof err);
+    ok = ncols == 0 && strcmp(cnt, "0") == 0;
+    if (!ok)
+      snprintf(m, sizeof m, "DML: ncols=%d rows=%s", ncols, cnt);
+  }
+  /* a bad statement reports its error at describe time */
+  if (ok) {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLPrepare(st, (SQLCHAR *)"SELECT x FROM seer_no_such_table", SQL_NTS);
+    SQLRETURN rb = SQLNumResultCols(st, &ncols);
+    err[0] = '\0';
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    ok = rb == SQL_ERROR && strstr(err, "ORA-00942") != NULL;
+    if (!ok)
+      snprintf(m, sizeof m, "bad SQL: rc=%d '%s'", rb, err);
+  }
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2323,6 +2390,7 @@ int main(void)
   check_length_boundaries(dbc);
   check_typed_null(dbc);
   check_statement_kind(dbc);
+  check_describe_before_execute(dbc);
   check_alter_session_state(dbc, strcmp(ver, "11.02") >= 0);
   check_os_user(dbc);
   check_failed_statements_close_cursors(dbc);

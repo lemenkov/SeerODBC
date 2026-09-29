@@ -186,6 +186,14 @@ const char *seer_odbc_sqlstate(SeerStatus st);
  * statement for SQLFetch/SQLGetData. Defined in exec.c, used by catalog.c. */
 SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *params, int nparams);
 
+/* Result metadata before execution: when the statement has been prepared
+ * (SQLPrepare) but has no core statement yet, create it and describe the
+ * query's columns with a parse-only round trip, so SQLNumResultCols /
+ * SQLDescribeCol / SQLColAttribute answer between SQLPrepare and SQLExecute.
+ * A no-op otherwise. Returns SQL_SUCCESS, or SQL_ERROR with a diagnostic when
+ * the server rejects the statement. */
+SQLRETURN seer_odbc_describe_prepared(OdbcStmt *s);
+
 /* Positioned DELETE / UPDATE for SQLSetPos on an updatable cursor: `row` is the
  * 0-based result-set row (SQLSetPos has already resolved the rowset offset).
  * Defined in exec.c (where the bind/exec machinery lives), used by results.c.

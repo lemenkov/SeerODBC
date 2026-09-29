@@ -117,6 +117,9 @@ SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT StatementHandle, SQLSMALLINT *Column
   if (s == NULL)
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(s);
+  SQLRETURN rc = seer_odbc_describe_prepared(s);
+  if (rc != SQL_SUCCESS)
+    return rc;
   if (ColumnCountPtr != NULL)
     *ColumnCountPtr = (SQLSMALLINT)odbc_visible_cols(s);
   return SQL_SUCCESS;
@@ -132,6 +135,9 @@ SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNu
   if (s == NULL)
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(s);
+  SQLRETURN drc = seer_odbc_describe_prepared(s);
+  if (drc != SQL_SUCCESS)
+    return drc;
   if (s->core == NULL || ColumnNumber < 1 || ColumnNumber > (SQLUSMALLINT)odbc_visible_cols(s))
     return seer_odbc_diag(s, "07009", 0, "Invalid column number", SQL_ERROR);
 
@@ -171,6 +177,9 @@ SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnN
   if (s == NULL)
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(s);
+  SQLRETURN drc = seer_odbc_describe_prepared(s);
+  if (drc != SQL_SUCCESS)
+    return drc;
   if (s->core == NULL)
     return seer_odbc_diag(s, "07005", 0, "No result set", SQL_ERROR);
 
