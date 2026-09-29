@@ -875,6 +875,36 @@ static void check_object_xmltype_attr(SQLHDBC dbc)
   }
 }
 
+/* Object with CLOB and BLOB attributes: each attribute is a LOB locator,
+ * read like a column LOB - not rendered as the locator's raw bytes. (Two LOB
+ * attributes; three break the fetch on 10g/11g server-side.) */
+static void check_object_lob_attrs(SQLHDBC dbc)
+{
+  const char *name = "SQL OBJECT with CLOB / BLOB attributes";
+  char err[256] = "", out[256] = "";
+  exec_do(dbc, "DROP TABLE seer_lot", err, sizeof err);
+  exec_do(dbc, "DROP TYPE seer_lo", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE TYPE seer_lo AS OBJECT (a NUMBER, c CLOB, b BLOB, z NUMBER)",
+                             err, sizeof err))) {
+    skip(name, err[0] ? err : "create type failed");
+    return;
+  }
+  exec_do(dbc, "CREATE TABLE seer_lot (o seer_lo)", err, sizeof err);
+  exec_do(dbc, "INSERT INTO seer_lot VALUES (seer_lo(1, 'hello clob', HEXTORAW('CAFE'), 7))", err,
+          sizeof err);
+  SQLRETURN rc = exec_scalar(dbc, "SELECT o FROM seer_lot", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_lot", err, sizeof err);
+  exec_do(dbc, "DROP TYPE seer_lo", err, sizeof err);
+  if (SQL_SUCCEEDED(rc) && strcasecmp(out, "1, hello clob, cafe, 7") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' %s", out, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2341,6 +2371,7 @@ int main(void)
   check_large_fetch(dbc);
   check_object(dbc);
   check_object_xmltype_attr(dbc);
+  check_object_lob_attrs(dbc);
   check_collection_of_objects(dbc);
   check_object_with_collection(dbc);
   check_xmltype(dbc);

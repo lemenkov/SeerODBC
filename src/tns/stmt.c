@@ -2741,6 +2741,10 @@ static uint8_t obj_type_to_ora(const char *tn)
 {
   if (tn == NULL)
     return ORA_TYPE_VARCHAR;
+  if (!strcmp(tn, "CLOB") || !strcmp(tn, "NCLOB"))
+    return ORA_TYPE_CLOB;
+  if (!strcmp(tn, "BLOB"))
+    return ORA_TYPE_BLOB;
   if (!strcmp(tn, "NUMBER") || !strcmp(tn, "FLOAT") || !strcmp(tn, "INTEGER"))
     return ORA_TYPE_NUMBER;
   if (!strcmp(tn, "DATE"))
@@ -2954,6 +2958,40 @@ static SeerStatus decode_collection_image(const uint8_t *img, size_t imglen, uin
 static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_t imglen,
                                        SeerCell *cell);
 
+/* A LOB attribute's image field is the LOB locator exactly as the server
+ * minted it - a ub2 length, then that many bytes - and that ub2 is part of the
+ * locator, so the whole field goes to TTI_LOBOPS like a column LOB's locator
+ * (seerdb PROTOCOL.md §21.14). CLOB -> UTF-8 text, BLOB -> hex. */
+static SeerStatus decode_lob_attr(SeerConn *conn, uint8_t type, const uint8_t *f, size_t n,
+                                  SeerCell *cell)
+{
+  if (conn == NULL || n < 2)
+    return SEER_EPARAM;
+  size_t loclen = (size_t)f[0] << 8 | f[1];
+  if (loclen == 0 || 2 + loclen != n)
+    return SEER_EPROTO;
+  uint8_t *raw = NULL;
+  size_t rawlen = 0;
+  SeerStatus st = seer_lob_read(conn, f, n, &raw, &rawlen);
+  if (st != SEER_OK)
+    return st;
+  if (type == ORA_TYPE_CLOB) {
+    char *u8 = NULL;
+    size_t u8len = 0;
+    if (rawlen == 0)
+      cell_set_text(cell, strdup(""));
+    else if (seer_iconv("UTF-16BE", "UTF-8", (const char *)raw, rawlen, &u8, &u8len) == 0) {
+      cell_set_bytes(cell, u8, u8len, false);
+      free(u8);
+    } else
+      st = SEER_EPROTO;
+  } else {
+    cell_set_text(cell, hex_dup(raw, rawlen));
+  }
+  free(raw);
+  return st;
+}
+
 /* Flatten an object image into "(a, b, ...)"-style text. `conn` resolves LOB
  * and XMLType attributes (a round trip each); NULL renders them unresolved. */
 static SeerStatus decode_object_image(SeerConn *conn, const uint8_t *img, size_t imglen,
@@ -2995,6 +3033,8 @@ static SeerStatus decode_object_image(SeerConn *conn, const uint8_t *img, size_t
       ast = decode_collection_image(img + pos, (size_t)len, elem[a], NULL, 0, &tmp);
     else if (types[a] == OBJ_ATTR_XMLTYPE)
       ast = conn ? decode_xmltype_image(conn, img + pos, (size_t)len, &tmp) : SEER_EPARAM;
+    else if (types[a] == ORA_TYPE_CLOB || types[a] == ORA_TYPE_BLOB)
+      ast = decode_lob_attr(conn, types[a], img + pos, (size_t)len, &tmp);
     else
       ast = decode_scalar(types[a], img + pos, (size_t)len, &tmp);
     if (ast == SEER_OK && tmp.data != NULL)
@@ -5067,10 +5107,11 @@ static SeerStatus obj_build_image(SeerConn *c, const char *schema, const char *t
     free(types);
     return SEER_EPARAM;
   }
-  /* An XMLType attribute needs an XMLType image, not text - refuse rather than send a value
+  /* A LOB or XMLType attribute needs a locator in the image (a temporary LOB
+   * created and written first), not text - refuse rather than send a value
    * the server would reject or misread. */
   for (int i = 0; i < ntypes; i++)
-    if (types[i] == OBJ_ATTR_XMLTYPE) {
+    if (types[i] == ORA_TYPE_CLOB || types[i] == ORA_TYPE_BLOB || types[i] == OBJ_ATTR_XMLTYPE) {
       free(types);
       return SEER_ENOTIMPL;
     }
