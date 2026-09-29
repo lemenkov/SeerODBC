@@ -18,7 +18,9 @@
 #include <string.h>
 
 /* Image flags (header ub2). */
-#define OSON_FLAG_TREE 0x2000        /* container image vs bare scalar      */
+#define OSON_FLAG_REL_OFFSETS                                                                      \
+  0x0001                      /* child offsets relative to their container (compressed column) */
+#define OSON_FLAG_TREE 0x2000 /* container image vs bare scalar      */
 #define OSON_FLAG_UB2_OFFSETS 0x0004 /* container value-offsets are ub2     */
 #define OSON_FLAG_UB2_FNAMES 0x0400  /* num_fnames is ub2 (> 255 fields)    */
 #define OSON_FLAG_UB4_TREE 0x1000    /* tree-segment size is ub4 (> 64 KiB) */
@@ -27,6 +29,10 @@
 #define OSON_TAG_WIDE_COUNT 0x08  /* count + field-ids are ub2           */
 #define OSON_TAG_UB4_COUNT 0x10   /* count + field-ids are ub4           */
 #define OSON_TAG_UB4_OFFSETS 0x20 /* this container's offsets are ub4    */
+/* On an OBJECT tag, both count-width bits set mean "shared field ids": the
+ * object stores no id array but an (absolute) offset to a donor object whose
+ * count and ids it uses (compressed columns, seerdb PROTOCOL.md §17.0c). */
+#define OSON_TAG_SHARED_IDS 0x18
 
 #define OSON_MAX_DEPTH 64
 
@@ -37,6 +43,14 @@ typedef struct {
   size_t fnames_len;
   const uint8_t *foff; /* field-name offset table (ub2 each)    */
   size_t nfnames;
+  /* Version 3: a second segment for names over 255 bytes, sharing the id
+   * space (ids above nfnames index it); <ub2 len><bytes> names. */
+  const uint8_t *lfnames;
+  size_t lfnames_len;
+  const uint8_t *lfoff; /* its offset table (lfoff_size bytes each) */
+  int lfoff_size;
+  size_t nlfnames;
+  bool rel;     /* container child offsets are relative to the container */
   int off_size; /* container value-offset width (2 or 4) */
   SeerWriter *w;
   bool ok;
@@ -114,6 +128,24 @@ static void emit_number(OsonCtx *c, const uint8_t *p, size_t n, const uint8_t *e
 /* The `id`-th field name (1-based) as a quoted JSON key. */
 static void emit_field_key(OsonCtx *c, uint32_t id)
 {
+  if (id > c->nfnames && id - c->nfnames <= c->nlfnames) { /* long-name segment */
+    size_t k = id - c->nfnames - 1;
+    const uint8_t *op = c->lfoff + (size_t)c->lfoff_size * k;
+    uint32_t off = 0;
+    for (int i = 0; i < c->lfoff_size; i++)
+      off = off << 8 | op[i];
+    if ((size_t)off + 2 > c->lfnames_len) {
+      c->ok = false;
+      return;
+    }
+    size_t len = (size_t)c->lfnames[off] << 8 | c->lfnames[off + 1];
+    if ((size_t)off + 2 + len > c->lfnames_len) {
+      c->ok = false;
+      return;
+    }
+    emit_json_string(c, c->lfnames + off + 2, len);
+    return;
+  }
   if (id == 0 || id > c->nfnames) {
     c->ok = false;
     return;
@@ -276,31 +308,55 @@ static void emit_node(OsonCtx *c, size_t off, int depth)
   if ((tag & 0xC0) == 0xC0 || (tag & 0xC0) == 0x80) { /* container */
     int csz = (tag & OSON_TAG_UB4_COUNT) ? 4 : (tag & OSON_TAG_WIDE_COUNT) ? 2 : 1;
     int osz = (tag & OSON_TAG_UB4_OFFSETS) ? 4 : c->off_size;
-    uint32_t count = rd_uint(c, tree + off + 1, csz, end);
+    /* Relative mode: a container's child offsets count from its own offset
+     * (the donor pointer below stays absolute). */
+    size_t rbase = c->rel ? off : 0;
+    uint32_t count;
+    size_t p;
+    const uint8_t *ids = NULL;
+    int idsz = csz;
+    if ((tag & 0xC0) == 0x80 && (tag & OSON_TAG_SHARED_IDS) == OSON_TAG_SHARED_IDS) {
+      uint32_t donor = rd_uint(c, tree + off + 1, osz, end);
+      if (!c->ok || donor >= c->tree_len || (tree[donor] & 0xC0) != 0x80 ||
+          (tree[donor] & OSON_TAG_SHARED_IDS) == OSON_TAG_SHARED_IDS) {
+        c->ok = false;
+        return;
+      }
+      uint8_t dtag = tree[donor];
+      idsz = (dtag & OSON_TAG_UB4_COUNT) ? 4 : (dtag & OSON_TAG_WIDE_COUNT) ? 2 : 1;
+      count = rd_uint(c, tree + donor + 1, idsz, end);
+      ids = tree + donor + 1 + idsz;
+      p = off + 1 + (size_t)osz; /* this node's value offsets follow the pointer */
+    } else {
+      count = rd_uint(c, tree + off + 1, csz, end);
+      p = off + 1 + csz;
+    }
     if (!c->ok)
       return;
-    size_t p = off + 1 + csz;
     if ((tag & 0xC0) == 0xC0) { /* array */
       seer_writer_u8(c->w, '[');
       for (uint32_t i = 0; i < count && c->ok; i++) {
         if (i)
           seer_writer_u8(c->w, ',');
         uint32_t coff = rd_uint(c, tree + p + (size_t)osz * i, osz, end);
-        emit_node(c, coff, depth + 1);
+        emit_node(c, rbase + coff, depth + 1);
       }
       seer_writer_u8(c->w, ']');
     } else { /* object */
-      const uint8_t *ids = tree + p;
-      size_t vbase = p + (size_t)csz * count;
+      size_t vbase = p;
+      if (ids == NULL) { /* own id array, then the value offsets */
+        ids = tree + p;
+        vbase = p + (size_t)csz * count;
+      }
       seer_writer_u8(c->w, '{');
       for (uint32_t i = 0; i < count && c->ok; i++) {
         if (i)
           seer_writer_u8(c->w, ',');
-        uint32_t id = rd_uint(c, ids + (size_t)csz * i, csz, end);
+        uint32_t id = rd_uint(c, ids + (size_t)idsz * i, idsz, end);
         uint32_t voff = rd_uint(c, tree + vbase + (size_t)osz * i, osz, end);
         emit_field_key(c, id);
         seer_writer_u8(c->w, ':');
-        emit_node(c, voff, depth + 1);
+        emit_node(c, rbase + voff, depth + 1);
       }
       seer_writer_u8(c->w, '}');
     }
@@ -316,11 +372,18 @@ SeerStatus seer_decode_oson(const uint8_t *d, size_t n, char **out)
   *out = NULL;
   if (n < 8 || d[0] != 0xFF || d[1] != 0x4A || d[2] != 0x5A)
     return SEER_EPROTO;
+  /* d[3] is the image version: 1, or 3 when names over 255 bytes sit in a
+   * second segment (seerdb PROTOCOL.md §17.0b). Parsing a version-3 header as
+   * version 1 lands 8 bytes out, so refuse anything else. */
+  uint8_t version = d[3];
+  if (version != 1 && version != 3)
+    return SEER_EPROTO;
   uint16_t flags = (uint16_t)((uint16_t)d[4] << 8 | d[5]);
   size_t pos = 6;
 
   OsonCtx c = {0};
   c.off_size = (flags & OSON_FLAG_UB2_OFFSETS) ? 2 : 4;
+  c.rel = (flags & OSON_FLAG_REL_OFFSETS) != 0;
   c.ok = true;
   SeerWriter w;
   if (!seer_writer_init(&w, 128))
@@ -350,6 +413,20 @@ SeerStatus seer_decode_oson(const uint8_t *d, size_t n, char **out)
     if (pos + 4 > n)
       goto bad; /* fnames_size(2) + ub2 tree_size(2) */
     uint16_t fnames_size = (uint16_t)((uint16_t)d[pos] << 8 | d[pos + 1]);
+    /* Version 3: secondary_flags(2) | num_long_fnames(4) | long_fnames_size(4)
+     * sit between fnames_size and tree_size. */
+    uint16_t sec_flags = 0;
+    size_t nlong = 0, long_size = 0;
+    if (version == 3) {
+      if (pos + 2 + 10 + 4 > n)
+        goto bad;
+      sec_flags = (uint16_t)((uint16_t)d[pos + 2] << 8 | d[pos + 3]);
+      nlong = (size_t)d[pos + 4] << 24 | (size_t)d[pos + 5] << 16 | (size_t)d[pos + 6] << 8 |
+              d[pos + 7];
+      long_size = (size_t)d[pos + 8] << 24 | (size_t)d[pos + 9] << 16 | (size_t)d[pos + 10] << 8 |
+                  d[pos + 11];
+      pos += 10; /* now at tree_size, as in version 1 (after fnames_size) */
+    }
     size_t tree_size;
     if (flags & OSON_FLAG_UB4_TREE) {
       if (pos + 6 > n)
@@ -370,6 +447,20 @@ SeerStatus seer_decode_oson(const uint8_t *d, size_t n, char **out)
     c.fnames_len = fnames_size;
     c.nfnames = num_fnames;
     pos += fnames_size;
+    if (version == 3 && nlong > 0) {
+      /* long hash array (ub2 each), long offsets (ub2 when sec_flags 0x0100,
+       * else ub4), then the long names */
+      c.lfoff_size = (sec_flags & 0x0100) ? 2 : 4;
+      if (nlong > n || pos + 2 * nlong + (size_t)c.lfoff_size * nlong + long_size > n)
+        goto bad;
+      pos += 2 * nlong;
+      c.lfoff = d + pos;
+      pos += (size_t)c.lfoff_size * nlong;
+      c.lfnames = d + pos;
+      c.lfnames_len = long_size;
+      c.nlfnames = nlong;
+      pos += long_size;
+    }
     if (pos + tree_size > n)
       goto bad;
     c.tree = d + pos;
