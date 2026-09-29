@@ -101,6 +101,7 @@ typedef struct {
   uint32_t oac_charset; /* 873 for char, 0 otherwise */
   uint8_t oac_flag;     /* 16 for char/raw, 0 otherwise */
   bool is_out;          /* OUT / IN OUT parameter */
+  bool type_from_null;  /* the OAC type came from a NULL value (a placeholder) */
   uint8_t **rxd;        /* per-iteration encoded RXD values, [n_iters] */
   size_t *rxd_len;
   SeerCell out;      /* OUT value captured from the IOV response */
@@ -1627,11 +1628,16 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
 
 /* Place an encoded value at 1-based position `param`, iteration `cur_iter`,
  * growing the bind array as needed and freeing any previous value there. The
- * OAC fields apply to the position (size grows to the widest value across
- * iterations). Takes ownership of `rxd`. */
-static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t oac_size,
-                             uint32_t oac_charset, uint8_t oac_flag, bool is_out, uint8_t *rxd,
-                             size_t rxd_len)
+ * OAC fields apply to the whole position - one descriptor for every row of an
+ * array execute - so they are chosen across iterations: the size grows to the
+ * widest value; a NULL (`is_null`) never overrides a type a real value set,
+ * while a real value replaces a NULL's placeholder type; and a LONG / LONG RAW
+ * value wins over the short VARCHAR / RAW form of the same column. (Taking
+ * the last row's type turned a NUMBER column into VARCHAR when the batch
+ * ended in a NULL.) Takes ownership of `rxd`. */
+static SeerStatus store_bind_ex(SeerStmt *s, int param, uint8_t oac_type, uint32_t oac_size,
+                                uint32_t oac_charset, uint8_t oac_flag, bool is_out, bool is_null,
+                                uint8_t *rxd, size_t rxd_len)
 {
   if (param < 1 || param > 1024) {
     free(rxd);
@@ -1661,9 +1667,15 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
       return SEER_ENOMEM;
     }
   }
-  b->oac_type = oac_type;
-  b->oac_charset = oac_charset;
-  b->oac_flag = oac_flag;
+  bool have_real = b->oac_type != 0 && !b->type_from_null;
+  bool demotion = (b->oac_type == ORA_TYPE_LONG && oac_type == ORA_TYPE_VARCHAR) ||
+                  (b->oac_type == ORA_TYPE_LONGRAW && oac_type == ORA_TYPE_RAW);
+  if (!(have_real && (is_null || demotion))) {
+    b->oac_type = oac_type;
+    b->oac_charset = oac_charset;
+    b->oac_flag = oac_flag;
+    b->type_from_null = is_null;
+  }
   b->is_out = is_out;
   if (oac_size > b->oac_size)
     b->oac_size = oac_size;
@@ -1673,8 +1685,16 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
   return SEER_OK;
 }
 
+static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t oac_size,
+                             uint32_t oac_charset, uint8_t oac_flag, bool is_out, uint8_t *rxd,
+                             size_t rxd_len)
+{
+  return store_bind_ex(s, param, oac_type, oac_size, oac_charset, oac_flag, is_out, false, rxd,
+                       rxd_len);
+}
+
 /* Encode a bind value (oracledb encode_chr). Two forms, split at 12.2:
- *   - 12.2+ (write_bytes_with_length): inline <ub1 len><bytes> for n < 254, else
+ *   - 12.2+ (write_bytes_with_length): inline <ub1 len><bytes> for n <= 252, else
  *     the 0xFE marker + 64-byte chunks each prefixed by an *sb4* length, then a
  *     zero-length terminator.
  *   - pre-12.2 (11g/10g): inline <ub1 len><bytes> for n <= 64, else 0xFE + 64-byte
@@ -1685,7 +1705,9 @@ static SeerStatus encode_chr(const uint8_t *data, size_t n, uint8_t fv, uint8_t 
                              size_t *outlen)
 {
   bool new_form = fv >= TTC_FIELD_VERSION_12_2;
-  size_t inline_max = new_form ? 253 : 64;
+  /* A plain length byte covers 1..252: 0xFD (253), 0xFE (chunked) and 0xFF
+   * (NULL) are markers, so a 253-byte value inline reads as a marker. */
+  size_t inline_max = new_form ? 252 : 64;
   SeerWriter w;
   if (!seer_writer_init(&w, n + 16))
     return SEER_ENOMEM;
@@ -1949,8 +1971,48 @@ SeerStatus seer_stmt_bind_null(SeerStmt *stmt, int param)
   uint8_t *rxd = malloc(1);
   if (rxd == NULL)
     return SEER_ENOMEM;
-  rxd[0] = 0;                                                                  /* NULL value */
-  return store_bind(stmt, param, ORA_TYPE_VARCHAR, 1, 873, 16, false, rxd, 1); /* NULL */
+  rxd[0] = 0; /* NULL value */
+  return store_bind_ex(stmt, param, ORA_TYPE_VARCHAR, 1, 873, 16, false, true, rxd, 1);
+}
+
+SeerStatus seer_stmt_bind_null_typed(SeerStmt *stmt, int param, int ora_type)
+{
+  if (stmt == NULL)
+    return SEER_EPARAM;
+  /* The descriptor a non-NULL value of that type would carry; the value is
+   * the NULL byte either way. A NULL declared as VARCHAR can't meet a NUMBER
+   * or DATE in COALESCE / CASE (ORA-00932), and in an array execute it must
+   * not type the column. */
+  uint8_t t;
+  uint32_t size, charset = 0;
+  uint8_t flag = 0;
+  switch (ora_type) {
+  case ORA_TYPE_NUMBER:
+    t = ORA_TYPE_NUMBER, size = 22;
+    break;
+  case ORA_TYPE_DATE:
+    t = ORA_TYPE_DATE, size = 7;
+    break;
+  case ORA_TYPE_TIMESTAMP:
+    t = ORA_TYPE_TIMESTAMP, size = 11;
+    break;
+  case ORA_TYPE_BDOUBLE:
+    t = ORA_TYPE_BDOUBLE, size = 8;
+    break;
+  case ORA_TYPE_BFLOAT:
+    t = ORA_TYPE_BFLOAT, size = 4;
+    break;
+  case ORA_TYPE_RAW:
+    t = ORA_TYPE_RAW, size = 1, flag = 16;
+    break;
+  default:
+    return seer_stmt_bind_null(stmt, param);
+  }
+  uint8_t *rxd = malloc(1);
+  if (rxd == NULL)
+    return SEER_ENOMEM;
+  rxd[0] = 0;
+  return store_bind_ex(stmt, param, t, size, charset, flag, false, true, rxd, 1);
 }
 
 SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_size)
@@ -2337,7 +2399,7 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     /* On a no-parse re-execute the SQL bytes are omitted entirely - even a
      * zero-length prefix would shift the server's read of the al8i4 array. */
     if (!reuse) {
-      if (qlen < 254) { /* length-prefixed SQL */
+      if (qlen <= 252) { /* length-prefixed SQL (253+ would read as a marker) */
         seer_writer_u8(w, (uint8_t)qlen);
         seer_writer_bytes(w, stmt->sql, qlen);
       } else {
@@ -2367,17 +2429,31 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
       else
         emit_oac(w, fv, b->oac_type, b->oac_size ? b->oac_size : 1, b->oac_flag, b->oac_charset);
     }
+    /* In a SQL statement the server reads each row's LONG-class values after
+     * all its other values, whatever their bind positions; a PL/SQL block
+     * takes them in order. A bind is LONG-class when its descriptor declares
+     * more than the server's maximum string size (4000, or 32767 on a server
+     * with 32K strings) - so a 5000-byte text is LONG-class on 11g but an
+     * ordinary value on a 12c+ server. Written in position order, a large text
+     * bind ahead of another bind lost the row. */
+    uint32_t max_str = stmt->conn->max_string_size ? stmt->conn->max_string_size : 4000;
+    int passes = (kind == STMT_BLOCK) ? 1 : 2;
     for (int it = 0; it < iters; it++) {
       seer_writer_u8(w, TTI_RXD);
-      for (int i = 0; i < nb; i++) {
-        SeerBind *b = &stmt->pbinds[i];
-        if (stmt->returning && b->is_out)
-          continue; /* return bind: server-filled */
-        uint8_t *rxd = (b->rxd != NULL) ? b->rxd[it] : NULL;
-        if (rxd != NULL)
-          seer_writer_bytes(w, rxd, b->rxd_len[it]);
-        else
-          seer_writer_u8(w, 0); /* unbound/NULL -> 0 */
+      for (int pass = 0; pass < passes; pass++) {
+        for (int i = 0; i < nb; i++) {
+          SeerBind *b = &stmt->pbinds[i];
+          if (stmt->returning && b->is_out)
+            continue; /* return bind: server-filled */
+          bool long_class = b->oac_size > max_str;
+          if (passes == 2 && long_class != (pass == 1))
+            continue;
+          uint8_t *rxd = (b->rxd != NULL) ? b->rxd[it] : NULL;
+          if (rxd != NULL)
+            seer_writer_bytes(w, rxd, b->rxd_len[it]);
+          else
+            seer_writer_u8(w, 0); /* unbound/NULL -> 0 */
+        }
       }
     }
   }
@@ -4607,7 +4683,7 @@ static void obj_write_length(SeerWriter *w, uint32_t n)
 }
 
 /* Append `data` length-framed as oracledb write_bytes_with_length (the 12c+ form
- * of encode_chr): <ub1 len> inline for <254, else 0xFE + sb4 chunks. */
+ * of encode_chr): <ub1 len> inline up to 252, else 0xFE + sb4 chunks. */
 static SeerStatus obj_append_chr(SeerWriter *w, const uint8_t *data, size_t n, uint8_t fv)
 {
   uint8_t *enc = NULL;

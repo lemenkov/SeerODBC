@@ -143,6 +143,9 @@
 #define TNS_CCAP_TTC4_EXPLICIT_BOUNDARY 0x40
 #define TNS_RCAP_TTC 6
 #define TNS_RCAP_TTC_SESSION_STATE_OPS 0x10
+/* runtime_caps[6] bit 0x04: the server takes 32767-byte strings (MAX_STRING_SIZE
+ * EXTENDED); otherwise its maximum string size is 4000. */
+#define TNS_RCAP_TTC_32K 0x04
 
 /* End-of-response framing (§32/#155): opt in by setting compile_caps[40] bit
  * 0x20 in the DTY, but only when the ACCEPT advertised support — the extended

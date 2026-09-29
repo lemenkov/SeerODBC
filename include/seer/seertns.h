@@ -270,6 +270,12 @@ SeerStatus seer_stmt_bind_float(SeerStmt *stmt, int param, float value);
 /* Bind a boolean: native 23ai BOOLEAN, or a NUMBER 0/1 on older servers. */
 SeerStatus seer_stmt_bind_bool(SeerStmt *stmt, int param, int value);
 SeerStatus seer_stmt_bind_null(SeerStmt *stmt, int param);
+/* Bind a NULL that still declares a type (an Oracle type number: NUMBER,
+ * DATE, TIMESTAMP, BINARY_DOUBLE/FLOAT or RAW; anything else binds as the
+ * VARCHAR NULL of seer_stmt_bind_null). Lets the server type the NULL - e.g.
+ * COALESCE(:1, SYSDATE) - and, in an array execute, keeps a NULL row from
+ * re-typing the column. */
+SeerStatus seer_stmt_bind_null_typed(SeerStmt *stmt, int param, int ora_type);
 
 /* Bind a SQL OBJECT (ADT) parameter (12c+). The type is `schema`.`type_name`;
  * its attribute values are supplied as text in attribute order (a NULL entry is

@@ -492,10 +492,13 @@ void seer_ttc_fun_header(SeerConn *c, SeerWriter *w, uint8_t opcode)
  * compile_caps[40] bit 0x40 AND runtime_caps[6] bit 0x10). Returns SEER_EPROTO
  * on a bounds violation reading the field version; the request-boundary probe is
  * best-effort and never fails the login (*req_bnd defaults to false). */
-static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool *req_bnd)
+static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool *req_bnd,
+                            bool *str32k)
 {
   if (req_bnd != NULL)
     *req_bnd = false;
+  if (str32k != NULL)
+    *str32k = false;
   size_t o = 0;
   if (n < 1 || b[0] != TTI_PRO)
     return SEER_EPROTO;
@@ -538,6 +541,8 @@ static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool
       if (req_bnd != NULL)
         *req_bnd =
             (cc40 & TNS_CCAP_TTC4_EXPLICIT_BOUNDARY) && (rc6 & TNS_RCAP_TTC_SESSION_STATE_OPS);
+      if (str32k != NULL)
+        *str32k = (rc6 & TNS_RCAP_TTC_32K) != 0;
     }
   }
   return SEER_OK;
@@ -924,14 +929,16 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   if (st != SEER_OK)
     return st;
   uint8_t server_fv = 0;
-  bool req_bnd = false;
-  st = parse_pro(resp, rlen, &server_fv, &req_bnd);
+  bool req_bnd = false, str32k = false;
+  st = parse_pro(resp, rlen, &server_fv, &req_bnd, &str32k);
   free(resp);
   if (st != SEER_OK) {
     seer_log(SEER_LOG_ERROR, "ttc: could not parse PRO reply");
     return st;
   }
   conn->req_boundaries = req_bnd; /* §35: explicit request-boundary support */
+  conn->max_string_size = str32k ? 32767 : 4000;
+  seer_log(SEER_LOG_DEBUG, "ttc: server max string size %u", conn->max_string_size);
   /* Advertise up to TTC_FIELD_VERSION_MAX (the biggest version whose data path
    * is complete); SEER_MAX_FV overrides it. The server negotiates down: we use
    * min(server_fv, our_max), so 9i/10g/11g stay on the legacy fv path

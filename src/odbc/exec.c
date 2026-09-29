@@ -92,11 +92,16 @@ static size_t ctype_stride(SQLSMALLINT c_type, SQLLEN buflen)
 
 /* Bind one parameter value (the value at `valptr`, length hint `ind`) into core
  * statement `core` at `param`, dispatching on the ODBC C type. */
-static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type, const void *valptr,
-                                 SQLLEN ind)
+static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
+                                 SQLSMALLINT sql_type, const void *valptr, SQLLEN ind)
 {
+  /* A NULL still declares the parameter's SQL type (SQLBindParameter's
+   * ParameterType), so the server types it as a NUMBER / DATE / RAW rather
+   * than VARCHAR - which COALESCE / CASE need, and which keeps a NULL row from
+   * re-typing an array-bound column. */
   if (ind == SQL_NULL_DATA || valptr == NULL)
-    return seer_stmt_bind_null(core, param);
+    return sql_type != 0 ? seer_stmt_bind_null_typed(core, param, ora_type_for_sql(sql_type))
+                         : seer_stmt_bind_null(core, param);
 
   switch (c_type) {
   case SQL_C_SLONG:
@@ -252,7 +257,7 @@ static SQLRETURN apply_params(OdbcStmt *s)
         size_t stride = ctype_stride(p->c_type, p->buflen);
         const void *val = (const char *)p->buf + (size_t)row * stride;
         SQLLEN ind = p->indicator ? p->indicator[row] : SQL_NTS;
-        st = bind_one_value(s->core, param, p->c_type, val, ind);
+        st = bind_one_value(s->core, param, p->c_type, p->sql_type, val, ind);
         if (st != SEER_OK)
           return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
       }
@@ -266,8 +271,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
 
     if (p->dae) { /* value streamed in via SQLPutData */
       if (p->dae_null)
-        seer_stmt_bind_null(s->core, param);
-      else if (bind_one_value(s->core, param, p->c_type, p->dae_buf ? p->dae_buf : "",
+        seer_stmt_bind_null_typed(s->core, param, ora_type_for_sql(p->sql_type));
+      else if (bind_one_value(s->core, param, p->c_type, p->sql_type, p->dae_buf ? p->dae_buf : "",
                               (SQLLEN)p->dae_len) != SEER_OK)
         return seer_odbc_diag(s, "HY000", 0, "Parameter bind failed", SQL_ERROR);
       continue;
@@ -282,7 +287,7 @@ static SQLRETURN apply_params(OdbcStmt *s)
       continue;
     }
     SQLLEN ind = p->indicator ? *p->indicator : SQL_NTS;
-    SeerStatus st = bind_one_value(s->core, param, p->c_type, p->buf, ind);
+    SeerStatus st = bind_one_value(s->core, param, p->c_type, p->sql_type, p->buf, ind);
     if (st != SEER_OK)
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
   }
@@ -830,7 +835,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
         ind = b->indicator ? *(SQLLEN *)((char *)b->indicator + (size_t)elem * s->row_bind_type)
                            : SQL_NTS;
       }
-      bind_one_value(dml, ++k, b->target_type, vp, ind);
+      bind_one_value(dml, ++k, b->target_type, 0, vp, ind);
     }
     seer_stmt_bind_text(dml, nset + 1, s->rowids[r], -1);
 

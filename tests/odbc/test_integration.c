@@ -320,6 +320,184 @@ static void check_urowid_physical(SQLHDBC dbc)
   }
 }
 
+/* A value or statement text of 253 bytes must go out chunked: a plain length
+ * byte covers 1..252, and 0xFD..0xFF are markers. Probe both sides of the
+ * boundary for a bind value and for the SQL text itself. */
+static void check_length_boundaries(SQLHDBC dbc)
+{
+  const char *name = "252/253/254-byte bind value and SQL text";
+  char m[400] = "";
+  int ok = 1;
+  for (int n = 252; n <= 254 && ok; n++) {
+    /* bind value of n bytes */
+    char val[300], out[32] = "", err[256] = "";
+    memset(val, 'v', (size_t)n);
+    val[n] = '\0';
+    SQLHSTMT st;
+    SQLLEN ind = SQL_NTS, oind = 0;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 400, 0, val, 0, &ind);
+    SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT LENGTH(?) FROM dual", SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+      SQLGetData(st, 1, SQL_C_CHAR, out, sizeof out, &oind);
+    else
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (atoi(out) != n) {
+      snprintf(m, sizeof m, "bind %d bytes: got '%s' %s", n, out, err);
+      ok = 0;
+      break;
+    }
+    /* SQL text of exactly n bytes */
+    char sql[300];
+    const char *head = "SELECT '";
+    const char *tail = "' FROM dual";
+    size_t pad = (size_t)n - strlen(head) - strlen(tail);
+    snprintf(
+        sql, sizeof sql, "%s%.*s%s", head, (int)pad,
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        tail);
+    char got[300] = "";
+    if (!SQL_SUCCEEDED(exec_scalar(dbc, sql, got, sizeof got, err, sizeof err)) ||
+        strlen(got) != pad) {
+      snprintf(m, sizeof m, "SQL of %d bytes: got %zu chars %s", n, strlen(got), err);
+      ok = 0;
+    }
+  }
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* In a SQL statement each row's LONG-class values - a bind declared larger
+ * than the server's maximum string size (4000, or 32767 on 12c+ with 32K
+ * strings) - travel after the row's other values. Put the large value first in
+ * the column list to prove the order is not positional; 5000 bytes is
+ * LONG-class only on 10g/11g, 40000 on every server. */
+static void check_long_bind_order(SQLHDBC dbc)
+{
+  const char *name = "large text bind ahead of another bind (5000 / 40000 bytes)";
+  static const int sizes[] = {5000, 40000};
+  static char big[40001];
+  char err[256] = "", m[400] = "";
+  int ok = 1;
+  for (size_t k = 0; k < sizeof sizes / sizeof sizes[0] && ok; k++) {
+    int n = sizes[k];
+    char out[64] = "", want[64];
+    exec_do(dbc, "DROP TABLE seer_longord", err, sizeof err);
+    if (!SQL_SUCCEEDED(
+            exec_do(dbc, "CREATE TABLE seer_longord (c CLOB, id NUMBER)", err, sizeof err))) {
+      skip(name, err);
+      return;
+    }
+    memset(big, 'L', (size_t)n);
+    big[n] = '\0';
+    SQLINTEGER id = 42;
+    SQLLEN bind = SQL_NTS;
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, (SQLULEN)n, 0, big, 0,
+                     &bind);
+    SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &id, 0, NULL);
+    SQLRETURN rc =
+        SQLExecDirect(st, (SQLCHAR *)"INSERT INTO seer_longord (c, id) VALUES (?, ?)", SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (SQL_SUCCEEDED(rc))
+      exec_scalar(dbc, "SELECT id || ':' || DBMS_LOB.GETLENGTH(c) FROM seer_longord", out,
+                  sizeof out, err, sizeof err);
+    exec_do(dbc, "DROP TABLE seer_longord", err, sizeof err);
+    snprintf(want, sizeof want, "42:%d", n);
+    if (strcmp(out, want) != 0) {
+      snprintf(m, sizeof m, "%d bytes: got '%s' want '%s' %s", n, out, want,
+               SQL_SUCCEEDED(rc) ? "" : err);
+      ok = 0;
+    }
+  }
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* An array execute sends one descriptor per column for every row, so a NULL
+ * in the last row must not re-type a NUMBER / DATE column as VARCHAR. */
+static void check_array_null_last_row(SQLHDBC dbc)
+{
+  const char *name = "array DML with NULL in the last row";
+  char err[256] = "", out[64] = "";
+  exec_do(dbc, "DROP TABLE seer_arrnull", err, sizeof err);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_arrnull (n NUMBER, d DATE)", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  SQLINTEGER ns[3] = {1, 2, 0};
+  SQLLEN nind[3] = {0, 0, SQL_NULL_DATA};
+  SQL_DATE_STRUCT ds[3] = {{2026, 1, 2}, {2026, 3, 4}, {0, 0, 0}};
+  SQLLEN dind[3] = {0, 0, SQL_NULL_DATA};
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)3, 0);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, ns, 0, nind);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, ds, 0, dind);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"INSERT INTO seer_arrnull VALUES (?, ?)", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (SQL_SUCCEEDED(rc))
+    exec_scalar(dbc,
+                "SELECT COUNT(*) || ':' || SUM(n) || ':' || COUNT(n) || ':' || "
+                "TO_CHAR(MAX(d), 'YYYY-MM-DD') FROM seer_arrnull",
+                out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_arrnull", err, sizeof err);
+  if (strcmp(out, "3:3:2:2026-03-04") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' want '3:3:2:2026-03-04' %s", out, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
+/* A NULL parameter declared as SQL_INTEGER / SQL_TYPE_DATE is typed as such,
+ * so it can meet a NUMBER or DATE in COALESCE (a VARCHAR NULL gets
+ * ORA-00932: inconsistent datatypes). */
+static void check_typed_null(SQLHDBC dbc)
+{
+  const char *name = "typed NULL parameter (COALESCE with NUMBER / DATE)";
+  char err[256] = "", a[32] = "", b[32] = "";
+  SQLLEN nul = SQL_NULL_DATA, ia = 0, ib = 0;
+  SQLINTEGER iv = 0;
+  SQL_DATE_STRUCT dv = {0};
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &iv, 0, &nul);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, &dv, 0, &nul);
+  SQLRETURN rc = SQLExecDirect(
+      st,
+      (SQLCHAR *)"SELECT COALESCE(?, 7) + 1, TO_CHAR(COALESCE(?, DATE '2026-09-29'), 'YYYY') "
+                 "FROM dual",
+      SQL_NTS);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, a, sizeof a, &ia)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, b, sizeof b, &ib));
+  if (!ok)
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ok && strcmp(a, "8") == 0 && strcmp(b, "2026") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' / '%s' %s", a, b, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1725,6 +1903,8 @@ int main(void)
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_zero_length_columns(dbc);
   check_nested_cursor_column(dbc);
+  check_length_boundaries(dbc);
+  check_typed_null(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");
@@ -1733,6 +1913,8 @@ int main(void)
     check_transaction(dbc);
     check_fetch_in_txn(dbc);
     check_urowid_physical(dbc);
+    check_long_bind_order(dbc);
+    check_array_null_last_row(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);

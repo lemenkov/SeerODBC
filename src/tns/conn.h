@@ -30,6 +30,10 @@ struct SeerConn {
    * armed marker (0 / REQUEST_BEGIN / REQUEST_END) flushed as a func-176
    * piggyback in front of the next call, and whether a logical request is open. */
   bool req_boundaries;
+  /* The server's maximum string size: 32767 when it advertises 32K strings,
+   * else 4000. A bind declared larger is "LONG-class" (sent after the row's
+   * other values in a SQL statement). */
+  uint32_t max_string_size;
   uint8_t session_state;
   bool in_request;
   /* End-of-response framing (§32/#155): the accept advertised it (flags2 bit),
