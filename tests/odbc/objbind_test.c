@@ -88,6 +88,26 @@ int main(void)
   for (char *p = schema; *p; p++)
     *p = (char)toupper((unsigned char)*p);
 
+  /* --- object bind with a LOB attribute: refused, not sent as text --- */
+  run(c, "DROP TYPE seerlb_o");
+  run(c, "CREATE TYPE seerlb_o AS OBJECT (n NUMBER, c CLOB)");
+  {
+    /* A LOB attribute needs a locator in the image (a temporary LOB written
+     * first), which the object bind can't build yet: it must say so rather
+     * than put the text where the server expects a locator (ORA-22275). */
+    const char *name = "object bind with a LOB attribute is refused";
+    const char *attrs[2] = {"1", "text"};
+    SeerStmt *ins = NULL;
+    seer_stmt_prepare(c, "SELECT 1 FROM dual WHERE :1 IS NOT NULL", &ins);
+    SeerStatus st = seer_stmt_bind_object(ins, 1, schema, "SEERLB_O", attrs, 2);
+    seer_stmt_close(ins);
+    if (st == SEER_ENOTIMPL)
+      pass(name);
+    else
+      fail(name, "bind accepted a LOB attribute value as text");
+  }
+  run(c, "DROP TYPE seerlb_o");
+
   /* --- SQL OBJECT bind --- */
   run(c, "DROP TABLE seerob_t");
   run(c, "DROP TYPE seerob_o");

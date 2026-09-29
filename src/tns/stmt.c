@@ -2731,10 +2731,20 @@ static void free_pending_objs(SeerStmt *stmt)
 
 /* Map an ALL_TYPE_ATTRS attr_type_name to the Oracle wire type used inside an
  * object image (the subset slice 1 decodes; unknowns fall back to text). */
+/* Pseudo type in an object layout (not an Oracle wire type): an XMLType
+ * attribute. Its image field is an XMLType image, decoded like an XMLType
+ * column - not a nested object to splice (XMLTYPE has no attributes of its
+ * own, so splicing it dropped a slot and shifted every later attribute). */
+#define OBJ_ATTR_XMLTYPE 0xF0
+
 static uint8_t obj_type_to_ora(const char *tn)
 {
   if (tn == NULL)
     return ORA_TYPE_VARCHAR;
+  if (!strcmp(tn, "CLOB") || !strcmp(tn, "NCLOB"))
+    return ORA_TYPE_CLOB;
+  if (!strcmp(tn, "BLOB"))
+    return ORA_TYPE_BLOB;
   if (!strcmp(tn, "NUMBER") || !strcmp(tn, "FLOAT") || !strcmp(tn, "INTEGER"))
     return ORA_TYPE_NUMBER;
   if (!strcmp(tn, "DATE"))
@@ -2861,7 +2871,9 @@ static void build_obj_layout(SeerConn *conn, const char *owner, const char *name
       if (user_type) {
         char *ow = strdup(aowner);
         char *nm = strdup(atype ? atype : "");
-        if (ow && nm) {
+        if (ow && nm && strcmp(ow, "SYS") == 0 && strcmp(nm, "XMLTYPE") == 0) {
+          append_attr(types, elem, n, cap, OBJ_ATTR_XMLTYPE, 0);
+        } else if (ow && nm) {
           uint8_t cet = coll_elem_wire_type(conn, ow, nm);
           if (cet != 0) /* collection attribute (one entry) */
             append_attr(types, elem, n, cap, ORA_TYPE_ADT, cet);
@@ -2943,8 +2955,48 @@ static SeerStatus decode_collection_image(const uint8_t *img, size_t imglen, uin
 /* Decode an object image into "v1, v2, ..." text. `elem`, when non-NULL, marks
  * collection attributes (elem[a] != 0 => attribute a is an embedded collection of
  * that element type, decoded as a nested "[...]"). */
-static SeerStatus decode_object_image(const uint8_t *img, size_t imglen, const uint8_t *types,
-                                      const uint8_t *elem, int ntypes, SeerCell *cell)
+static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_t imglen,
+                                       SeerCell *cell);
+
+/* A LOB attribute's image field is the LOB locator exactly as the server
+ * minted it - a ub2 length, then that many bytes - and that ub2 is part of the
+ * locator, so the whole field goes to TTI_LOBOPS like a column LOB's locator
+ * (seerdb PROTOCOL.md §21.14). CLOB -> UTF-8 text, BLOB -> hex. */
+static SeerStatus decode_lob_attr(SeerConn *conn, uint8_t type, const uint8_t *f, size_t n,
+                                  SeerCell *cell)
+{
+  if (conn == NULL || n < 2)
+    return SEER_EPARAM;
+  size_t loclen = (size_t)f[0] << 8 | f[1];
+  if (loclen == 0 || 2 + loclen != n)
+    return SEER_EPROTO;
+  uint8_t *raw = NULL;
+  size_t rawlen = 0;
+  SeerStatus st = seer_lob_read(conn, f, n, &raw, &rawlen);
+  if (st != SEER_OK)
+    return st;
+  if (type == ORA_TYPE_CLOB) {
+    char *u8 = NULL;
+    size_t u8len = 0;
+    if (rawlen == 0)
+      cell_set_text(cell, strdup(""));
+    else if (seer_iconv("UTF-16BE", "UTF-8", (const char *)raw, rawlen, &u8, &u8len) == 0) {
+      cell_set_bytes(cell, u8, u8len, false);
+      free(u8);
+    } else
+      st = SEER_EPROTO;
+  } else {
+    cell_set_text(cell, hex_dup(raw, rawlen));
+  }
+  free(raw);
+  return st;
+}
+
+/* Flatten an object image into "(a, b, ...)"-style text. `conn` resolves LOB
+ * and XMLType attributes (a round trip each); NULL renders them unresolved. */
+static SeerStatus decode_object_image(SeerConn *conn, const uint8_t *img, size_t imglen,
+                                      const uint8_t *types, const uint8_t *elem, int ntypes,
+                                      SeerCell *cell)
 {
   if (imglen < 3)
     return SEER_EPROTO;
@@ -2976,9 +3028,15 @@ static SeerStatus decode_object_image(const uint8_t *img, size_t imglen, const u
       return SEER_EPROTO;
     }
     SeerCell tmp = {0};
-    SeerStatus ast = (elem != NULL && elem[a] != 0) /* embedded collection */
-                         ? decode_collection_image(img + pos, (size_t)len, elem[a], NULL, 0, &tmp)
-                         : decode_scalar(types[a], img + pos, (size_t)len, &tmp);
+    SeerStatus ast;
+    if (elem != NULL && elem[a] != 0) /* embedded collection */
+      ast = decode_collection_image(img + pos, (size_t)len, elem[a], NULL, 0, &tmp);
+    else if (types[a] == OBJ_ATTR_XMLTYPE)
+      ast = conn ? decode_xmltype_image(conn, img + pos, (size_t)len, &tmp) : SEER_EPARAM;
+    else if (types[a] == ORA_TYPE_CLOB || types[a] == ORA_TYPE_BLOB)
+      ast = decode_lob_attr(conn, types[a], img + pos, (size_t)len, &tmp);
+    else
+      ast = decode_scalar(types[a], img + pos, (size_t)len, &tmp);
     if (ast == SEER_OK && tmp.data != NULL)
       seer_writer_bytes(&w, tmp.data, tmp.len);
     free(tmp.data);
@@ -3035,7 +3093,7 @@ static SeerStatus decode_collection_image(const uint8_t *img, size_t imglen, uin
     }
     SeerCell tmp = {0};
     SeerStatus est = (n_elem_obj_attrs > 0) /* element is an object image */
-                         ? decode_object_image(img + pos, (size_t)len, elem_obj_types, NULL,
+                         ? decode_object_image(NULL, img + pos, (size_t)len, elem_obj_types, NULL,
                                                n_elem_obj_attrs, &tmp)
                          : decode_scalar(element_type, img + pos, (size_t)len, &tmp);
     if (est == SEER_OK && tmp.data != NULL) {
@@ -3145,8 +3203,8 @@ static void resolve_pending_objs(SeerStmt *stmt)
       st = decode_collection_image(p->image, p->imagelen, col->element_type, col->elem_obj_types,
                                    col->n_elem_obj_attrs, cell);
     else if (col->n_obj_attrs > 0)
-      st = decode_object_image(p->image, p->imagelen, col->obj_attr_types, col->obj_attr_elem,
-                               col->n_obj_attrs, cell);
+      st = decode_object_image(stmt->conn, p->image, p->imagelen, col->obj_attr_types,
+                               col->obj_attr_elem, col->n_obj_attrs, cell);
     else
       continue; /* layout unavailable */
     if (st != SEER_OK)
@@ -5049,6 +5107,14 @@ static SeerStatus obj_build_image(SeerConn *c, const char *schema, const char *t
     free(types);
     return SEER_EPARAM;
   }
+  /* A LOB or XMLType attribute needs a locator in the image (a temporary LOB
+   * created and written first), not text - refuse rather than send a value
+   * the server would reject or misread. */
+  for (int i = 0; i < ntypes; i++)
+    if (types[i] == ORA_TYPE_CLOB || types[i] == ORA_TYPE_BLOB || types[i] == OBJ_ATTR_XMLTYPE) {
+      free(types);
+      return SEER_ENOTIMPL;
+    }
 
   SeerWriter body;
   if (!seer_writer_init(&body, 64)) {
@@ -6547,7 +6613,7 @@ SeerStatus seer_aq_deq_object(SeerConn *conn, const char *queue_name, const char
   st = read_object_image(&r, &img, &imglen);
   if (st == SEER_OK && img != NULL && ntypes > 0) {
     SeerCell cell = {0};
-    if (decode_object_image(img, imglen, types, NULL, ntypes, &cell) == SEER_OK &&
+    if (decode_object_image(conn, img, imglen, types, NULL, ntypes, &cell) == SEER_OK &&
         out_text != NULL) {
       *out_text = cell.data; /* transfer ownership */
       cell.data = NULL;
@@ -6941,7 +7007,7 @@ void seer_fuzz_image_decoders(const uint8_t *img, size_t n)
   for (int i = 0; i < na; i++)
     attrs[i] = types[((size_t)(i + 1) < n ? img[i + 1] : (uint8_t)i) % 8];
   cell = (SeerCell){0};
-  decode_object_image(img, n, attrs, NULL, na, &cell);
+  decode_object_image(NULL, img, n, attrs, NULL, na, &cell);
   free(cell.data);
 
   /* collection: element type from a byte */
