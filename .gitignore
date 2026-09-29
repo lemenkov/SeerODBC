@@ -28,3 +28,6 @@ compile_commands.json
 *~
 .idea/
 .vscode/
+
+# Local run-matrix.sh settings (lab addresses, credentials)
+/tests/odbc/matrix.env

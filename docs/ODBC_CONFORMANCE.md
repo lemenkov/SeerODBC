@@ -108,6 +108,12 @@ for any function where only one width is exported.
   script also runs a local-only **9i** row via a dedicated core-API test
   (`tests/odbc/test_9i.c`): 9i speaks the legacy fv2 / `TTI_ALL7` dialect and is
   exercised through the `seer_*` core API rather than the Driver Manager.
+  Where the servers live is set by environment variables (`SEER_CONTAINER_HOST`
+  for the container tiers, `SEER_9I_HOST` for the 9i VM, per-tier
+  `SEER_<TIER>_{HOST,PORT,TARGET,USER,PASS}` overrides) or a gitignored
+  `tests/odbc/matrix.env` (see `matrix.env.example`); `--only` / `--skip`
+  select tiers, and an unreachable tier is reported and skipped. The run exits
+  non-zero if any tier has a failing check.
 - **Live validation**: each feature is exercised against the full 10g/11g/21c/23ai
   matrix through unixODBC (isql + C clients), plus the 9i core-API tier. See
   `docs/ARCHITECTURE.md` "Protocol progress" and `docs/ROADMAP.md` for the

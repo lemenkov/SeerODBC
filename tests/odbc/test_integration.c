@@ -956,7 +956,7 @@ static void check_tls(const char *drv, const char *svc, const char *user, const 
   const char *name = "TLS transport (TCPS)";
   const char *tport = getenv("SEER_TLS_PROXY_PORT");
   const char *ca = getenv("SEER_TLS_CA");
-  if (tport == NULL || ca == NULL) {
+  if (tport == NULL || ca == NULL || !tport[0] || !ca[0]) {
     skip(name, "set SEER_TLS_PROXY_PORT + SEER_TLS_CA to exercise TLS");
     return;
   }
