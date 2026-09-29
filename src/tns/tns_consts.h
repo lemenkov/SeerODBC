@@ -19,6 +19,7 @@
 #define TTI_LOB 14             /* LOB data chunk             */
 #define TTI_WRN 15             /* warning                    */
 #define TTI_DCB 16             /* describe info (columns)    */
+#define TTI_FOB 19             /* flush out binds: a server request, echoed back */
 #define TTI_BVC 21             /* bit vector for changed cols */
 #define TTI_SVR_PIGGYBACK 23   /* server-side session-state piggyback (DRCP) */
 #define TTI_IRD 27             /* implicit result set descriptor (12c+) */

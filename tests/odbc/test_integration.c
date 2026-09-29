@@ -498,6 +498,39 @@ static void check_typed_null(SQLHDBC dbc)
   }
 }
 
+/* A DML RETURNING statement that fails gets a flush-out-binds request (a lone
+ * TTI_FOB byte) before its error; the client must echo it, or the server
+ * keeps waiting and the NEXT statement fails with ORA-03137 / ORA-00600. */
+static void check_returning_failure_recovers(SQLHDBC dbc)
+{
+  const char *name = "failing DML RETURNING, then the connection still works";
+  char err[256] = "", out[32] = "";
+  exec_do(dbc, "DROP TABLE seer_fob", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_fob (id NUMBER NOT NULL)", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  SQLINTEGER ret = 0;
+  SQLLEN rind = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &ret, 0, &rind);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"INSERT INTO seer_fob (id) VALUES (NULL) RETURNING id INTO ?", SQL_NTS);
+  char first[256] = "";
+  diag_text(SQL_HANDLE_STMT, st, first, sizeof first);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLRETURN rc2 = exec_scalar(dbc, "SELECT 5 FROM dual", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_fob", err, sizeof err);
+  if (!SQL_SUCCEEDED(rc) && strstr(first, "01400") && SQL_SUCCEEDED(rc2) && strcmp(out, "5") == 0)
+    pass(name);
+  else {
+    char m[600];
+    snprintf(m, sizeof m, "rc=%d first='%s' next='%s' %s", rc, first, out, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1915,6 +1948,7 @@ int main(void)
     check_urowid_physical(dbc);
     check_long_bind_order(dbc);
     check_array_null_last_row(dbc);
+    check_returning_failure_recovers(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);

@@ -201,6 +201,7 @@ typedef struct {
   int64_t err_code;
   int64_t cursor_id;
   int64_t row_count; /* "current row number" - DML affected rows on 11g */
+  bool flush_binds;  /* the server asked for a TTI_FOB echo (see seer_ttc_recv) */
 } OerResult;
 
 /* ----------------------------------------------------------- value decode */
@@ -1591,6 +1592,14 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       break;
     case TTI_STA:
       got_oer = true; /* treat as terminal */
+      break;
+    case TTI_FOB:
+      /* Flush-out-binds request: a failing DML RETURNING. 10g/11g send it as a
+       * whole message (answered in seer_ttc_recv); 12c+ can send it after an
+       * RXD in the same message. Stop here - the caller echoes it and reads
+       * the real (error) response that follows. */
+      oer->flush_binds = true;
+      got_oer = true;
       break;
     case TTI_END_OF_RESPONSE:
       /* EOR framing (§32/#155): the per-response terminator. It normally
@@ -4242,8 +4251,29 @@ retry_exec:
    * fresh parse does. */
   st = parse_response(stmt, resp, rlen, stmt->reuse_cursor == 0, &oer);
   free(resp);
+  resp = NULL;
   if (st != SEER_OK)
     return st;
+  /* The server asked to flush out-binds (a failing DML RETURNING): echo the
+   * TTI_FOB and read the real response behind it - the statement's error. */
+  for (int asked = 0; oer.flush_binds; asked++) {
+    if (asked == 3) {
+      seer_log(SEER_LOG_ERROR, "stmt: server keeps asking to flush out-binds");
+      return SEER_EPROTO;
+    }
+    const uint8_t fob = TTI_FOB;
+    st = seer_ttc_send(stmt->conn, &fob, 1);
+    if (st == SEER_OK)
+      st = seer_ttc_recv(stmt->conn, &resp, &rlen);
+    if (st != SEER_OK)
+      return st;
+    oer = (OerResult){0};
+    st = parse_response(stmt, resp, rlen, false, &oer);
+    free(resp);
+    resp = NULL;
+    if (st != SEER_OK)
+      return st;
+  }
 
   seer_log(SEER_LOG_DEBUG, "stmt: exec OER call_status=%ld err=%ld cursor=%ld rows=%zu",
            (long)oer.call_status, (long)oer.err_code, (long)oer.cursor_id, stmt->nrows);
