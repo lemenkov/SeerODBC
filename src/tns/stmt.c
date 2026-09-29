@@ -104,9 +104,10 @@ typedef struct {
   bool type_from_null;  /* the OAC type came from a NULL value (a placeholder) */
   uint8_t **rxd;        /* per-iteration encoded RXD values, [n_iters] */
   size_t *rxd_len;
-  SeerCell out;      /* OUT value captured from the IOV response */
-  bool is_array;     /* PL/SQL associative-array (index-by table) bind  */
-  SeerCell *out_arr; /* OUT assoc-array elements captured from the IOV   */
+  SeerCell out;         /* OUT value captured from the IOV response */
+  int64_t out_full_len; /* RETURNING value the server truncated: its real length, else 0 */
+  bool is_array;        /* PL/SQL associative-array (index-by table) bind  */
+  SeerCell *out_arr;    /* OUT assoc-array elements captured from the IOV   */
   int out_arr_n;
   uint8_t *oac_override; /* pre-built OAC bytes (SQL OBJECT bind); else emit_oac */
   size_t oac_override_len;
@@ -1464,6 +1465,7 @@ static SeerStatus parse_returning_rxd(SeerReader *r, SeerStmt *stmt)
     SeerBind *b = &stmt->pbinds[i];
     if (!b->is_out)
       continue;
+    b->out_full_len = 0;
     int64_t num_rows = seer_dec_sb4(r);
     if (num_rows < 0 || num_rows > 1000000 || !seer_reader_ok(r))
       return SEER_EPROTO;
@@ -1474,11 +1476,14 @@ static SeerStatus parse_returning_rxd(SeerReader *r, SeerStmt *stmt)
         free(v);
         return SEER_EPROTO;
       }
-      (void)seer_dec_sb4(r); /* sb4 actual/truncation length */
-      if (row == 0) {        /* keep the first row's value */
+      /* The value's real length: larger than what arrived when the server
+       * cut it to the bind's declared size (seerdb/seerdb@1812615). */
+      int64_t actual = seer_dec_sb4(r);
+      if (row == 0) { /* keep the first row's value */
         free(b->out.data);
         b->out = (SeerCell){0};
         decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, v, vl, &b->out);
+        b->out_full_len = actual > (int64_t)vl ? actual : 0;
       }
       free(v);
     }
@@ -2079,6 +2084,13 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
     rxd_len = 1;
   }
   return store_bind(stmt, param, oac_type, oac_size, oac_charset, oac_flag, true, rxd, rxd_len);
+}
+
+long seer_stmt_out_truncated(SeerStmt *stmt, int param)
+{
+  if (stmt == NULL || param < 1 || param > stmt->npbinds)
+    return 0;
+  return (long)stmt->pbinds[param - 1].out_full_len;
 }
 
 SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size)
