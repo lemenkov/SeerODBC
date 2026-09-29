@@ -4115,14 +4115,29 @@ static void fv2_decode_dml_response(const uint8_t *data, size_t dlen, int64_t *r
   if (data[0] == TTI_RPA) { /* skip the RPA piggyback */
     r.pos = 1;
     int64_t num = seer_dec_sb4(&r);
-    for (int64_t i = 0; i < num && i < 100000 && seer_reader_remaining(&r) > 0; i++) {
-      uint8_t t = r.buf[r.pos];
-      if (t == TTI_OER || t == TTI_RXH || t == TTI_RXD)
-        break;
+    /* The parameters are consumed by count: the first is a counter that grows
+     * with the instance, and once past 2^24 its length byte is 0x04 - the OER
+     * token - so stopping at a token-valued byte took the counter for the
+     * status and made every successful DML/DDL on an aged 9i report a garbled
+     * negative ORA code (seerdb/seerdb@0babf60). Only when the counted walk
+     * doesn't land on the OER is the old token-sniffing walk used. */
+    size_t start = r.pos;
+    for (int64_t i = 0; i < num && i < 100000 && seer_reader_ok(&r); i++)
       (void)seer_dec_sb4(&r);
-    }
     while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
       r.pos++;
+    if (!seer_reader_ok(&r) || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
+      seer_reader_init(&r, data, dlen);
+      r.pos = start;
+      for (int64_t i = 0; i < num && i < 100000 && seer_reader_remaining(&r) > 0; i++) {
+        uint8_t t = r.buf[r.pos];
+        if (t == TTI_OER || t == TTI_RXH || t == TTI_RXD)
+          break;
+        (void)seer_dec_sb4(&r);
+      }
+      while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
+        r.pos++;
+    }
   }
   if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_OER) {
     r.pos += 1;
@@ -6964,6 +6979,11 @@ out:
  * field version `fv`, reporting the column count and the trailing OER error
  * code. Used by the RPA-skip regression test (a 26ai/fv27 execute response whose
  * RPA field byte 0x04 collided with the OER token). Not exported from the .so. */
+void seer_test_fv2_decode_dml(const uint8_t *buf, size_t len, int64_t *rowcount, int64_t *code)
+{
+  fv2_decode_dml_response(buf, len, rowcount, code);
+}
+
 SeerStatus seer_test_parse_execute_response(const uint8_t *buf, size_t len, uint8_t fv,
                                             int *out_ncols, int64_t *out_err)
 {

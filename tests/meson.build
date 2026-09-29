@@ -81,6 +81,14 @@ test_rpa_skip = executable('test_rpa_skip',
 )
 test('rpa skip (fv27)', test_rpa_skip)
 
+# 9i (fv2) DML status reply regression: live 9.2.0.4 captures whose RPA counter
+# has a 0x04 length byte (== the OER token) once the instance ages past 2^24.
+test_fv2_status = executable('test_fv2_status',
+  'unit/test_fv2_status.c',
+  dependencies : [seertns_dep],
+)
+test('fv2 dml status', test_fv2_status)
+
 # Accept-and-reject stubs for features not on the thin wire: sharding (§37) + CQN
 # (§38). Pure offline: the reject paths take no network.
 test_stubs = executable('test_stubs',
