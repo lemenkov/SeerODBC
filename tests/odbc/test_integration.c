@@ -320,6 +320,58 @@ static void check_urowid_physical(SQLHDBC dbc)
   }
 }
 
+/* A value or statement text of 253 bytes must go out chunked: a plain length
+ * byte covers 1..252, and 0xFD..0xFF are markers. Probe both sides of the
+ * boundary for a bind value and for the SQL text itself. */
+static void check_length_boundaries(SQLHDBC dbc)
+{
+  const char *name = "252/253/254-byte bind value and SQL text";
+  char m[400] = "";
+  int ok = 1;
+  for (int n = 252; n <= 254 && ok; n++) {
+    /* bind value of n bytes */
+    char val[300], out[32] = "", err[256] = "";
+    memset(val, 'v', (size_t)n);
+    val[n] = '\0';
+    SQLHSTMT st;
+    SQLLEN ind = SQL_NTS, oind = 0;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 400, 0, val, 0, &ind);
+    SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT LENGTH(?) FROM dual", SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+      SQLGetData(st, 1, SQL_C_CHAR, out, sizeof out, &oind);
+    else
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (atoi(out) != n) {
+      snprintf(m, sizeof m, "bind %d bytes: got '%s' %s", n, out, err);
+      ok = 0;
+      break;
+    }
+    /* SQL text of exactly n bytes */
+    char sql[300];
+    const char *head = "SELECT '";
+    const char *tail = "' FROM dual";
+    size_t pad = (size_t)n - strlen(head) - strlen(tail);
+    snprintf(
+        sql, sizeof sql, "%s%.*s%s", head, (int)pad,
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        tail);
+    char got[300] = "";
+    if (!SQL_SUCCEEDED(exec_scalar(dbc, sql, got, sizeof got, err, sizeof err)) ||
+        strlen(got) != pad) {
+      snprintf(m, sizeof m, "SQL of %d bytes: got %zu chars %s", n, strlen(got), err);
+      ok = 0;
+    }
+  }
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* An array execute sends one descriptor per column for every row, so a NULL
  * in the last row must not re-type a NUMBER / DATE column as VARCHAR. */
 static void check_array_null_last_row(SQLHDBC dbc)
@@ -1799,6 +1851,7 @@ int main(void)
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_zero_length_columns(dbc);
   check_nested_cursor_column(dbc);
+  check_length_boundaries(dbc);
   check_typed_null(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");

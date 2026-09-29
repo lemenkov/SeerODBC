@@ -1694,7 +1694,7 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
 }
 
 /* Encode a bind value (oracledb encode_chr). Two forms, split at 12.2:
- *   - 12.2+ (write_bytes_with_length): inline <ub1 len><bytes> for n < 254, else
+ *   - 12.2+ (write_bytes_with_length): inline <ub1 len><bytes> for n <= 252, else
  *     the 0xFE marker + 64-byte chunks each prefixed by an *sb4* length, then a
  *     zero-length terminator.
  *   - pre-12.2 (11g/10g): inline <ub1 len><bytes> for n <= 64, else 0xFE + 64-byte
@@ -1705,7 +1705,9 @@ static SeerStatus encode_chr(const uint8_t *data, size_t n, uint8_t fv, uint8_t 
                              size_t *outlen)
 {
   bool new_form = fv >= TTC_FIELD_VERSION_12_2;
-  size_t inline_max = new_form ? 253 : 64;
+  /* A plain length byte covers 1..252: 0xFD (253), 0xFE (chunked) and 0xFF
+   * (NULL) are markers, so a 253-byte value inline reads as a marker. */
+  size_t inline_max = new_form ? 252 : 64;
   SeerWriter w;
   if (!seer_writer_init(&w, n + 16))
     return SEER_ENOMEM;
@@ -2397,7 +2399,7 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     /* On a no-parse re-execute the SQL bytes are omitted entirely - even a
      * zero-length prefix would shift the server's read of the al8i4 array. */
     if (!reuse) {
-      if (qlen < 254) { /* length-prefixed SQL */
+      if (qlen <= 252) { /* length-prefixed SQL (253+ would read as a marker) */
         seer_writer_u8(w, (uint8_t)qlen);
         seer_writer_bytes(w, stmt->sql, qlen);
       } else {
@@ -4667,7 +4669,7 @@ static void obj_write_length(SeerWriter *w, uint32_t n)
 }
 
 /* Append `data` length-framed as oracledb write_bytes_with_length (the 12c+ form
- * of encode_chr): <ub1 len> inline for <254, else 0xFE + sb4 chunks. */
+ * of encode_chr): <ub1 len> inline up to 252, else 0xFE + sb4 chunks. */
 static SeerStatus obj_append_chr(SeerWriter *w, const uint8_t *data, size_t n, uint8_t fv)
 {
   uint8_t *enc = NULL;
