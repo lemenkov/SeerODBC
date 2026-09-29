@@ -716,6 +716,28 @@ static void check_returning_truncation(SQLHDBC dbc)
   }
 }
 
+/* A statement that fails still leaves the server a cursor, which must be
+ * closed: 500 failing statements on one connection (more than a typical
+ * OPEN_CURSORS of 300) must not exhaust the session's cursors (ORA-01000). */
+static void check_failed_statements_close_cursors(SQLHDBC dbc)
+{
+  const char *name = "failed statements don't leak server cursors";
+  char err[256] = "", out[32] = "";
+  for (int i = 0; i < 500; i++) {
+    char sql[64];
+    snprintf(sql, sizeof sql, "SELECT %d FROM seer_no_such_table", i);
+    exec_do(dbc, sql, err, sizeof err);
+  }
+  if (SQL_SUCCEEDED(exec_scalar(dbc, "SELECT 5 FROM dual", out, sizeof out, err, sizeof err)) &&
+      strcmp(out, "5") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "after 500 failures: '%s' %s", out, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2124,6 +2146,7 @@ int main(void)
   check_length_boundaries(dbc);
   check_typed_null(dbc);
   check_statement_kind(dbc);
+  check_failed_statements_close_cursors(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");

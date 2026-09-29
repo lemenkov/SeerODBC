@@ -2540,6 +2540,14 @@ static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
   return SEER_OK;
 }
 
+/* Queue a server cursor to be closed with the next call's CLOSE_CURSORS
+ * piggyback. */
+static void queue_cursor_close(SeerConn *c, int64_t cursor_id)
+{
+  if (cursor_id > 0 && c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0]))
+    c->close_cursors[c->n_close++] = (int)cursor_id;
+}
+
 /* ------------------------------------------------------------- public API */
 
 /* Statement cache. take() returns a cached parsed cursor for `sql`, moving its
@@ -4340,6 +4348,7 @@ retry_exec:
      * and its describe and retry once with a full parse before surfacing. */
     if (was_reuse) {
       was_reuse = false;
+      queue_cursor_close(stmt->conn, stmt->reuse_cursor); /* the stale cursor */
       stmt->reuse_cursor = 0;
       free_columns(stmt->cols, stmt->ncols);
       stmt->cols = NULL;
@@ -4350,6 +4359,10 @@ retry_exec:
       stmt->cursor_id = 0;
       goto retry_exec;
     }
+    /* A failed statement still holds a server cursor; close it, or every
+     * error leaks one until the session hits ORA-01000. */
+    queue_cursor_close(stmt->conn, oer.cursor_id);
+    stmt->cursor_id = 0;
     seer_log(SEER_LOG_ERROR, "stmt: execute failed (ORA-%05ld)", (long)oer.err_code);
     return SEER_EDB;
   }
