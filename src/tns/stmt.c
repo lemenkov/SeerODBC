@@ -812,23 +812,42 @@ static SeerStatus parse_dcb(SeerReader *r, SeerStmt *stmt)
   return SEER_OK;
 }
 
-/* A REF CURSOR OUT value (§6.5): a length byte, an inline describe, the nested
- * cursor id, and an indicator. Stash the describe + cursor id; the cursor is
- * drained into the statement result set after execute. */
-static SeerStatus parse_refcursor_out(SeerReader *r, SeerStmt *stmt)
+/* A cursor value: a length byte, an inline describe, and the nested cursor id.
+ * A REF CURSOR OUT bind (§6.5) follows it with a per-value indicator; a nested
+ * CURSOR(...) column in a row does not - there the next byte is the following
+ * row's token, so reading an indicator would swallow it. */
+static SeerStatus read_cursor_value(SeerReader *r, int fv, bool indicator, SeerColumn **out_cols,
+                                    int *out_ncols, int64_t *out_id)
 {
   (void)seer_reader_u8(r); /* value length */
   SeerColumn *cols = NULL;
   int ncols = 0;
-  SeerStatus st = parse_describe_body(r, stmt->conn->field_version, &cols, &ncols);
+  SeerStatus st = parse_describe_body(r, fv, &cols, &ncols);
   if (st != SEER_OK)
     return st;
   int64_t cursor_id = seer_dec_sb4(r); /* nested cursor id */
-  (void)seer_reader_u8(r);             /* per-value indicator */
+  if (indicator)
+    (void)seer_reader_u8(r);
   if (!seer_reader_ok(r)) {
     free_columns(cols, ncols);
     return SEER_EPROTO;
   }
+  *out_cols = cols;
+  *out_ncols = ncols;
+  *out_id = cursor_id;
+  return SEER_OK;
+}
+
+/* A REF CURSOR OUT value: stash the describe + cursor id; the cursor is drained
+ * into the statement result set after execute. */
+static SeerStatus parse_refcursor_out(SeerReader *r, SeerStmt *stmt)
+{
+  SeerColumn *cols = NULL;
+  int ncols = 0;
+  int64_t cursor_id = 0;
+  SeerStatus st = read_cursor_value(r, stmt->conn->field_version, true, &cols, &ncols, &cursor_id);
+  if (st != SEER_OK)
+    return st;
   if (stmt->refcursor_cols != NULL)
     free_columns(stmt->refcursor_cols, stmt->refcursor_ncols);
   stmt->refcursor_cols = cols;
@@ -1055,6 +1074,22 @@ static SeerStatus parse_rxd(SeerReader *r, SeerStmt *stmt, const uint8_t *bv, si
 
     if (stmt->cols[i].zero_len)
       continue; /* no bytes on the wire; the cell stays NULL */
+
+    if (type == ORA_TYPE_REFCURSOR) {
+      /* A nested CURSOR(...) column. ODBC has no nested-cursor type, so the
+       * cell is reported as NULL; the server opened a cursor for it, which is
+       * queued to close so it doesn't leak. */
+      SeerColumn *ncols_desc = NULL;
+      int nn = 0;
+      int64_t cid = 0;
+      if (read_cursor_value(r, stmt->conn->field_version, false, &ncols_desc, &nn, &cid) != SEER_OK)
+        goto fail;
+      free_columns(ncols_desc, nn);
+      SeerConn *c = stmt->conn;
+      if (cid > 0 && c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0]))
+        c->close_cursors[c->n_close++] = (int)cid;
+      continue;
+    }
 
     SeerStatus st = decode_cell(r, &stmt->cols[i], &row[i]);
     if (st != SEER_OK)

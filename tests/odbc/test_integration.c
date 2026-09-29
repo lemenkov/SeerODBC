@@ -269,6 +269,35 @@ static void check_zero_length_columns(SQLHDBC dbc)
   }
 }
 
+/* A CURSOR(...) column (nested cursor, type 102) has its own row form - a
+ * length byte, an inline describe and a ub2 cursor id. ODBC has no nested
+ * cursor type, so the driver reports it as NULL; what matters is that the
+ * columns after it still decode and the cursor is not leaked. */
+static void check_nested_cursor_column(SQLHDBC dbc)
+{
+  const char *name = "nested CURSOR() column";
+  SQLHSTMT st;
+  char err[256] = "", tail[32] = "";
+  SQLLEN ic = 0, it = 0;
+  char b[8];
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"SELECT CURSOR(SELECT 1 FROM dual), 'tail' FROM dual", SQL_NTS);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, b, sizeof b, &ic)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, tail, sizeof tail, &it));
+  if (!ok)
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ok && ic == SQL_NULL_DATA && strcmp(tail, "tail") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "ind=%ld tail='%s' %s", (long)ic, tail, err);
+    fail(name, m);
+  }
+}
+
 /* A UROWID holding a physical rowid (tag 01) renders exactly like the ROWID it
  * is, so it can be fed back into WHERE ROWID = ?. */
 static void check_urowid_physical(SQLHDBC dbc)
@@ -1695,6 +1724,7 @@ int main(void)
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_zero_length_columns(dbc);
+  check_nested_cursor_column(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");
