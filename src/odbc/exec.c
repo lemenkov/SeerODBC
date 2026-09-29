@@ -484,8 +484,17 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     int is_null = 0, is_binary = 0;
     if (seer_stmt_out_data(s->core, i + 1, &data, &dlen, &is_null, &is_binary) != SEER_OK)
       continue;
-    seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, p->c_type, p->buf, p->buflen,
-                      p->indicator, NULL);
+    SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, p->c_type, p->buf,
+                                      p->buflen, p->indicator, NULL);
+    /* Truncated either way - by the server to the declared ColumnSize (a
+     * RETURNING value), or into the application's buffer - is 01004, with
+     * the full length in the indicator where the server told us it. */
+    long full = seer_stmt_out_truncated(s->core, i + 1);
+    if (full > 0 && p->indicator != NULL)
+      *p->indicator = (SQLLEN)full;
+    if (full > 0 || crc == SQL_SUCCESS_WITH_INFO)
+      result = seer_odbc_diag(s, "01004", 0, "String data, right truncated",
+                              result == SQL_SUCCESS ? SQL_SUCCESS_WITH_INFO : result);
   }
 
   int ncols = seer_stmt_num_cols(s->core);

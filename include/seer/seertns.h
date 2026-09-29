@@ -353,6 +353,9 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
  * seer_stmt_out_data). `max_size` reserves room for a VARCHAR / RAW result
  * longer than the value sent. Bind the input value first. */
 SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size);
+/* For a DML RETURNING bind whose value the server truncated to the bind's
+ * declared size: the value's full length. 0 when it arrived whole. */
+long seer_stmt_out_truncated(SeerStmt *stmt, int param);
 
 /* Retrieve a captured OUT parameter value (valid after execute). */
 SeerStatus seer_stmt_out_data(SeerStmt *stmt, int param, const void **data, size_t *len,

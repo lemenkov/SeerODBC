@@ -645,6 +645,77 @@ static void check_cache_after_block_ddl(SQLHDBC dbc)
   }
 }
 
+/* A DML RETURNING whose every bind is a return bind has no row of input
+ * values: the request must carry no TTI_RXD at all. (An empty one drew
+ * ORA-03146 on 12c+ and made 11g drop the session on the next call.) */
+static void check_returning_only_binds(SQLHDBC dbc)
+{
+  const char *name = "DML RETURNING with only return binds (VARCHAR)";
+  char err[256] = "", out[32] = "";
+  exec_do(dbc, "DROP TABLE seer_reto", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_reto (v VARCHAR2(50))", err, sizeof err)) ||
+      !SQL_SUCCEEDED(
+          exec_do(dbc, "INSERT INTO seer_reto VALUES ('abcdefghij')", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  char v[64] = "";
+  SQLLEN vind = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 60, 0, v, sizeof v, &vind);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"UPDATE seer_reto SET v = v RETURNING v INTO ?", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLRETURN rc2 = exec_scalar(dbc, "SELECT 5 FROM dual", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_reto", err, sizeof err);
+  if (rc == SQL_SUCCESS && strcmp(v, "abcdefghij") == 0 && SQL_SUCCEEDED(rc2) &&
+      strcmp(out, "5") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "rc=%d value='%s' next='%s' %s", rc, v, out, err);
+    fail(name, m);
+  }
+}
+
+/* A RETURNING value longer than the parameter's ColumnSize is truncated by
+ * the server; that must be reported (01004), not returned silently cut. */
+static void check_returning_truncation(SQLHDBC dbc)
+{
+  const char *name = "truncated DML RETURNING value reports 01004";
+  char err[256] = "";
+  exec_do(dbc, "DROP TABLE seer_rett", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_rett (v VARCHAR2(50))", err, sizeof err)) ||
+      !SQL_SUCCEEDED(
+          exec_do(dbc, "INSERT INTO seer_rett VALUES ('abcdefghij')", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  char v[64] = "";
+  SQLLEN vind = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 5, 0, v, sizeof v, &vind);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"UPDATE seer_rett SET v = v RETURNING v INTO ?", SQL_NTS);
+  SQLCHAR state[6] = "";
+  SQLINTEGER native = 0;
+  SQLSMALLINT ml = 0;
+  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, NULL, 0, &ml);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_rett", err, sizeof err);
+  if (rc == SQL_SUCCESS_WITH_INFO && strcmp((char *)state, "01004") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "rc=%d state='%s' value='%s' ind=%ld", rc, state, v, (long)vind);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2065,6 +2136,8 @@ int main(void)
     check_array_null_last_row(dbc);
     check_returning_failure_recovers(dbc);
     check_inout_param(dbc);
+    check_returning_only_binds(dbc);
+    check_returning_truncation(dbc);
     check_cache_after_block_ddl(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
