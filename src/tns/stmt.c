@@ -2908,13 +2908,25 @@ static void free_implicit(SeerStmt *stmt)
   stmt->implicit_pos = 0;
 }
 
+/* True while a query's cursor still has rows to hand out. "More rows" is the
+ * absence of the end-of-fetch code (ORA-01403) on a cursor that described a
+ * result set - NOT the OER call_status, which is a flag word (1 with
+ * autocommit on, 2 while a transaction is open, 5 after PL/SQL): gating on
+ * call_status == 1 silently stopped after the first batch inside a
+ * transaction. Requiring described columns keeps DML (which also carries a
+ * cursor handle) from ever being sent a FETCH. */
+static bool more_rows_pending(const SeerStmt *stmt, int64_t cursor_id, int64_t err_code)
+{
+  return stmt->ncols > 0 && cursor_id != 0 && err_code != 1403;
+}
+
 /* Fetch every remaining row of stmt->cursor_id into stmt->rows (one FETCH is
- * always issued, then more while the server reports rows pending). */
+ * always issued, then more while the cursor has rows pending). */
 static SeerStatus fetch_all_rows(SeerStmt *stmt)
 {
   SeerWriter w;
-  OerResult rc = {.call_status = 1}; /* prime: fetch at least once */
-  while (rc.call_status == 1 && stmt->cursor_id != 0 && rc.err_code != 1403) {
+  OerResult rc = {0}; /* prime: fetch at least once */
+  while (more_rows_pending(stmt, stmt->cursor_id, rc.err_code)) {
     SeerStatus st = build_fetch(stmt, &w);
     if (st != SEER_OK)
       return st;
@@ -2936,7 +2948,6 @@ static SeerStatus fetch_all_rows(SeerStmt *stmt)
       seer_log(SEER_LOG_ERROR, "stmt: fetch failed (ORA-%05ld)", (long)f.err_code);
       return SEER_EDB;
     }
-    rc.call_status = f.err_code == 1403 ? 0 : f.call_status;
     rc.err_code = f.err_code;
   }
   return SEER_OK;
@@ -4117,8 +4128,8 @@ retry_exec:
   if (!sql_is_cacheable(stmt->sql))
     stmt_cache_flush(stmt->conn);
 
-  /* Fetch more while the server reports rows pending. */
-  while (oer.call_status == 1 && oer.cursor_id != 0 && oer.err_code != 1403) {
+  /* Fetch more while the cursor has rows pending. */
+  while (more_rows_pending(stmt, oer.cursor_id, oer.err_code)) {
     seer_log(SEER_LOG_DEBUG, "stmt: issuing FETCH on cursor %ld", (long)oer.cursor_id);
     st = build_fetch(stmt, &w);
     if (st != SEER_OK)
@@ -4139,7 +4150,6 @@ retry_exec:
       seer_log(SEER_LOG_ERROR, "stmt: fetch failed (ORA-%05ld)", (long)more.err_code);
       return SEER_EDB;
     }
-    oer.call_status = more.err_code == 1403 ? 0 : more.call_status;
     oer.err_code = more.err_code;
   }
 

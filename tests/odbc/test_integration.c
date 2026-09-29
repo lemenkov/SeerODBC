@@ -207,6 +207,37 @@ static void check_transaction(SQLHDBC dbc)
   }
 }
 
+/* A query run while a transaction is open must still return every row. The
+ * server reports call_status 2 (transaction in progress) rather than 1 in the
+ * OER then, so the fetch loop must keep going on the cursor, not on that flag. */
+static void check_fetch_in_txn(SQLHDBC dbc)
+{
+  const char *name = "fetch all rows inside an open transaction";
+  char err[256];
+  SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+  exec_do(dbc, "INSERT INTO " TBL " VALUES (98, 'txnopen')", err, sizeof err);
+  SQLHSTMT st;
+  long n = 0;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"SELECT level FROM dual CONNECT BY level <= 250", SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    while (SQL_SUCCEEDED(SQLFetch(st)))
+      n++;
+  else
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
+  SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+  if (n == 250)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "fetched %ld rows, want 250 %s", n, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1616,6 +1647,7 @@ int main(void)
   check_bind(dbc);
   if (check_dml(dbc)) {
     check_transaction(dbc);
+    check_fetch_in_txn(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);
