@@ -2188,21 +2188,48 @@ SeerStatus seer_stmt_batch_error(SeerStmt *stmt, size_t i, unsigned *row, unsign
 /* Statement class - drives the execute options, All8 array, and long-max. */
 typedef enum { STMT_SELECT, STMT_BLOCK, STMT_CHANGE } StmtKind;
 
-/* Classify by the leading keyword: SELECT/WITH are queries, BEGIN/DECLARE are
- * anonymous PL/SQL blocks, everything else (DML, DDL) is a "change". */
-static StmtKind classify_sql(const char *sql)
+/* Skip what can precede a statement's first keyword: whitespace, `--` and
+ * block comments, PL/SQL `<<labels>>`, and the opening parentheses of a
+ * "(SELECT ...)". The first keyword decides the execute options, so hiding it
+ * behind a comment misclassified the statement. */
+static const char *sql_first_keyword(const char *p)
 {
-  const char *p = sql;
-  while (*p != '\0' && isspace((unsigned char)*p))
-    p++;
-  while (*p == '(') { /* "(SELECT ...)" */
-    p++;
+  for (;;) {
     while (*p != '\0' && isspace((unsigned char)*p))
       p++;
+    if (p[0] == '-' && p[1] == '-') {
+      while (*p != '\0' && *p != '\n')
+        p++;
+    } else if (p[0] == '/' && p[1] == '*') {
+      const char *e = strstr(p + 2, "*/");
+      p = e ? e + 2 : p + strlen(p);
+    } else if (p[0] == '<' && p[1] == '<') {
+      const char *e = strstr(p + 2, ">>");
+      p = e ? e + 2 : p + strlen(p);
+    } else if (*p == '(') {
+      p++;
+    } else {
+      return p;
+    }
   }
-  if (strncasecmp(p, "SELECT", 6) == 0 || strncasecmp(p, "WITH", 4) == 0)
+}
+
+static bool starts_with_word(const char *p, const char *kw)
+{
+  size_t n = strlen(kw);
+  return strncasecmp(p, kw, n) == 0 && !isalnum((unsigned char)p[n]) && p[n] != '_';
+}
+
+/* Classify by the leading keyword: SELECT/WITH are queries; BEGIN/DECLARE
+ * blocks and CALL are PL/SQL (a CALL ... INTO's target is an ordinary OUT
+ * bind - read as DML RETURNING, the client sent no value and the call hung);
+ * everything else (DML, DDL) is a "change". */
+static StmtKind classify_sql(const char *sql)
+{
+  const char *p = sql_first_keyword(sql);
+  if (starts_with_word(p, "SELECT") || starts_with_word(p, "WITH"))
     return STMT_SELECT;
-  if (strncasecmp(p, "BEGIN", 5) == 0 || strncasecmp(p, "DECLARE", 7) == 0)
+  if (starts_with_word(p, "BEGIN") || starts_with_word(p, "DECLARE") || starts_with_word(p, "CALL"))
     return STMT_BLOCK;
   return STMT_CHANGE;
 }
@@ -2213,21 +2240,12 @@ static StmtKind classify_sql(const char *sql)
  * actually re-run the DDL. */
 static bool sql_is_cacheable(const char *sql)
 {
-  const char *p = sql;
-  while (*p != '\0' && isspace((unsigned char)*p))
-    p++;
-  while (*p == '(') {
-    p++;
-    while (*p != '\0' && isspace((unsigned char)*p))
-      p++;
-  }
+  const char *p = sql_first_keyword(sql);
   static const char *const kw[] = {"SELECT", "WITH",  "INSERT", "UPDATE",
                                    "DELETE", "MERGE", "BEGIN",  "DECLARE"};
-  for (size_t i = 0; i < sizeof kw / sizeof kw[0]; i++) {
-    size_t n = strlen(kw[i]);
-    if (strncasecmp(p, kw[i], n) == 0 && !isalnum((unsigned char)p[n]) && p[n] != '_')
+  for (size_t i = 0; i < sizeof kw / sizeof kw[0]; i++)
+    if (starts_with_word(p, kw[i]))
       return true;
-  }
   return false;
 }
 
@@ -4319,8 +4337,9 @@ retry_exec:
   stmt->affected = (long)oer.row_count;
 
   /* A DDL (non-cacheable) statement can invalidate other cached cursors; drop
-   * the cache so none is reused stale after an object is recreated. */
-  if (!sql_is_cacheable(stmt->sql))
+   * the cache so none is reused stale after an object is recreated. A PL/SQL
+   * block can run DDL too (EXECUTE IMMEDIATE), so it flushes the same way. */
+  if (!sql_is_cacheable(stmt->sql) || classify_sql(stmt->sql) == STMT_BLOCK)
     stmt_cache_flush(stmt->conn);
 
   /* Fetch more while the cursor has rows pending. */
