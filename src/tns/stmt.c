@@ -101,6 +101,7 @@ typedef struct {
   uint32_t oac_charset; /* 873 for char, 0 otherwise */
   uint8_t oac_flag;     /* 16 for char/raw, 0 otherwise */
   bool is_out;          /* OUT / IN OUT parameter */
+  bool type_from_null;  /* the OAC type came from a NULL value (a placeholder) */
   uint8_t **rxd;        /* per-iteration encoded RXD values, [n_iters] */
   size_t *rxd_len;
   SeerCell out;      /* OUT value captured from the IOV response */
@@ -1627,11 +1628,16 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
 
 /* Place an encoded value at 1-based position `param`, iteration `cur_iter`,
  * growing the bind array as needed and freeing any previous value there. The
- * OAC fields apply to the position (size grows to the widest value across
- * iterations). Takes ownership of `rxd`. */
-static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t oac_size,
-                             uint32_t oac_charset, uint8_t oac_flag, bool is_out, uint8_t *rxd,
-                             size_t rxd_len)
+ * OAC fields apply to the whole position - one descriptor for every row of an
+ * array execute - so they are chosen across iterations: the size grows to the
+ * widest value; a NULL (`is_null`) never overrides a type a real value set,
+ * while a real value replaces a NULL's placeholder type; and a LONG / LONG RAW
+ * value wins over the short VARCHAR / RAW form of the same column. (Taking
+ * the last row's type turned a NUMBER column into VARCHAR when the batch
+ * ended in a NULL.) Takes ownership of `rxd`. */
+static SeerStatus store_bind_ex(SeerStmt *s, int param, uint8_t oac_type, uint32_t oac_size,
+                                uint32_t oac_charset, uint8_t oac_flag, bool is_out, bool is_null,
+                                uint8_t *rxd, size_t rxd_len)
 {
   if (param < 1 || param > 1024) {
     free(rxd);
@@ -1661,9 +1667,15 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
       return SEER_ENOMEM;
     }
   }
-  b->oac_type = oac_type;
-  b->oac_charset = oac_charset;
-  b->oac_flag = oac_flag;
+  bool have_real = b->oac_type != 0 && !b->type_from_null;
+  bool demotion = (b->oac_type == ORA_TYPE_LONG && oac_type == ORA_TYPE_VARCHAR) ||
+                  (b->oac_type == ORA_TYPE_LONGRAW && oac_type == ORA_TYPE_RAW);
+  if (!(have_real && (is_null || demotion))) {
+    b->oac_type = oac_type;
+    b->oac_charset = oac_charset;
+    b->oac_flag = oac_flag;
+    b->type_from_null = is_null;
+  }
   b->is_out = is_out;
   if (oac_size > b->oac_size)
     b->oac_size = oac_size;
@@ -1671,6 +1683,14 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
   b->rxd[it] = rxd;
   b->rxd_len[it] = rxd_len;
   return SEER_OK;
+}
+
+static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t oac_size,
+                             uint32_t oac_charset, uint8_t oac_flag, bool is_out, uint8_t *rxd,
+                             size_t rxd_len)
+{
+  return store_bind_ex(s, param, oac_type, oac_size, oac_charset, oac_flag, is_out, false, rxd,
+                       rxd_len);
 }
 
 /* Encode a bind value (oracledb encode_chr). Two forms, split at 12.2:
@@ -1949,8 +1969,48 @@ SeerStatus seer_stmt_bind_null(SeerStmt *stmt, int param)
   uint8_t *rxd = malloc(1);
   if (rxd == NULL)
     return SEER_ENOMEM;
-  rxd[0] = 0;                                                                  /* NULL value */
-  return store_bind(stmt, param, ORA_TYPE_VARCHAR, 1, 873, 16, false, rxd, 1); /* NULL */
+  rxd[0] = 0; /* NULL value */
+  return store_bind_ex(stmt, param, ORA_TYPE_VARCHAR, 1, 873, 16, false, true, rxd, 1);
+}
+
+SeerStatus seer_stmt_bind_null_typed(SeerStmt *stmt, int param, int ora_type)
+{
+  if (stmt == NULL)
+    return SEER_EPARAM;
+  /* The descriptor a non-NULL value of that type would carry; the value is
+   * the NULL byte either way. A NULL declared as VARCHAR can't meet a NUMBER
+   * or DATE in COALESCE / CASE (ORA-00932), and in an array execute it must
+   * not type the column. */
+  uint8_t t;
+  uint32_t size, charset = 0;
+  uint8_t flag = 0;
+  switch (ora_type) {
+  case ORA_TYPE_NUMBER:
+    t = ORA_TYPE_NUMBER, size = 22;
+    break;
+  case ORA_TYPE_DATE:
+    t = ORA_TYPE_DATE, size = 7;
+    break;
+  case ORA_TYPE_TIMESTAMP:
+    t = ORA_TYPE_TIMESTAMP, size = 11;
+    break;
+  case ORA_TYPE_BDOUBLE:
+    t = ORA_TYPE_BDOUBLE, size = 8;
+    break;
+  case ORA_TYPE_BFLOAT:
+    t = ORA_TYPE_BFLOAT, size = 4;
+    break;
+  case ORA_TYPE_RAW:
+    t = ORA_TYPE_RAW, size = 1, flag = 16;
+    break;
+  default:
+    return seer_stmt_bind_null(stmt, param);
+  }
+  uint8_t *rxd = malloc(1);
+  if (rxd == NULL)
+    return SEER_ENOMEM;
+  rxd[0] = 0;
+  return store_bind_ex(stmt, param, t, size, charset, flag, false, true, rxd, 1);
 }
 
 SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_size)

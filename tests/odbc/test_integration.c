@@ -320,6 +320,80 @@ static void check_urowid_physical(SQLHDBC dbc)
   }
 }
 
+/* An array execute sends one descriptor per column for every row, so a NULL
+ * in the last row must not re-type a NUMBER / DATE column as VARCHAR. */
+static void check_array_null_last_row(SQLHDBC dbc)
+{
+  const char *name = "array DML with NULL in the last row";
+  char err[256] = "", out[64] = "";
+  exec_do(dbc, "DROP TABLE seer_arrnull", err, sizeof err);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_arrnull (n NUMBER, d DATE)", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  SQLINTEGER ns[3] = {1, 2, 0};
+  SQLLEN nind[3] = {0, 0, SQL_NULL_DATA};
+  SQL_DATE_STRUCT ds[3] = {{2026, 1, 2}, {2026, 3, 4}, {0, 0, 0}};
+  SQLLEN dind[3] = {0, 0, SQL_NULL_DATA};
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)3, 0);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, ns, 0, nind);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, ds, 0, dind);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"INSERT INTO seer_arrnull VALUES (?, ?)", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (SQL_SUCCEEDED(rc))
+    exec_scalar(dbc,
+                "SELECT COUNT(*) || ':' || SUM(n) || ':' || COUNT(n) || ':' || "
+                "TO_CHAR(MAX(d), 'YYYY-MM-DD') FROM seer_arrnull",
+                out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_arrnull", err, sizeof err);
+  if (strcmp(out, "3:3:2:2026-03-04") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' want '3:3:2:2026-03-04' %s", out, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
+/* A NULL parameter declared as SQL_INTEGER / SQL_TYPE_DATE is typed as such,
+ * so it can meet a NUMBER or DATE in COALESCE (a VARCHAR NULL gets
+ * ORA-00932: inconsistent datatypes). */
+static void check_typed_null(SQLHDBC dbc)
+{
+  const char *name = "typed NULL parameter (COALESCE with NUMBER / DATE)";
+  char err[256] = "", a[32] = "", b[32] = "";
+  SQLLEN nul = SQL_NULL_DATA, ia = 0, ib = 0;
+  SQLINTEGER iv = 0;
+  SQL_DATE_STRUCT dv = {0};
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &iv, 0, &nul);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, &dv, 0, &nul);
+  SQLRETURN rc = SQLExecDirect(
+      st,
+      (SQLCHAR *)"SELECT COALESCE(?, 7) + 1, TO_CHAR(COALESCE(?, DATE '2026-09-29'), 'YYYY') "
+                 "FROM dual",
+      SQL_NTS);
+  int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, a, sizeof a, &ia)) &&
+           SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, b, sizeof b, &ib));
+  if (!ok)
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ok && strcmp(a, "8") == 0 && strcmp(b, "2026") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' / '%s' %s", a, b, err);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -1725,6 +1799,7 @@ int main(void)
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_zero_length_columns(dbc);
   check_nested_cursor_column(dbc);
+  check_typed_null(dbc);
   check_scalar(dbc, "VARCHAR2 fetch", "SELECT 'hello' FROM DUAL", "hello");
   check_scalar(dbc, "NUMBER fetch", "SELECT 123.5 FROM DUAL", "123.5");
   check_scalar(dbc, "DATE fetch", "SELECT DATE '2020-01-02' FROM DUAL", "2020-01-02");
@@ -1733,6 +1808,7 @@ int main(void)
     check_transaction(dbc);
     check_fetch_in_txn(dbc);
     check_urowid_physical(dbc);
+    check_array_null_last_row(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);
     check_lock(dbc);
