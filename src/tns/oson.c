@@ -1,5 +1,5 @@
 /* OSON decoder: Oracle's binary JSON image (the wire form of a native JSON
- * column, 21c+) to JSON text. Ported from pyoracle/oracle/oson.py; layout per
+ * column, 21c+) to JSON text. Ported from seerdb's seerdb/common/oson.py; layout per
  * PROTOCOL.md. We walk the image tree and emit JSON text directly (objects,
  * arrays, strings, numbers, true/false/null), reusing the column-type decoders
  * for extended scalars (native NUMBER, DATE, TIMESTAMP, BINARY_FLOAT/DOUBLE,

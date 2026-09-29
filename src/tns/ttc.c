@@ -61,7 +61,7 @@ static const uint8_t RUNTIME_CAPS_12C[] = {
 /* The 12c+ datatype table is a flat list of UB2 (type, conv, repr) entries.
  * conv defaults to type and repr to 1, except the overrides below (repr 10 =
  * Oracle-native: NUMBER/DATE families). Ported from python-oracledb 4.0.1's
- * DATA_TYPES (verified by pyoracle against a 21c capture). */
+ * DATA_TYPES (verified by seerdb against a 21c capture). */
 static const uint16_t DTY_12C_TYPES[] = {
     1,   2,   8,   12,  23,  24,  25,  26,  27,  28,  29,  30,  31,  32,  33,  10,  11,  40,  41,
     117, 120, 290, 291, 292, 293, 294, 298, 299, 300, 301, 302, 303, 304, 305, 306, 307, 308, 309,
@@ -509,7 +509,7 @@ void seer_ttc_fun_header(SeerConn *c, SeerWriter *w, uint8_t opcode)
   seer_writer_u8(w, opcode);
   seer_writer_u8(w, seer_ttc_next_seq(c));
   /* fv24 (23ai): oracledb writes a ub8 token after the sequence number on every
-   * function message (pyoracle _fun_header, PROTOCOL.md §20). It is 0 for an
+   * function message (seerdb _fun_header, PROTOCOL.md §20). It is 0 for an
    * ordinary call (encoding to a single 0x00) and 1..N for a pipelined op
    * (§32/#158), so the server can correlate each burst response. */
   if (c->field_version > TTC_FIELD_VERSION_23_1)
@@ -579,7 +579,7 @@ static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool
   return SEER_OK;
 }
 
-/* Oracle 9i (fv2) minimal capabilities (pyoracle capability_arrays, fv<10g): all
+/* Oracle 9i (fv2) minimal capabilities (seerdb capability_arrays, fv<10g): all
  * zero except compile-cap index 17 = 0x03, and a single 0x02 runtime byte.
  * Critically CCAP_LOGON_TYPES (index 4) stays 0 - we must NOT advertise O5LOGON,
  * else 9i tries a verifier the account lacks and the O3LOGON path never engages
@@ -1082,14 +1082,14 @@ static char *hex_upper(const uint8_t *in, size_t n)
  * password under the recovered session key) + decimal pad count. A clean OER
  * (code 0/1403) means authenticated - there is no separate TTI_AUTH step, and no
  * AUTH_SVR_RESPONSE to validate. The fixed message skeletons and env strings match
- * the JDBC thin driver byte-for-byte (pyoracle #90). */
+ * the JDBC thin driver byte-for-byte (seerdb/seerdb#90). */
 static const uint8_t O3_MID1[] = {
-    /* 31 bytes (pyoracle _O3_MID1) */
+    /* 31 bytes (seerdb _O3_MID1) */
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x07, 0x01, 0x01, 0x03, 0x01, 0x01, 0x04, 0x02,
     0x10, 0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x01,
 };
 static const uint8_t O3_MID2[] = {
-    /* 29 bytes (pyoracle _O3_MID2) */
+    /* 29 bytes (seerdb _O3_MID2) */
     0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x07, 0x01, 0x01, 0x03, 0x01, 0x01, 0x04, 0x02, 0x10,
     0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00,
 };

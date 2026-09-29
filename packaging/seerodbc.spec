@@ -8,7 +8,7 @@ Version:        0.1.0
 Release:        %autorelease
 Summary:        Clean-room ODBC driver for Oracle Database
 License:        Apache-2.0
-URL:            https://github.com/lemenkov/seerodbc
+URL:            https://github.com/seerdb/SeerODBC
 VCS:            git:%{url}.git
 Source:         %{url}/archive/%{version}/%{name}-%{version}.tar.gz
 BuildRequires:  gcc

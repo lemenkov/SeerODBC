@@ -45,7 +45,7 @@ the DM-independent test path (our `tsql`).
    language would have given the parser — and it's the natural fuzz target.
 3. **`src/odbc/convert.c` is the only seam** that touches *both* ODBC C-types
    (`SQL_C_*`) and core native types. The messy type coercion has exactly one
-   home. (This is where pyoracle's NUMBER/DATE decode work transplants.)
+   home. (This is where seerdb's NUMBER/DATE decode work transplants.)
 4. **The driver exports only `SQL*` symbols** (`src/odbc/seerodbc.map`).
    The core and OpenSSL stay out of the host process's dynamic symbol table —
    the same "don't pollute the host process" reasoning that ruled out GLib.

@@ -3331,7 +3331,7 @@ static void resolve_pending_lobs(SeerStmt *stmt)
 
 /* ========= Oracle 9i (field version 2): the TTI_ALL7 query dialect ===========
  * 9i speaks an older execute RPC than TTI_ALL8. A SELECT is a four-call sequence
- * (pyoracle PROTOCOL.md §19): OOPEN -> parse -> describe -> exec/fetch* -> close.
+ * (seerdb PROTOCOL.md §19): OOPEN -> parse -> describe -> exec/fetch* -> close.
  * All calls carry sequence byte 0 and cursor field 0 (the server tracks the one
  * cursor OOPEN allocated). RE'd from the Oracle JDBC thin driver. */
 
@@ -3435,8 +3435,8 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   (void)seer_reader_u8(r); /* csfrm      */
   /* Before the name: null_ok(1B) + name-length-in-bytes(1B), then the name length
    * in chars (a real ub4, always width 1 for a <=255-char name), then the DALC
-   * name. NOTE: pyoracle's §19.1 mislabels the null_ok + byte-length pair as one
-   * "ub4 namelen" - which only decodes cleanly for a NULLABLE column (null_ok=1
+   * name (seerdb PROTOCOL.md §19.1). Reading the null_ok + byte-length pair as
+   * one "ub4 namelen" only decodes cleanly for a NULLABLE column (null_ok=1
    * mimics a width-1 ub4); a NOT-NULL column (null_ok=0) makes that ub4 slip.
    * Verified live: a NOT NULL vs nullable pair with identical 9-char names differ
    * only in this first byte (00 vs 01). We read null_ok properly; the two length

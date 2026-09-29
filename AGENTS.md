@@ -43,7 +43,7 @@ never to merge or tag it. The steps:
    than a real server.
 
 4. **Open a PR** against upstream `master` following the normal fork→upstream
-   flow: push the branch to your fork (the `github` remote, `lemenkov/SeerODBC`)
+   flow: push the branch to your personal fork (never to upstream directly)
    and open the PR against upstream (`seerdb/SeerODBC`). Title it
    `Release x.y.z`. In the body, summarise the shipped features and repeat the
    honest validation status from the notes.

@@ -16,7 +16,7 @@ SeerODBC is a **clean-room reverse-engineering** effort. We have no
 relationship with Oracle Corporation and no access to Oracle's confidential
 materials. The legal defensibility of the project depends on everyone keeping
 to the rules below. This is the same posture as the sibling project
-`pyoracle`, extended here to the ODBC layer.
+[`seerdb`](https://github.com/seerdb/seerdb), extended here to the ODBC layer.
 
 ### Allowed references
 
@@ -25,7 +25,7 @@ to the rules below. This is the same posture as the sibling project
 - ODBC headers from **unixODBC** (LGPL) or **iODBC** (dual LGPL/BSD), used as
   build-time dependencies. We *depend on* these headers; we do not copy
   driver source.
-- `pyoracle`'s `PROTOCOL.md` and its readable reference implementation
+- `seerdb`'s [`PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) and its readable reference implementation
   (the protocol the two projects share is documented there).
 - Public protocol descriptions: RFCs, blog posts, conference talks,
   community wikis, the Wireshark TNS dissector's *documentation*.
