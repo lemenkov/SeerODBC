@@ -734,14 +734,18 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
   if (is12c) {
     seer_writer_u8(w, (uint8_t)ulen); /* length-prefixed username */
     seer_writer_bytes(w, user, ulen);
-    seer_enc_kv(w, "AUTH_TERMINAL", 13, "unknown", 7, 0);
+    seer_enc_kv(w, "AUTH_TERMINAL", 13, "unknown", 7, 0,
+                c->field_version >= TTC_FIELD_VERSION_12_1);
   } else {
     seer_writer_bytes(w, user, ulen); /* raw username (11g) */
   }
-  seer_enc_kv(w, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0);
-  seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0);
-  seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0);
-  seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0);
+  seer_enc_kv(w, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0,
+              c->field_version >= TTC_FIELD_VERSION_12_1);
+  seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0,
+              c->field_version >= TTC_FIELD_VERSION_12_1);
+  seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0, c->field_version >= TTC_FIELD_VERSION_12_1);
+  seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0,
+              c->field_version >= TTC_FIELD_VERSION_12_1);
 
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
@@ -1289,18 +1293,24 @@ static SeerStatus build_auth(SeerConn *c, const SeerConnParams *p, const SeerAut
   }
   /* Order matters: AUTH_PASSWORD, then AUTH_PBKDF2_SPEEDY_KEY (12c), then
    * AUTH_SESSKEY (the last pair carries the trailing flag). */
-  seer_enc_kv(w, "AUTH_PASSWORD", 13, passhex, strlen(passhex), 0);
+  seer_enc_kv(w, "AUTH_PASSWORD", 13, passhex, strlen(passhex), 0,
+              c->field_version >= TTC_FIELD_VERSION_12_1);
   if (has_speedy)
-    seer_enc_kv(w, "AUTH_PBKDF2_SPEEDY_KEY", 22, speedyhex, strlen(speedyhex), 0);
+    seer_enc_kv(w, "AUTH_PBKDF2_SPEEDY_KEY", 22, speedyhex, strlen(speedyhex), 0,
+                c->field_version >= TTC_FIELD_VERSION_12_1);
   if (proxy_schema)
-    seer_enc_kv(w, "PROXY_CLIENT_NAME", 17, proxy_schema, schema_len, 0);
-  seer_enc_kv(w, "AUTH_SESSKEY", 12, sesshex, strlen(sesshex), 1);
+    seer_enc_kv(w, "PROXY_CLIENT_NAME", 17, proxy_schema, schema_len, 0,
+                c->field_version >= TTC_FIELD_VERSION_12_1);
+  seer_enc_kv(w, "AUTH_SESSKEY", 12, sesshex, strlen(sesshex), 1,
+              c->field_version >= TTC_FIELD_VERSION_12_1);
   if (cclass)
-    seer_enc_kv(w, "AUTH_KPPL_CONN_CLASS", 20, cclass, strlen(cclass), 0);
+    seer_enc_kv(w, "AUTH_KPPL_CONN_CLASS", 20, cclass, strlen(cclass), 0,
+                c->field_version >= TTC_FIELD_VERSION_12_1);
   if (purity) {
     char ps[16];
     int pl = snprintf(ps, sizeof ps, "%d", purity);
-    seer_enc_kv(w, "AUTH_KPPL_PURITY", 16, ps, (size_t)pl, 1);
+    seer_enc_kv(w, "AUTH_KPPL_PURITY", 16, ps, (size_t)pl, 1,
+                c->field_version >= TTC_FIELD_VERSION_12_1);
   }
 
   if (!seer_writer_ok(w)) {

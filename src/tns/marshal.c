@@ -50,23 +50,44 @@ int64_t seer_dec_sb4(SeerReader *r)
   return neg ? -(int64_t)mag : (int64_t)mag;
 }
 
-/* Encode one field (key or value): empty -> 0x00, else <sb4 len><ub1 len><data>. */
-static void enc_field(SeerWriter *w, const void *d, size_t n)
+/* Encode one field (key or value): empty -> 0x00, else <sb4 len> then the bytes
+ * with their length - a single length byte up to 252, else the 0xFE chunked form
+ * (64-byte chunks, each length a ub1 before 12.1 and a ub4 from 12.1, then a zero
+ * terminator). The one-byte form can't carry more than 252 bytes, so a long value
+ * - an AUTH_PASSWORD for a password of roughly 110+ bytes - came out corrupt. */
+static void enc_field(SeerWriter *w, const void *d, size_t n, bool wide_chunks)
 {
   if (n == 0) {
     seer_writer_u8(w, 0);
     return;
   }
   seer_enc_sb4(w, (uint32_t)n);
-  seer_writer_u8(w, (uint8_t)n); /* ub1 length echo (callers keep n < 256) */
-  seer_writer_bytes(w, d, n);
+  if (n <= 252) {
+    seer_writer_u8(w, (uint8_t)n);
+    seer_writer_bytes(w, d, n);
+    return;
+  }
+  seer_writer_u8(w, 0xFE);
+  const uint8_t *p = d;
+  for (size_t i = 0; i < n; i += 0x40) {
+    size_t chunk = (n - i < 0x40) ? n - i : 0x40;
+    if (wide_chunks)
+      seer_enc_sb4(w, (uint32_t)chunk);
+    else
+      seer_writer_u8(w, (uint8_t)chunk);
+    seer_writer_bytes(w, p + i, chunk);
+  }
+  if (wide_chunks)
+    seer_enc_sb4(w, 0);
+  else
+    seer_writer_u8(w, 0);
 }
 
 void seer_enc_kv(SeerWriter *w, const void *key, size_t klen, const void *val, size_t vlen,
-                 uint32_t padding)
+                 uint32_t padding, bool wide_chunks)
 {
-  enc_field(w, key, klen);
-  enc_field(w, val, vlen);
+  enc_field(w, key, klen, wide_chunks);
+  enc_field(w, val, vlen, wide_chunks);
   seer_enc_sb4(w, padding);
 }
 

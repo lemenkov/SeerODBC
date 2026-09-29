@@ -54,7 +54,7 @@ int main(void)
   {
     SeerWriter w;
     assert(seer_writer_init(&w, 64));
-    seer_enc_kv(&w, "AUTH_MACHINE", 12, "ExampleHost", 11, 0);
+    seer_enc_kv(&w, "AUTH_MACHINE", 12, "ExampleHost", 11, 0, true);
     const uint8_t expect[] = {
         0x01, 0x0C, 0x0C, 'A', 'U', 'T', 'H', '_', 'M', 'A', 'C', 'H', 'I', 'N', 'E',
         0x01, 0x0B, 0x0B, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 'H', 'o', 's', 't', 0x00,
@@ -98,6 +98,28 @@ int main(void)
     assert(seer_dec_field(&r, &out, &outlen) == SEER_OK);
     assert(outlen == 5 && memcmp(out, "abcde", 5) == 0);
     free(out);
+  }
+
+  /* A key/value field over 252 bytes (e.g. AUTH_PASSWORD for a long password)
+   * goes chunked: sb4 len, 0xFE, 64-byte chunks with ub1 (pre-12.1) or ub4
+   * (12.1+) lengths, a zero terminator. 300 bytes = 4 x 64 + 44. */
+  for (int wide = 0; wide <= 1; wide++) {
+    static uint8_t val[300];
+    memset(val, 'P', sizeof val);
+    SeerWriter w;
+    assert(seer_writer_init(&w, 16));
+    seer_enc_kv(&w, "K", 1, val, sizeof val, 0, wide);
+    /* key: 01 01 | 01 'K' (4) ; value: 02 01 2C (3) | FE (1) | chunks | term |
+     * padding 00 (1) */
+    size_t lenb = wide ? 2 : 1; /* a chunk length: sb4 var-int 01 NN, or NN */
+    size_t want = 4 + 3 + 1 + 4 * (lenb + 64) + (lenb + 44) + 1 + 1;
+    assert(w.len == want);
+    assert(w.buf[4] == 0x02 && w.buf[5] == 0x01 && w.buf[6] == 0x2C && w.buf[7] == 0xFE);
+    if (wide)
+      assert(w.buf[8] == 0x01 && w.buf[9] == 0x40 && w.buf[10] == 'P');
+    else
+      assert(w.buf[8] == 0x40 && w.buf[9] == 'P');
+    seer_writer_free(&w);
   }
 
   /* seer_skip_chunked follows the chunk-length width of the session: one byte

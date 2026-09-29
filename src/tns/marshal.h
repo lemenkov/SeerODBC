@@ -29,10 +29,12 @@ void seer_enc_sb4(SeerWriter *w, uint32_t v);
 int64_t seer_dec_sb4(SeerReader *r);
 
 /* Encode one key/value pair (PROTOCOL.md §12.3): each of key and value is
- * either a single 0x00 (empty) or <sb4 len><ub1 len><bytes>, followed by an
- * sb4 `padding` trailer (normally 0). Both lengths must be < 256. */
+ * either a single 0x00 (empty) or <sb4 len> + the bytes with their length (a ub1
+ * length up to 252 bytes, else the 0xFE chunked form whose chunk lengths are ub4
+ * when `wide_chunks` - field version 12.1+ - and ub1 before), followed by an
+ * sb4 `padding` trailer (normally 0). */
 void seer_enc_kv(SeerWriter *w, const void *key, size_t klen, const void *val, size_t vlen,
-                 uint32_t padding);
+                 uint32_t padding, bool wide_chunks);
 
 /* Decode one length-coded field (the key or value half of a KV pair).
  * Allocates *out (caller frees). An empty field yields *out=NULL, *outlen=0
