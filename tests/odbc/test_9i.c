@@ -235,6 +235,53 @@ static void check_plsql(void)
   }
 }
 
+static void check_block_directions(void)
+{
+  /* An IN OUT bind: the block reads it and assigns it. The bind prompt's masks
+   * say so; sending no value for it (it's declared OUT) gave the block NULL. */
+  {
+    const char *name = "PL/SQL block IN OUT (number)";
+    SeerStmt *s = NULL;
+    seer_stmt_prepare(C, "BEGIN :1 := :1 + 1; END;", &s);
+    SeerStatus b = seer_stmt_bind_int64(s, 1, 41);
+    if (b == SEER_OK)
+      b = seer_stmt_bind_set_inout(s, 1, 22);
+    SeerStatus e = (b == SEER_OK) ? seer_stmt_execute(s) : b;
+    const void *d = NULL;
+    size_t l = 0;
+    int isn = 0, isb = 0;
+    seer_stmt_out_data(s, 1, &d, &l, &isn, &isb);
+    if (e == SEER_OK && !isn && d && strcmp((const char *)d, "42") == 0)
+      pass(name);
+    else
+      fail(name, e ? (seer_last_error(C) ? seer_last_error(C) : "exec") : "wrong IN OUT value");
+    seer_stmt_close(s);
+  }
+  /* Declared IN OUT but only read by the block: the masks say IN only, so it
+   * gets a value sent and none back - counting it as an output shifted :1's
+   * value (seerdb/seerdb@c730f2b). */
+  {
+    const char *name = "PL/SQL block: IN OUT bind the block only reads";
+    SeerStmt *s = NULL;
+    seer_stmt_prepare(C, "BEGIN :1 := :2 * 10; END;", &s);
+    SeerStatus b = seer_stmt_bind_out(s, 1, T_NUMBER, 22);
+    if (b == SEER_OK)
+      b = seer_stmt_bind_int64(s, 2, 5);
+    if (b == SEER_OK)
+      b = seer_stmt_bind_set_inout(s, 2, 22);
+    SeerStatus e = (b == SEER_OK) ? seer_stmt_execute(s) : b;
+    const void *d = NULL;
+    size_t l = 0;
+    int isn = 0, isb = 0;
+    seer_stmt_out_data(s, 1, &d, &l, &isn, &isb);
+    if (e == SEER_OK && !isn && d && strcmp((const char *)d, "50") == 0)
+      pass(name);
+    else
+      fail(name, e ? (seer_last_error(C) ? seer_last_error(C) : "exec") : "wrong OUT value");
+    seer_stmt_close(s);
+  }
+}
+
 static void check_lob(void)
 {
   run("DROP TABLE seer9l");
@@ -592,6 +639,7 @@ int main(void)
   check_error_recovery();
   check_rollback();
   check_plsql();
+  check_block_directions();
   check_lob();
   check_bfile();
   check_national();
