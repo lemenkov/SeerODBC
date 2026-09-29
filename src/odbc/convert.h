@@ -12,7 +12,7 @@
 
 #include <stddef.h>
 
-#include "odbc_platform.h"   /* <windows.h> before the ODBC headers on Windows */
+#include "odbc_platform.h" /* <windows.h> before the ODBC headers on Windows */
 
 #include <sql.h>
 
@@ -21,9 +21,8 @@
  * be NULL) tracks partial SQL_C_CHAR/BINARY retrieval across SQLGetData calls,
  * in source-byte units. Returns SQL_SUCCESS, SQL_SUCCESS_WITH_INFO (truncated),
  * or SQL_ERROR (e.g. NULL with no indicator, or an unconvertible target). */
-SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null,
-                            int is_binary, SQLSMALLINT target,
-                            SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
+SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
+                            SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
                             SQLLEN *offset);
 
 #endif /* SEERODBC_CONVERT_H */

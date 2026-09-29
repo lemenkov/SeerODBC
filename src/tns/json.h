@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "seer/seertns.h"   /* SeerStatus */
+#include "seer/seertns.h" /* SeerStatus */
 
 /* Parse JSON text and encode it to an OSON image. On SEER_OK *out is a malloc'd
  * buffer of *outlen bytes (caller frees). Supports the common small-document

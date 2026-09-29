@@ -18,8 +18,7 @@
 /* Locate the first occurrence of the byte string needle[0..needle_len) within
  * hay[0..hay_len). Returns a pointer into hay, or NULL. Matches memmem(3):
  * a zero-length needle matches at the start of hay. */
-void *seer_memmem(const void *hay, size_t hay_len,
-                  const void *needle, size_t needle_len);
+void *seer_memmem(const void *hay, size_t hay_len, const void *needle, size_t needle_len);
 
 /* Duplicate at most n bytes of s (stopping early at a NUL), NUL-terminating the
  * result. Returns a malloc'd string the caller frees, or NULL on OOM. Matches

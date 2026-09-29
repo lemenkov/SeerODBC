@@ -20,12 +20,12 @@
 /* The server's authentication challenge (PROTOCOL.md §4.4), with the hex-coded
  * wire values decoded to raw bytes. For 11g `csk_salt` is absent (NULL). */
 typedef struct {
-    uint8_t *sesskey;       /* AUTH_SESSKEY (server session key)   */
-    size_t   sesskey_len;
-    uint8_t *salt;          /* AUTH_VFR_DATA (verifier salt)       */
-    size_t   salt_len;
-    uint8_t *csk_salt;      /* AUTH_PBKDF2_CSK_SALT (12c+ only)    */
-    size_t   csk_salt_len;
+  uint8_t *sesskey; /* AUTH_SESSKEY (server session key)   */
+  size_t sesskey_len;
+  uint8_t *salt; /* AUTH_VFR_DATA (verifier salt)       */
+  size_t salt_len;
+  uint8_t *csk_salt; /* AUTH_PBKDF2_CSK_SALT (12c+ only)    */
+  size_t csk_salt_len;
 } SeerAuthChallenge;
 
 void seer_auth_challenge_free(SeerAuthChallenge *ch);
@@ -72,8 +72,8 @@ uint8_t seer_ttc_next_seq(SeerConn *conn);
 /* Encode a request-boundary (session-state) piggyback (§35) into `w`: func-176,
  * `seq`, an optional ub8 token (fv > 23.1), then the var-int state with the
  * explicit-boundary bit OR'd in. Pure/testable. */
-void seer_ttc_session_state_piggyback(SeerWriter *w, uint8_t seq,
-                                      uint8_t field_version, uint8_t state);
+void seer_ttc_session_state_piggyback(SeerWriter *w, uint8_t seq, uint8_t field_version,
+                                      uint8_t state);
 
 /* If a request-boundary marker is armed on `conn`, prepend its piggyback into
  * `w` (consuming a sequence number) and clear it (one-shot). No-op otherwise. */

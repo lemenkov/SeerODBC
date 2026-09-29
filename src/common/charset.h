@@ -26,8 +26,7 @@
  * On success returns 0 and stores a newly malloc'd buffer in *out (NUL
  * terminated for convenience, length in *out_len, not counting the NUL).
  * The caller frees *out. Returns -1 on failure. */
-int seer_iconv(const char *from, const char *to,
-               const char *in, size_t in_len,
-               char **out, size_t *out_len);
+int seer_iconv(const char *from, const char *to, const char *in, size_t in_len, char **out,
+               size_t *out_len);
 
 #endif /* SEER_COMMON_CHARSET_H */

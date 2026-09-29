@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: © 2025 Peter Lemenkov
+#
+# SPDX-License-Identifier: CC0-1.0
+
+name: Format Check with clang-format
+
+on:
+  pull_request:
+    paths:
+      - 'src/**/*.c'
+      - 'src/**/*.h'
+      - 'tests/**/*.c'
+      - '.github/workflows/format-check.yml'
+
+jobs:
+  format:
+    name: Check Clang format compliance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Clang Format Github Action
+        uses: RafikFarhad/clang-format-github-action@v7
+        with:
+          sources: "src/**/*.h,src/**/*.c,tests/**/*.c"

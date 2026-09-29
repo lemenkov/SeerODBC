@@ -20,13 +20,15 @@
 
 static size_t unhex(const char *hex, uint8_t *out)
 {
-    size_t n = strlen(hex) / 2;
-    for (size_t i = 0; i < n; i++) {
-        unsigned b;
-        if (sscanf(hex + 2 * i, "%2x", &b) != 1) { assert(0 && "bad hex"); }
-        out[i] = (uint8_t)b;
+  size_t n = strlen(hex) / 2;
+  for (size_t i = 0; i < n; i++) {
+    unsigned b;
+    if (sscanf(hex + 2 * i, "%2x", &b) != 1) {
+      assert(0 && "bad hex");
     }
-    return n;
+    out[i] = (uint8_t)b;
+  }
+  return n;
 }
 
 /* A live 26ai (23.1.162, advertises fv27) `SELECT 42 FROM dual` execute response:
@@ -41,25 +43,24 @@ static const char *FV27_SELECT42 =
 
 int main(void)
 {
-    static uint8_t buf[512];
-    size_t len = unhex(FV27_SELECT42, buf);
+  static uint8_t buf[512];
+  size_t len = unhex(FV27_SELECT42, buf);
 
-    int     ncols = -1;
-    int64_t err   = -1;
-    SeerStatus st = seer_test_parse_execute_response(buf, len, 24, &ncols, &err);
+  int ncols = -1;
+  int64_t err = -1;
+  SeerStatus st = seer_test_parse_execute_response(buf, len, 24, &ncols, &err);
 
-    assert(st == SEER_OK);
-    if (ncols != 1) {
-        fprintf(stderr, "FAIL: ncols=%d (want 1)\n", ncols);
-        assert(0);
-    }
-    /* The real trailing status is ORA-01403 (no data found = end of fetch), NOT
-     * the bogus ORA-00002 the desync produced. */
-    if (err != 1403) {
-        fprintf(stderr, "FAIL: OER err=%lld (want 1403; a desync yields ~2)\n",
-                (long long)err);
-        assert(0);
-    }
-    printf("rpa_skip: fv27 execute RPA decoded correctly (ncols=1, OER=1403)\n");
-    return 0;
+  assert(st == SEER_OK);
+  if (ncols != 1) {
+    fprintf(stderr, "FAIL: ncols=%d (want 1)\n", ncols);
+    assert(0);
+  }
+  /* The real trailing status is ORA-01403 (no data found = end of fetch), NOT
+   * the bogus ORA-00002 the desync produced. */
+  if (err != 1403) {
+    fprintf(stderr, "FAIL: OER err=%lld (want 1403; a desync yields ~2)\n", (long long)err);
+    assert(0);
+  }
+  printf("rpa_skip: fv27 execute RPA decoded correctly (ncols=1, OER=1403)\n");
+  return 0;
 }

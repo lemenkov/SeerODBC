@@ -18,27 +18,27 @@
 /* Decode a hex string into `out` (must hold strlen(hex)/2 bytes); returns len. */
 static size_t unhex(const char *hex, uint8_t *out)
 {
-    size_t n = strlen(hex) / 2;
-    for (size_t i = 0; i < n; i++) {
-        unsigned b;
-        if (sscanf(hex + 2 * i, "%2x", &b) != 1) {
-            fprintf(stderr, "bad hex digit at offset %zu\n", 2 * i);
-            assert(0 && "bad hex vector");
-        }
-        out[i] = (uint8_t)b;
+  size_t n = strlen(hex) / 2;
+  for (size_t i = 0; i < n; i++) {
+    unsigned b;
+    if (sscanf(hex + 2 * i, "%2x", &b) != 1) {
+      fprintf(stderr, "bad hex digit at offset %zu\n", 2 * i);
+      assert(0 && "bad hex vector");
     }
-    return n;
+    out[i] = (uint8_t)b;
+  }
+  return n;
 }
 
 /* Assert a (buf,len) equals the bytes of a hex string. */
 static void eqx(const char *what, const uint8_t *got, size_t got_len, const char *hex)
 {
-    static uint8_t exp[8192];
-    size_t n = unhex(hex, exp);
-    if (got_len != n || memcmp(got, exp, n) != 0) {
-        fprintf(stderr, "FAIL %s: got %zu bytes, want %zu\n", what, got_len, n);
-        assert(0 && "vector mismatch");
-    }
+  static uint8_t exp[8192];
+  size_t n = unhex(hex, exp);
+  if (got_len != n || memcmp(got, exp, n) != 0) {
+    fprintf(stderr, "FAIL %s: got %zu bytes, want %zu\n", what, got_len, n);
+    assert(0 && "vector mismatch");
+  }
 }
 
 /* --- reference vectors (from seerdb/common/ano*.py) --- */
@@ -78,10 +78,10 @@ static const char *SESSION_KEY =
 
 /* The client-side wrap() of five payloads, in sequence (stateful MAC keystream). */
 static const char *WRAP_PT[5] = {
-    "73656c65637420312066726f6d206475616c",     /* "select 1 from dual" */
-    "",                                          /* empty */
-    "78787878787878787878787878787878",         /* 16 * 'x' */
-    "79797979797979797979797979797979797979797979797979797979797979",  /* 31 * 'y' */
+    "73656c65637420312066726f6d206475616c",                           /* "select 1 from dual" */
+    "",                                                               /* empty */
+    "78787878787878787878787878787878",                               /* 16 * 'x' */
+    "79797979797979797979797979797979797979797979797979797979797979", /* 31 * 'y' */
     "00010203",
 };
 static const char *WRAP_CT[5] = {
@@ -98,112 +98,112 @@ static const char *WRAP_CT[5] = {
 
 int main(void)
 {
-    static uint8_t buf[8192];
+  static uint8_t buf[8192];
 
-    /* 1. Round-1 request is deterministic and byte-identical to the reference. */
-    {
-        uint8_t *r1 = NULL;
-        size_t   r1len = 0;
-        assert(seer_ano_build_round1(&r1, &r1len) == SEER_OK);
-        eqx("round1", r1, r1len, ROUND1);
-        free(r1);
-    }
+  /* 1. Round-1 request is deterministic and byte-identical to the reference. */
+  {
+    uint8_t *r1 = NULL;
+    size_t r1len = 0;
+    assert(seer_ano_build_round1(&r1, &r1len) == SEER_OK);
+    eqx("round1", r1, r1len, ROUND1);
+    free(r1);
+  }
 
-    /* 2. Parse the real 26ai (AES256+SHA256, required) negotiation response. */
-    static uint8_t fixture[4096];
-    FILE *f = fopen(SEER_ANO_FIXTURE, "rb");
-    assert(f != NULL && "cannot open ano_server_response.bin");
-    size_t fixlen = fread(fixture, 1, sizeof fixture, f);
-    fclose(f);
+  /* 2. Parse the real 26ai (AES256+SHA256, required) negotiation response. */
+  static uint8_t fixture[4096];
+  FILE *f = fopen(SEER_ANO_FIXTURE, "rb");
+  assert(f != NULL && "cannot open ano_server_response.bin");
+  size_t fixlen = fread(fixture, 1, sizeof fixture, f);
+  fclose(f);
 
-    SeerAnoResponse ar;
-    assert(seer_ano_parse_response(fixture, fixlen, &ar) == SEER_OK);
-    assert(ar.enc_id == 17);          /* AES256 */
-    assert(ar.int_id == 5);           /* SHA256 */
-    assert(ar.have_dh);
-    assert(ar.prime_len == 256);      /* 2048-bit DH group */
-    assert(ar.server_pub_len == 256);
-    assert(ar.server_iv_len == 20 &&
-           memcmp(ar.server_iv, "foo bar baz bat quux", 20) == 0);
+  SeerAnoResponse ar;
+  assert(seer_ano_parse_response(fixture, fixlen, &ar) == SEER_OK);
+  assert(ar.enc_id == 17); /* AES256 */
+  assert(ar.int_id == 5);  /* SHA256 */
+  assert(ar.have_dh);
+  assert(ar.prime_len == 256); /* 2048-bit DH group */
+  assert(ar.server_pub_len == 256);
+  assert(ar.server_iv_len == 20 && memcmp(ar.server_iv, "foo bar baz bat quux", 20) == 0);
 
-    /* 3. DH with the deterministic private key 2**2000 (256-byte big-endian). */
-    uint8_t priv[256] = { 0 };
-    priv[5] = 0x01;                   /* 2**2000 has its only set bit here */
-    uint8_t *cpub = NULL, *sk = NULL;
-    size_t   cpub_len = 0, sk_len = 0;
-    assert(seer_ano_dh_priv(&ar, priv, sizeof priv,
-                            &cpub, &cpub_len, &sk, &sk_len) == SEER_OK);
-    eqx("client_pub", cpub, cpub_len, CLIENT_PUB);
-    eqx("session_key", sk, sk_len, SESSION_KEY);
+  /* 3. DH with the deterministic private key 2**2000 (256-byte big-endian). */
+  uint8_t priv[256] = {0};
+  priv[5] = 0x01; /* 2**2000 has its only set bit here */
+  uint8_t *cpub = NULL, *sk = NULL;
+  size_t cpub_len = 0, sk_len = 0;
+  assert(seer_ano_dh_priv(&ar, priv, sizeof priv, &cpub, &cpub_len, &sk, &sk_len) == SEER_OK);
+  eqx("client_pub", cpub, cpub_len, CLIENT_PUB);
+  eqx("session_key", sk, sk_len, SESSION_KEY);
 
-    /* 4. Round-2 container carries exactly that public key. */
-    {
-        uint8_t *r2 = NULL;
-        size_t   r2len = 0;
-        assert(seer_ano_build_round2(cpub, cpub_len, &r2, &r2len) == SEER_OK);
-        eqx("round2", r2, r2len, ROUND2);
-        free(r2);
-    }
+  /* 4. Round-2 container carries exactly that public key. */
+  {
+    uint8_t *r2 = NULL;
+    size_t r2len = 0;
+    assert(seer_ano_build_round2(cpub, cpub_len, &r2, &r2len) == SEER_OK);
+    eqx("round2", r2, r2len, ROUND2);
+    free(r2);
+  }
 
-    /* 5. The client channel's wrap() sequence matches the reference byte-for-byte
-     *    (the MAC keystream is stateful, so the sequence is fixed). */
-    SeerAno *client = NULL;
-    assert(seer_ano_channel_new(ar.enc_id, ar.int_id, sk, sk_len,
-                                ar.server_iv, ar.server_iv_len,
-                                /*client_side=*/true, &client) == SEER_OK);
-    for (int i = 0; i < 5; i++) {
-        size_t ptlen = unhex(WRAP_PT[i], buf);
-        uint8_t *ct = NULL;
-        size_t   ctlen = 0;
-        assert(seer_ano_wrap(client, buf, ptlen, &ct, &ctlen) == SEER_OK);
-        char label[16];
-        snprintf(label, sizeof label, "wrap%d", i);
-        eqx(label, ct, ctlen, WRAP_CT[i]);
-        free(ct);
-    }
-    seer_ano_free(client);
+  /* 5. The client channel's wrap() sequence matches the reference byte-for-byte
+   *    (the MAC keystream is stateful, so the sequence is fixed). */
+  SeerAno *client = NULL;
+  assert(seer_ano_channel_new(ar.enc_id, ar.int_id, sk, sk_len, ar.server_iv, ar.server_iv_len,
+                              /*client_side=*/true, &client) == SEER_OK);
+  for (int i = 0; i < 5; i++) {
+    size_t ptlen = unhex(WRAP_PT[i], buf);
+    uint8_t *ct = NULL;
+    size_t ctlen = 0;
+    assert(seer_ano_wrap(client, buf, ptlen, &ct, &ctlen) == SEER_OK);
+    char label[16];
+    snprintf(label, sizeof label, "wrap%d", i);
+    eqx(label, ct, ctlen, WRAP_CT[i]);
+    free(ct);
+  }
+  seer_ano_free(client);
 
-    /* 6. A client channel and a server channel decrypt each other's packets,
-     *    both directions, in lock-step (the crux of interoperability). */
-    SeerAno *c = NULL, *s = NULL;
-    assert(seer_ano_channel_new(17, 5, sk, sk_len, ar.server_iv, ar.server_iv_len,
-                                true, &c) == SEER_OK);
-    assert(seer_ano_channel_new(17, 5, sk, sk_len, ar.server_iv, ar.server_iv_len,
-                                false, &s) == SEER_OK);
-    for (int i = 0; i < 4; i++) {
-        const char *msg = "select 42 from dual";
-        size_t mlen = strlen(msg);
-        uint8_t *ct = NULL, *pt = NULL;
-        size_t   ctlen = 0, ptlen = 0;
-        /* client -> server */
-        assert(seer_ano_wrap(c, (const uint8_t *)msg, mlen, &ct, &ctlen) == SEER_OK);
-        assert(seer_ano_unwrap(s, ct, ctlen, &pt, &ptlen) == SEER_OK);
-        assert(ptlen == mlen && memcmp(pt, msg, mlen) == 0);
-        free(ct); free(pt);
-        /* server -> client */
-        assert(seer_ano_wrap(s, (const uint8_t *)msg, mlen, &ct, &ctlen) == SEER_OK);
-        assert(seer_ano_unwrap(c, ct, ctlen, &pt, &ptlen) == SEER_OK);
-        assert(ptlen == mlen && memcmp(pt, msg, mlen) == 0);
-        free(ct); free(pt);
-    }
-    /* A tampered ciphertext must fail the integrity check. */
-    {
-        const char *msg = "tamper me";
-        uint8_t *ct = NULL, *pt = NULL;
-        size_t   ctlen = 0, ptlen = 0;
-        assert(seer_ano_wrap(c, (const uint8_t *)msg, strlen(msg), &ct, &ctlen) == SEER_OK);
-        ct[0] ^= 0x01;
-        assert(seer_ano_unwrap(s, ct, ctlen, &pt, &ptlen) == SEER_EPROTO);
-        free(ct); free(pt);
-    }
-    seer_ano_free(c);
-    seer_ano_free(s);
+  /* 6. A client channel and a server channel decrypt each other's packets,
+   *    both directions, in lock-step (the crux of interoperability). */
+  SeerAno *c = NULL, *s = NULL;
+  assert(seer_ano_channel_new(17, 5, sk, sk_len, ar.server_iv, ar.server_iv_len, true, &c) ==
+         SEER_OK);
+  assert(seer_ano_channel_new(17, 5, sk, sk_len, ar.server_iv, ar.server_iv_len, false, &s) ==
+         SEER_OK);
+  for (int i = 0; i < 4; i++) {
+    const char *msg = "select 42 from dual";
+    size_t mlen = strlen(msg);
+    uint8_t *ct = NULL, *pt = NULL;
+    size_t ctlen = 0, ptlen = 0;
+    /* client -> server */
+    assert(seer_ano_wrap(c, (const uint8_t *)msg, mlen, &ct, &ctlen) == SEER_OK);
+    assert(seer_ano_unwrap(s, ct, ctlen, &pt, &ptlen) == SEER_OK);
+    assert(ptlen == mlen && memcmp(pt, msg, mlen) == 0);
+    free(ct);
+    free(pt);
+    /* server -> client */
+    assert(seer_ano_wrap(s, (const uint8_t *)msg, mlen, &ct, &ctlen) == SEER_OK);
+    assert(seer_ano_unwrap(c, ct, ctlen, &pt, &ptlen) == SEER_OK);
+    assert(ptlen == mlen && memcmp(pt, msg, mlen) == 0);
+    free(ct);
+    free(pt);
+  }
+  /* A tampered ciphertext must fail the integrity check. */
+  {
+    const char *msg = "tamper me";
+    uint8_t *ct = NULL, *pt = NULL;
+    size_t ctlen = 0, ptlen = 0;
+    assert(seer_ano_wrap(c, (const uint8_t *)msg, strlen(msg), &ct, &ctlen) == SEER_OK);
+    ct[0] ^= 0x01;
+    assert(seer_ano_unwrap(s, ct, ctlen, &pt, &ptlen) == SEER_EPROTO);
+    free(ct);
+    free(pt);
+  }
+  seer_ano_free(c);
+  seer_ano_free(s);
 
-    free(cpub);
-    free(sk);
-    seer_ano_response_free(&ar);
+  free(cpub);
+  free(sk);
+  seer_ano_response_free(&ar);
 
-    (void)fixlen;
-    printf("ano: all known-answer vectors match\n");
-    return 0;
+  (void)fixlen;
+  printf("ano: all known-answer vectors match\n");
+  return 0;
 }

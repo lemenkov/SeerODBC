@@ -31,8 +31,8 @@ int64_t seer_dec_sb4(SeerReader *r);
 /* Encode one key/value pair (PROTOCOL.md §12.3): each of key and value is
  * either a single 0x00 (empty) or <sb4 len><ub1 len><bytes>, followed by an
  * sb4 `padding` trailer (normally 0). Both lengths must be < 256. */
-void seer_enc_kv(SeerWriter *w, const void *key, size_t klen,
-                 const void *val, size_t vlen, uint32_t padding);
+void seer_enc_kv(SeerWriter *w, const void *key, size_t klen, const void *val, size_t vlen,
+                 uint32_t padding);
 
 /* Decode one length-coded field (the key or value half of a KV pair).
  * Allocates *out (caller frees). An empty field yields *out=NULL, *outlen=0

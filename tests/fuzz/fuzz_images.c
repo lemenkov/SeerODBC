@@ -15,6 +15,6 @@ extern void seer_fuzz_image_decoders(const uint8_t *d, size_t n);
 
 int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n)
 {
-    seer_fuzz_image_decoders(d, n);
-    return 0;
+  seer_fuzz_image_decoders(d, n);
+  return 0;
 }

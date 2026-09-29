@@ -32,8 +32,7 @@
  *
  * Enumeration (section == NULL or entry == NULL) is not implemented - the shim
  * never needs it - and such calls return the default. */
-int seer_get_private_profile_string(const char *section, const char *entry,
-                                    const char *defstr, char *retbuf,
-                                    int retbuf_len, const char *filename);
+int seer_get_private_profile_string(const char *section, const char *entry, const char *defstr,
+                                    char *retbuf, int retbuf_len, const char *filename);
 
 #endif /* SEER_ODBCINI_H */
