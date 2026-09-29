@@ -1151,6 +1151,50 @@ static void skip_capability_block(SeerReader *r)
   }
 }
 
+/* The three fields that follow an RPA's al8o4l words: a transaction-id length
+ * (+ raw bytes), a count of session-state key/value pairs - each `ub2 text len
+ * (+DALC) | ub2 binary len (+DALC) | ub2 keyword` - and a registration length
+ * (+ raw bytes). Usually each is a single zero byte, but 11g answers ALTER
+ * SESSION SET CURRENT_SCHEMA with two pairs here (keywords 168/169; EDITION
+ * likewise). Parsed on a copy: returns true and advances *r only when the parse
+ * lands where an RPA can end - a known token, the end of the buffer, or an
+ * armed array-DML row-count tail. Otherwise the fields aren't there to read (a
+ * changepassword reply's RPA goes straight to its OER) and the caller falls
+ * back to skipping zero bytes. Mirrors seerdb's _skip_rpa_tail_fields. */
+static bool skip_rpa_tail_fields(SeerReader *r, const SeerStmt *stmt)
+{
+  SeerReader t = *r;
+  int64_t txl = seer_dec_sb4(&t);
+  if (txl < 0 || (txl > 0 && seer_reader_bytes(&t, (size_t)txl) == NULL))
+    return false;
+  int64_t npairs = seer_dec_sb4(&t);
+  if (npairs < 0 || npairs > 1024)
+    return false;
+  for (int64_t i = 0; i < npairs && seer_reader_ok(&t); i++) {
+    for (int part = 0; part < 2; part++) { /* text value, then binary value */
+      if (seer_dec_sb4(&t) > 0) {
+        uint8_t *v = NULL;
+        size_t vl = 0;
+        SeerStatus st = seer_dec_dalc(&t, &v, &vl);
+        free(v);
+        if (st != SEER_OK)
+          return false;
+      }
+    }
+    (void)seer_dec_sb4(&t); /* keyword number */
+  }
+  int64_t reglen = seer_dec_sb4(&t);
+  if (reglen < 0 || (reglen > 0 && seer_reader_bytes(&t, (size_t)reglen) == NULL))
+    return false;
+  if (!seer_reader_ok(&t))
+    return false;
+  bool rowcount_tail = stmt != NULL && stmt->want_dml_rowcounts && stmt->dml_rowcounts == NULL;
+  if (seer_reader_remaining(&t) > 0 && !is_known_token(t.buf[t.pos]) && !rowcount_tail)
+    return false;
+  *r = t;
+  return true;
+}
+
 static SeerStatus skip_rpa(SeerReader *r, SeerStmt *stmt)
 {
   /* The execute/fetch RPA (return-parameter) block precedes the trailing OER.
@@ -1170,8 +1214,9 @@ static SeerStatus skip_rpa(SeerReader *r, SeerStmt *stmt)
       break;
     (void)seer_dec_sb4(r);
   }
-  while (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0)
-    (void)seer_reader_u8(r);
+  if (break_on_token || !skip_rpa_tail_fields(r, stmt))
+    while (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0)
+      (void)seer_reader_u8(r);
   /* Array-DML row counts (12c+): when armed, a ub4 count and that many ub4
    * per-iteration affected-row counts ride here, ahead of the OER. */
   if (stmt != NULL && stmt->want_dml_rowcounts && stmt->dml_rowcounts == NULL &&
