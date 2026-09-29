@@ -1259,6 +1259,10 @@ static void check_json(SQLHDBC dbc)
     skip(name, err[0] ? err : "no native JSON type");
     return;
   }
+  if (!out[0]) { /* 18c has no JSON type: its JSON() yields NULL (DUMP says so) */
+    skip(name, "server's JSON() returns NULL (no native JSON type)");
+    return;
+  }
   if (strstr(out, "\"n\":42") && strstr(out, "\"s\":\"hi\"") && strstr(out, "\"b\":true"))
     pass(name); /* our native OSON decode */
   else if ((strstr(out, "42") && strstr(out, "hi")) ||
