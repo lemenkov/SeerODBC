@@ -100,6 +100,26 @@ int main(void)
     free(out);
   }
 
+  /* seer_skip_chunked follows the chunk-length width of the session: one byte
+   * before 12.1, a ub4 (sb4 var-int) from 12.1. Each case ends in a 0x99
+   * sentinel the skip must land on exactly. */
+  {
+    const uint8_t pre121[] = {0xFE, 0x03, 'a', 'b', 'c', 0x02, 'd', 'e', 0x00, 0x99};
+    SeerReader r;
+    seer_reader_init(&r, pre121, sizeof pre121);
+    r.sb4_chunks = false;
+    seer_skip_chunked(&r);
+    assert(seer_reader_ok(&r) && seer_reader_remaining(&r) == 1 && r.buf[r.pos] == 0x99);
+  }
+  {
+    const uint8_t v121[] = {0xFE, 0x01, 0x03, 'a', 'b', 'c', 0x01, 0x02, 'd', 'e', 0x00, 0x99};
+    SeerReader r;
+    seer_reader_init(&r, v121, sizeof v121);
+    r.sb4_chunks = true;
+    seer_skip_chunked(&r);
+    assert(seer_reader_ok(&r) && seer_reader_remaining(&r) == 1 && r.buf[r.pos] == 0x99);
+  }
+
   printf("test_marshal: all assertions passed\n");
   return 0;
 }

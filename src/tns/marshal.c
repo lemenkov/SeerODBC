@@ -196,8 +196,11 @@ void seer_skip_chunked(SeerReader *r)
   if (!seer_reader_ok(r))
     return;
   if (lb == 0xFE) {
+    /* Chunk lengths are one byte before 12.1 and a ub4 from 12.1 - the same
+     * rule seer_dec_dalc follows (seerdb/seerdb@c754a15). Always reading ub4
+     * misread an 11g value of 253+ bytes being skipped. */
     for (;;) {
-      int64_t clen = seer_dec_sb4(r);
+      int64_t clen = r->sb4_chunks ? seer_dec_sb4(r) : (int64_t)seer_reader_u8(r);
       if (!seer_reader_ok(r) || clen <= 0)
         break;
       seer_reader_bytes(r, (size_t)clen);
