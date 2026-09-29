@@ -843,6 +843,38 @@ static void check_json_server_forms(SQLHDBC dbc)
   }
 }
 
+/* Object with an XMLType attribute between two NUMBERs: the XMLType is its own
+ * image (decoded like an XMLType column), and the attribute after it must not
+ * shift into its place. */
+static void check_object_xmltype_attr(SQLHDBC dbc)
+{
+  const char *name = "SQL OBJECT with an XMLType attribute";
+  char err[256] = "", out[256] = "";
+  exec_do(dbc, "DROP TABLE seer_xot", err, sizeof err);
+  exec_do(dbc, "DROP TYPE seer_xo", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE TYPE seer_xo AS OBJECT (a NUMBER, x SYS.XMLTYPE, z NUMBER)",
+                             err, sizeof err))) {
+    skip(name, err[0] ? err : "create type failed");
+    return;
+  }
+  exec_do(dbc, "CREATE TABLE seer_xot (o seer_xo)", err, sizeof err);
+  exec_do(dbc, "INSERT INTO seer_xot VALUES (seer_xo(1, XMLTYPE('<r>hi</r>'), 77))", err,
+          sizeof err);
+  SQLRETURN rc = exec_scalar(dbc, "SELECT o FROM seer_xot", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_xot", err, sizeof err);
+  exec_do(dbc, "DROP TYPE seer_xo", err, sizeof err);
+  size_t n = strlen(out);
+  if (SQL_SUCCEEDED(rc) && strncmp(out, "1, ", 3) == 0 && strstr(out, "<r>hi</r>") && n > 4 &&
+      strcmp(out + n - 4, ", 77") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s'", out);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2308,6 +2340,7 @@ int main(void)
   check_desc_write(dbc);
   check_large_fetch(dbc);
   check_object(dbc);
+  check_object_xmltype_attr(dbc);
   check_collection_of_objects(dbc);
   check_object_with_collection(dbc);
   check_xmltype(dbc);
