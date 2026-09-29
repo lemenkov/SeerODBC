@@ -372,6 +372,58 @@ static void check_length_boundaries(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* In a SQL statement each row's LONG-class values - a bind declared larger
+ * than the server's maximum string size (4000, or 32767 on 12c+ with 32K
+ * strings) - travel after the row's other values. Put the large value first in
+ * the column list to prove the order is not positional; 5000 bytes is
+ * LONG-class only on 10g/11g, 40000 on every server. */
+static void check_long_bind_order(SQLHDBC dbc)
+{
+  const char *name = "large text bind ahead of another bind (5000 / 40000 bytes)";
+  static const int sizes[] = {5000, 40000};
+  static char big[40001];
+  char err[256] = "", m[400] = "";
+  int ok = 1;
+  for (size_t k = 0; k < sizeof sizes / sizeof sizes[0] && ok; k++) {
+    int n = sizes[k];
+    char out[64] = "", want[64];
+    exec_do(dbc, "DROP TABLE seer_longord", err, sizeof err);
+    if (!SQL_SUCCEEDED(
+            exec_do(dbc, "CREATE TABLE seer_longord (c CLOB, id NUMBER)", err, sizeof err))) {
+      skip(name, err);
+      return;
+    }
+    memset(big, 'L', (size_t)n);
+    big[n] = '\0';
+    SQLINTEGER id = 42;
+    SQLLEN bind = SQL_NTS;
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, (SQLULEN)n, 0, big, 0,
+                     &bind);
+    SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &id, 0, NULL);
+    SQLRETURN rc =
+        SQLExecDirect(st, (SQLCHAR *)"INSERT INTO seer_longord (c, id) VALUES (?, ?)", SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (SQL_SUCCEEDED(rc))
+      exec_scalar(dbc, "SELECT id || ':' || DBMS_LOB.GETLENGTH(c) FROM seer_longord", out,
+                  sizeof out, err, sizeof err);
+    exec_do(dbc, "DROP TABLE seer_longord", err, sizeof err);
+    snprintf(want, sizeof want, "42:%d", n);
+    if (strcmp(out, want) != 0) {
+      snprintf(m, sizeof m, "%d bytes: got '%s' want '%s' %s", n, out, want,
+               SQL_SUCCEEDED(rc) ? "" : err);
+      ok = 0;
+    }
+  }
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* An array execute sends one descriptor per column for every row, so a NULL
  * in the last row must not re-type a NUMBER / DATE column as VARCHAR. */
 static void check_array_null_last_row(SQLHDBC dbc)
@@ -1861,6 +1913,7 @@ int main(void)
     check_transaction(dbc);
     check_fetch_in_txn(dbc);
     check_urowid_physical(dbc);
+    check_long_bind_order(dbc);
     check_array_null_last_row(dbc);
     check_array_batch(dbc);
     check_catalog(dbc);

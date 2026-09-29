@@ -2429,17 +2429,31 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
       else
         emit_oac(w, fv, b->oac_type, b->oac_size ? b->oac_size : 1, b->oac_flag, b->oac_charset);
     }
+    /* In a SQL statement the server reads each row's LONG-class values after
+     * all its other values, whatever their bind positions; a PL/SQL block
+     * takes them in order. A bind is LONG-class when its descriptor declares
+     * more than the server's maximum string size (4000, or 32767 on a server
+     * with 32K strings) - so a 5000-byte text is LONG-class on 11g but an
+     * ordinary value on a 12c+ server. Written in position order, a large text
+     * bind ahead of another bind lost the row. */
+    uint32_t max_str = stmt->conn->max_string_size ? stmt->conn->max_string_size : 4000;
+    int passes = (kind == STMT_BLOCK) ? 1 : 2;
     for (int it = 0; it < iters; it++) {
       seer_writer_u8(w, TTI_RXD);
-      for (int i = 0; i < nb; i++) {
-        SeerBind *b = &stmt->pbinds[i];
-        if (stmt->returning && b->is_out)
-          continue; /* return bind: server-filled */
-        uint8_t *rxd = (b->rxd != NULL) ? b->rxd[it] : NULL;
-        if (rxd != NULL)
-          seer_writer_bytes(w, rxd, b->rxd_len[it]);
-        else
-          seer_writer_u8(w, 0); /* unbound/NULL -> 0 */
+      for (int pass = 0; pass < passes; pass++) {
+        for (int i = 0; i < nb; i++) {
+          SeerBind *b = &stmt->pbinds[i];
+          if (stmt->returning && b->is_out)
+            continue; /* return bind: server-filled */
+          bool long_class = b->oac_size > max_str;
+          if (passes == 2 && long_class != (pass == 1))
+            continue;
+          uint8_t *rxd = (b->rxd != NULL) ? b->rxd[it] : NULL;
+          if (rxd != NULL)
+            seer_writer_bytes(w, rxd, b->rxd_len[it]);
+          else
+            seer_writer_u8(w, 0); /* unbound/NULL -> 0 */
+        }
       }
     }
   }
