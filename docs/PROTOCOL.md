@@ -7,9 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 # Oracle TNS/TTC wire protocol notes
 
 This document is the **shared protocol asset** between SeerODBC and the
-sibling project `pyoracle`. pyoracle's `PROTOCOL.md` is the more mature
-reference today; SeerODBC's core is implemented against that specification,
-not by copying pyoracle's Python.
+sibling project [`seerdb`](https://github.com/seerdb/seerdb). seerdb's [`PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) is the more
+mature reference today; SeerODBC's core is implemented against that
+specification, not by copying seerdb's Python.
 
 > Clean-room reminder: everything here is derived from public references and
 > our own packet captures of a stock client talking to an authorized server.
@@ -42,7 +42,7 @@ reverse-engineering work, tracked separately from the TLS transport path.
 
 ## References
 
-- pyoracle `PROTOCOL.md` and its reference implementation.
+- seerdb's [`PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) and its reference implementation.
 - Public TNS/TTC protocol descriptions; the Wireshark TNS dissector's
   documented field layouts.
 - Our own `tcpdump`/`tshark` captures.

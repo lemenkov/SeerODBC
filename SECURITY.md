@@ -20,7 +20,7 @@ supported — please reproduce against it before reporting.
 **Please do not open a public issue for a security vulnerability.**
 
 Report privately through GitHub's
-[private vulnerability reporting](https://github.com/lemenkov/SeerODBC/security/advisories/new),
+[private vulnerability reporting](https://github.com/seerdb/SeerODBC/security/advisories/new),
 or by email to **lemenkov@gmail.com**.
 
 Helpful details:

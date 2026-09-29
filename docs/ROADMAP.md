@@ -23,7 +23,7 @@ and exercised (most against the live 9i/10g/11g/21c/23ai matrix, see
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
       TTI_ALL8 we send 10g+), DML/DDL, binds, PL/SQL blocks (IN/OUT), CLOB/BLOB/BFILE
       read, and national-charset binds — all fv-gated so 10g+ is untouched. See the
-      per-feature `[x]` entries below and pyoracle's `docs/PROTOCOL.md` §19. Wired
+      per-feature `[x]` entries below and seerdb's [`docs/PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) §19. Wired
       into `run-matrix.sh` as a **local-only** 9i row (its own core-API test
       `tests/odbc/test_9i.c`, SID-addressed, self-gating); it is deliberately *not*
       a meson `test()` so `meson test` / GitHub CI never reference 9i (9i and 10g
@@ -408,5 +408,5 @@ Deep-RE / environment-blocked (no reference):
   Application Continuity — larger, environment-dependent (need a KDC / RAC cluster).
 
 Deliberately out of scope: TIMESTAMP WITH TIME ZONE binds (the ODBC struct carries
-no zone — would require guessing), AQ recipient-list enqueue (pyoracle only stubs
+no zone — would require guessing), AQ recipient-list enqueue (seerdb only stubs
 it), SQLBulkOperations (no bookmarks).

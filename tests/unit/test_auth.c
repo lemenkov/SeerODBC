@@ -125,7 +125,7 @@ int main(void)
   assert(out.speedy_key != NULL && out.speedy_key_len == 80);
   seer_o5logon_free(&out);
 
-  /* 9i O3LOGON: pinned to a live JDBC-thin -> 9.2.0.4 capture (pyoracle #90).
+  /* 9i O3LOGON: pinned to a live JDBC-thin -> 9.2.0.4 capture (seerdb/seerdb#90).
    * The server's AUTH_SESSKEY 83B9CF7F17B84F76, DES-decrypted under the PYO
    * verifier, then used to DES-encrypt "pyo123" -> AUTH_PASSWORD F18CC9AF1CE5A7E8. */
   const uint8_t o3_sess[8] = {0x83, 0xB9, 0xCF, 0x7F, 0x17, 0xB8, 0x4F, 0x76};
