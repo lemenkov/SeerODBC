@@ -28,9 +28,12 @@ and exercised (most against the live 9i/10g/11g/18c/21c/23ai matrix, see
       not proven against the real releases.
 - [ ] Oracle 8i (8.1.7) — a distinct older protocol dialect; a live 8i VM exists
       but the driver does not speak it yet.
-- [ ] 26ai with native network encryption **required** — the ANO negotiation
-      runs, but a server that insists on encryption fails most of the suite
-      (31 checks on the 26ai encryption bed). Plaintext-fallback servers are fine.
+- [x] 26ai with native network encryption **required** (AES256 + SHA256) —
+      validated live on the 26ai encryption bed. A server error there arrives as
+      a break/reset marker exchange, after which both peers re-derive the
+      data-integrity keystreams (`seer_ano_reset`); before that fix the first
+      SQL error desynced the session. The bed's test account has only CREATE
+      SESSION, so the DDL-dependent checks can't run there yet.
 - [x] Oracle 9i — **fv2, live-validated against a 9i VM** (127.0.0.1:1526, SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
@@ -75,7 +78,9 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       (0x0101) and gated on the accept's ACFL flags; a bare-supported server picks
       the null algorithm and stays plaintext. Validated byte-for-byte against the
       seerdb reference + a captured 26ai response (test_ano), live plaintext-
-      fallback on 11g, and AES256+SHA256 end-to-end against a required Mirror.
+      fallback on 11g, and AES256+SHA256 end-to-end against a required Mirror
+      and a live required-encryption 26ai. Break/reset re-derivation of the MAC
+      keystreams pinned to a captured 26ai session (test_ano_reset).
 - [ ] External / OS / Kerberos auth
 - [x] Proxy authentication (`proxy_user[schema]`) — one `PROXY_CLIENT_NAME` auth
       pair names the target schema; the proxy authenticates normally and the
