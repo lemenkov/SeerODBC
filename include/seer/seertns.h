@@ -396,6 +396,10 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt);
  * describes afresh as usual. A no-op for a statement that is not a
  * query, one already described or executed, and on 9i. */
 SeerStatus seer_stmt_describe(SeerStmt *stmt);
+/* Non-zero when the last execute created a PL/SQL object (procedure, function,
+ * package, trigger, ...) that compiled with errors: the statement succeeded
+ * but the object is invalid (ORA-24344 "success with compilation error"). */
+int seer_stmt_compile_warning(SeerStmt *stmt);
 
 /* Advance to the next row. SEER_OK if a row is now current, SEER_ENODATA when
  * the result set is exhausted. */

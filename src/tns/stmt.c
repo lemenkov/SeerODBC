@@ -171,9 +171,10 @@ struct SeerStmt {
   long cur;      /* current row index, -1 before the first fetch */
   long affected; /* DML affected-row count (from the OER) */
   int cursor_id;
-  int reuse_cursor;    /* cached server cursor to re-execute without a re-parse */
-  bool describe_only;  /* build_exec: a parse + describe, no execute (seer_stmt_describe) */
-  bool described_only; /* cols came from seer_stmt_describe; the execute re-describes */
+  int reuse_cursor;     /* cached server cursor to re-execute without a re-parse */
+  bool describe_only;   /* build_exec: a parse + describe, no execute (seer_stmt_describe) */
+  bool described_only;  /* cols came from seer_stmt_describe; the execute re-describes */
+  bool compile_warning; /* the last execute created an object that compiled with errors */
   bool executed;
   bool batch_errors;     /* arm batcherrors for array DML (continue on row error) */
   SeerBatchError *berrs; /* per-row failures captured from the OER */
@@ -203,8 +204,9 @@ typedef struct {
   int64_t call_status;
   int64_t err_code;
   int64_t cursor_id;
-  int64_t row_count; /* "current row number" - DML affected rows on 11g */
-  bool flush_binds;  /* the server asked for a TTI_FOB echo (see seer_ttc_recv) */
+  int64_t row_count;  /* "current row number" - DML affected rows on 11g */
+  bool flush_binds;   /* the server asked for a TTI_FOB echo (see seer_ttc_recv) */
+  uint8_t warn_flags; /* 0x20: a PL/SQL object was created with compilation errors */
 } OerResult;
 
 /* ----------------------------------------------------------- value decode */
@@ -1288,8 +1290,11 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
   (void)seer_dec_sb4(r); /* array elem error 1 */
   (void)seer_dec_sb4(r); /* array elem error 2 */
   oer->cursor_id = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r);          /* error position */
-  seer_reader_bytes(r, 6);        /* sql_type..warn_flags */
+  (void)seer_dec_sb4(r); /* error position */
+  /* sql_type .. warn_flags (6 x ub1): the last is a real signal (§6.3a) */
+  const uint8_t *six = seer_reader_bytes(r, 6);
+  if (six != NULL)
+    oer->warn_flags = six[5];
   (void)seer_dec_sb4(r);          /* rowid: data object  */
   (void)seer_dec_sb4(r);          /* rowid: file         */
   seer_reader_bytes(r, 1);        /* rowid: reserved     */
@@ -4519,6 +4524,11 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   return SEER_OK;
 }
 
+int seer_stmt_compile_warning(SeerStmt *stmt)
+{
+  return stmt != NULL && stmt->compile_warning;
+}
+
 SeerStatus seer_stmt_describe(SeerStmt *stmt)
 {
   if (stmt == NULL)
@@ -4679,6 +4689,9 @@ retry_exec:
   }
   stmt->cursor_id = (int)oer.cursor_id;
   stmt->affected = (long)oer.row_count;
+  /* A CREATE of a PL/SQL object that compiled with errors SUCCEEDS (error 0):
+   * only warn_flags bit 0x20 tells (seerdb/seerdb@6cc60d3). */
+  stmt->compile_warning = (oer.warn_flags & 0x20) != 0;
 
   /* A DDL (non-cacheable) statement can invalidate other cached cursors; drop
    * the cache so none is reused stale after an object is recreated. A PL/SQL

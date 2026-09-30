@@ -437,11 +437,17 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     const char *ora = seer_last_error(s->dbc->conn);
     return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
   }
+  /* Created, but compiled with errors: success with a warning, as Oracle's own
+   * clients report it (ORA-24344). */
+  bool compile_warning = seer_stmt_compile_warning(s->core);
 
   /* Array-bind status: every set was attempted (batcherrors mode). Mark all
    * rows SUCCESS, then flip the failed ones to SQL_PARAM_ERROR and post one
    * diag record per failure (carrying its 1-based SQL_DIAG_ROW_NUMBER). */
-  SQLRETURN result = SQL_SUCCESS;
+  SQLRETURN result = compile_warning ? seer_odbc_diag(s, "01000", 24344,
+                                                      "ORA-24344: success with compilation error",
+                                                      SQL_SUCCESS_WITH_INFO)
+                                     : SQL_SUCCESS;
   {
     SQLULEN n = s->paramset_size ? s->paramset_size : 1;
     if (s->params_processed != NULL)
