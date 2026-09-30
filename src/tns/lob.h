@@ -11,6 +11,7 @@
 #ifndef SEER_TNS_LOB_H
 #define SEER_TNS_LOB_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -28,5 +29,17 @@ SeerStatus seer_lob_read(SeerConn *conn, const uint8_t *locator, size_t loclen, 
  * malloc'd buffer of *outlen raw file bytes; caller frees. */
 SeerStatus seer_bfile_read(SeerConn *conn, const uint8_t *locator, size_t loclen, uint8_t **out,
                            size_t *outlen);
+
+/* Allocate a session-duration temporary CLOB (or BLOB, `blob`) with
+ * TTI_LOBOPS CREATE_TEMP. On SEER_OK *locator is its malloc'd locator of
+ * *loclen bytes; caller frees. 12.1+ (SEER_ENOTIMPL on older servers). */
+SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, size_t *loclen);
+
+/* Write `n` bytes of `data` into the temporary LOB named by `locator`, from
+ * offset 1 (TTI_LOBOPS WRITE): UTF-16BE for a CLOB, raw bytes for a BLOB. On
+ * SEER_OK *resp is the server's raw reply - an RPA and the call's OER - for the
+ * caller to check (caller frees). */
+SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
+                          const uint8_t *data, size_t n, uint8_t **resp, size_t *rlen);
 
 #endif /* SEER_TNS_LOB_H */

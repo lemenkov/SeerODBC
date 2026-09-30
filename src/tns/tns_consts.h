@@ -109,12 +109,14 @@
 
 /* TTI_LOBOPS opcodes (§14.2) */
 #define LOB_OP_READ 0x0002
-#define LOB_OP_FILE_OPEN 0x0100  /* open a BFILE before reading (§19.8) */
-#define LOB_OP_FILE_CLOSE 0x0200 /* close an opened BFILE                */
-#define TTI_AUTH 115             /* O5LOGON authentication response  */
-#define TTI_SESS 118             /* session setup / auth phase 1     */
-#define TTI_3LOGON 81            /* O3LOGON phase 2 (9i, 0x51)       */
-#define TTI_3LOGA 82             /* O3LOGON phase 1 (9i, 0x52)       */
+#define LOB_OP_WRITE 0x0040       /* write at an offset (§14.2)           */
+#define LOB_OP_FILE_OPEN 0x0100   /* open a BFILE before reading (§19.8) */
+#define LOB_OP_FILE_CLOSE 0x0200  /* close an opened BFILE                */
+#define LOB_OP_CREATE_TEMP 0x0110 /* allocate a temporary LOB (§14.2)   */
+#define TTI_AUTH 115              /* O5LOGON authentication response  */
+#define TTI_SESS 118              /* session setup / auth phase 1     */
+#define TTI_3LOGON 81             /* O3LOGON phase 2 (9i, 0x51)       */
+#define TTI_3LOGA 82              /* O3LOGON phase 1 (9i, 0x52)       */
 /* Oracle 9i (fv2) TTI_ALL7 query dialect function IDs (PROTOCOL.md §19). */
 #define O7_OPEN 0x02         /* OOPEN: allocate a server cursor  */
 #define O7_DESCRIBE 0x62     /* describe columns (metadata RPA)  */
