@@ -20,11 +20,15 @@ TNS/TTC wire protocol directly.
 
 ## What works
 
-Validated live across five Oracle releases — **9i, 10g, 11g, 21c and 23ai**
+Validated live across six Oracle releases — **9i, 10g, 11g, 18c, 21c and 23ai**
 (TTC field versions 2 through 24) — via `tests/odbc/run-matrix.sh`. The 10g–23ai
 tier runs the full ODBC surface through unixODBC; 9i (the legacy fv2 / `TTI_ALL7`
 dialect) is validated through the core API. 11g/21c/23ai are the public-CI tier;
-9i and 10g stay local (their images aren't redistributable).
+9i, 10g and 18c stay local (their images aren't redistributable). 12.1 / 12.2 /
+19c have no live server here but share the down-negotiated 12c wire forms (the
+12.1 level is exercised by capping a 21c session at fv7). Not supported: 8i (a
+distinct older protocol dialect) and native network encryption where the server
+*requires* it (26ai).
 
 - **Connect & auth** — O5LOGON across the 10g (DES), 11g (AES-192/SHA-1) and
   12c (AES-256/PBKDF2) verifiers, 23ai fv24 fast-auth, and 9i O3LOGON (legacy

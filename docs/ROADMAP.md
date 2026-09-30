@@ -6,8 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # SeerODBC roadmap / feature checklist
 
 A living inventory of what the driver does and doesn't do yet. `[x]` = implemented
-and exercised (most against the live 9i/10g/11g/21c/23ai matrix, see
-`tests/odbc/run-matrix.sh`); `[ ]` = not yet. Keep this in sync as features land.
+and exercised (most against the live 9i/10g/11g/18c/21c/23ai matrix, see
+`tests/odbc/run-matrix.sh`); `[~]` = expected to work but not proven live;
+`[ ]` = not yet. Keep this in sync as features land.
 
 ## Server versions (negotiated TTC field version)
 
@@ -17,7 +18,19 @@ and exercised (most against the live 9i/10g/11g/21c/23ai matrix, see
 - [x] Oracle 11g — fv6 (the long-standing baseline).  ┐ public-CI tier
 - [x] Oracle 21c — fv16 (native 12c wire forms).      │ (11g XE / 21c XE /
 - [x] Oracle 23ai — **fv24 native** (fast-auth), default cap.  ┘ 23ai FREE images)
-- [ ] Oracle 12c / 18c / 19c — should negotiate fv7–14, but no container to prove it
+      The live 23ai bed (release 23.1.162) advertises fv27 - the 26ai level - and
+      is capped to fv24; the CI job runs a genuine 23.x image.
+- [x] Oracle 18c — fv11, live-validated (18c XE; full integration + object /
+      temp-LOB / inline-LOB checks). **Local-only** like 10g.
+- [~] Oracle 12.1 / 12.2 / 19c — no live server; they negotiate the same 12c wire
+      forms (fv7–14) the 18c / 21c tiers exercise, and the 12.1 level itself is
+      tested by capping a 21c session with `SEER_MAX_FV=7`. Expected to work,
+      not proven against the real releases.
+- [ ] Oracle 8i (8.1.7) — a distinct older protocol dialect; a live 8i VM exists
+      but the driver does not speak it yet.
+- [ ] 26ai with native network encryption **required** — the ANO negotiation
+      runs, but a server that insists on encryption fails most of the suite
+      (31 checks on the 26ai encryption bed). Plaintext-fallback servers are fine.
 - [x] Oracle 9i — **fv2, live-validated against a 9i VM** (127.0.0.1:1526, SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
@@ -348,7 +361,7 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 ## Docs & testing
 
 - [x] Offline unit tests (codecs, O5LOGON vectors, SQL preprocessor, conversions)
-- [x] Driver-level integration suite + version matrix runner (10g/11g/21c/23ai)
+- [x] Driver-level integration suite + version matrix runner (9i/10g/11g/18c/21c/23ai)
 - [x] Large-value fetch fix: a column value >= 254 bytes arrives 0xFE-chunked
       with sb4 chunk lengths on 12c+ (ub1 on 11g); seer_dec_dalc read ub1
       unconditionally, so *every* large VARCHAR/RAW/object/XMLType fetch on 21c/
@@ -404,8 +417,9 @@ Not on the thin wire (documented above, nothing to emit): **sharding** (§37) an
 
 Deep-RE / environment-blocked (no reference):
 
-- **12c / 18c / 19c matrix coverage** — the fv7–14 wire forms should already work
-  via down-negotiation; unproven only for lack of a container. (Near-zero code.)
+- **12.1 / 12.2 / 19c matrix coverage** — the 12c wire forms are exercised on 18c
+  (fv11) and 21c (fv16), and the 12.1 level via a capped 21c session; the real
+  releases are unproven only for lack of a server. (Near-zero code.)
 - **Server-side scrollable cursors** — fetch is client-buffered today (already a
   correct `SQLFetchScroll`); a true server-side scroll cursor would help very large
   result sets. Attempted 2026-07 and reverted at a wire-framing blocker (the

@@ -132,7 +132,7 @@ for any function where only one width is exported.
   `tests/odbc/matrix.env` (see `matrix.env.example`); `--only` / `--skip`
   select tiers, and an unreachable tier is reported and skipped. The run exits
   non-zero if any tier has a failing check.
-- **Live validation**: each feature is exercised against the full 10g/11g/21c/23ai
+- **Live validation**: each feature is exercised against the full 10g/11g/18c/21c/23ai
   matrix through unixODBC (isql + C clients), plus the 9i core-API tier. See
   `docs/ARCHITECTURE.md` "Protocol progress" and `docs/ROADMAP.md` for the
   per-feature inventory.
