@@ -92,6 +92,20 @@ int seer_transport_large_frames(const SeerTransport *t)
   return t != NULL && t->large_frames;
 }
 
+int seer_transport_wait_readable(SeerTransport *t, int timeout_ms)
+{
+  if (t == NULL)
+    return -1;
+  if (t->ssl != NULL && SSL_pending(t->ssl) > 0)
+    return 1; /* already decrypted, the socket may be quiet */
+  seer_pollfd pfd = {.fd = t->fd, .events = POLLIN};
+  int rc;
+  do {
+    rc = seer_poll(&pfd, 1, timeout_ms);
+  } while (rc < 0 && seer_sock_errno() == SEER_EINTR);
+  return rc > 0 ? 1 : (rc == 0 ? 0 : -1);
+}
+
 /* The most recent OpenSSL error string (for logging), or a fallback. */
 static const char *ssl_err(void)
 {

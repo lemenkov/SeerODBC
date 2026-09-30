@@ -204,6 +204,30 @@ void seer_cancel(SeerConn *c)
  * packet carries 2 data-flag bytes that are stripped; the server signals "more
  * fragments follow" by sizing a packet to exactly SDU-37 or SDU-81 (§1.3).
  * *out is malloc'd; caller frees. */
+/* How long to wait, after a packet sized like a non-final fragment, for the
+ * continuation before deciding the message ended with it. */
+#define FRAGMENT_WAIT_MS 2000
+
+/* Whether the message continues past a DATA packet of `total` bytes. The
+ * server marks nothing: a non-final fragment is filled to exactly SDU-37 (or
+ * SDU-81) bytes (§1.3), and a shorter packet ends the message. But a message
+ * can also END in a packet of exactly that size - a 10g LOB read whose reply
+ * came to 2001 bytes on a 2048 SDU did - and waiting for a continuation that
+ * never comes stalled the call for the full 30 s socket timeout, then failed
+ * it. A real continuation is already in flight when its predecessor arrives
+ * (the server wrote the whole message), so it is waited for only briefly:
+ * nothing to read by then means the message is complete. */
+static bool more_fragments(SeerConn *c, size_t total)
+{
+  if (c->sdu == 0 || (total != (size_t)c->sdu - 37 && total != (size_t)c->sdu - 81))
+    return false;
+  if (seer_transport_wait_readable(c->t, FRAGMENT_WAIT_MS) == 0) {
+    seer_log(SEER_LOG_DEBUG, "ttc: a %zu-byte packet ended its message", total);
+    return false;
+  }
+  return true; /* data (or an error the next read reports) */
+}
+
 static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
 {
   *out = NULL;
@@ -269,8 +293,7 @@ static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
       free(body);
     }
 
-    bool fragment = c->sdu > 0 && (total == (size_t)c->sdu - 37 || total == (size_t)c->sdu - 81);
-    if (!fragment)
+    if (!more_fragments(c, total))
       break;
   }
   c->in_call = false;
@@ -415,8 +438,7 @@ SeerStatus seer_ttc_recv_pipeline(SeerConn *c, uint8_t **out, size_t *outlen)
     size_t total = blen + TNS_HEADER_LEN;
     free(body);
 
-    bool fragment = c->sdu > 0 && (total == (size_t)c->sdu - 37 || total == (size_t)c->sdu - 81);
-    if (!fragment)
+    if (!more_fragments(c, total))
       break;
   }
   if (!seer_writer_ok(&acc)) {

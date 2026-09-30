@@ -42,6 +42,11 @@ int seer_transport_large_frames(const SeerTransport *t);
 /* Write exactly `len` bytes (looping over short writes). */
 SeerStatus seer_transport_write_all(SeerTransport *t, const void *buf, size_t len);
 
+/* Wait up to `timeout_ms` for data to read (including bytes TLS has already
+ * decrypted and buffered): 1 when there is some (or EOF), 0 on timeout, -1 on
+ * error. */
+int seer_transport_wait_readable(SeerTransport *t, int timeout_ms);
+
 /* Read exactly `len` bytes (looping over short reads). SEER_EIO on EOF or
  * error before `len` bytes arrive. */
 SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len);
