@@ -3390,7 +3390,10 @@ static SeerStatus decode_object_image(SeerConn *conn, const uint8_t *img, size_t
       ast = conn ? decode_xmltype_image(conn, img + pos, (size_t)len, &tmp) : SEER_EPARAM;
     else if (types[a] == ORA_TYPE_CLOB || types[a] == ORA_TYPE_BLOB)
       ast = decode_lob_attr(conn, types[a], img + pos, (size_t)len, &tmp);
-    else
+    else if (types[a] == ORA_TYPE_BOOLEAN) { /* 4 bytes, the truth in the first */
+      cell_set_text(&tmp, strdup(img[pos] ? "TRUE" : "FALSE"));
+      ast = SEER_OK;
+    } else
       ast = decode_scalar(types[a], img + pos, (size_t)len, &tmp);
     if (ast == SEER_OK && tmp.data != NULL)
       seer_writer_bytes(&w, tmp.data, tmp.len);

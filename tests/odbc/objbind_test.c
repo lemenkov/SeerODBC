@@ -623,6 +623,52 @@ int main(void)
   }
   run(c, "DROP PACKAGE seer_pkt");
 
+  /* --- a SQL object with a BOOLEAN attribute (23ai): bound and fetched back.
+   * In the image the attribute is 4 bytes with the truth in the first. --- */
+  run(c, "DROP TABLE seer_bo_t");
+  run(c, "DROP TYPE seer_bo");
+  {
+    const char *name = "SQL OBJECT with a BOOLEAN attribute";
+    /* Before 23ai a CREATE TYPE with a BOOLEAN attribute succeeds "with
+     * compilation errors", so ask for a SQL BOOLEAN directly. */
+    SeerStmt *s = NULL;
+    int has_bool = seer_stmt_prepare(c, "SELECT TRUE FROM dual", &s) == SEER_OK &&
+                   seer_stmt_execute(s) == SEER_OK;
+    seer_stmt_close(s);
+    if (!has_bool) {
+      skip(name, "no SQL BOOLEAN before 23ai");
+    } else {
+      run(c, "CREATE TYPE seer_bo AS OBJECT (n NUMBER, b BOOLEAN)");
+      run(c, "CREATE TABLE seer_bo_t (id NUMBER, o seer_bo)");
+      const char *t[2] = {"1", "TRUE"}, *f[2] = {"2", "FALSE"};
+      SeerStatus e = SEER_OK;
+      for (int k = 0; k < 2 && e == SEER_OK; k++) {
+        SeerStmt *ins = NULL;
+        seer_stmt_prepare(c, "INSERT INTO seer_bo_t VALUES (:1, :2)", &ins);
+        e = seer_stmt_bind_int64(ins, 1, k + 1);
+        if (e == SEER_OK)
+          e = seer_stmt_bind_object(ins, 2, schema, "SEER_BO", k == 0 ? t : f, 2);
+        if (e == SEER_OK)
+          e = seer_stmt_execute(ins);
+        seer_stmt_close(ins);
+      }
+      seer_commit(c);
+      if (e != SEER_OK)
+        fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
+      else if (!readback_has(c, "SELECT o FROM seer_bo_t WHERE id = 1", "1", "TRUE") ||
+               !readback_has(c, "SELECT o FROM seer_bo_t WHERE id = 2", "2", "FALSE") ||
+               !readback_has(c,
+                             "SELECT CASE WHEN t.o.b THEN 'yes' END || COUNT(*) FROM seer_bo_t t "
+                             "WHERE t.o.b GROUP BY t.o.b",
+                             "yes", "1"))
+        fail(name, "readback mismatch");
+      else
+        pass(name);
+      run(c, "DROP TABLE seer_bo_t");
+      run(c, "DROP TYPE seer_bo");
+    }
+  }
+
   seer_disconnect(c);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
   return fail_n > 0 ? 1 : 0;
