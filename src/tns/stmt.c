@@ -110,8 +110,11 @@ typedef struct {
   size_t *rxd_len;
   SeerCell out;         /* OUT value captured from the IOV response */
   int64_t out_full_len; /* RETURNING value the server truncated: its real length, else 0 */
-  bool is_array;        /* PL/SQL associative-array (index-by table) bind  */
-  SeerCell *out_arr;    /* OUT assoc-array elements captured from the IOV   */
+  uint8_t ret_lob;      /* RETURNING target declared as this LOB type (CLOB/BLOB), else 0 */
+  uint8_t *ret_locator; /* its returned locator, resolved after the response */
+  size_t ret_loclen;
+  bool is_array;     /* PL/SQL associative-array (index-by table) bind  */
+  SeerCell *out_arr; /* OUT assoc-array elements captured from the IOV   */
   int out_arr_n;
   uint8_t *oac_override; /* pre-built OAC bytes (SQL OBJECT bind); else emit_oac */
   size_t oac_override_len;
@@ -1533,6 +1536,42 @@ static SeerStatus parse_returning_rxd(SeerReader *r, SeerStmt *stmt)
     if (num_rows < 0 || num_rows > 1000000 || !seer_reader_ok(r))
       return SEER_EPROTO;
     for (int64_t row = 0; row < num_rows; row++) {
+      if (b->ret_lob != 0) {
+        /* A LOB return value is the LOB block (§22.1d): from 12.1 a lone 0x00
+         * for NULL, else ub4 block length, ub8 size, ub4 chunk size and the
+         * locator as a DALC; before 12.1 (measured on 10g / 11g) a ub4 size and
+         * the locator, as a fetched LOB column. Then the usual sb4 length. The
+         * content is read through the locator once the response is parsed. */
+        uint8_t *loc = NULL;
+        size_t ll = 0;
+        if (stmt->conn->field_version < TTC_FIELD_VERSION_12_1) {
+          if (read_lob_locator(r, &loc, &ll) != SEER_OK) { /* 11g: ub4 + locator */
+            free(loc);
+            return SEER_EPROTO;
+          }
+        } else if (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0x00) {
+          (void)seer_reader_u8(r);
+        } else {
+          (void)seer_dec_sb4(r); /* block length */
+          (void)seer_dec_sb4(r); /* LOB size (ub8) */
+          (void)seer_dec_sb4(r); /* chunk size */
+          if (seer_dec_dalc(r, &loc, &ll) != SEER_OK) {
+            free(loc);
+            return SEER_EPROTO;
+          }
+        }
+        (void)seer_dec_sb4(r); /* sb4 length */
+        if (row == 0) {
+          free(b->out.data);
+          b->out = (SeerCell){0};
+          free(b->ret_locator);
+          b->ret_locator = loc;
+          b->ret_loclen = ll;
+        } else {
+          free(loc);
+        }
+        continue;
+      }
       uint8_t *v = NULL;
       size_t vl = 0;
       if (seer_dec_dalc(r, &v, &vl) != SEER_OK) {
@@ -1552,6 +1591,39 @@ static SeerStatus parse_returning_rxd(SeerReader *r, SeerStmt *stmt)
     }
   }
   return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
+}
+
+/* Read the content of each LOB a DML RETURNING returned (their locators were
+ * stashed by parse_returning_rxd): CLOB as UTF-8 text, BLOB as bytes. */
+static SeerStatus resolve_returned_lobs(SeerStmt *stmt)
+{
+  for (int i = 0; i < stmt->npbinds; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    if (b->ret_locator == NULL)
+      continue;
+    uint8_t *raw = NULL;
+    size_t rawlen = 0;
+    SeerStatus st = seer_lob_read(stmt->conn, b->ret_locator, b->ret_loclen, &raw, &rawlen);
+    free(b->ret_locator);
+    b->ret_locator = NULL;
+    b->ret_loclen = 0;
+    if (st != SEER_OK)
+      return st;
+    if (b->ret_lob == ORA_TYPE_CLOB) {
+      char *u8 = NULL;
+      size_t u8len = 0;
+      if (rawlen == 0)
+        cell_set_text(&b->out, strdup(""));
+      else if (seer_iconv("UTF-16BE", "UTF-8", (const char *)raw, rawlen, &u8, &u8len) == 0) {
+        cell_set_bytes(&b->out, u8, u8len, false);
+        free(u8);
+      }
+    } else {
+      cell_set_bytes(&b->out, raw, rawlen, true);
+    }
+    free(raw);
+  }
+  return SEER_OK;
 }
 
 /* Consume a server-side piggyback (TTI_SVR_PIGGYBACK, DRCP #130) the server
@@ -2181,6 +2253,7 @@ static void free_binds(SeerStmt *s)
     free(s->pbinds[i].rxd);
     free(s->pbinds[i].rxd_len);
     free(s->pbinds[i].out.data);
+    free(s->pbinds[i].ret_locator);
     for (int k = 0; k < s->pbinds[i].out_arr_n; k++)
       free(s->pbinds[i].out_arr[k].data);
     free(s->pbinds[i].out_arr);
@@ -2379,6 +2452,48 @@ static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint
   seer_enc_sb4(w, 0); /* max */
 }
 
+/* The LOB type a DML RETURNING target is declared as, or 0. A VARCHAR / RAW
+ * return bind can't receive more than 4000 bytes of a CLOB / BLOB (ORA-22835
+ * "buffer too small", even declared as LONG), so a target declared larger goes
+ * out as a CLOB / BLOB: the server returns the LOB block and its content is
+ * read through the locator. */
+static uint8_t returning_lob_type(const SeerStmt *stmt, const SeerBind *b)
+{
+  if (!stmt->returning || !b->is_out || b->oac_size <= 4000)
+    return 0;
+  if (b->oac_type == ORA_TYPE_VARCHAR)
+    return ORA_TYPE_CLOB;
+  if (b->oac_type == ORA_TYPE_RAW)
+    return ORA_TYPE_BLOB;
+  return 0;
+}
+
+/* The CLOB / BLOB bind OAC: 12.1+ sets the LOB cont-flag 0x02000000, and every
+ * form announces a max length of 112 - the LOB buffer-size factor, not the
+ * value's size (seerdb _encode_lob_bind_oac). */
+static void emit_lob_oac(SeerWriter *w, int fv, uint8_t lob_type)
+{
+  bool clob = lob_type == ORA_TYPE_CLOB;
+  if (fv < TTC_FIELD_VERSION_12_1) { /* 11g layout: no cont-flag field */
+    emit_oac(w, fv, lob_type, 112, 0, clob ? 873 : 0);
+    return;
+  }
+  seer_writer_u8(w, lob_type);
+  seer_writer_u8(w, 1); /* TNS_BIND_USE_INDICATORS */
+  seer_writer_u8(w, 0);
+  seer_writer_u8(w, 0);
+  seer_enc_sb4(w, 112);        /* max data length: the LOB buffer-size factor */
+  seer_enc_sb4(w, 0);          /* max number of array elements */
+  seer_enc_sb4(w, 0x02000000); /* cont flag (ub8): LOB */
+  seer_enc_sb4(w, 0);          /* OID */
+  seer_enc_sb4(w, 0);          /* version */
+  seer_enc_sb4(w, clob ? 873 : 0);
+  seer_writer_u8(w, clob ? 1 : 0); /* character set form */
+  seer_enc_sb4(w, 0);              /* LOB prefetch length */
+  if (fv >= TTC_FIELD_VERSION_12_2)
+    seer_enc_sb4(w, 0); /* oaccolid */
+}
+
 static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
 {
   size_t qlen = strlen(stmt->sql);
@@ -2558,6 +2673,8 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
         seer_writer_bytes(w, b->oac_override, b->oac_override_len);
       else if (b->oac_type == 0)
         emit_oac(w, fv, ORA_TYPE_VARCHAR, 1, 16, 873); /* unbound -> NULL VARCHAR */
+      else if ((b->ret_lob = returning_lob_type(stmt, b)) != 0)
+        emit_lob_oac(w, fv, b->ret_lob);
       else
         emit_oac(w, fv, b->oac_type, b->oac_size ? b->oac_size : 1, b->oac_flag, b->oac_charset);
     }
@@ -4652,6 +4769,8 @@ retry_exec:
   /* A reused cursor's response carries no describe (we kept the columns); a
    * fresh parse does. */
   st = parse_response(stmt, resp, rlen, stmt->reuse_cursor == 0, &oer);
+  if (st == SEER_OK)
+    st = resolve_returned_lobs(stmt);
   free(resp);
   resp = NULL;
   if (st != SEER_OK)
