@@ -59,6 +59,15 @@ test_ano = executable('test_ano',
 )
 test('ano native encryption', test_ano)
 
+# ANO data integrity across a break/reset: the MAC keystreams re-derive, pinned
+# to a captured 26ai session (AES256 + SHA256, a SQL error with DISABLE_OOB).
+test_ano_reset = executable('test_ano_reset',
+  'unit/test_ano_reset.c',
+  c_args : ['-DSEER_ANO_RESET_FIXTURE="' + meson.current_source_dir() + '/fixtures/ano_reset_session.txt"'],
+  dependencies : [seertns_dep, openssl_dep],
+)
+test('ano break/reset re-derivation', test_ano_reset)
+
 # Request-boundary (session-state) piggyback known-answer test (§35).
 test_reqbound = executable('test_reqbound',
   'unit/test_reqbound.c',

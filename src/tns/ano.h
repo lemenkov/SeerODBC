@@ -82,6 +82,12 @@ SeerStatus seer_ano_channel_new(uint8_t enc_id, uint8_t int_id, const uint8_t *s
 
 void seer_ano_free(SeerAno *a);
 
+/* After a break/reset marker exchange, both peers re-derive the data-integrity
+ * keystreams: the seed chains forward and each direction's keystream is re-keyed
+ * from it, carrying on from its current block. Call once per exchange, before
+ * the first DATA packet either way. A no-op without integrity. */
+SeerStatus seer_ano_reset(SeerAno *a);
+
 /* Max plaintext bytes to pack in one wrapped fragment for a given SDU: SDU-64
  * leaves room for the MAC, cipher padding, marker + fold byte, and framing. */
 size_t seer_ano_max_plain(uint16_t sdu);

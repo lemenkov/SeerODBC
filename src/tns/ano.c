@@ -454,6 +454,11 @@ struct SeerAno {
   size_t mac_size;         /* digest size (block-aligned: 32/48/64) */
   EVP_CIPHER_CTX *send_ks; /* persistent MAC keystream (chained CBC) */
   EVP_CIPHER_CTX *recv_ks;
+  /* The keystreams' seed and the chained CBC cipher that derives the next one
+   * (keyed by the current seed). A break/reset re-derives from them. */
+  uint8_t seed[32];
+  EVP_CIPHER_CTX *seed_gen;
+  bool client_side;
   uint8_t send_buf[64]; /* evolving keystream block (mac_size) */
   uint8_t recv_buf[64];
 };
@@ -512,6 +517,30 @@ static EVP_CIPHER_CTX *keystream_ctx(const uint8_t *base_key, uint8_t tag, const
     return NULL;
   }
   return ctx;
+}
+
+/* Set up the MAC keystreams from `a->seed`: the per-direction keystreams keyed
+ * by seed[:16] (byte 5 the direction tag) with IV seed[16:32], and the seed
+ * generator for the next derivation keyed the same way, untagged. The evolving
+ * keystream blocks (send_buf / recv_buf) are left as they are. */
+static bool mac_keystreams_from_seed(SeerAno *a, bool client_side)
+{
+  const uint8_t *base_key = a->seed;
+  const uint8_t *base_iv = a->seed + 16;
+  if (a->send_ks)
+    EVP_CIPHER_CTX_free(a->send_ks);
+  if (a->recv_ks)
+    EVP_CIPHER_CTX_free(a->recv_ks);
+  if (a->seed_gen)
+    EVP_CIPHER_CTX_free(a->seed_gen);
+  /* Client side: send tag 90, recv tag 180 (swapped for a server). */
+  a->send_ks = keystream_ctx(base_key, client_side ? 90 : 180, base_iv);
+  a->recv_ks = keystream_ctx(base_key, client_side ? 180 : 90, base_iv);
+  a->seed_gen = EVP_CIPHER_CTX_new();
+  bool ok = a->send_ks != NULL && a->recv_ks != NULL && a->seed_gen != NULL &&
+            EVP_EncryptInit_ex(a->seed_gen, EVP_aes_128_cbc(), NULL, base_key, base_iv) == 1 &&
+            EVP_CIPHER_CTX_set_padding(a->seed_gen, 0) == 1;
+  return ok;
 }
 
 SeerStatus seer_ano_channel_new(uint8_t enc_id, uint8_t int_id, const uint8_t *session_key,
@@ -580,15 +609,9 @@ SeerStatus seer_ano_channel_new(uint8_t enc_id, uint8_t int_id, const uint8_t *s
       free(a);
       return SEER_EPROTO;
     }
-    const uint8_t *base_key = seed;
-    const uint8_t *base_iv = seed + 16;
-
-    /* Client side: send tag 90, recv tag 180 (swapped for a server). */
-    uint8_t send_tag = client_side ? 90 : 180;
-    uint8_t recv_tag = client_side ? 180 : 90;
-    a->send_ks = keystream_ctx(base_key, send_tag, base_iv);
-    a->recv_ks = keystream_ctx(base_key, recv_tag, base_iv);
-    if (a->send_ks == NULL || a->recv_ks == NULL) {
+    memcpy(a->seed, seed, sizeof a->seed);
+    a->client_side = client_side;
+    if (!mac_keystreams_from_seed(a, client_side)) {
       seer_ano_free(a);
       return SEER_ENOMEM;
     }
@@ -607,8 +630,28 @@ void seer_ano_free(SeerAno *a)
     EVP_CIPHER_CTX_free(a->send_ks);
   if (a->recv_ks)
     EVP_CIPHER_CTX_free(a->recv_ks);
+  if (a->seed_gen)
+    EVP_CIPHER_CTX_free(a->seed_gen);
   OPENSSL_cleanse(a->enc_key, sizeof a->enc_key);
+  OPENSSL_cleanse(a->seed, sizeof a->seed);
   free(a);
+}
+
+SeerStatus seer_ano_reset(SeerAno *a)
+{
+  if (a == NULL || !a->has_mac)
+    return SEER_OK; /* the cipher is per-packet (zero IV): nothing to reset */
+  /* The next seed is the current one run through the seed generator (the
+   * chained CBC keyed by the current seed); the keystreams are re-keyed from
+   * it and carry on from their current blocks. */
+  uint8_t next[32];
+  int outl = 0;
+  if (EVP_EncryptUpdate(a->seed_gen, next, &outl, a->seed, (int)sizeof a->seed) != 1 ||
+      outl != (int)sizeof next)
+    return SEER_EPROTO;
+  memcpy(a->seed, next, sizeof a->seed);
+  OPENSSL_cleanse(next, sizeof next);
+  return mac_keystreams_from_seed(a, a->client_side) ? SEER_OK : SEER_ENOMEM;
 }
 
 size_t seer_ano_max_plain(uint16_t sdu)

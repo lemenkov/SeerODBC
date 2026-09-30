@@ -260,6 +260,14 @@ static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
         const uint8_t reset[3] = {0x01, 0x00, 0x02};
         seer_packet_send(c->t, TNS_PT_MARKER, reset, sizeof reset);
         sent_reset = true;
+        /* With data integrity on, the break/reset renews both MAC
+         * keystreams; the server's reply after it is already under the new
+         * ones. */
+        if (c->ano != NULL && seer_ano_reset(c->ano) != SEER_OK) {
+          c->in_call = false;
+          seer_writer_free(&acc);
+          return SEER_EPROTO;
+        }
       }
       continue;
     }
