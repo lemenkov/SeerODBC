@@ -1158,6 +1158,81 @@ static void check_long_column(SQLHDBC dbc)
   }
 }
 
+/* CLOB / BLOB columns over more rows (120) than one fetch batch (100), mixed sizes
+ * (to 30000 two-byte characters / 20000 bytes), NULL and empty values; run
+ * twice, the second time on the cached cursor. With `lob_inline` (a LOBINLINE=1
+ * connection, 12.1+) the rows come after a DEFINE call asking for the LOBs as
+ * LONG / LONG RAW, content inline, and the later batches keep that framing -
+ * and there an empty LOB reads as NULL, the one thing that form can't tell. */
+static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
+{
+  const char *name = lob_inline ? "CLOB / BLOB columns across fetch batches (LOBINLINE)"
+                                : "CLOB / BLOB columns across fetch batches";
+  char err[256], e2[256];
+  exec_do(dbc, "DROP TABLE seer_ld", e2, sizeof e2);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_ld (id NUMBER, c CLOB, b BLOB)", err, sizeof err)) ||
+      !SQL_SUCCEEDED(exec_do(
+          dbc,
+          "DECLARE cc CLOB; bb BLOB; nc PLS_INTEGER; nb PLS_INTEGER; k PLS_INTEGER; "
+          "r RAW(2000); BEGIN FOR i IN 1 .. 120 LOOP "
+          "IF MOD(i, 50) = 0 THEN INSERT INTO seer_ld VALUES (i, NULL, NULL); ELSE "
+          "nc := CASE WHEN MOD(i, 50) = 1 THEN 0 WHEN i > 115 THEN 30000 ELSE i * 7 END; "
+          "nb := CASE WHEN i > 115 THEN 20000 ELSE i * 5 END; "
+          "r := UTL_RAW.COPIES(HEXTORAW(LPAD(TRIM(TO_CHAR(MOD(i, 256), 'XX')), 2, '0')), 2000); "
+          "DBMS_LOB.CREATETEMPORARY(cc, TRUE); DBMS_LOB.CREATETEMPORARY(bb, TRUE); "
+          "k := nc; WHILE k > 0 LOOP DBMS_LOB.WRITEAPPEND(cc, LEAST(k, 1000), "
+          "RPAD(UNISTR('\\0436'), LEAST(k, 1000), UNISTR('\\0436'))); k := k - 1000; END LOOP; "
+          "k := nb; WHILE k > 0 LOOP DBMS_LOB.WRITEAPPEND(bb, LEAST(k, 2000), "
+          "UTL_RAW.SUBSTR(r, 1, LEAST(k, 2000))); k := k - 2000; END LOOP; "
+          "INSERT INTO seer_ld VALUES (i, cc, bb); "
+          "DBMS_LOB.FREETEMPORARY(cc); DBMS_LOB.FREETEMPORARY(bb); END IF; "
+          "END LOOP; COMMIT; END;",
+          err, sizeof err))) {
+    fail(name, err);
+    exec_do(dbc, "DROP TABLE seer_ld", e2, sizeof e2);
+    return;
+  }
+  static char cbuf[70000];
+  static unsigned char bbuf[30000];
+  char why[200] = "";
+  for (int pass_no = 0; pass_no < 2 && why[0] == '\0'; pass_no++) {
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLRETURN rc =
+        SQLExecDirect(st, (SQLCHAR *)"SELECT id, c, b FROM seer_ld ORDER BY id", SQL_NTS);
+    int rows = 0;
+    while (SQL_SUCCEEDED(rc) && why[0] == '\0' && SQL_SUCCEEDED(rc = SQLFetch(st))) {
+      SQLINTEGER id = 0;
+      SQLLEN ind = 0, cind = 0, bind = 0;
+      SQLGetData(st, 1, SQL_C_SLONG, &id, 0, &ind);
+      SQLGetData(st, 2, SQL_C_CHAR, cbuf, sizeof cbuf, &cind);
+      SQLGetData(st, 3, SQL_C_BINARY, bbuf, sizeof bbuf, &bind);
+      long wc = id % 50 == 0   ? SQL_NULL_DATA
+                : id % 50 == 1 ? (lob_inline ? SQL_NULL_DATA : 0)
+                               : (id > 115 ? 30000 : id * 7) * 2;
+      long wb = id % 50 == 0 ? SQL_NULL_DATA : (id > 115 ? 20000 : id * 5);
+      if ((long)cind != wc || (wc > 0 && memcmp(cbuf + wc - 2, "\xd0\xb6", 2) != 0))
+        snprintf(why, sizeof why, "pass %d row %d: CLOB length %ld, want %ld", pass_no + 1, (int)id,
+                 (long)cind, wc);
+      else if ((long)bind != wb || (wb > 0 && bbuf[wb - 1] != (unsigned char)(id & 0xFF)))
+        snprintf(why, sizeof why, "pass %d row %d: BLOB length %ld, want %ld", pass_no + 1, (int)id,
+                 (long)bind, wb);
+      rows++;
+    }
+    if (why[0] == '\0' && rc != SQL_NO_DATA)
+      diag_text(SQL_HANDLE_STMT, st, why, sizeof why);
+    else if (why[0] == '\0' && rows != 120)
+      snprintf(why, sizeof why, "pass %d: %d rows, want 120", pass_no + 1, rows);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+  }
+  exec_do(dbc, "DROP TABLE seer_ld", e2, sizeof e2);
+  if (why[0] == '\0')
+    pass(name);
+  else
+    fail(name, why);
+}
+
 /* A large CLOB OUT parameter, and a CLOB + BLOB returned by DML RETURNING into
  * SQL_LONGVARCHAR / SQL_LONGVARBINARY parameters: the whole values come back
  * (a VARCHAR / RAW return target is capped at 4000 bytes - ORA-22835). */
@@ -1892,6 +1967,40 @@ static void check_tls(const char *drv, const char *svc, const char *user, const 
       pass(name);
     else
       fail(name, err[0] ? err : "query over TLS failed");
+    SQLDisconnect(d);
+  }
+  SQLFreeHandle(SQL_HANDLE_DBC, d);
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+}
+
+/* The batched LOB check again on a LOBINLINE=1 connection (inline LOB fetch). */
+static void check_lob_inline(const char *drv, const char *host, const char *port, const char *svc,
+                             const char *user, const char *pwd)
+{
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC d;
+  SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+  char cs[640];
+  snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;LOBINLINE=1;", drv,
+           host, port, svc, user, pwd);
+  SQLCHAR o[256];
+  SQLSMALLINT ol;
+  if (!SQL_SUCCEEDED(SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol,
+                                      SQL_DRIVER_NOPROMPT))) {
+    char m[256];
+    diag_text(SQL_HANDLE_DBC, d, m, sizeof m);
+    fail("CLOB / BLOB columns across fetch batches (LOBINLINE)", m[0] ? m : "connect failed");
+  } else {
+    char ver[16] = "", err[256];
+    exec_scalar(d,
+                "SELECT MAX(version) FROM product_component_version WHERE product LIKE 'Oracle%'",
+                ver, sizeof ver, err, sizeof err);
+    if (atoi(ver) < 12) /* before 12.1 the option has no effect */
+      skip("CLOB / BLOB columns across fetch batches (LOBINLINE)", "inline LOB fetch is 12.1+");
+    else
+      check_lob_columns_batched(d, 1);
     SQLDisconnect(d);
   }
   SQLFreeHandle(SQL_HANDLE_DBC, d);
@@ -2639,6 +2748,7 @@ int main(void)
   check_describe_before_execute(dbc);
   check_long_column(dbc);
   check_lob_out(dbc);
+  check_lob_columns_batched(dbc, 0);
   check_plsql_large_lob_param(dbc);
   check_compile_warning(dbc);
   check_error_native_and_offset(dbc);
@@ -2716,6 +2826,7 @@ int main(void)
   check_proxy_auth(dbc, drv, host, port, svc);
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_tls(drv, svc, user, pwd);
+  check_lob_inline(drv, host, port, svc, user, pwd);
 
   char err[256];
   exec_do(dbc, "DROP TABLE " TBL, err, sizeof err);

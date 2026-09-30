@@ -26,6 +26,7 @@ struct SeerConn {
   uint8_t field_version; /* negotiated TTC field version (from PRO) */
   bool authenticated;    /* O5LOGON completed                      */
   bool autocommit;       /* commit each statement (default true)    */
+  bool lob_inline;       /* fetch CLOB / BLOB columns inline (SeerConnParams) */
   /* Request boundaries (§35): server support (from PRO caps), the one-shot
    * armed marker (0 / REQUEST_BEGIN / REQUEST_END) flushed as a func-176
    * piggyback in front of the next call, and whether a logical request is open. */
