@@ -282,7 +282,9 @@ SeerStatus seer_stmt_bind_null_typed(SeerStmt *stmt, int param, int ora_type);
  * a SQL NULL attribute), and `n_attrs` must match the type's attribute count.
  * The driver looks up the type and encodes each value as its attribute's Oracle
  * type: character attributes take the UTF-8 text; NUMBER attributes take an
- * integer parsed from the text. (Slice 1: flat object of scalar attributes.) */
+ * integer parsed from the text. A type declared in a PL/SQL package (a record)
+ * is named "PKG.TYPE"; its PLS_INTEGER attributes take an integer and BOOLEAN
+ * ones "TRUE"/"FALSE" (or 1/0). */
 SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
                                  const char *type_name, const char *const *attr_values,
                                  int n_attrs);
@@ -317,7 +319,9 @@ SeerStatus seer_stmt_bind_vector_sparse_i8(SeerStmt *stmt, int param, int num_di
 
 /* Bind a collection (VARRAY / nested table) parameter (12c+). `type_name` is the
  * collection type; `elem_values` are its `n_elems` element values as text (a NULL
- * entry is a SQL NULL element), each encoded as the collection's element type. */
+ * entry is a SQL NULL element), each encoded as the collection's element type.
+ * A collection type declared in a PL/SQL package is named "PKG.TYPE"; an
+ * index-by table (INDEX BY BINARY_INTEGER) gets its elements keyed 0..n-1. */
 SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *schema,
                                      const char *type_name, const char *const *elem_values,
                                      int n_elems);
