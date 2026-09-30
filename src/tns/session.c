@@ -395,6 +395,10 @@ void seer_disconnect(SeerConn *conn)
   seer_stmt_cache_clear(conn);
   free(conn->last_error);
   free(conn->tpc_context);
+  for (int i = 0; i < conn->n_free_lobs; i++)
+    free(conn->free_lobs[i]); /* the session end frees them server-side */
+  free(conn->free_lobs);
+  free(conn->free_lob_lens);
   free(conn);
 }
 

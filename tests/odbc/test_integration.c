@@ -38,9 +38,14 @@ static void pass(const char *name)
   printf("  \033[32mPASS\033[0m %s\n", name);
   n_pass++;
 }
+/* Failures are also kept to repeat on stderr at the end: a CI runner showing
+ * only a failed test's last lines of stderr then still names them. */
+static char fail_log[4096];
 static void fail(const char *name, const char *why)
 {
   printf("  \033[31mFAIL\033[0m %s: %s\n", name, why);
+  size_t used = strlen(fail_log);
+  snprintf(fail_log + used, sizeof fail_log - used, "FAIL %s: %s\n", name, why);
   n_fail++;
 }
 static void skip(const char *name, const char *why)
@@ -1227,6 +1232,60 @@ static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
     SQLFreeHandle(SQL_HANDLE_STMT, st);
   }
   exec_do(dbc, "DROP TABLE seer_ld", e2, sizeof e2);
+  if (why[0] == '\0')
+    pass(name);
+  else
+    fail(name, why);
+}
+
+/* The temporary LOB a large PL/SQL bind is promoted to is freed once nothing
+ * references it - when the bind is replaced or the statement freed - with a
+ * FREE_TEMP piggyback on the next call, not left until the session ends. A
+ * prepared statement executed twice reuses its bind in between, so the LOB
+ * must survive that. Counted in V$TEMPORARY_LOBS (skipped where unreadable). */
+static void check_temp_lobs_freed(SQLHDBC dbc)
+{
+  const char *name = "temporary LOBs of large PL/SQL binds are freed";
+  const char *count_sql = "SELECT cache_lobs + nocache_lobs FROM v$temporary_lobs "
+                          "WHERE sid = SYS_CONTEXT('USERENV', 'SID')";
+  char before[32], err[256];
+  if (!SQL_SUCCEEDED(exec_scalar(dbc, count_sql, before, sizeof before, err, sizeof err))) {
+    skip(name, "V$TEMPORARY_LOBS not readable");
+    return;
+  }
+  if (!server_is_12c(dbc)) {
+    skip(name, "pre-12c: no temporary LOB promotion");
+    return;
+  }
+  static char text[40001];
+  memset(text, 't', 40000);
+  text[40000] = '\0';
+  char why[300] = "";
+  for (int round = 0; round < 3 && why[0] == '\0'; round++) {
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLINTEGER out = 0;
+    SQLLEN ti = SQL_NTS, oi = 0;
+    SQLRETURN rc = SQLPrepare(st, (SQLCHAR *)"BEGIN ? := DBMS_LOB.GETLENGTH(?); END;", SQL_NTS);
+    SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &out, 0, &oi);
+    SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 40000, 0, text, 0, &ti);
+    for (int k = 0; k < 2 && SQL_SUCCEEDED(rc) && why[0] == '\0'; k++) {
+      out = 0;
+      rc = SQLExecute(st);
+      if (SQL_SUCCEEDED(rc) && out != 40000)
+        snprintf(why, sizeof why, "round %d exec %d: got %d, want 40000", round, k, (int)out);
+    }
+    if (!SQL_SUCCEEDED(rc)) {
+      char e[256];
+      diag_text(SQL_HANDLE_STMT, st, e, sizeof e);
+      snprintf(why, sizeof why, "round %d: %s", round, e);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+  }
+  char after[32];
+  exec_scalar(dbc, count_sql, after, sizeof after, err, sizeof err);
+  if (why[0] == '\0' && atoi(after) > atoi(before))
+    snprintf(why, sizeof why, "%s temporary LOBs left, %s before", after, before);
   if (why[0] == '\0')
     pass(name);
   else
@@ -2750,6 +2809,7 @@ int main(void)
   check_lob_out(dbc);
   check_lob_columns_batched(dbc, 0);
   check_plsql_large_lob_param(dbc);
+  check_temp_lobs_freed(dbc);
   check_compile_warning(dbc);
   check_error_native_and_offset(dbc);
   check_vector_metadata(dbc);
@@ -2832,6 +2892,9 @@ int main(void)
   exec_do(dbc, "DROP TABLE " TBL, err, sizeof err);
 
   printf("SUMMARY pass=%d fail=%d skip=%d\n", n_pass, n_fail, n_skip);
+  fflush(stdout);
+  if (n_fail > 0)
+    fprintf(stderr, "%s", fail_log);
 
   SQLDisconnect(dbc);
   SQLFreeHandle(SQL_HANDLE_DBC, dbc);

@@ -60,6 +60,11 @@ struct SeerConn {
    * in front of the next execute so they don't leak until session end. */
   int close_cursors[256];
   int n_close;
+  /* Temporary LOBs (bind promotions) no longer referenced, to free with a
+   * FREE_TEMP piggyback in front of the next execute (like close_cursors). */
+  uint8_t **free_lobs;
+  size_t *free_lob_lens;
+  int n_free_lobs, free_lobs_cap;
   /* Statement cache: a closed statement's parsed server cursor is kept open,
    * keyed by its exact SQL text, so re-preparing the same SQL re-executes it
    * without a re-parse. `cols`/`ncols` carry the SELECT column describe (moved
