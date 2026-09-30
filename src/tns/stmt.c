@@ -119,6 +119,12 @@ typedef struct {
   uint8_t *oac_override; /* pre-built OAC bytes (SQL OBJECT bind); else emit_oac */
   size_t oac_override_len;
   bool temp_lob; /* a text / raw value promoted to a temporary LOB (bind_temp_lob) */
+  /* Object / collection bind: its type (identity, and the layout once resolved)
+   * for decoding a returned value, and the image an OUT value brought back,
+   * decoded into `out` once the response is in. */
+  SeerColumn *obj_type;
+  uint8_t *out_image;
+  size_t out_imagelen;
 } SeerBind;
 
 /* A LOB cell whose locator was captured during parse and whose content is
@@ -1473,6 +1479,25 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
         }
         continue;
       }
+      if (b != NULL && b->oac_type == ORA_TYPE_ADT) {
+        /* An object / collection value: the object frame a fetched row carries
+         * (§21.2), then a ub4 return code - not a DALC. The image is decoded
+         * after the response (its layout may need a dictionary query). */
+        uint8_t *img = NULL;
+        size_t il = 0;
+        if (read_object_image(r, &img, &il) != SEER_OK) {
+          free(img);
+          free(dirs);
+          return SEER_EPROTO;
+        }
+        (void)seer_dec_sb4(r); /* return code */
+        free(b->out.data);
+        b->out = (SeerCell){0};
+        free(b->out_image);
+        b->out_image = img; /* NULL for a NULL object */
+        b->out_imagelen = il;
+        continue;
+      }
       if (b != NULL && b->is_array) {
         /* OUT assoc array (#122): ub4 count, then each element as a DALC
          * value + a ub4 per-element return code. */
@@ -2371,6 +2396,8 @@ SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size)
   SeerBind *b = &stmt->pbinds[param - 1];
   if (b->temp_lob)
     return SEER_ENOTIMPL; /* an IN OUT LOB comes back as a locator, not handled */
+  if (b->oac_type == ORA_TYPE_ADT && b->obj_type == NULL)
+    return SEER_ENOTIMPL; /* no type to decode the returned value with */
   b->is_out = true;
   /* Room for the returned value, which can outgrow the value sent in; only
    * the variable-width types size by value (NUMBER / DATE / ... are fixed). */
@@ -2396,6 +2423,8 @@ static void free_binds(SeerStmt *s)
       free(s->pbinds[i].out_arr[k].data);
     free(s->pbinds[i].out_arr);
     free(s->pbinds[i].oac_override);
+    free(s->pbinds[i].out_image);
+    free_columns(s->pbinds[i].obj_type, s->pbinds[i].obj_type ? 1 : 0);
   }
   free(s->pbinds);
   s->pbinds = NULL;
@@ -3258,20 +3287,30 @@ static void fetch_obj_layout(SeerConn *conn, SeerColumn *col)
    * is itself an object type (elem_type_owner is set), fetch the element's
    * attribute layout so decode_collection_image can decode object elements. */
   SeerStmt *q = NULL;
-  if (seer_stmt_prepare(conn,
-                        "SELECT elem_type_owner, elem_type_name FROM all_coll_types "
-                        "WHERE owner = :1 AND type_name = :2",
-                        &q) == SEER_OK) {
-    if (seer_stmt_bind_text(q, 1, col->type_schema, -1) == SEER_OK &&
-        seer_stmt_bind_text(q, 2, col->type_name, -1) == SEER_OK &&
-        seer_stmt_execute(q) == SEER_OK && seer_stmt_fetch(q) == SEER_OK) {
-      const char *eowner = NULL, *et = NULL;
-      int isn_owner = 0, isn = 0;
+  if (type_dict_query(conn,
+                      "SELECT elem_type_owner, NULL, elem_type_name FROM all_coll_types "
+                      "WHERE owner = :1 AND type_name = :2",
+                      "SELECT elem_type_owner, elem_type_package, elem_type_name "
+                      "FROM all_plsql_coll_types WHERE owner = :1 AND package_name = :2 "
+                      "AND type_name = :3",
+                      col->type_schema, col->type_name, &q) == SEER_OK) {
+    if (seer_stmt_fetch(q) == SEER_OK) {
+      const char *eowner = NULL, *epkg = NULL, *et = NULL;
+      int isn_owner = 0, isn_pkg = 0, isn = 0;
       seer_stmt_get_string(q, 0, &eowner, &isn_owner);
-      seer_stmt_get_string(q, 1, &et, &isn);
+      seer_stmt_get_string(q, 1, &epkg, &isn_pkg);
+      seer_stmt_get_string(q, 2, &et, &isn);
       col->is_collection = true;
       char *eo = (!isn_owner && eowner && eowner[0]) ? strdup(eowner) : NULL;
-      char *en = et ? strdup(et) : NULL;
+      char *en = NULL;
+      if (et != NULL && !isn_pkg && epkg != NULL && epkg[0] != '\0') {
+        size_t l = strlen(epkg) + strlen(et) + 2;
+        en = malloc(l);
+        if (en != NULL)
+          snprintf(en, l, "%s.%s", epkg, et); /* a package type, as PKG.TYPE */
+      } else if (et != NULL) {
+        en = strdup(et);
+      }
       seer_stmt_close(q);
       if (eo != NULL && en != NULL) { /* element is an object type */
         uint8_t *types = NULL;
@@ -3393,6 +3432,13 @@ static SeerStatus decode_object_image(SeerConn *conn, const uint8_t *img, size_t
     else if (types[a] == ORA_TYPE_BOOLEAN) { /* 4 bytes, the truth in the first */
       cell_set_text(&tmp, strdup(img[pos] ? "TRUE" : "FALSE"));
       ast = SEER_OK;
+    } else if (types[a] == ORA_TYPE_BINARY_INTEGER && len == 4) { /* big-endian signed */
+      char nb[16];
+      snprintf(nb, sizeof nb, "%ld",
+               (long)(int32_t)(((uint32_t)img[pos] << 24) | ((uint32_t)img[pos + 1] << 16) |
+                               ((uint32_t)img[pos + 2] << 8) | img[pos + 3]));
+      cell_set_text(&tmp, strdup(nb));
+      ast = SEER_OK;
     } else
       ast = decode_scalar(types[a], img + pos, (size_t)len, &tmp);
     if (ast == SEER_OK && tmp.data != NULL)
@@ -3424,7 +3470,10 @@ static SeerStatus decode_collection_image(const uint8_t *img, size_t imglen, uin
   }
   if (pos >= imglen)
     return SEER_EPROTO;
-  pos++; /* collection flags byte */
+  /* Collection flags: HAS_INDEXES (0x10) - a PL/SQL index-by table - puts each
+   * element's key, a 4-byte big-endian signed integer, before it (§21.6b);
+   * the elements are rendered as "key: value" then. */
+  bool keyed = (img[pos++] & 0x10) != 0;
   long count = obj_read_len(img, imglen, &pos);
   if (count < 0)
     count = 0;
@@ -3436,6 +3485,18 @@ static SeerStatus decode_collection_image(const uint8_t *img, size_t imglen, uin
   for (long e = 0; e < count; e++) {
     if (e > 0)
       seer_writer_bytes(&w, ", ", 2);
+    if (keyed) {
+      if (pos + 4 > imglen) {
+        seer_writer_free(&w);
+        return SEER_EPROTO;
+      }
+      int32_t key = (int32_t)(((uint32_t)img[pos] << 24) | ((uint32_t)img[pos + 1] << 16) |
+                              ((uint32_t)img[pos + 2] << 8) | img[pos + 3]);
+      pos += 4;
+      char kb[16];
+      int kl = snprintf(kb, sizeof kb, "%ld: ", (long)key);
+      seer_writer_bytes(&w, kb, (size_t)kl);
+    }
     long len = obj_read_len(img, imglen, &pos);
     if (len == -2) {
       seer_writer_free(&w);
@@ -3540,35 +3601,58 @@ static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_
  * on the SeerColumn) and reused for all its rows: XMLType decodes to its XML
  * text, a collection as "[...]", a plain object as "v1, v2, ...". Per-cell
  * failures are non-fatal. */
+/* Decode one object / collection image of the type `col` describes into
+ * `cell`, resolving the type's layout first if needed (cached on `col`):
+ * XMLType to its XML text, a collection as "[...]", an object as "v1, ...".
+ * SEER_ENOTIMPL when no layout could be found. */
+static SeerStatus decode_typed_image(SeerConn *conn, SeerColumn *col, const uint8_t *img,
+                                     size_t imglen, SeerCell *cell)
+{
+  if (col->type_name != NULL && strcmp(col->type_name, "XMLTYPE") == 0)
+    return decode_xmltype_image(conn, img, imglen, cell); /* no attribute layout */
+  if (col->n_obj_attrs < 0 && col->type_schema && col->type_name)
+    fetch_obj_layout(conn, col); /* fills column; sets n_obj_attrs>=0 */
+  if (col->is_collection)
+    return decode_collection_image(img, imglen, col->element_type, col->elem_obj_types,
+                                   col->n_elem_obj_attrs, cell);
+  if (col->n_obj_attrs > 0)
+    return decode_object_image(conn, img, imglen, col->obj_attr_types, col->obj_attr_elem,
+                               col->n_obj_attrs, cell);
+  return SEER_ENOTIMPL; /* layout unavailable */
+}
+
 static void resolve_pending_objs(SeerStmt *stmt)
 {
   for (size_t k = 0; k < stmt->npobjs; k++) {
     SeerPendingObj *p = &stmt->pobjs[k];
-    SeerColumn *col = &stmt->cols[p->col];
-    SeerCell *cell = &stmt->rows[p->row][p->col];
-
-    if (col->type_name != NULL && strcmp(col->type_name, "XMLTYPE") == 0) {
-      if (decode_xmltype_image(stmt->conn, p->image, p->imagelen, cell) != SEER_OK)
-        seer_log(SEER_LOG_WARN, "stmt: XMLType decode failed (row %zu col %d)", p->row, p->col);
-      continue; /* XMLType has no attribute layout */
-    }
-
-    if (col->n_obj_attrs < 0 && col->type_schema && col->type_name)
-      fetch_obj_layout(stmt->conn, col); /* fills column; sets n_obj_attrs>=0 */
-
-    SeerStatus st;
-    if (col->is_collection)
-      st = decode_collection_image(p->image, p->imagelen, col->element_type, col->elem_obj_types,
-                                   col->n_elem_obj_attrs, cell);
-    else if (col->n_obj_attrs > 0)
-      st = decode_object_image(stmt->conn, p->image, p->imagelen, col->obj_attr_types,
-                               col->obj_attr_elem, col->n_obj_attrs, cell);
-    else
-      continue; /* layout unavailable */
-    if (st != SEER_OK)
+    SeerStatus st = decode_typed_image(stmt->conn, &stmt->cols[p->col], p->image, p->imagelen,
+                                       &stmt->rows[p->row][p->col]);
+    if (st != SEER_OK && st != SEER_ENOTIMPL)
       seer_log(SEER_LOG_WARN, "stmt: OBJECT/collection decode failed (row %zu col %d)", p->row,
                p->col);
   }
+}
+
+/* Decode the object / collection each OUT bind brought back (stashed by
+ * parse_iov) into its OUT value. A NULL object leaves the value NULL. */
+static SeerStatus resolve_out_objects(SeerStmt *stmt)
+{
+  for (int i = 0; i < stmt->npbinds; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    if (b->out_image == NULL)
+      continue;
+    SeerStatus st = b->obj_type != NULL ? decode_typed_image(stmt->conn, b->obj_type, b->out_image,
+                                                             b->out_imagelen, &b->out)
+                                        : SEER_ENOTIMPL;
+    free(b->out_image);
+    b->out_image = NULL;
+    b->out_imagelen = 0;
+    if (st != SEER_OK) {
+      seer_log(SEER_LOG_ERROR, "stmt: OUT object decode failed (param %d)", i + 1);
+      return st == SEER_ENOTIMPL ? SEER_EPROTO : st;
+    }
+  }
+  return SEER_OK;
 }
 
 /* Discard captured-but-undrained implicit result sets. */
@@ -4974,6 +5058,8 @@ retry_exec:
   st = parse_response(stmt, resp, rlen, stmt->reuse_cursor == 0, &oer);
   if (st == SEER_OK)
     st = resolve_returned_lobs(stmt);
+  if (st == SEER_OK)
+    st = resolve_out_objects(stmt);
   free(resp);
   resp = NULL;
   if (st != SEER_OK)
@@ -5587,9 +5673,6 @@ static void obj_encode_field(SeerWriter *body, uint8_t ora_type, const char *val
   }
 }
 
-/* Shared finalize for an object/collection bind: given the encoded image and the
- * 16-byte type OID, build the bind-value framing + the object OAC and store the
- * bind. Takes ownership of `img` (always frees it). */
 /* Object bind-value framing (oracledb write_dbobject), shared by SQL object
  * binds and AQ object payloads: a 36-byte TOID (prefix + the 16-byte type OID +
  * extent OID), empty object OID, zero snapshot/version, the image length, the
@@ -5616,19 +5699,52 @@ static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], c
   return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
 }
 
-static SeerStatus obj_finalize_bind(SeerStmt *stmt, int param, const uint8_t oid[16],
-                                    SeerWriter *img)
+/* The object frame of a NULL object of the type `oid`: the frame an object
+ * value binds with, with a zero image gate and no image - what a pure OUT
+ * object / collection bind sends (seerdb encode_object_column_value). */
+static SeerStatus obj_encode_null_value(SeerWriter *bv, const uint8_t oid[16], uint8_t fv)
+{
+  static const uint8_t PFX[4] = {0x00, 0x22, 0x02, 0x08};
+  static const uint8_t EXT[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1};
+  uint8_t toid[36];
+  memcpy(toid, PFX, 4);
+  memcpy(toid + 4, oid, 16);
+  memcpy(toid + 20, EXT, 16);
+  seer_enc_sb4(bv, 36);
+  if (obj_append_chr(bv, toid, sizeof toid, fv) != SEER_OK)
+    return SEER_ENOMEM;
+  seer_enc_sb4(bv, 0); /* object OID (empty) */
+  seer_enc_sb4(bv, 0); /* snapshot */
+  seer_enc_sb4(bv, 0); /* version */
+  seer_enc_sb4(bv, 0); /* image gate: 0 = NULL, no image */
+  seer_enc_sb4(bv, 1); /* flags: TOP_LEVEL */
+  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+}
+
+/* Store an object / collection bind of type (schema, type_name), OID `oid`:
+ * the value is `img`'s image, or with `img` NULL the NULL-object frame of a
+ * pure OUT bind (`is_out`). The OAC announces the image size, at least 2000 -
+ * the size an object column describes with - so a value coming back has
+ * room. The type is kept on the bind to decode a returned value. Takes
+ * ownership of `img` (always frees it). */
+static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
+                                 const char *type_name, const uint8_t oid[16], SeerWriter *img,
+                                 bool is_out)
 {
   uint8_t fv = stmt->conn->field_version;
-  size_t imglen = img->len;
+  size_t imglen = img != NULL ? img->len : 0;
   SeerStatus st = SEER_ENOMEM;
+  SeerWriter empty = {0};
+  if (img == NULL)
+    img = &empty;
 
   SeerWriter bv, oac;
   if (!seer_writer_init(&bv, 64 + imglen)) {
     seer_writer_free(img);
     return SEER_ENOMEM;
   }
-  if (obj_encode_bind_value(&bv, oid, img->buf, imglen, fv) != SEER_OK)
+  if ((imglen > 0 ? obj_encode_bind_value(&bv, oid, img->buf, imglen, fv)
+                  : obj_encode_null_value(&bv, oid, fv)) != SEER_OK)
     goto fail;
 
   if (!seer_writer_init(&oac, 64))
@@ -5637,9 +5753,9 @@ static SeerStatus obj_finalize_bind(SeerStmt *stmt, int param, const uint8_t oid
   seer_writer_u8(&oac, 1); /* USE_INDICATORS */
   seer_writer_u8(&oac, 0);
   seer_writer_u8(&oac, 0);
-  seer_enc_sb4(&oac, (uint32_t)imglen); /* buffer size */
-  seer_enc_sb4(&oac, 0);                /* max array elements */
-  seer_enc_sb4(&oac, 0);                /* cont flag */
+  seer_enc_sb4(&oac, (uint32_t)(imglen > 2000 ? imglen : 2000)); /* buffer size */
+  seer_enc_sb4(&oac, 0);                                         /* max array elements */
+  seer_enc_sb4(&oac, 0);                                         /* cont flag */
   seer_enc_sb4(&oac, 16);
   if (obj_append_chr(&oac, oid, 16, fv) != SEER_OK) {
     seer_writer_free(&oac);
@@ -5656,8 +5772,18 @@ static SeerStatus obj_finalize_bind(SeerStmt *stmt, int param, const uint8_t oid
   }
 
   seer_writer_free(img); /* image now copied into bv */
-  st = store_bind(stmt, param, ORA_TYPE_ADT, (uint32_t)imglen, 0, 0, false, bv.buf, bv.len);
+  SeerColumn *type = calloc(1, sizeof *type);
+  if (type == NULL || (type->type_schema = strdup(schema)) == NULL ||
+      (type->type_name = strdup(type_name)) == NULL) {
+    free_columns(type, type ? 1 : 0);
+    seer_writer_free(&oac);
+    seer_writer_free(&bv);
+    return SEER_ENOMEM;
+  }
+  type->n_obj_attrs = -1; /* layout resolved on first decode */
+  st = store_bind(stmt, param, ORA_TYPE_ADT, (uint32_t)imglen, 0, 0, is_out, bv.buf, bv.len);
   if (st != SEER_OK) {
+    free_columns(type, 1);
     seer_writer_free(&oac);
     return st;
   } /* store_bind freed bv.buf */
@@ -5665,6 +5791,8 @@ static SeerStatus obj_finalize_bind(SeerStmt *stmt, int param, const uint8_t oid
   free(b->oac_override);
   b->oac_override = oac.buf; /* ownership transferred */
   b->oac_override_len = oac.len;
+  free_columns(b->obj_type, b->obj_type ? 1 : 0);
+  b->obj_type = type;
   return SEER_OK;
 
 fail:
@@ -5742,7 +5870,21 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
   SeerStatus st = obj_build_image(stmt->conn, schema, type_name, attr_values, n_attrs, oid, &img);
   if (st != SEER_OK)
     return st;
-  return obj_finalize_bind(stmt, param, oid, &img);
+  return obj_store_bind(stmt, param, schema, type_name, oid, &img, false);
+}
+
+SeerStatus seer_stmt_bind_object_out(SeerStmt *stmt, int param, const char *schema,
+                                     const char *type_name)
+{
+  if (stmt == NULL || schema == NULL || type_name == NULL)
+    return SEER_EPARAM;
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
+    return SEER_ENOTIMPL; /* object binds are 12c+ */
+  uint8_t oid[16];
+  SeerStatus st = obj_lookup_oid(stmt->conn, schema, type_name, oid);
+  if (st != SEER_OK)
+    return st;
+  return obj_store_bind(stmt, param, schema, type_name, oid, NULL, true);
 }
 
 /* Bind a native LOB-backed value (JSON #70 / VECTOR #62): wrap `image` in the
@@ -6063,7 +6205,7 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
     seer_writer_free(&img);
     return SEER_ENOMEM;
   }
-  return obj_finalize_bind(stmt, param, oid, &img);
+  return obj_store_bind(stmt, param, schema, type_name, oid, &img, false);
 }
 
 /* Build the OAC for an associative-array (PL/SQL index-by) bind: the scalar OAC

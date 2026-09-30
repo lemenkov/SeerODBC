@@ -289,6 +289,16 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
                                  const char *type_name, const char *const *attr_values,
                                  int n_attrs);
 
+/* Bind an OUT parameter of an object or collection type (12c+), named as for
+ * seer_stmt_bind_object (a package type as "PKG.TYPE"). After execute,
+ * seer_stmt_out_data returns the value rendered as text, as a fetched object
+ * is: "v1, v2, ..." for an object, "[e1, e2, ...]" for a collection ("[k: e,
+ * ...]" for an index-by table, with its keys), NULL for a NULL object. For an
+ * IN OUT object, bind the value with seer_stmt_bind_object /
+ * seer_stmt_bind_collection and call seer_stmt_bind_set_inout. */
+SeerStatus seer_stmt_bind_object_out(SeerStmt *stmt, int param, const char *schema,
+                                     const char *type_name);
+
 /* Bind a native JSON parameter (21c+): the JSON document is given as JSON text,
  * parsed and encoded to OSON (native binary JSON) and bound directly - no server-
  * side text-to-JSON cast. SEER_ENOTIMPL on a pre-21c server (bind JSON as a string
