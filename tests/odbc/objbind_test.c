@@ -669,6 +669,124 @@ int main(void)
     }
   }
 
+  /* --- object / collection OUT binds: the value comes back in the object
+   * frame a fetched row carries and is rendered as a fetched object is. --- */
+  run(c, "CREATE OR REPLACE TYPE seer_oo AS OBJECT (n NUMBER, s VARCHAR2(20))");
+  run(c, "CREATE OR REPLACE TYPE seer_on AS OBJECT (id NUMBER, inner seer_oo)");
+  run(c, "CREATE OR REPLACE TYPE seer_ol AS VARRAY(10) OF NUMBER");
+  run(c, "CREATE OR REPLACE TYPE seer_obig AS OBJECT (a VARCHAR2(4000), b VARCHAR2(4000))");
+  run(c, "CREATE OR REPLACE PACKAGE seer_pko AS "
+         "TYPE rec IS RECORD (id NUMBER, name VARCHAR2(30), n PLS_INTEGER, d DATE); "
+         "TYPE strix IS TABLE OF VARCHAR2(40) INDEX BY BINARY_INTEGER; END;");
+  run(c, "CREATE OR REPLACE PROCEDURE seer_oip(o IN OUT seer_oo) AS BEGIN "
+         "o := seer_oo(o.n + 100, o.s || 'yz'); END;");
+  {
+    static const struct {
+      const char *name, *sql, *type, *want;
+      int want_null;
+    } cases[] = {
+        {"object OUT bind", "BEGIN :1 := seer_oo(42, 'hello'); END;", "SEER_OO", "42, hello", 0},
+        {"nested object OUT bind", "BEGIN :1 := seer_on(7, seer_oo(8, 'in')); END;", "SEER_ON",
+         "7, 8, in", 0},
+        {"collection OUT bind", "BEGIN :1 := seer_ol(1, 2.5, 3); END;", "SEER_OL", "[1, 2.5, 3]",
+         0},
+        {"NULL object OUT bind", "BEGIN :1 := NULL; END;", "SEER_OO", "", 1},
+        {"package record OUT bind",
+         "DECLARE r seer_pko.rec; BEGIN r.id := 5; r.name := 'rec'; r.n := -3; "
+         "r.d := DATE '2021-02-03'; :1 := r; END;",
+         "SEER_PKO.REC", "5, rec, -3, 2021-02-03 00:00:00", 0},
+        {"index-by table OUT bind",
+         "DECLARE t seer_pko.strix; BEGIN t(-5) := 'neg'; t(10) := 'ten'; :1 := t; END;",
+         "SEER_PKO.STRIX", "[-5: neg, 10: ten]", 0},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+      SeerStmt *s = NULL;
+      SeerStatus st = seer_stmt_prepare(c, cases[k].sql, &s);
+      if (st == SEER_OK)
+        st = seer_stmt_bind_object_out(s, 1, schema, cases[k].type);
+      if (st == SEER_OK)
+        st = seer_stmt_execute(s);
+      const void *d = NULL;
+      size_t l = 0;
+      int isnull = 0, isbin = 0;
+      if (st == SEER_OK)
+        st = seer_stmt_out_data(s, 1, &d, &l, &isnull, &isbin);
+      char got[128];
+      snprintf(got, sizeof got, "%.*s", (int)l, d ? (const char *)d : "");
+      seer_stmt_close(s);
+      if (st == SEER_ENOTIMPL) {
+        skip(cases[k].name, "object binds require a 12c+ server");
+      } else if (st != SEER_OK) {
+        fail(cases[k].name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
+      } else if (isnull != cases[k].want_null || strcmp(got, cases[k].want) != 0) {
+        char m[300];
+        snprintf(m, sizeof m, "got '%s' (null=%d), want '%s'", got, isnull, cases[k].want);
+        fail(cases[k].name, m);
+      } else {
+        pass(cases[k].name);
+      }
+    }
+  }
+  {
+    /* An object image well past the 2000 bytes the OUT bind announces. */
+    const char *name = "large object OUT bind";
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(
+        c, "BEGIN :1 := seer_obig(RPAD('a', 3500, 'a'), RPAD('b', 3900, 'b')); END;", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_object_out(s, 1, schema, "SEER_OBIG");
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    const void *d = NULL;
+    size_t l = 0;
+    int isnull = 0, isbin = 0;
+    if (st == SEER_OK)
+      st = seer_stmt_out_data(s, 1, &d, &l, &isnull, &isbin);
+    int ok = st == SEER_OK && l == 3500 + 2 + 3900 && ((const char *)d)[0] == 'a' &&
+             ((const char *)d)[l - 1] == 'b';
+    seer_stmt_close(s);
+    if (st == SEER_ENOTIMPL)
+      skip(name, "object binds require a 12c+ server");
+    else if (!ok)
+      fail(name, st != SEER_OK && seer_last_error(c) ? seer_last_error(c) : "value mismatch");
+    else
+      pass(name);
+  }
+  {
+    const char *name = "object IN OUT bind";
+    const char *v[2] = {"1", "x"};
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(c, "BEGIN seer_oip(:1); END;", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_object(s, 1, schema, "SEER_OO", v, 2);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_set_inout(s, 1, 0);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    const void *d = NULL;
+    size_t l = 0;
+    int isnull = 0, isbin = 0;
+    if (st == SEER_OK)
+      st = seer_stmt_out_data(s, 1, &d, &l, &isnull, &isbin);
+    char got[64];
+    snprintf(got, sizeof got, "%.*s", (int)l, d ? (const char *)d : "");
+    seer_stmt_close(s);
+    if (st == SEER_ENOTIMPL)
+      skip(name, "object binds require a 12c+ server");
+    else if (st != SEER_OK)
+      fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
+    else if (strcmp(got, "101, xyz") != 0)
+      fail(name, got);
+    else
+      pass(name);
+  }
+  run(c, "DROP PROCEDURE seer_oip");
+  run(c, "DROP PACKAGE seer_pko");
+  run(c, "DROP TYPE seer_on");
+  run(c, "DROP TYPE seer_oo");
+  run(c, "DROP TYPE seer_ol");
+  run(c, "DROP TYPE seer_obig");
+
   seer_disconnect(c);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
   return fail_n > 0 ? 1 : 0;
