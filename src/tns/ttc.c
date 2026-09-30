@@ -217,9 +217,29 @@ void seer_cancel(SeerConn *c)
  * it. A real continuation is already in flight when its predecessor arrives
  * (the server wrote the whole message), so it is waited for only briefly:
  * nothing to read by then means the message is complete. */
+/* Whether `total` is a size a non-final fragment can have. In the clear it is
+ * exactly SDU-37 or SDU-81. With native encryption each packet is encrypted on
+ * its own, whole AES blocks plus two trailer bytes, so a fragment filled as far
+ * as it goes can end up to a block short of that limit - or a byte over it: a
+ * 26ai LOB read on an 8192 SDU came in 8156-byte fragments. */
+static bool fragment_sized(const SeerConn *c, size_t total)
+{
+  static const size_t LIMITS[] = {37, 81};
+  for (size_t i = 0; i < sizeof LIMITS / sizeof LIMITS[0]; i++) {
+    if (c->sdu <= LIMITS[i] + 16)
+      continue;
+    size_t limit = (size_t)c->sdu - LIMITS[i];
+    if (total == limit)
+      return true;
+    if (c->ano != NULL && total + 16 > limit && total <= limit + 1)
+      return true;
+  }
+  return false;
+}
+
 static bool more_fragments(SeerConn *c, size_t total)
 {
-  if (c->sdu == 0 || (total != (size_t)c->sdu - 37 && total != (size_t)c->sdu - 81))
+  if (c->sdu == 0 || !fragment_sized(c, total))
     return false;
   if (seer_transport_wait_readable(c->t, FRAGMENT_WAIT_MS) == 0) {
     seer_log(SEER_LOG_DEBUG, "ttc: a %zu-byte packet ended its message", total);

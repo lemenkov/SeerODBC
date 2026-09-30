@@ -32,8 +32,10 @@ and exercised (most against the live 9i/10g/11g/18c/21c/23ai matrix, see
       validated live on the 26ai encryption bed. A server error there arrives as
       a break/reset marker exchange, after which both peers re-derive the
       data-integrity keystreams (`seer_ano_reset`); before that fix the first
-      SQL error desynced the session. The bed's test account has only CREATE
-      SESSION, so the DDL-dependent checks can't run there yet.
+      SQL error desynced the session. A multi-packet reply's encrypted
+      fragments are whole AES blocks, so they can fall up to a block short of
+      (or a byte over) the fragment size; both are read as fragments. The full
+      integration suite passes on that bed.
 - [x] Oracle 9i — **fv2, live-validated against a 9i VM** (127.0.0.1:1526, SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
