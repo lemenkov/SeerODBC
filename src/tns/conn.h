@@ -53,6 +53,7 @@ struct SeerConn {
   bool sessionless_active;
   uint32_t server_release; /* packed AUTH_VERSION_NO                  */
   char *last_error;        /* last ORA-NNNNN message (malloc'd)       */
+  long last_error_offset;  /* its parse offset into the SQL text, 0 if none */
   volatile bool in_call;   /* blocked in seer_ttc_recv (cancel window) */
   /* Server cursors of closed statements, flushed as a CLOSE_CURSORS piggyback
    * in front of the next execute so they don't leak until session end. */

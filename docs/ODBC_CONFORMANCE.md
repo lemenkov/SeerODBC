@@ -71,6 +71,24 @@ descriptor API (`SQLGetDescField` / `SQLGetDescRec` read path; `SQLSetDescField`
 that execute and fetch consume, so it is equivalent to `SQLBindCol` (ARD) or the
 value/type halves of `SQLBindParameter` (APD/IPD); the IRD is read-only (`HY016`).
 
+## SeerODBC-specific identifiers
+
+Oracle features with no standard ODBC surface are exposed through
+driver-specific identifiers. An application defines the numbers itself (they
+are not in any Driver Manager header):
+
+| Identifier | Value | Used with | Meaning |
+|---|---|---|---|
+| `SQL_DESC_SEER_ANNOTATIONS` | 19111 | `SQLColAttribute` (string) | 23ai column annotations as `name=value` lines |
+| `SQL_ATTR_SEER_DML_ROW_COUNTS` | 19112 | `SQLSetStmtAttr` (`SQLLEN *`) | per-row affected counts of an array DML (12c+) |
+| `SQL_DIAG_SEER_ERROR_OFFSET` | 19113 | `SQLGetDiagField` (`SQLINTEGER`) | the parse offset the server reported with an error |
+| `SQL_DESC_SEER_VECTOR_DIMENSIONS` | 19114 | `SQLColAttribute` (numeric) | a VECTOR column's declared dimensions (0 = flexible) |
+| `SQL_DESC_SEER_VECTOR_FORMAT` | 19115 | `SQLColAttribute` (numeric) | its element format: 2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY (0 = flexible) |
+
+Diagnostics also follow Oracle's own clients: the native error of a failed
+statement is its ORA number, and creating a PL/SQL object that compiled with
+errors returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01000`, native 24344.
+
 ## Not implemented (deliberate / future)
 
 | Function | Why |

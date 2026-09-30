@@ -39,6 +39,18 @@
  * many rows each parameter set affected. */
 #define SQL_ATTR_SEER_DML_ROW_COUNTS 19112
 
+/* SeerODBC extension SQLGetDiagField identifier: the parse offset into the SQL
+ * text the server reported with the error (SQLINTEGER; 0 when none) - where the
+ * parser stopped, as Oracle clients show it. */
+#define SQL_DIAG_SEER_ERROR_OFFSET 19113
+
+/* SeerODBC extension SQLColAttribute field identifiers for a 23ai VECTOR
+ * column (numeric): its declared dimension count (0 = flexible), and its
+ * element format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible). 0 for
+ * any other column. */
+#define SQL_DESC_SEER_VECTOR_DIMENSIONS 19114
+#define SQL_DESC_SEER_VECTOR_FORMAT 19115
+
 /* A diagnostic record. Most failures post one; an array-DML execute in
  * batch-errors mode posts one per failed row, each carrying its 1-based
  * SQL_DIAG_ROW_NUMBER. */
@@ -46,7 +58,8 @@ typedef struct {
   char state[6];     /* 5-char SQLSTATE + NUL */
   SQLINTEGER native; /* native error (ORA number), 0 if none */
   char message[600];
-  SQLLEN row_number; /* 1-based row, or SQL_NO_ROW_NUMBER */
+  SQLLEN row_number;       /* 1-based row, or SQL_NO_ROW_NUMBER */
+  SQLINTEGER error_offset; /* SQL_DIAG_SEER_ERROR_OFFSET */
 } OdbcDiagRec;
 
 /* A growable diagnostic-record queue per handle (the buffer is kept across
@@ -193,6 +206,10 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
  * A no-op otherwise. Returns SQL_SUCCESS, or SQL_ERROR with a diagnostic when
  * the server rejects the statement. */
 SQLRETURN seer_odbc_describe_prepared(OdbcStmt *s);
+
+/* Post the diagnostic for a failed core execute: SQLSTATE from the status,
+ * the ORA number as the native error and the server's error offset. */
+SQLRETURN seer_odbc_exec_error(OdbcStmt *s, SeerStatus st);
 
 /* Positioned DELETE / UPDATE for SQLSetPos on an updatable cursor: `row` is the
  * 0-based result-set row (SQLSetPos has already resolved the rowset offset).

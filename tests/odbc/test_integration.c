@@ -978,6 +978,91 @@ static void check_describe_before_execute(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SeerODBC extension identifiers (see the driver's documentation). */
+#define SQL_DIAG_SEER_ERROR_OFFSET 19113
+#define SQL_DESC_SEER_VECTOR_DIMENSIONS 19114
+#define SQL_DESC_SEER_VECTOR_FORMAT 19115
+
+/* A CREATE of a PL/SQL object that doesn't compile SUCCEEDS (the object
+ * exists, invalid); the driver reports it as success with a warning, like
+ * Oracle's own clients (ORA-24344). */
+static void check_compile_warning(SQLHDBC dbc)
+{
+  const char *name = "compilation errors reported as SUCCESS_WITH_INFO (ORA-24344)";
+  SQLHSTMT st;
+  SQLCHAR state[6] = "";
+  SQLINTEGER native = 0;
+  SQLSMALLINT ml = 0;
+  char err[256] = "";
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"CREATE OR REPLACE PROCEDURE seer_broken AS BEGIN no_such_thing; END;",
+      SQL_NTS);
+  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, NULL, 0, &ml);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLRETURN rd = exec_do(dbc, "DROP PROCEDURE seer_broken", err, sizeof err);
+  if (rc == SQL_SUCCESS_WITH_INFO && strcmp((char *)state, "01000") == 0 && native == 24344 &&
+      rd == SQL_SUCCESS)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "create rc=%d state='%s' native=%d, drop rc=%d", rc, state, (int)native,
+             rd);
+    fail(name, m);
+  }
+}
+
+/* A failed statement's diagnostic carries the ORA number as its native error
+ * and the parse offset the server reported (SQL_DIAG_SEER_ERROR_OFFSET). */
+static void check_error_native_and_offset(SQLHDBC dbc)
+{
+  const char *name = "ORA number as native error, and the error offset";
+  SQLHSTMT st;
+  SQLCHAR state[6] = "";
+  SQLINTEGER native = 0, off = -1;
+  SQLSMALLINT ml = 0;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT nonexistent FROM dual", SQL_NTS);
+  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, NULL, 0, &ml);
+  SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_SEER_ERROR_OFFSET, &off, 0, NULL);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (rc == SQL_ERROR && native == 904 && off == 7)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "rc=%d native=%d offset=%d", rc, (int)native, (int)off);
+    fail(name, m);
+  }
+}
+
+/* 23ai VECTOR column metadata: declared dimensions and element format. */
+static void check_vector_metadata(SQLHDBC dbc)
+{
+  const char *name = "VECTOR column dimensions / format (SQLColAttribute)";
+  char err[256] = "";
+  exec_do(dbc, "DROP TABLE seer_vmeta", err, sizeof err);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_vmeta (v VECTOR(3, FLOAT32))", err, sizeof err))) {
+    skip(name, "no VECTOR type (23ai+)");
+    return;
+  }
+  SQLHSTMT st;
+  SQLLEN dims = -1, fmt = -1;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT v FROM seer_vmeta", SQL_NTS);
+  SQLColAttribute(st, 1, SQL_DESC_SEER_VECTOR_DIMENSIONS, NULL, 0, NULL, &dims);
+  SQLColAttribute(st, 1, SQL_DESC_SEER_VECTOR_FORMAT, NULL, 0, NULL, &fmt);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_vmeta", err, sizeof err);
+  if (SQL_SUCCEEDED(rc) && dims == 3 && fmt == 2)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "rc=%d dims=%ld format=%ld (want 3, 2)", rc, (long)dims, (long)fmt);
+    fail(name, m);
+  }
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2391,6 +2476,9 @@ int main(void)
   check_typed_null(dbc);
   check_statement_kind(dbc);
   check_describe_before_execute(dbc);
+  check_compile_warning(dbc);
+  check_error_native_and_offset(dbc);
+  check_vector_metadata(dbc);
   check_alter_session_state(dbc, strcmp(ver, "11.02") >= 0);
   check_os_user(dbc);
   check_failed_statements_close_cursors(dbc);

@@ -396,6 +396,18 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt);
  * describes afresh as usual. A no-op for a statement that is not a
  * query, one already described or executed, and on 9i. */
 SeerStatus seer_stmt_describe(SeerStmt *stmt);
+/* Non-zero when the last execute created a PL/SQL object (procedure, function,
+ * package, trigger, ...) that compiled with errors: the statement succeeded
+ * but the object is invalid (ORA-24344 "success with compilation error"). */
+int seer_stmt_compile_warning(SeerStmt *stmt);
+/* A 23ai VECTOR column's declared dimension count (0 = flexible) and element
+ * format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible); both 0 for
+ * any other column or an older server. */
+SeerStatus seer_stmt_col_vector(SeerStmt *stmt, int col, int *dims, int *format);
+/* The parse offset (into the statement text) the server reported with the
+ * last execute error - where the parser stopped, e.g. 7 for the bad column in
+ * "SELECT nonexistent FROM dual"; 0 when it gave none. */
+long seer_last_error_offset(SeerConn *conn);
 
 /* Advance to the next row. SEER_OK if a row is now current, SEER_ENODATA when
  * the result set is exhausted. */
