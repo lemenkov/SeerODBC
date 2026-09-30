@@ -11,6 +11,7 @@
 #include "reader.h"
 #include "tns_consts.h"
 #include "ttc.h"
+#include "types.h"
 #include "writer.h"
 
 #include <stdlib.h>
@@ -248,4 +249,108 @@ SeerStatus seer_bfile_read(SeerConn *conn, const uint8_t *locator, size_t loclen
   if (st == SEER_OK)
     seer_log(SEER_LOG_DEBUG, "bfile: read %zu bytes", *outlen);
   return st;
+}
+
+SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, size_t *loclen)
+{
+  *locator = NULL;
+  *loclen = 0;
+  if (conn == NULL)
+    return SEER_EPARAM;
+  if (conn->field_version < TTC_FIELD_VERSION_12_1)
+    return SEER_ENOTIMPL; /* 11g drops the connection on a CREATE_TEMP */
+
+  /* CREATE_TEMP carries no locator; its body is a fixed field block with the
+   * LOB kind and charset spliced in (PROTOCOL.md §14.2): the shared head, the
+   * charset form (CLOB `01 01`, BLOB none), `01` + the LOB type, 47 zero bytes,
+   * then the charset id. */
+  static const uint8_t HEAD[16] = {0x01, 0x01, 0x28, 0x00, 0x01, 0x0a, 0x00, 0x00,
+                                   0x01, 0x00, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00};
+  SeerWriter req;
+  if (!seer_writer_init(&req, 128))
+    return SEER_ENOMEM;
+  seer_ttc_fun_header(conn, &req, TTI_LOBOPS);
+  seer_writer_bytes(&req, HEAD, sizeof HEAD);
+  if (!blob) {
+    seer_writer_u8(&req, 0x01);
+    seer_writer_u8(&req, 0x01); /* implicit (database) charset form */
+  } else {
+    seer_writer_u8(&req, 0x00);
+  }
+  seer_writer_u8(&req, 0x01);
+  seer_writer_u8(&req, blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB);
+  for (int i = 0; i < 47; i++)
+    seer_writer_u8(&req, 0);
+  seer_enc_sb4(&req, 873); /* AL32UTF8, for BLOB too */
+  if (!seer_writer_ok(&req)) {
+    seer_writer_free(&req);
+    return SEER_ENOMEM;
+  }
+
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  SeerStatus st = lobop_round_trip(conn, &req, &resp, &rlen);
+  if (st != SEER_OK)
+    return st;
+
+  /* Reply: TTI_RPA, a ub2 length and the new locator. */
+  SeerReader r;
+  seer_reader_init(&r, resp, rlen);
+  if (seer_reader_u8(&r) != TTI_RPA) {
+    seer_log(SEER_LOG_ERROR, "lob: CREATE_TEMP refused");
+    free(resp);
+    return SEER_EDB;
+  }
+  uint16_t len = seer_reader_u16(&r);
+  const uint8_t *p = seer_reader_bytes(&r, len);
+  if (p == NULL || len == 0) {
+    free(resp);
+    return SEER_EPROTO;
+  }
+  uint8_t *loc = malloc(len);
+  if (loc == NULL) {
+    free(resp);
+    return SEER_ENOMEM;
+  }
+  memcpy(loc, p, len);
+  free(resp);
+  *locator = loc;
+  *loclen = len;
+  return SEER_OK;
+}
+
+SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
+                          const uint8_t *data, size_t n, uint8_t **resp, size_t *rlen)
+{
+  *resp = NULL;
+  *rlen = 0;
+  if (conn == NULL || locator == NULL || loclen == 0 || (data == NULL && n > 0))
+    return SEER_EPARAM;
+
+  /* The READ field block with the WRITE op, the temp locator ub2-prefixed, no
+   * amount, and the data appended behind a 0x0E marker as chunked bytes: a ub1
+   * length for up to 0xFC bytes, else 0xFE + sb4-prefixed chunks of at most
+   * 0x7FFF bytes and a zero-length terminator (PROTOCOL.md §14.2). */
+  SeerWriter req;
+  SeerStatus st = build_lobop(conn, locator, loclen, LOB_OP_WRITE, true, 1, false, 0, &req);
+  if (st != SEER_OK)
+    return st;
+  seer_writer_u8(&req, 0x0E);
+  if (n <= 0xFC) {
+    seer_writer_u8(&req, (uint8_t)n);
+    seer_writer_bytes(&req, data, n);
+  } else {
+    seer_writer_u8(&req, 0xFE);
+    for (size_t i = 0; i < n; i += 0x7FFF) {
+      size_t chunk = n - i < 0x7FFF ? n - i : 0x7FFF;
+      seer_enc_sb4(&req, (uint32_t)chunk);
+      seer_writer_bytes(&req, data + i, chunk);
+    }
+    seer_enc_sb4(&req, 0);
+  }
+  if (!seer_writer_ok(&req)) {
+    seer_writer_free(&req);
+    return SEER_ENOMEM;
+  }
+  return lobop_round_trip(conn, &req, resp, rlen);
 }
