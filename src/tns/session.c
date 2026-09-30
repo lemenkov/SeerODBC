@@ -404,6 +404,11 @@ const char *seer_last_error(SeerConn *conn)
   return conn ? conn->last_error : NULL;
 }
 
+long seer_last_error_offset(SeerConn *conn)
+{
+  return conn ? conn->last_error_offset : 0;
+}
+
 /* Continuous Query Notification (§38): not on the thin wire. CQN needs the server
  * to open a callback connection back to a client-hosted listener, which a
  * pure-protocol request/response client cannot host. Accepted for API parity and

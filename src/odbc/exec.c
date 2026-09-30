@@ -325,10 +325,8 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
   }
 
   st = seer_stmt_execute(s->core);
-  if (st != SEER_OK) {
-    const char *ora = seer_last_error(s->dbc->conn);
-    return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
-  }
+  if (st != SEER_OK)
+    return seer_odbc_exec_error(s, st);
 
   int ncols = seer_stmt_num_cols(s->core);
   free(s->binds);
@@ -433,10 +431,8 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     return pr;
 
   SeerStatus st = seer_stmt_execute(s->core);
-  if (st != SEER_OK) {
-    const char *ora = seer_last_error(s->dbc->conn);
-    return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
-  }
+  if (st != SEER_OK)
+    return seer_odbc_exec_error(s, st);
   /* Created, but compiled with errors: success with a warning, as Oracle's own
    * clients report it (ORA-24344). */
   bool compile_warning = seer_stmt_compile_warning(s->core);

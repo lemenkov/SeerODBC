@@ -400,6 +400,10 @@ SeerStatus seer_stmt_describe(SeerStmt *stmt);
  * package, trigger, ...) that compiled with errors: the statement succeeded
  * but the object is invalid (ORA-24344 "success with compilation error"). */
 int seer_stmt_compile_warning(SeerStmt *stmt);
+/* The parse offset (into the statement text) the server reported with the
+ * last execute error - where the parser stopped, e.g. 7 for the bad column in
+ * "SELECT nonexistent FROM dual"; 0 when it gave none. */
+long seer_last_error_offset(SeerConn *conn);
 
 /* Advance to the next row. SEER_OK if a row is now current, SEER_ENODATA when
  * the result set is exhausted. */

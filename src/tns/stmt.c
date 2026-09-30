@@ -207,6 +207,7 @@ typedef struct {
   int64_t row_count;  /* "current row number" - DML affected rows on 11g */
   bool flush_binds;   /* the server asked for a TTI_FOB echo (see seer_ttc_recv) */
   uint8_t warn_flags; /* 0x20: a PL/SQL object was created with compilation errors */
+  int64_t err_offset; /* the error's parse offset into the SQL text */
 } OerResult;
 
 /* ----------------------------------------------------------- value decode */
@@ -1290,7 +1291,7 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
   (void)seer_dec_sb4(r); /* array elem error 1 */
   (void)seer_dec_sb4(r); /* array elem error 2 */
   oer->cursor_id = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* error position */
+  oer->err_offset = seer_dec_sb4(r); /* error position (parse offset) */
   /* sql_type .. warn_flags (6 x ub1): the last is a real signal (§6.3a) */
   const uint8_t *six = seer_reader_bytes(r, 6);
   if (six != NULL)
@@ -4684,6 +4685,7 @@ retry_exec:
      * error leaks one until the session hits ORA-01000. */
     queue_cursor_close(stmt->conn, oer.cursor_id);
     stmt->cursor_id = 0;
+    stmt->conn->last_error_offset = (long)oer.err_offset;
     seer_log(SEER_LOG_ERROR, "stmt: execute failed (ORA-%05ld)", (long)oer.err_code);
     return SEER_EDB;
   }

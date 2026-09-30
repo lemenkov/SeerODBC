@@ -71,6 +71,7 @@ static OdbcDiagRec *diag_push(OdbcHeader *h, const char *state, SQLINTEGER nativ
   rec->native = native;
   snprintf(rec->message, sizeof rec->message, "%s", msg ? msg : "");
   rec->row_number = row;
+  rec->error_offset = 0;
   return rec;
 }
 
@@ -83,6 +84,20 @@ SQLRETURN seer_odbc_diag(SQLHANDLE handle, const char *state, SQLINTEGER native,
   h->diag.count = 0; /* replace any existing records */
   diag_push(h, state, native, msg, SQL_NO_ROW_NUMBER);
   return ret;
+}
+
+SQLRETURN seer_odbc_exec_error(OdbcStmt *s, SeerStatus st)
+{
+  SeerConn *c = s->dbc != NULL ? s->dbc->conn : NULL;
+  const char *ora = seer_last_error(c);
+  /* The native error is the ORA number, as SQLGetDiagRec callers expect. */
+  SQLINTEGER native = (ora != NULL && strncmp(ora, "ORA-", 4) == 0) ? (SQLINTEGER)atoi(ora + 4) : 0;
+  SQLRETURN r =
+      seer_odbc_diag(s, seer_odbc_sqlstate(st), native, ora ? ora : seer_strerror(st), SQL_ERROR);
+  OdbcHeader *h = (OdbcHeader *)s;
+  if (h->diag.count > 0)
+    h->diag.recs[h->diag.count - 1].error_offset = (SQLINTEGER)seer_last_error_offset(c);
+  return r;
 }
 
 void seer_odbc_diag_add(SQLHANDLE handle, const char *state, SQLINTEGER native, const char *msg,
@@ -165,6 +180,10 @@ SQLRETURN SQL_API SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLS
   case SQL_DIAG_ROW_NUMBER:
     if (DiagInfoPtr != NULL)
       *(SQLLEN *)DiagInfoPtr = rec->row_number;
+    return SQL_SUCCESS;
+  case SQL_DIAG_SEER_ERROR_OFFSET:
+    if (DiagInfoPtr != NULL)
+      *(SQLINTEGER *)DiagInfoPtr = rec->error_offset;
     return SQL_SUCCESS;
   default:
     return SQL_NO_DATA;
