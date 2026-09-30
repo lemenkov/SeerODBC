@@ -2585,7 +2585,11 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
           SeerBind *b = &stmt->pbinds[i];
           if (stmt->returning && b->is_out)
             continue; /* return bind: server-filled */
-          bool long_class = b->oac_size > max_str;
+          /* A bind with a prebuilt OAC - native JSON / VECTOR, a SQL object -
+           * carries its own descriptor framing and rides in place whatever
+           * its size (seerdb PROTOCOL.md §17.2b): moving it last swapped it
+           * with the binds after it. */
+          bool long_class = b->oac_size > max_str && b->oac_override == NULL;
           if (passes == 2 && long_class != (pass == 1))
             continue;
           uint8_t *rxd = (b->rxd != NULL) ? b->rxd[it] : NULL;
