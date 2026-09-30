@@ -536,6 +536,24 @@ static SQLRETURN exec_finish(OdbcStmt *s)
   return result;
 }
 
+SQLRETURN seer_odbc_describe_prepared(OdbcStmt *s)
+{
+  if (s == NULL || s->core != NULL || s->sql == NULL || s->dbc == NULL || !s->dbc->connected)
+    return SQL_SUCCESS;
+  SeerStatus st = seer_stmt_prepare(s->dbc->conn, s->sql, &s->core);
+  if (st == SEER_OK)
+    st = seer_stmt_describe(s->core);
+  if (st != SEER_OK) {
+    const char *e = seer_last_error(s->dbc->conn);
+    if (s->core != NULL) {
+      seer_stmt_close(s->core);
+      s->core = NULL;
+    }
+    return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, e ? e : seer_strerror(st), SQL_ERROR);
+  }
+  return SQL_SUCCESS;
+}
+
 SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR *StatementText,
                              SQLINTEGER TextLength)
 {
@@ -551,6 +569,12 @@ SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR *StatementText,
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   free(s->sql);
   s->sql = sql;
+  /* A new statement: drop the previous one's result set, so metadata calls
+   * before SQLExecute describe this one rather than report the old columns. */
+  if (s->core != NULL) {
+    seer_stmt_close(s->core);
+    s->core = NULL;
+  }
   return SQL_SUCCESS;
 }
 

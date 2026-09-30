@@ -171,7 +171,9 @@ struct SeerStmt {
   long cur;      /* current row index, -1 before the first fetch */
   long affected; /* DML affected-row count (from the OER) */
   int cursor_id;
-  int reuse_cursor; /* cached server cursor to re-execute without a re-parse */
+  int reuse_cursor;    /* cached server cursor to re-execute without a re-parse */
+  bool describe_only;  /* build_exec: a parse + describe, no execute (seer_stmt_describe) */
+  bool described_only; /* cols came from seer_stmt_describe; the execute re-describes */
   bool executed;
   bool batch_errors;     /* arm batcherrors for array DML (continue on row error) */
   SeerBatchError *berrs; /* per-row failures captured from the OER */
@@ -2381,6 +2383,12 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
    * option set (0x0421); DML/DDL uses 0x8021 with All8 type 0. Binds add
    * 0x8; autocommit adds 0x100 (not on a SELECT - nothing to commit). */
   uint32_t opt = (kind == STMT_BLOCK) ? 0x0421u : 0x8021u;
+  /* A describe-only parse (seer_stmt_describe): PARSE | DESCRIBE, no EXECUTE,
+   * and no binds - it carries no values however many placeholders there are. */
+  if (stmt->describe_only) {
+    opt = 0x20001u;
+    nb = 0;
+  }
   if (nb > 0)
     opt |= 0x0008u;
   if (kind != STMT_SELECT && stmt->conn->autocommit)
@@ -2422,8 +2430,10 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
    * execute instead is rejected (ORA-03137 kpoal8Check-5). */
   if (stmt->conn->field_version > TTC_FIELD_VERSION_23_1 && kind == STMT_SELECT) {
     lmax = 0;
-    opt |= 0x40u;
-    all8[9] |= 0x8000u;
+    if (!stmt->describe_only) { /* a parse must not ask to fetch (ORA-01002) */
+      opt |= 0x40u;
+      all8[9] |= 0x8000u;
+    }
   }
   /* A PL/SQL block (12c+) requests implicit result sets (DBMS_SQL.RETURN_RESULT)
    * via al8i4[9] |= 0x8000; the server returns a TTI_IRD token only if the block
@@ -2467,7 +2477,9 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   seer_writer_u8(w, 0);
   seer_writer_u8(w, 0);
   seer_enc_sb4(w, lmax); /* long max value               */
-  seer_enc_sb4(w, stmt->prefetch ? stmt->prefetch : PREFETCH_ROWS); /* prefetch */
+  seer_enc_sb4(w, stmt->describe_only
+                      ? 1u
+                      : (stmt->prefetch ? stmt->prefetch : PREFETCH_ROWS)); /* prefetch */
   seer_enc_sb4(w, 0x7FFFFFFF);       /* max value                    */
   seer_writer_u8(w, nb > 0 ? 1 : 0); /* bind present                 */
   seer_enc_sb4(w, (uint32_t)nb);     /* bind count                   */
@@ -4507,6 +4519,51 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   return SEER_OK;
 }
 
+SeerStatus seer_stmt_describe(SeerStmt *stmt)
+{
+  if (stmt == NULL)
+    return SEER_EPARAM;
+  /* Already known (a cached cursor brings its describe), or nothing to
+   * describe: only a query has a result set to describe. 9i's ALL7 dialect has
+   * no parse-only call here; there the columns appear at execute. */
+  if (stmt->ncols > 0 || stmt->executed || classify_sql(stmt->sql) != STMT_SELECT ||
+      stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_OK;
+
+  SeerWriter w;
+  stmt->describe_only = true;
+  SeerStatus st = build_exec(stmt, &w);
+  stmt->describe_only = false;
+  if (st != SEER_OK)
+    return st;
+  st = seer_ttc_send(stmt->conn, w.buf, w.len);
+  seer_writer_free(&w);
+  if (st != SEER_OK)
+    return st;
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  st = seer_ttc_recv(stmt->conn, &resp, &rlen);
+  if (st != SEER_OK)
+    return st;
+  OerResult oer = {0};
+  st = parse_response(stmt, resp, rlen, true, &oer);
+  free(resp);
+  if (st != SEER_OK)
+    return st;
+  if (oer.err_code != 0) {
+    queue_cursor_close(stmt->conn, oer.cursor_id);
+    seer_log(SEER_LOG_ERROR, "stmt: describe failed (ORA-%05ld)", (long)oer.err_code);
+    return SEER_EDB;
+  }
+  /* The reply is the describe and a success status - no rows, and no drain:
+   * a FETCH on a cursor that was only parsed is ORA-01002. Re-executing that
+   * parse-only cursor without a parse proved unreliable, so it is closed and
+   * the execute parses afresh (replacing these columns with its describe). */
+  queue_cursor_close(stmt->conn, oer.cursor_id);
+  stmt->described_only = true;
+  return SEER_OK;
+}
+
 SeerStatus seer_stmt_execute(SeerStmt *stmt)
 {
   if (stmt == NULL)
@@ -4526,6 +4583,12 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
     return fv2_execute_block(stmt); /* BEGIN / DECLARE */
   }
 
+  if (stmt->described_only) { /* the execute parses and describes afresh */
+    free_columns(stmt->cols, stmt->ncols);
+    stmt->cols = NULL;
+    stmt->ncols = 0;
+    stmt->described_only = false;
+  }
   free_batch_errors(stmt);   /* clear any prior execute's failures */
   free_implicit(stmt);       /* and any prior implicit result sets   */
   free(stmt->dml_rowcounts); /* and any prior array-DML row counts   */
@@ -4868,13 +4931,17 @@ void seer_stmt_close(SeerStmt *stmt)
    * re-parse. The describe columns move with it. (A full cache evicts + closes
    * its oldest cursor.) Done after the rows are freed - that loop needs ncols. */
   SeerConn *c = stmt->conn;
-  if (c != NULL && c->authenticated && stmt->cursor_id > 0 && stmt->sql != NULL) {
+  /* A statement closed before it executed may still hold a parsed cursor - taken
+   * taken from the statement cache at prepare - which goes back the same way
+   * (it used to be dropped without a close, leaking the server cursor). */
+  int keep_cursor = stmt->cursor_id > 0 ? stmt->cursor_id : stmt->reuse_cursor;
+  if (c != NULL && c->authenticated && keep_cursor > 0 && stmt->sql != NULL) {
     if (sql_is_cacheable(stmt->sql)) {
-      stmt_cache_put(c, stmt->sql, stmt->cursor_id, stmt->cols, stmt->ncols);
+      stmt_cache_put(c, stmt->sql, keep_cursor, stmt->cols, stmt->ncols);
       stmt->cols = NULL; /* moved to the cache; don't free */
       stmt->ncols = 0;
     } else if (c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0])) {
-      c->close_cursors[c->n_close++] = stmt->cursor_id; /* DDL etc: just close */
+      c->close_cursors[c->n_close++] = keep_cursor; /* DDL etc: just close */
     }
   }
   free_columns(stmt->cols, stmt->ncols);
