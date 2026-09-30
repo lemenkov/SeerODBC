@@ -112,6 +112,8 @@
 #define LOB_OP_WRITE 0x0040       /* write at an offset (§14.2)           */
 #define LOB_OP_FILE_OPEN 0x0100   /* open a BFILE before reading (§19.8) */
 #define LOB_OP_FILE_CLOSE 0x0200  /* close an opened BFILE                */
+#define LOB_OP_FREE_TEMP 0x0111   /* release a temporary LOB (§14.2)    */
+#define LOB_OP_ARRAY 0x80000      /* array form: several locators       */
 #define LOB_OP_CREATE_TEMP 0x0110 /* allocate a temporary LOB (§14.2)   */
 #define TTI_AUTH 115              /* O5LOGON authentication response  */
 #define TTI_SESS 118              /* session setup / auth phase 1     */

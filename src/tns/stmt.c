@@ -121,7 +121,9 @@ typedef struct {
   int out_arr_n;
   uint8_t *oac_override; /* pre-built OAC bytes (SQL OBJECT bind); else emit_oac */
   size_t oac_override_len;
-  bool temp_lob; /* a text / raw value promoted to a temporary LOB (bind_temp_lob) */
+  bool temp_lob;         /* a text / raw value promoted to a temporary LOB (bind_temp_lob) */
+  uint8_t *temp_locator; /* that temporary LOB, freed when the bind is replaced */
+  size_t temp_loclen;
   /* Object / collection bind: its type (identity, and the layout once resolved)
    * for decoding a returned value, and the image an OUT value brought back,
    * decoded into `out` once the response is in. */
@@ -1967,6 +1969,30 @@ static bool wants_temp_lob(const SeerStmt *s, size_t n)
          sql_is_block(s->sql);
 }
 
+/* Hand a temporary LOB no bind references any more to the connection, which
+ * frees it with the next execute's FREE_TEMP piggyback. Takes ownership. */
+static void queue_temp_lob_free(SeerConn *c, uint8_t *loc, size_t len)
+{
+  if (loc == NULL)
+    return;
+  if (c->n_free_lobs == c->free_lobs_cap) {
+    int cap = c->free_lobs_cap ? c->free_lobs_cap * 2 : 8;
+    uint8_t **nl = realloc(c->free_lobs, (size_t)cap * sizeof *nl);
+    if (nl != NULL)
+      c->free_lobs = nl;
+    size_t *nn = realloc(c->free_lob_lens, (size_t)cap * sizeof *nn);
+    if (nn != NULL)
+      c->free_lob_lens = nn;
+    if (nl == NULL || nn == NULL) {
+      free(loc); /* out of memory: it lives until the session ends */
+      return;
+    }
+    c->free_lobs_cap = cap;
+  }
+  c->free_lobs[c->n_free_lobs] = loc;
+  c->free_lob_lens[c->n_free_lobs++] = len;
+}
+
 /* A LOBOPS reply's status: the RPA (its ub2-prefixed locator skipped - it may
  * hold a 0x04) and then the OER, whose error, if any, lands on the connection.
  * The OER's call status is not a fixed value, so the token is matched with a
@@ -1998,7 +2024,8 @@ static SeerStatus lobops_status(SeerConn *c, const uint8_t *resp, size_t rlen)
  * CREATE_TEMP allocates it, WRITE fills it - a CLOB with the UTF-8 text as
  * UTF-16BE, a BLOB with the bytes - and the bind carries its locator behind
  * the LOB descriptor prefix `01 28 28` + ub2 length, under the LOB bind OAC.
- * The temp LOB lives until the session ends. */
+ * The bind keeps the locator; the temp LOB is freed once the bind is replaced
+ * or the statement closed (not at execute: a re-execute reuses the value). */
 static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint8_t *data, size_t n)
 {
   SeerConn *c = stmt->conn;
@@ -2023,7 +2050,7 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
   }
   free(u16);
   if (st != SEER_OK) {
-    free(loc);
+    queue_temp_lob_free(c, loc, loclen); /* created, then the WRITE failed */
     return st;
   }
 
@@ -2037,13 +2064,9 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
     seer_writer_bytes(&v, loc, loclen);
     ok = seer_writer_ok(&v);
   }
-  free(loc);
-  if (!ok) {
+  if (!ok || !seer_writer_init(&oac, 64)) {
     seer_writer_free(&v);
-    return SEER_ENOMEM;
-  }
-  if (!seer_writer_init(&oac, 64)) {
-    seer_writer_free(&v);
+    queue_temp_lob_free(c, loc, loclen);
     return SEER_ENOMEM;
   }
   uint8_t lob_type = blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB;
@@ -2051,11 +2074,13 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
   if (!seer_writer_ok(&oac)) {
     seer_writer_free(&v);
     seer_writer_free(&oac);
+    queue_temp_lob_free(c, loc, loclen);
     return SEER_ENOMEM;
   }
   st = store_bind(stmt, param, lob_type, 112, blob ? 0 : 873, 0, false, v.buf, v.len);
   if (st != SEER_OK) {
     seer_writer_free(&oac);
+    queue_temp_lob_free(c, loc, loclen);
     return st;
   } /* store_bind took v.buf */
   SeerBind *b = &stmt->pbinds[param - 1];
@@ -2063,6 +2088,9 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
   b->oac_override = oac.buf;
   b->oac_override_len = oac.len;
   b->temp_lob = true;
+  queue_temp_lob_free(c, b->temp_locator, b->temp_loclen); /* the one it replaces */
+  b->temp_locator = loc;
+  b->temp_loclen = loclen;
   return SEER_OK;
 }
 
@@ -2077,6 +2105,9 @@ static void clear_temp_lob(SeerStmt *stmt, int param)
   b->oac_override = NULL;
   b->oac_override_len = 0;
   b->temp_lob = false;
+  queue_temp_lob_free(stmt->conn, b->temp_locator, b->temp_loclen);
+  b->temp_locator = NULL;
+  b->temp_loclen = 0;
 }
 
 SeerStatus seer_stmt_bind_text(SeerStmt *stmt, int param, const char *str, int len)
@@ -2434,6 +2465,7 @@ static void free_binds(SeerStmt *s)
     free(s->pbinds[i].out_arr);
     free(s->pbinds[i].oac_override);
     free(s->pbinds[i].out_image);
+    queue_temp_lob_free(s->conn, s->pbinds[i].temp_locator, s->pbinds[i].temp_loclen);
     free_columns(s->pbinds[i].obj_type, s->pbinds[i].obj_type ? 1 : 0);
   }
   free(s->pbinds);
@@ -2769,6 +2801,46 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     for (int i = 0; i < c->n_close; i++)
       seer_enc_sb4(w, (uint32_t)c->close_cursors[i]);
     c->n_close = 0;
+  }
+
+  /* Free temporary LOBs no bind references any more, the same way: a
+   * TTI_LOBOPS piggyback - the FREE_TEMP field block with the ARRAY bit on
+   * the operation (0x80111), the source length the locators' total, and the
+   * locators behind it, each ub2-prefixed (seerdb PROTOCOL.md §14.5, captured
+   * off a 23ai python-oracledb session). */
+  if (c->n_free_lobs > 0) {
+    size_t total = 0;
+    for (int i = 0; i < c->n_free_lobs; i++)
+      total += 2 + c->free_lob_lens[i];
+    seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
+    seer_writer_u8(w, TTI_LOBOPS);
+    seer_writer_u8(w, seer_ttc_next_seq(c));
+    if (c->field_version > TTC_FIELD_VERSION_23_1)
+      seer_enc_sb4(w, 0);             /* ub8 token (fv24) */
+    seer_writer_u8(w, 1);             /* source pointer */
+    seer_enc_sb4(w, (uint32_t)total); /* the locators' total length */
+    seer_writer_u8(w, 0);             /* dest pointer */
+    seer_enc_sb4(w, 0);               /* dest length */
+    seer_enc_sb4(w, 0);               /* short source offset */
+    seer_enc_sb4(w, 0);               /* short dest offset */
+    for (int i = 0; i < 3; i++)       /* charset / short amount / null-LOB */
+      seer_writer_u8(w, 0);
+    seer_enc_sb4(w, LOB_OP_FREE_TEMP | LOB_OP_ARRAY);
+    seer_writer_u8(w, 0);         /* scn array pointer */
+    seer_enc_sb4(w, 0);           /* scn array length */
+    seer_enc_sb4(w, 0);           /* source offset (ub8) */
+    seer_enc_sb4(w, 0);           /* dest offset (ub8) */
+    seer_writer_u8(w, 0);         /* amount pointer */
+    for (int i = 0; i < 3; i++) { /* array-LOB slots: pointer + ub4 */
+      seer_writer_u8(w, 0);
+      seer_enc_sb4(w, 0);
+    }
+    for (int i = 0; i < c->n_free_lobs; i++) {
+      seer_writer_u16(w, (uint16_t)c->free_lob_lens[i]);
+      seer_writer_bytes(w, c->free_lobs[i], c->free_lob_lens[i]);
+      free(c->free_lobs[i]);
+    }
+    c->n_free_lobs = 0;
   }
 
   /* Statement-cache reuse: re-execute a parsed cursor with no re-parse - send
