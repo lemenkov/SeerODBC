@@ -124,6 +124,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   char *cproto = cs ? conn_str_get(cs, "PROTOCOL") : NULL;
   char *ctlsca = cs ? conn_str_get(cs, "TLSCA") : NULL;
   char *ctlsverify = cs ? conn_str_get(cs, "TLSVERIFY") : NULL;
+  char *clobinline = cs ? conn_str_get(cs, "LOBINLINE") : NULL;
 
   /* Fill any gaps from the DSN section of odbc.ini. */
   if (dsn != NULL) {
@@ -157,6 +158,8 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       ctlsca = dsn_get(dsn, "TLSCA");
     if (ctlsverify == NULL)
       ctlsverify = dsn_get(dsn, "TLSVERIFY");
+    if (clobinline == NULL)
+      clobinline = dsn_get(dsn, "LOBINLINE");
   }
 
   /* TLS is requested by SSL=1/yes/true or PROTOCOL=TCPS; verification is on by
@@ -192,6 +195,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       .tls_verify = tls_verify,
       .cclass = cclass,
       .purity = parse_purity(cpurity),
+      .lob_inline = flag_is_on(clobinline),
   };
 
   SeerConn *conn = NULL;
@@ -219,6 +223,7 @@ out:
   free(cproto);
   free(ctlsca);
   free(ctlsverify);
+  free(clobinline);
   return ret;
 }
 

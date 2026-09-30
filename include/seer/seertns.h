@@ -63,6 +63,14 @@ typedef struct {
    * non-empty key with SEER_ENOTIMPL rather than silently ignoring it. */
   const char *shardingkey;
   const char *supershardingkey;
+  /* Fetch CLOB / BLOB columns inline (12.1+): a query's LOB content comes in
+   * the rows, not through one LOB read round trip per cell - far faster for
+   * many LOBs. The cost: in that form an empty LOB (EMPTY_CLOB() /
+   * EMPTY_BLOB()) is indistinguishable from NULL and reads as NULL, as a
+   * zero-length VARCHAR2 would. Off by default. Applies to results whose other
+   * columns are plain scalars; NCLOB, BFILE, JSON, VECTOR and object columns
+   * are always read through their locators. */
+  int lob_inline;
 } SeerConnParams;
 
 #define SEER_PURITY_NEW 1

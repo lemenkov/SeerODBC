@@ -67,6 +67,9 @@ typedef struct {
   uint8_t element_type;    /* collection element's Oracle wire type          */
   uint8_t *elem_obj_types; /* collection-of-objects: the element's attr layout */
   int n_elem_obj_attrs;    /* >0 when the element type is itself an object    */
+  /* A CLOB / BLOB column the cursor has a define for (§14.5d): its content
+   * comes inline in the row as LONG / LONG RAW, not as a locator. */
+  bool inline_long;
 } SeerColumn;
 
 /* Free a column array (names + annotation strings + ADT metadata). Safe on a
@@ -282,13 +285,14 @@ static SeerStatus decode_long(SeerReader *r, bool is_raw, SeerCell *cell)
   bool is_null = (marker == 0x00);
   if (marker == 0xFE) {
     for (;;) {
-      uint8_t clen = seer_reader_u8(r);
-      if (!seer_reader_ok(r) || clen == 0)
+      /* Each chunk's length: an sb4 on 12c+, a bare ub1 before (§6.4). */
+      int64_t clen = r->sb4_chunks ? seer_dec_sb4(r) : (int64_t)seer_reader_u8(r);
+      if (!seer_reader_ok(r) || clen <= 0)
         break;
-      const uint8_t *p = seer_reader_bytes(r, clen);
+      const uint8_t *p = seer_reader_bytes(r, (size_t)clen);
       if (p == NULL)
         break;
-      seer_writer_bytes(&acc, p, clen);
+      seer_writer_bytes(&acc, p, (size_t)clen);
     }
   } else if (!is_null) {
     const uint8_t *p = seer_reader_bytes(r, marker);
@@ -1069,6 +1073,12 @@ static SeerStatus parse_rxd(SeerReader *r, SeerStmt *stmt, const uint8_t *bv, si
     }
 
     uint8_t type = stmt->cols[i].ora_type;
+    if (stmt->cols[i].inline_long) {
+      /* LOB content inline (the cursor's define): LONG / LONG RAW framing. */
+      if (decode_long(r, type == ORA_TYPE_BLOB, &row[i]) != SEER_OK)
+        goto fail;
+      continue;
+    }
     if (type == ORA_TYPE_CLOB || type == ORA_TYPE_BLOB || type == ORA_TYPE_BFILE ||
         type == ORA_TYPE_VECTOR || type == ORA_TYPE_JSON) { /* all LOB-backed: defer */
       uint8_t *loc = NULL;
@@ -2900,6 +2910,113 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   return SEER_OK;
 }
 
+/* Whether a query's CLOB / BLOB columns are fetched inline (§14.5d): the
+ * rows of a result with a LOB column come with the fetch after the execute,
+ * and a DEFINE call in its place - asking for each LOB column as LONG / LONG
+ * RAW - has the server put the content in the row, where each cell otherwise
+ * costs a TTI_LOBOPS READ round trip. Only for results whose every other
+ * column is a plain scalar the define can restate as it is; anything else
+ * (NCLOB, BFILE, objects, JSON / VECTOR, ...) keeps the locator path. 12.1+,
+ * where the define OAC is the bind OAC's shape. */
+static bool wants_lob_define(const SeerStmt *stmt)
+{
+  if (!stmt->conn->lob_inline || stmt->conn->field_version < TTC_FIELD_VERSION_12_1)
+    return false;
+  bool any_lob = false;
+  for (int i = 0; i < stmt->ncols; i++) {
+    const SeerColumn *col = &stmt->cols[i];
+    if (col->inline_long || col->zero_len)
+      return false; /* the cursor already has its define / a bare-NULL column */
+    switch (col->ora_type) {
+    case ORA_TYPE_CLOB:
+      if (col->charset == 2000)
+        return false; /* NCLOB */
+      any_lob = true;
+      break;
+    case ORA_TYPE_BLOB:
+      any_lob = true;
+      break;
+    case ORA_TYPE_VARCHAR:
+    case ORA_TYPE_CHAR:
+    case ORA_TYPE_NUMBER:
+    case ORA_TYPE_DATE:
+    case ORA_TYPE_RAW:
+    case ORA_TYPE_BFLOAT:
+    case ORA_TYPE_BDOUBLE:
+    case ORA_TYPE_TIMESTAMP:
+      break;
+    default:
+      return false;
+    }
+  }
+  return any_lob;
+}
+
+/* The DEFINE call (§14.5d): an OALL8 with the DEFINE option alone on the
+ * executed cursor - no SQL, no binds - and one OAC per column in the bind OAC
+ * layout: each LOB column as LONG / LONG RAW (buffer 0x7FFFFFFF), every other
+ * column as described. The server answers with the next batch of rows, the
+ * LOB content inline, and the define stands for the life of the cursor. */
+static SeerStatus build_define(SeerStmt *stmt, SeerWriter *w)
+{
+  SeerConn *c = stmt->conn;
+  int fv = c->field_version;
+  if (!seer_writer_init(w, 96 + (size_t)stmt->ncols * 24))
+    return SEER_ENOMEM;
+  seer_ttc_fun_header(c, w, TTI_ALL8);
+  seer_enc_sb4(w, 0x8010u);                   /* NOT_PLSQL | DEFINE */
+  seer_enc_sb4(w, (uint32_t)stmt->cursor_id); /* cursor */
+  seer_writer_u8(w, 0);                       /* query absent */
+  seer_enc_sb4(w, 0);                         /* query length */
+  seer_writer_u8(w, 1);                       /* all8 present */
+  seer_enc_sb4(w, 13);                        /* all8 length */
+  seer_writer_u8(w, 0);
+  seer_writer_u8(w, 0);
+  seer_enc_sb4(w, fv > TTC_FIELD_VERSION_23_1 ? 0u : 0xFFFFFFFFu); /* long max */
+  seer_enc_sb4(w, PREFETCH_ROWS);                                  /* rows */
+  seer_enc_sb4(w, 0x7FFFFFFF);                                     /* max value */
+  seer_writer_u8(w, 0);                                            /* binds absent */
+  seer_enc_sb4(w, 0);
+  for (int i = 0; i < 5; i++)
+    seer_writer_u8(w, 0);
+  seer_writer_u8(w, 1);                   /* defines present */
+  seer_enc_sb4(w, (uint32_t)stmt->ncols); /* define count */
+  seer_writer_u8(w, 0);                   /* registration 0,0,1 .. */
+  seer_writer_u8(w, 0);
+  seer_writer_u8(w, 1);
+  if ((c->server_release >> 24) != 10)
+    for (int i = 0; i < 5; i++)
+      seer_writer_u8(w, 0);
+  for (int i = 0; i < 3; i++)
+    seer_writer_u8(w, 0); /* al8pidmlrc */
+  if (fv >= TTC_FIELD_VERSION_12_2)
+    for (int i = 0; i < 5; i++)
+      seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
+  if (fv > TTC_FIELD_VERSION_12_2)
+    for (int i = 0; i < 2; i++)
+      seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
+  uint32_t all8[13] = {0};
+  all8[1] = PREFETCH_ROWS; /* rows to return */
+  all8[7] = 1;             /* a query */
+  for (int i = 0; i < 13; i++)
+    seer_enc_sb4(w, all8[i]);
+  for (int i = 0; i < stmt->ncols; i++) {
+    const SeerColumn *col = &stmt->cols[i];
+    if (col->ora_type == ORA_TYPE_CLOB) /* as LONG, in the database charset */
+      emit_oac(w, fv, ORA_TYPE_LONG, 0x7FFFFFFF, 1, 873);
+    else if (col->ora_type == ORA_TYPE_BLOB)
+      emit_oac(w, fv, ORA_TYPE_LONGRAW, 0x7FFFFFFF, 1, 0);
+    else
+      emit_oac(w, fv, col->ora_type, col->max_size ? col->max_size : 1, 1,
+               col->charset == 2000 ? 2000 : (col->charset ? 873 : 0));
+  }
+  if (!seer_writer_ok(w)) {
+    seer_writer_free(w);
+    return SEER_ENOMEM;
+  }
+  return SEER_OK;
+}
+
 static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
 {
   if (!seer_writer_init(w, 16))
@@ -2912,6 +3029,21 @@ static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
     return SEER_ENOMEM;
   }
   return SEER_OK;
+}
+
+/* The call that fetches a query's next rows: a plain TTI_FETCH - or, for a
+ * result with LOB columns whose rows have not started, the DEFINE call, from
+ * which on those columns come inline as LONG / LONG RAW. The columns are
+ * marked to read them that way; the statement cache keeps them with the
+ * cursor, which keeps its define. */
+static SeerStatus build_next_fetch(SeerStmt *stmt, SeerWriter *w)
+{
+  if (stmt->nrows > 0 || !wants_lob_define(stmt))
+    return build_fetch(stmt, w);
+  for (int i = 0; i < stmt->ncols; i++)
+    if (stmt->cols[i].ora_type == ORA_TYPE_CLOB || stmt->cols[i].ora_type == ORA_TYPE_BLOB)
+      stmt->cols[i].inline_long = true;
+  return build_define(stmt, w);
 }
 
 /* Queue a server cursor to be closed with the next call's CLOSE_CURSORS
@@ -3685,7 +3817,7 @@ static SeerStatus fetch_all_rows(SeerStmt *stmt)
   SeerWriter w;
   OerResult rc = {0}; /* prime: fetch at least once */
   while (more_rows_pending(stmt, stmt->cursor_id, rc.err_code)) {
-    SeerStatus st = build_fetch(stmt, &w);
+    SeerStatus st = build_next_fetch(stmt, &w);
     if (st != SEER_OK)
       return st;
     st = seer_ttc_send(stmt->conn, w.buf, w.len);
@@ -5132,7 +5264,7 @@ retry_exec:
   /* Fetch more while the cursor has rows pending. */
   while (more_rows_pending(stmt, oer.cursor_id, oer.err_code)) {
     seer_log(SEER_LOG_DEBUG, "stmt: issuing FETCH on cursor %ld", (long)oer.cursor_id);
-    st = build_fetch(stmt, &w);
+    st = build_next_fetch(stmt, &w);
     if (st != SEER_OK)
       return st;
     st = seer_ttc_send(stmt->conn, w.buf, w.len);

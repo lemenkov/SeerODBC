@@ -157,6 +157,12 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] RAW
 - [x] LONG, LONG RAW
 - [x] CLOB, BLOB, BFILE
+- [x] Inline LOB fetch (opt-in `LOBINLINE=1`, 12.1+) — a DEFINE call asks for a
+      query's CLOB / BLOB columns as LONG / LONG RAW, so their content comes in
+      the rows instead of one TTI_LOBOPS READ round trip per cell (~17-20x faster
+      for 250 LOB rows on 18c/21c/23ai). Off by default because in that form an
+      empty LOB (EMPTY_CLOB() / EMPTY_BLOB()) reads as NULL. Results with NCLOB,
+      BFILE, JSON, VECTOR or object columns keep the locator path.
 - [x] REF CURSOR (nested, drained into the result set)
 - [x] ROWID / UROWID — physical ROWID (18-char extended) + UROWID ("*"+base64)
 - [x] INTERVAL YEAR TO MONTH / DAY TO SECOND — text "[+|-]Y-MM" / "[+|-]D HH:MM:SS.fffffffff"
