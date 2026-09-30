@@ -395,12 +395,12 @@ int main(void)
 
   {
     /* A large VECTOR ahead of another bind: its image rides in place (it is
-     * not a LONG-class value, whatever its size). 5000 FLOAT64 dimensions =
-     * ~40 KB, over a 12c+ server's 32767-byte string maximum. */
+     * not a LONG-class value, whatever its size), and past 64 KiB its length
+     * needs the 3-byte field. 5000 FLOAT64 dimensions = ~40 KB, 30000 = ~240 KB. */
     const char *name = "native VECTOR bind, large, ahead of another bind";
     run(c, "DROP TABLE seervl");
     run(c, "CREATE TABLE seervl (v VECTOR(*, FLOAT64), id NUMBER) TABLESPACE USERS");
-    static const int sizes[] = {5000};
+    static const int sizes[] = {5000, 30000};
     static double big[30000];
     for (int i = 0; i < 30000; i++)
       big[i] = i * 0.5;

@@ -5413,17 +5413,22 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
 static SeerStatus native_lob_bind(SeerStmt *stmt, int param, uint8_t ora_type, const uint8_t *image,
                                   size_t imagelen, const uint8_t *oac_bytes, size_t oac_len)
 {
-  if (imagelen > 0xFFFF)
+  /* The 18-byte descriptor, then the image length as THREE bytes - not a
+   * 19-byte descriptor + ub2: identical below 64 KiB (the 19th byte is the
+   * length's high byte), but a ub2 can't carry a bigger image, e.g. a float64
+   * vector past ~8190 dimensions (seerdb/seerdb@d15e421). */
+  if (imagelen > 0xFFFFFF)
     return SEER_EPARAM;
   uint8_t fv = stmt->conn->field_version;
-  static const uint8_t DESC[19] = {
-      0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00,
-      0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  static const uint8_t DESC[18] = {
+      0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08,
+      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
   };
   SeerWriter v;
   if (!seer_writer_init(&v, 64 + imagelen))
     return SEER_ENOMEM;
   seer_writer_bytes(&v, DESC, sizeof DESC);
+  seer_writer_u8(&v, (uint8_t)(imagelen >> 16));
   seer_writer_u8(&v, (uint8_t)(imagelen >> 8));
   seer_writer_u8(&v, (uint8_t)(imagelen & 0xFF));
   for (int i = 0; i < 22; i++)
