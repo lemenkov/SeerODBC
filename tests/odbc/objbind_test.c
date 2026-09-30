@@ -21,9 +21,14 @@ static void pass(const char *n)
   printf("  PASS %s\n", n);
   pass_n++;
 }
+/* Failures are also kept to repeat on stderr at the end: a CI runner showing
+ * only a failed test's last lines of stderr then still names them. */
+static char fail_log[4096];
 static void fail(const char *n, const char *w)
 {
   printf("  FAIL %s: %s\n", n, w);
+  size_t used = strlen(fail_log);
+  snprintf(fail_log + used, sizeof fail_log - used, "FAIL %s: %s\n", n, w);
   fail_n++;
 }
 static void skip(const char *n, const char *w)
@@ -789,5 +794,8 @@ int main(void)
 
   seer_disconnect(c);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
+  fflush(stdout);
+  if (fail_n > 0)
+    fprintf(stderr, "%s", fail_log);
   return fail_n > 0 ? 1 : 0;
 }

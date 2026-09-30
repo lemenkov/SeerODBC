@@ -38,9 +38,14 @@ static void pass(const char *name)
   printf("  \033[32mPASS\033[0m %s\n", name);
   n_pass++;
 }
+/* Failures are also kept to repeat on stderr at the end: a CI runner showing
+ * only a failed test's last lines of stderr then still names them. */
+static char fail_log[4096];
 static void fail(const char *name, const char *why)
 {
   printf("  \033[31mFAIL\033[0m %s: %s\n", name, why);
+  size_t used = strlen(fail_log);
+  snprintf(fail_log + used, sizeof fail_log - used, "FAIL %s: %s\n", name, why);
   n_fail++;
 }
 static void skip(const char *name, const char *why)
@@ -2887,6 +2892,9 @@ int main(void)
   exec_do(dbc, "DROP TABLE " TBL, err, sizeof err);
 
   printf("SUMMARY pass=%d fail=%d skip=%d\n", n_pass, n_fail, n_skip);
+  fflush(stdout);
+  if (n_fail > 0)
+    fprintf(stderr, "%s", fail_log);
 
   SQLDisconnect(dbc);
   SQLFreeHandle(SQL_HANDLE_DBC, dbc);
