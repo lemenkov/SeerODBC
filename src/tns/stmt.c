@@ -282,13 +282,14 @@ static SeerStatus decode_long(SeerReader *r, bool is_raw, SeerCell *cell)
   bool is_null = (marker == 0x00);
   if (marker == 0xFE) {
     for (;;) {
-      uint8_t clen = seer_reader_u8(r);
-      if (!seer_reader_ok(r) || clen == 0)
+      /* Each chunk's length: an sb4 on 12c+, a bare ub1 before (§6.4). */
+      int64_t clen = r->sb4_chunks ? seer_dec_sb4(r) : (int64_t)seer_reader_u8(r);
+      if (!seer_reader_ok(r) || clen <= 0)
         break;
-      const uint8_t *p = seer_reader_bytes(r, clen);
+      const uint8_t *p = seer_reader_bytes(r, (size_t)clen);
       if (p == NULL)
         break;
-      seer_writer_bytes(&acc, p, clen);
+      seer_writer_bytes(&acc, p, (size_t)clen);
     }
   } else if (!is_null) {
     const uint8_t *p = seer_reader_bytes(r, marker);

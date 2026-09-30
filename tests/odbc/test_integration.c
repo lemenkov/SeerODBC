@@ -1119,6 +1119,45 @@ static void check_plsql_large_lob_param(SQLHDBC dbc)
   }
 }
 
+/* A LONG column past 252 bytes arrives chunked, each chunk's length an sb4 on
+ * 12c+ (a ub1 before): read with ub1 lengths it desynced the row on 12c+. */
+static void check_long_column(SQLHDBC dbc)
+{
+  const char *name = "LONG column over 252 bytes";
+  char err[256], e2[256];
+  exec_do(dbc, "DROP TABLE seer_lg", e2, sizeof e2);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_lg (id NUMBER, l LONG)", err, sizeof err)) ||
+      !SQL_SUCCEEDED(
+          exec_do(dbc, "INSERT INTO seer_lg VALUES (1, RPAD('q', 1000, 'q'))", err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  static char buf[2048];
+  char tail[16] = "";
+  SQLLEN ind = 0, tind = 0;
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT l, 'end' FROM seer_lg", SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLFetch(st);
+  if (SQL_SUCCEEDED(rc)) {
+    SQLGetData(st, 1, SQL_C_CHAR, buf, sizeof buf, &ind);
+    SQLGetData(st, 2, SQL_C_CHAR, tail, sizeof tail, &tind);
+  } else {
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_lg", e2, sizeof e2);
+  if (SQL_SUCCEEDED(rc) && ind == 1000 && buf[999] == 'q' && strcmp(tail, "end") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "rc=%d len=%ld tail='%s' %s", rc, (long)ind, tail,
+             SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
 /* A large CLOB OUT parameter, and a CLOB + BLOB returned by DML RETURNING into
  * SQL_LONGVARCHAR / SQL_LONGVARBINARY parameters: the whole values come back
  * (a VARCHAR / RAW return target is capped at 4000 bytes - ORA-22835). */
@@ -2598,6 +2637,7 @@ int main(void)
   check_typed_null(dbc);
   check_statement_kind(dbc);
   check_describe_before_execute(dbc);
+  check_long_column(dbc);
   check_lob_out(dbc);
   check_plsql_large_lob_param(dbc);
   check_compile_warning(dbc);
