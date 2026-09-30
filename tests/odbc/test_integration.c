@@ -1063,6 +1063,72 @@ static void check_vector_metadata(SQLHDBC dbc)
   }
 }
 
+/* A large CLOB OUT parameter, and a CLOB + BLOB returned by DML RETURNING into
+ * SQL_LONGVARCHAR / SQL_LONGVARBINARY parameters: the whole values come back
+ * (a VARCHAR / RAW return target is capped at 4000 bytes - ORA-22835). */
+static void check_lob_out(SQLHDBC dbc)
+{
+  const char *name = "large CLOB OUT parameter; CLOB + BLOB via RETURNING";
+  static char buf[20001];
+  char err[256] = "", m[400] = "";
+  SQLLEN ind = 0;
+  SQLHSTMT st;
+  int ok = 1;
+  /* PL/SQL OUT */
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  buf[0] = '\0';
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 20000, 0, buf, sizeof buf,
+                   &ind);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"DECLARE c CLOB; BEGIN c := RPAD('o', 10000, 'o'); ? := c; END;", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (!SQL_SUCCEEDED(rc) || strlen(buf) != 10000) {
+    snprintf(m, sizeof m, "OUT: rc=%d len=%zu ind=%ld %s", rc, strlen(buf), (long)ind, err);
+    ok = 0;
+  }
+  /* DML RETURNING a CLOB */
+  if (ok) {
+    exec_do(dbc, "DROP TABLE seer_lobret", err, sizeof err);
+    exec_do(dbc, "CREATE TABLE seer_lobret (c CLOB, b BLOB)", err, sizeof err);
+    /* the BLOB is built in PL/SQL: a SQL RAW expression caps at 2000 bytes */
+    exec_do(dbc,
+            "DECLARE b BLOB; BEGIN INSERT INTO seer_lobret VALUES (RPAD(TO_CLOB('r'), 10000, 'r'), "
+            "EMPTY_BLOB()) RETURNING b INTO b; FOR i IN 1 .. 3 LOOP DBMS_LOB.WRITEAPPEND(b, 2000, "
+            "UTL_RAW.COPIES(HEXTORAW('AB'), 2000)); END LOOP; END;",
+            err, sizeof err);
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    buf[0] = '\0';
+    ind = 0;
+    static unsigned char bin[20000];
+    SQLLEN bind_b = 0;
+    SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 20000, 0, buf,
+                     sizeof buf, &ind);
+    SQLBindParameter(st, 2, SQL_PARAM_OUTPUT, SQL_C_BINARY, SQL_LONGVARBINARY, 20000, 0, bin,
+                     sizeof bin, &bind_b);
+    rc = SQLExecDirect(st, (SQLCHAR *)"UPDATE seer_lobret SET c = c RETURNING c, b INTO ?, ?",
+                       SQL_NTS);
+    err[0] = '\0';
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    char next[16] = "", e2[256] = "";
+    exec_scalar(dbc, "SELECT 5 FROM dual", next, sizeof next, e2, sizeof e2);
+    exec_do(dbc, "DROP TABLE seer_lobret", e2, sizeof e2);
+    if (!SQL_SUCCEEDED(rc) || strlen(buf) != 10000 || bind_b != 6000 || bin[5999] != 0xAB ||
+        strcmp(next, "5") != 0) {
+      snprintf(m, sizeof m, "RETURNING: rc=%d clob=%zu blob=%ld next='%s' %s", rc, strlen(buf),
+               (long)bind_b, next, err);
+      ok = 0;
+    }
+  }
+  if (ok)
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -2476,6 +2542,7 @@ int main(void)
   check_typed_null(dbc);
   check_statement_kind(dbc);
   check_describe_before_execute(dbc);
+  check_lob_out(dbc);
   check_compile_warning(dbc);
   check_error_native_and_offset(dbc);
   check_vector_metadata(dbc);
