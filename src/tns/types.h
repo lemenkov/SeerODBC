@@ -16,7 +16,8 @@
 /* Oracle TNS data-type numbers we recognise (subset). */
 #define ORA_TYPE_VARCHAR 1
 #define ORA_TYPE_NUMBER 2
-#define ORA_TYPE_VARNUM 6 /* NUMBER return/define request (9i fv2) */
+#define ORA_TYPE_BINARY_INTEGER 3 /* PLS_INTEGER / BINARY_INTEGER */
+#define ORA_TYPE_VARNUM 6         /* NUMBER return/define request (9i fv2) */
 #define ORA_TYPE_LONG 8
 #define ORA_TYPE_RID 11 /* physical ROWID (column wire type)   */
 #define ORA_TYPE_DATE 12

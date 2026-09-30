@@ -3037,10 +3037,55 @@ static void free_pending_objs(SeerStmt *stmt)
  * own, so splicing it dropped a slot and shifted every later attribute). */
 #define OBJ_ATTR_XMLTYPE 0xF0
 
+/* A type declared inside a PL/SQL package is named PKG.TYPE here; its metadata
+ * lives in ALL_PLSQL_TYPES / _TYPE_ATTRS / _COLL_TYPES, keyed by the package as
+ * well (seerdb PROTOCOL.md §21.6a). Split `name` at its dot: the type part is
+ * returned and the package copied into `pkg` ("" for a schema-level type). */
+static const char *type_pkg_split(const char *name, char *pkg, size_t pkgsz)
+{
+  pkg[0] = '\0';
+  const char *dot = name != NULL ? strchr(name, '.') : NULL;
+  if (dot == NULL || (size_t)(dot - name) >= pkgsz)
+    return name;
+  memcpy(pkg, name, (size_t)(dot - name));
+  pkg[dot - name] = '\0';
+  return dot + 1;
+}
+
+/* Prepare a dictionary query on a type, schema-level (`sql`, binds owner and
+ * type) or package-level (`plsql_sql`, binds owner, package and type), and
+ * execute it. On SEER_OK *q is the executed statement (caller closes). */
+static SeerStatus type_dict_query(SeerConn *conn, const char *sql, const char *plsql_sql,
+                                  const char *owner, const char *name, SeerStmt **q)
+{
+  char pkg[129];
+  const char *tn = type_pkg_split(name, pkg, sizeof pkg);
+  *q = NULL;
+  SeerStatus st = seer_stmt_prepare(conn, pkg[0] ? plsql_sql : sql, q);
+  int k = 1;
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(*q, k++, owner, -1);
+  if (st == SEER_OK && pkg[0])
+    st = seer_stmt_bind_text(*q, k++, pkg, -1);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(*q, k, tn, -1);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(*q);
+  if (st != SEER_OK) {
+    seer_stmt_close(*q);
+    *q = NULL;
+  }
+  return st;
+}
+
 static uint8_t obj_type_to_ora(const char *tn)
 {
   if (tn == NULL)
     return ORA_TYPE_VARCHAR;
+  if (!strcmp(tn, "PL/SQL PLS INTEGER") || !strcmp(tn, "PL/SQL BINARY INTEGER"))
+    return ORA_TYPE_BINARY_INTEGER;
+  if (!strcmp(tn, "PL/SQL BOOLEAN") || !strcmp(tn, "BOOLEAN")) /* 23ai: plain BOOLEAN */
+    return ORA_TYPE_BOOLEAN;
   if (!strcmp(tn, "CLOB") || !strcmp(tn, "NCLOB"))
     return ORA_TYPE_CLOB;
   if (!strcmp(tn, "BLOB"))
@@ -3127,18 +3172,17 @@ static uint8_t coll_elem_wire_type(SeerConn *conn, const char *owner, const char
 {
   uint8_t et = 0;
   SeerStmt *q = NULL;
-  if (seer_stmt_prepare(conn,
-                        "SELECT elem_type_name FROM all_coll_types "
-                        "WHERE owner = :1 AND type_name = :2",
-                        &q) == SEER_OK) {
-    if (seer_stmt_bind_text(q, 1, owner, -1) == SEER_OK &&
-        seer_stmt_bind_text(q, 2, name, -1) == SEER_OK && seer_stmt_execute(q) == SEER_OK &&
-        seer_stmt_fetch(q) == SEER_OK) {
-      const char *en = NULL;
-      int isn = 0;
-      seer_stmt_get_string(q, 0, &en, &isn);
-      et = obj_type_to_ora(en); /* non-zero (defaults VARCHAR) */
-    }
+  if (type_dict_query(conn,
+                      "SELECT elem_type_name FROM all_coll_types "
+                      "WHERE owner = :1 AND type_name = :2",
+                      "SELECT elem_type_name FROM all_plsql_coll_types "
+                      "WHERE owner = :1 AND package_name = :2 AND type_name = :3",
+                      owner, name, &q) == SEER_OK &&
+      seer_stmt_fetch(q) == SEER_OK) {
+    const char *en = NULL;
+    int isn = 0;
+    seer_stmt_get_string(q, 0, &en, &isn);
+    et = obj_type_to_ora(en); /* non-zero (defaults VARCHAR) */
   }
   seer_stmt_close(q);
   return et;
@@ -3154,23 +3198,34 @@ static void build_obj_layout(SeerConn *conn, const char *owner, const char *name
 {
   if (depth > 8)
     return;
+  /* A package-level record names its attribute types with their package
+   * (attr_type_package), which goes back on as PKG.TYPE. */
   SeerStmt *q = NULL;
-  if (seer_stmt_prepare(conn,
-                        "SELECT attr_type_owner, attr_type_name FROM all_type_attrs "
-                        "WHERE owner = :1 AND type_name = :2 ORDER BY attr_no",
-                        &q) != SEER_OK)
-    return;
-  if (seer_stmt_bind_text(q, 1, owner, -1) == SEER_OK &&
-      seer_stmt_bind_text(q, 2, name, -1) == SEER_OK && seer_stmt_execute(q) == SEER_OK) {
+  if (type_dict_query(conn,
+                      "SELECT attr_type_owner, NULL, attr_type_name FROM all_type_attrs "
+                      "WHERE owner = :1 AND type_name = :2 ORDER BY attr_no",
+                      "SELECT attr_type_owner, attr_type_package, attr_type_name "
+                      "FROM all_plsql_type_attrs WHERE owner = :1 AND package_name = :2 "
+                      "AND type_name = :3 ORDER BY attr_no",
+                      owner, name, &q) == SEER_OK) {
     while (seer_stmt_fetch(q) == SEER_OK) {
-      const char *aowner = NULL, *atype = NULL;
-      int isn = 0;
+      const char *aowner = NULL, *apkg = NULL, *atype = NULL;
+      int isn = 0, isn_pkg = 0;
       seer_stmt_get_string(q, 0, &aowner, &isn);
       bool user_type = !isn && aowner != NULL && aowner[0] != '\0';
-      seer_stmt_get_string(q, 1, &atype, &isn);
+      seer_stmt_get_string(q, 1, &apkg, &isn_pkg);
+      seer_stmt_get_string(q, 2, &atype, &isn);
       if (user_type) {
         char *ow = strdup(aowner);
-        char *nm = strdup(atype ? atype : "");
+        char *nm = NULL;
+        if (!isn_pkg && apkg != NULL && apkg[0] != '\0') {
+          size_t l = strlen(apkg) + 1 + strlen(atype ? atype : "") + 1;
+          nm = malloc(l);
+          if (nm != NULL)
+            snprintf(nm, l, "%s.%s", apkg, atype ? atype : "");
+        } else {
+          nm = strdup(atype ? atype : "");
+        }
         if (ow && nm && strcmp(ow, "SYS") == 0 && strcmp(nm, "XMLTYPE") == 0) {
           append_attr(types, elem, n, cap, OBJ_ATTR_XMLTYPE, 0);
         } else if (ow && nm) {
@@ -5413,14 +5468,13 @@ static SeerStatus obj_lookup_oid(SeerConn *conn, const char *schema, const char 
                                  uint8_t oid[16])
 {
   SeerStmt *q = NULL;
-  if (seer_stmt_prepare(conn,
-                        "SELECT type_oid FROM all_types "
-                        "WHERE owner = :1 AND type_name = :2",
-                        &q) != SEER_OK)
-    return SEER_EPROTO;
   bool got = false;
-  if (seer_stmt_bind_text(q, 1, schema, -1) == SEER_OK &&
-      seer_stmt_bind_text(q, 2, name, -1) == SEER_OK && seer_stmt_execute(q) == SEER_OK &&
+  if (type_dict_query(conn,
+                      "SELECT type_oid FROM all_types "
+                      "WHERE owner = :1 AND type_name = :2",
+                      "SELECT type_oid FROM all_plsql_types "
+                      "WHERE owner = :1 AND package_name = :2 AND type_name = :3",
+                      schema, name, &q) == SEER_OK &&
       seer_stmt_fetch(q) == SEER_OK) {
     const void *d = NULL;
     size_t dl = 0;
@@ -5434,24 +5488,28 @@ static SeerStatus obj_lookup_oid(SeerConn *conn, const char *schema, const char 
   return got ? SEER_OK : SEER_EDB; /* not found / not RAW(16) */
 }
 
-/* A collection type's single element wire-type (ALL_COLL_TYPES). */
+/* A collection type's single element wire-type (ALL_COLL_TYPES, or
+ * ALL_PLSQL_COLL_TYPES for PKG.TYPE), and whether it is a PL/SQL index-by
+ * table - whose image keys every element (§21.6b). */
 static SeerStatus obj_lookup_elem(SeerConn *conn, const char *schema, const char *name,
-                                  uint8_t *elem_type)
+                                  uint8_t *elem_type, bool *index_table)
 {
   SeerStmt *q = NULL;
-  if (seer_stmt_prepare(conn,
-                        "SELECT elem_type_name FROM all_coll_types "
-                        "WHERE owner = :1 AND type_name = :2",
-                        &q) != SEER_OK)
-    return SEER_EPROTO;
   bool got = false;
-  if (seer_stmt_bind_text(q, 1, schema, -1) == SEER_OK &&
-      seer_stmt_bind_text(q, 2, name, -1) == SEER_OK && seer_stmt_execute(q) == SEER_OK &&
+  *index_table = false;
+  if (type_dict_query(conn,
+                      "SELECT elem_type_name, coll_type FROM all_coll_types "
+                      "WHERE owner = :1 AND type_name = :2",
+                      "SELECT elem_type_name, coll_type FROM all_plsql_coll_types "
+                      "WHERE owner = :1 AND package_name = :2 AND type_name = :3",
+                      schema, name, &q) == SEER_OK &&
       seer_stmt_fetch(q) == SEER_OK) {
-    const char *tn = NULL;
+    const char *tn = NULL, *kind = NULL;
     int isnull = 0;
     seer_stmt_get_string(q, 0, &tn, &isnull);
     *elem_type = obj_type_to_ora(tn);
+    seer_stmt_get_string(q, 1, &kind, &isnull);
+    *index_table = !isnull && kind != NULL && strcmp(kind, "PL/SQL INDEX TABLE") == 0;
     got = true;
   }
   seer_stmt_close(q);
@@ -5468,7 +5526,21 @@ static void obj_encode_field(SeerWriter *body, uint8_t ora_type, const char *val
     seer_writer_u8(body, 0xFF);
     return;
   }
-  if (ora_type == ORA_TYPE_NUMBER) {
+  if (ora_type == ORA_TYPE_BINARY_INTEGER || ora_type == ORA_TYPE_BOOLEAN) {
+    /* PLS_INTEGER / BOOLEAN of a PL/SQL record: a 4-byte big-endian integer
+     * (a BOOLEAN is 1 / 0, from "1"/"TRUE" or "0"/"FALSE"). */
+    long long v = atoll(val);
+    if (ora_type == ORA_TYPE_BOOLEAN)
+      v = (strcasecmp(val, "TRUE") == 0 || v != 0) ? 1 : 0;
+    obj_write_length(body, 4);
+    if (ora_type == ORA_TYPE_BOOLEAN) { /* as the server writes one: 01 00 00 00 */
+      seer_writer_u8(body, (uint8_t)v);
+      for (int k = 0; k < 3; k++)
+        seer_writer_u8(body, 0);
+    } else {
+      obj_be4(body, (uint32_t)(int32_t)v);
+    }
+  } else if (ora_type == ORA_TYPE_NUMBER) {
     uint8_t num[24];
     size_t nn = seer_encode_number_str(val, num);
     if (nn == 0) /* not a decimal: fall back to integer */
@@ -5944,19 +6016,25 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
   if (st != SEER_OK)
     return st;
   uint8_t elem_type = 0;
-  st = obj_lookup_elem(stmt->conn, schema, type_name, &elem_type);
+  bool index_table = false;
+  st = obj_lookup_elem(stmt->conn, schema, type_name, &elem_type, &index_table);
   if (st != SEER_OK)
     return st;
 
   /* Collection image body: a collection-flags byte, the length-prefixed element
-   * count, then each element field. */
+   * count, then each element field. A PL/SQL index-by table sets HAS_INDEXES
+   * (0x10) and puts each element's key before it - a 4-byte big-endian signed
+   * integer, here 0..n-1, as PL/SQL indexes such arrays from zero (§21.6b). */
   SeerWriter body;
   if (!seer_writer_init(&body, 64))
     return SEER_ENOMEM;
-  seer_writer_u8(&body, 0x00); /* collection flags */
+  seer_writer_u8(&body, index_table ? 0x10 : 0x00); /* collection flags */
   obj_write_length(&body, (uint32_t)(n_elems > 0 ? n_elems : 0));
-  for (int i = 0; i < n_elems; i++)
+  for (int i = 0; i < n_elems; i++) {
+    if (index_table)
+      obj_be4(&body, (uint32_t)i);
     obj_encode_field(&body, elem_type, elem_values[i]);
+  }
   if (!seer_writer_ok(&body)) {
     seer_writer_free(&body);
     return SEER_ENOMEM;

@@ -71,6 +71,34 @@ static int readback_has(SeerConn *c, const char *sql, const char *a, const char 
   return ok;
 }
 
+/* Run `sql` - a block assigning a VARCHAR2 result to :1 - with an object (or,
+ * `collection`, a collection) of type `type_name` bound to :2; the result goes
+ * to out[]. Returns the bind / execute status. */
+static SeerStatus call_with_type(SeerConn *c, const char *sql, const char *schema,
+                                 const char *type_name, int collection, const char *const *vals,
+                                 int n, char *out, size_t outsz)
+{
+  SeerStmt *s = NULL;
+  out[0] = '\0';
+  SeerStatus st = seer_stmt_prepare(c, sql, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 1, 1, 200);
+  if (st == SEER_OK)
+    st = collection ? seer_stmt_bind_collection(s, 2, schema, type_name, vals, n)
+                    : seer_stmt_bind_object(s, 2, schema, type_name, vals, n);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (st == SEER_OK) {
+    const void *d = NULL;
+    size_t l = 0;
+    int isnull = 0, isbin = 0;
+    if (seer_stmt_out_data(s, 1, &d, &l, &isnull, &isbin) == SEER_OK && d != NULL)
+      snprintf(out, outsz, "%.*s", (int)l, (const char *)d);
+  }
+  seer_stmt_close(s);
+  return st;
+}
+
 int main(void)
 {
   if (!getenv("SEER_TEST_HOST") || !getenv("SEER_TEST_SERVICE") || !getenv("SEER_TEST_USER")) {
@@ -519,6 +547,81 @@ int main(void)
     }
     run(c, "DROP TABLE seer_xb");
   }
+
+  /* --- PL/SQL package-level types: a record (with PLS_INTEGER / BOOLEAN / DATE
+   * attributes), a record nesting a record, a nested table and an index-by
+   * table, named PKG.TYPE. Their metadata is in ALL_PLSQL_TYPES & co., and an
+   * index-by table keys each element from 0. --- */
+  run(c, "CREATE OR REPLACE PACKAGE seer_pkt AS "
+         "TYPE rec IS RECORD (id NUMBER, name VARCHAR2(30), n PLS_INTEGER, b BOOLEAN, d DATE); "
+         "TYPE outer_rec IS RECORD (r rec, tag VARCHAR2(10)); "
+         "TYPE numtab IS TABLE OF NUMBER; "
+         "TYPE strix IS TABLE OF VARCHAR2(40) INDEX BY BINARY_INTEGER; "
+         "FUNCTION f(r rec) RETURN VARCHAR2; FUNCTION o(x outer_rec) RETURN VARCHAR2; "
+         "FUNCTION g(t numtab) RETURN VARCHAR2; FUNCTION h(t strix) RETURN VARCHAR2; END;");
+  run(c, "CREATE OR REPLACE PACKAGE BODY seer_pkt AS "
+         "FUNCTION f(r rec) RETURN VARCHAR2 IS BEGIN RETURN r.id || '/' || r.name || '/' || r.n "
+         "|| '/' || CASE WHEN r.b THEN 'T' WHEN NOT r.b THEN 'F' ELSE 'N' END || '/' || "
+         "TO_CHAR(r.d, 'YYYY-MM-DD'); END; "
+         "FUNCTION o(x outer_rec) RETURN VARCHAR2 IS BEGIN RETURN f(x.r) || '#' || x.tag; END; "
+         "FUNCTION g(t numtab) RETURN VARCHAR2 IS s NUMBER := 0; BEGIN "
+         "FOR i IN 1 .. t.COUNT LOOP s := s + t(i); END LOOP; RETURN t.COUNT || ':' || s; END; "
+         "FUNCTION h(t strix) RETURN VARCHAR2 IS BEGIN RETURN t.COUNT || ':' || t.FIRST || ':' "
+         "|| t(t.FIRST) || ',' || t(t.LAST); END; END;");
+  {
+    static const struct {
+      const char *name, *sql, *type;
+      int collection, n;
+      const char *vals[6];
+      const char *want;
+    } cases[] = {
+        {"package record bind",
+         "BEGIN :1 := seer_pkt.f(:2); END;",
+         "SEER_PKT.REC",
+         0,
+         5,
+         {"42", "alpha", "-7", "TRUE", "2024-05-06"},
+         "42/alpha/-7/T/2024-05-06"},
+        {"package record nesting a record bind",
+         "BEGIN :1 := seer_pkt.o(:2); END;",
+         "SEER_PKT.OUTER_REC",
+         0,
+         6,
+         {"7", "beta", "3", "FALSE", "2020-01-02", "tg"},
+         "7/beta/3/F/2020-01-02#tg"},
+        {"package nested table bind",
+         "BEGIN :1 := seer_pkt.g(:2); END;",
+         "SEER_PKT.NUMTAB",
+         1,
+         3,
+         {"1", "2.5", "40"},
+         "3:43.5"},
+        {"package index-by table bind",
+         "BEGIN :1 := seer_pkt.h(:2); END;",
+         "SEER_PKT.STRIX",
+         1,
+         3,
+         {"zero", "one", "two"},
+         "3:0:zero,two"},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+      char out[256];
+      SeerStatus st = call_with_type(c, cases[k].sql, schema, cases[k].type, cases[k].collection,
+                                     cases[k].vals, cases[k].n, out, sizeof out);
+      if (st == SEER_ENOTIMPL) {
+        skip(cases[k].name, "object binds require a 12c+ server");
+      } else if (st != SEER_OK) {
+        fail(cases[k].name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
+      } else if (strcmp(out, cases[k].want) != 0) {
+        char m[400];
+        snprintf(m, sizeof m, "got '%s', want '%s'", out, cases[k].want);
+        fail(cases[k].name, m);
+      } else {
+        pass(cases[k].name);
+      }
+    }
+  }
+  run(c, "DROP PACKAGE seer_pkt");
 
   seer_disconnect(c);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
