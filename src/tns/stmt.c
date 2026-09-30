@@ -51,6 +51,10 @@ typedef struct {
    * row carries no bytes at all for it - not even an empty DALC - and its
    * value is always NULL. Default false = read the value as usual. */
   bool zero_len;
+  /* 23ai VECTOR column: declared dimension count (0 = flexible) and element
+   * format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible). */
+  uint32_t vector_dims;
+  uint8_t vector_format;
   char *annotations; /* 23ai: "name=value\n..." serialized map, or NULL */
   /* SQL OBJECT (ADT, type 109) columns: the object type's identity, and its
    * attribute layout (Oracle type per attribute) once resolved/cached. */
@@ -770,9 +774,10 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
         }
         seer_writer_free(&ann);
       }
-      (void)seer_dec_sb4(r);   /* vector dimensions  */
-      (void)seer_reader_u8(r); /* vector format      */
-      (void)seer_reader_u8(r); /* vector flags       */
+      int64_t vdims = seer_dec_sb4(r); /* vector dimensions */
+      cols[i].vector_dims = (uint32_t)(vdims < 0 ? 0 : vdims);
+      cols[i].vector_format = seer_reader_u8(r); /* vector format */
+      (void)seer_reader_u8(r);                   /* vector flags  */
     }
 
     cols[i].name = name;
@@ -4522,6 +4527,17 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   stmt->executed = true;
   if (c->autocommit)
     seer_commit(c);
+  return SEER_OK;
+}
+
+SeerStatus seer_stmt_col_vector(SeerStmt *stmt, int col, int *dims, int *format)
+{
+  if (stmt == NULL || col < 0 || col >= stmt->ncols)
+    return SEER_EPARAM;
+  if (dims != NULL)
+    *dims = (int)stmt->cols[col].vector_dims;
+  if (format != NULL)
+    *format = stmt->cols[col].vector_format;
   return SEER_OK;
 }
 

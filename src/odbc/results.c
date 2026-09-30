@@ -209,6 +209,14 @@ SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnN
   case SQL_DESC_SEER_ANNOTATIONS:
     str = seer_stmt_col_annotations(s->core, col);
     break;
+  case SQL_DESC_SEER_VECTOR_DIMENSIONS:
+  case SQL_DESC_SEER_VECTOR_FORMAT: {
+    int dims = 0, fmt = 0;
+    seer_stmt_col_vector(s->core, col, &dims, &fmt);
+    if (NumericAttributePtr)
+      *NumericAttributePtr = FieldIdentifier == SQL_DESC_SEER_VECTOR_DIMENSIONS ? dims : fmt;
+    return SQL_SUCCESS;
+  }
   case SQL_DESC_TYPE:
   case SQL_DESC_CONCISE_TYPE:
     if (NumericAttributePtr)

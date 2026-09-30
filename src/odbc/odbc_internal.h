@@ -44,6 +44,13 @@
  * parser stopped, as Oracle clients show it. */
 #define SQL_DIAG_SEER_ERROR_OFFSET 19113
 
+/* SeerODBC extension SQLColAttribute field identifiers for a 23ai VECTOR
+ * column (numeric): its declared dimension count (0 = flexible), and its
+ * element format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible). 0 for
+ * any other column. */
+#define SQL_DESC_SEER_VECTOR_DIMENSIONS 19114
+#define SQL_DESC_SEER_VECTOR_FORMAT 19115
+
 /* A diagnostic record. Most failures post one; an array-DML execute in
  * batch-errors mode posts one per failed row, each carrying its 1-based
  * SQL_DIAG_ROW_NUMBER. */

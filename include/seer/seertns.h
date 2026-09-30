@@ -400,6 +400,10 @@ SeerStatus seer_stmt_describe(SeerStmt *stmt);
  * package, trigger, ...) that compiled with errors: the statement succeeded
  * but the object is invalid (ORA-24344 "success with compilation error"). */
 int seer_stmt_compile_warning(SeerStmt *stmt);
+/* A 23ai VECTOR column's declared dimension count (0 = flexible) and element
+ * format (2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY; 0 = flexible); both 0 for
+ * any other column or an older server. */
+SeerStatus seer_stmt_col_vector(SeerStmt *stmt, int col, int *dims, int *format);
 /* The parse offset (into the statement text) the server reported with the
  * last execute error - where the parser stopped, e.g. 7 for the bad column in
  * "SELECT nonexistent FROM dual"; 0 when it gave none. */
