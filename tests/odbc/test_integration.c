@@ -1063,6 +1063,62 @@ static void check_vector_metadata(SQLHDBC dbc)
   }
 }
 
+/* Whether the server is 12c or later (SQL_DBMS_VER is a fixed string, so ask
+ * the server). */
+static int server_is_12c(SQLHDBC dbc)
+{
+  char ver[64] = "", err[256];
+  exec_scalar(dbc,
+              "SELECT MAX(version) FROM product_component_version WHERE product LIKE 'Oracle%'",
+              ver, sizeof ver, err, sizeof err);
+  return atoi(ver) >= 12;
+}
+
+/* A value over 32767 bytes bound to a PL/SQL CLOB / BLOB parameter: a LONG
+ * (the form a large text bind takes) can't reach a PL/SQL LOB parameter that
+ * big (ORA-01460); it has to go as a temporary LOB. 11g has no CREATE_TEMP,
+ * so there the ORA-01460 stands and the check is skipped. */
+static void check_plsql_large_lob_param(SQLHDBC dbc)
+{
+  const char *name = "PL/SQL CLOB / BLOB parameter over 32 KB";
+  char err[256] = "", out[64] = "";
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE OR REPLACE PROCEDURE seer_lobp (c IN CLOB, b IN BLOB, "
+                             "n OUT VARCHAR2) AS BEGIN n := DBMS_LOB.GETLENGTH(c) || ':' || "
+                             "DBMS_LOB.GETLENGTH(b); END;",
+                             err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  static char text[50001];
+  static unsigned char bin[40000];
+  memset(text, 'c', 50000);
+  text[50000] = '\0';
+  memset(bin, 0xAB, sizeof bin);
+  SQLLEN ti = SQL_NTS, bi = sizeof bin, oi = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 50000, 0, text, 0, &ti);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY, sizeof bin, 0, bin, 0,
+                   &bi);
+  SQLBindParameter(st, 3, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 60, 0, out, sizeof out, &oi);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"BEGIN seer_lobp(?, ?, ?); END;", SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  char e2[256];
+  exec_do(dbc, "DROP PROCEDURE seer_lobp", e2, sizeof e2);
+  if (SQL_SUCCEEDED(rc) && strcmp(out, "50000:40000") == 0)
+    pass(name);
+  else if (!SQL_SUCCEEDED(rc) && strstr(err, "ORA-01460") != NULL && !server_is_12c(dbc))
+    skip(name, "pre-12c: no temporary LOB to carry it");
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "rc=%d got '%s' %s", rc, out, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
 /* A large CLOB OUT parameter, and a CLOB + BLOB returned by DML RETURNING into
  * SQL_LONGVARCHAR / SQL_LONGVARBINARY parameters: the whole values come back
  * (a VARCHAR / RAW return target is capped at 4000 bytes - ORA-22835). */
@@ -2543,6 +2599,7 @@ int main(void)
   check_statement_kind(dbc);
   check_describe_before_execute(dbc);
   check_lob_out(dbc);
+  check_plsql_large_lob_param(dbc);
   check_compile_warning(dbc);
   check_error_native_and_offset(dbc);
   check_vector_metadata(dbc);

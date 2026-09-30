@@ -118,6 +118,7 @@ typedef struct {
   int out_arr_n;
   uint8_t *oac_override; /* pre-built OAC bytes (SQL OBJECT bind); else emit_oac */
   size_t oac_override_len;
+  bool temp_lob; /* a text / raw value promoted to a temporary LOB (bind_temp_lob) */
 } SeerBind;
 
 /* A LOB cell whose locator was captured during parse and whose content is
@@ -1914,11 +1915,143 @@ SeerStatus seer_stmt_bind_int64(SeerStmt *stmt, int param, int64_t value)
   return store_bind(stmt, param, ORA_TYPE_NUMBER, 22, 0, 0, false, rxd, rl);
 }
 
+static bool sql_is_block(const char *sql);
+static void emit_lob_oac(SeerWriter *w, int fv, uint8_t lob_type);
+
+/* The largest value a PL/SQL VARCHAR2 / RAW parameter takes. */
+#define PLSQL_MAX_STR 32767
+
+/* Whether a text / raw value of `n` bytes goes in as a temporary LOB: past the
+ * PL/SQL VARCHAR2 / RAW limit a block's CLOB / BLOB parameter rejects it
+ * (ORA-01460), whereas a plain DML statement takes it as a streamed LONG. Not
+ * for an array execute (one temp LOB per row is not implemented), and 12.1+
+ * only - 11g has no CREATE_TEMP. */
+static bool wants_temp_lob(const SeerStmt *s, size_t n)
+{
+  return n > PLSQL_MAX_STR && s->n_iters <= 1 && s->conn->field_version >= TTC_FIELD_VERSION_12_1 &&
+         sql_is_block(s->sql);
+}
+
+/* A LOBOPS reply's status: the RPA (its ub2-prefixed locator skipped - it may
+ * hold a 0x04) and then the OER, whose error, if any, lands on the connection.
+ * The OER's call status is not a fixed value, so the token is matched with a
+ * plausible ub4 length byte behind it (seerdb decode_lobops_oer). */
+static SeerStatus lobops_status(SeerConn *c, const uint8_t *resp, size_t rlen)
+{
+  size_t pos = 0;
+  if (rlen >= 3 && resp[0] == TTI_RPA)
+    pos = 3 + (((size_t)resp[1] << 8) | resp[2]);
+  for (; pos + 1 < rlen; pos++) {
+    if (resp[pos] != TTI_OER || resp[pos + 1] < 1 || resp[pos + 1] > 4)
+      continue;
+    SeerReader r;
+    seer_reader_init(&r, resp + pos + 1, rlen - pos - 1);
+    SeerStmt tmp = {.conn = c};
+    OerResult oer = {0};
+    parse_oer(&r, &tmp, &oer);
+    free_batch_errors(&tmp);
+    if (oer.err_code != 0) {
+      seer_log(SEER_LOG_ERROR, "lob: WRITE failed (ORA-%05ld)", (long)oer.err_code);
+      return SEER_EDB;
+    }
+    return SEER_OK;
+  }
+  return SEER_OK;
+}
+
+/* Bind `n` bytes of `data` as a temporary LOB (seerdb PROTOCOL.md §14.4):
+ * CREATE_TEMP allocates it, WRITE fills it - a CLOB with the UTF-8 text as
+ * UTF-16BE, a BLOB with the bytes - and the bind carries its locator behind
+ * the LOB descriptor prefix `01 28 28` + ub2 length, under the LOB bind OAC.
+ * The temp LOB lives until the session ends. */
+static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint8_t *data, size_t n)
+{
+  SeerConn *c = stmt->conn;
+  char *u16 = NULL;
+  size_t u16len = 0;
+  if (!blob) {
+    if (seer_iconv("UTF-8", "UTF-16BE", (const char *)data, n, &u16, &u16len) != 0)
+      return SEER_EPROTO;
+    data = (const uint8_t *)u16;
+    n = u16len;
+  }
+  uint8_t *loc = NULL;
+  size_t loclen = 0;
+  SeerStatus st = seer_lob_create_temp(c, blob, &loc, &loclen);
+  if (st == SEER_OK) {
+    uint8_t *resp = NULL;
+    size_t rlen = 0;
+    st = seer_lob_write(c, loc, loclen, data, n, &resp, &rlen);
+    if (st == SEER_OK)
+      st = lobops_status(c, resp, rlen);
+    free(resp);
+  }
+  free(u16);
+  if (st != SEER_OK) {
+    free(loc);
+    return st;
+  }
+
+  SeerWriter v, oac;
+  bool ok = seer_writer_init(&v, loclen + 8);
+  if (ok) {
+    seer_writer_u8(&v, 0x01);
+    seer_writer_u8(&v, 0x28);
+    seer_writer_u8(&v, 0x28);
+    seer_writer_u16(&v, (uint16_t)loclen);
+    seer_writer_bytes(&v, loc, loclen);
+    ok = seer_writer_ok(&v);
+  }
+  free(loc);
+  if (!ok) {
+    seer_writer_free(&v);
+    return SEER_ENOMEM;
+  }
+  if (!seer_writer_init(&oac, 64)) {
+    seer_writer_free(&v);
+    return SEER_ENOMEM;
+  }
+  uint8_t lob_type = blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB;
+  emit_lob_oac(&oac, c->field_version, lob_type);
+  if (!seer_writer_ok(&oac)) {
+    seer_writer_free(&v);
+    seer_writer_free(&oac);
+    return SEER_ENOMEM;
+  }
+  st = store_bind(stmt, param, lob_type, 112, blob ? 0 : 873, 0, false, v.buf, v.len);
+  if (st != SEER_OK) {
+    seer_writer_free(&oac);
+    return st;
+  } /* store_bind took v.buf */
+  SeerBind *b = &stmt->pbinds[param - 1];
+  free(b->oac_override);
+  b->oac_override = oac.buf;
+  b->oac_override_len = oac.len;
+  b->temp_lob = true;
+  return SEER_OK;
+}
+
+/* A plain text / raw value rebound over an earlier temp-LOB bind drops its
+ * LOB OAC. */
+static void clear_temp_lob(SeerStmt *stmt, int param)
+{
+  if (param < 1 || param > stmt->npbinds || !stmt->pbinds[param - 1].temp_lob)
+    return;
+  SeerBind *b = &stmt->pbinds[param - 1];
+  free(b->oac_override);
+  b->oac_override = NULL;
+  b->oac_override_len = 0;
+  b->temp_lob = false;
+}
+
 SeerStatus seer_stmt_bind_text(SeerStmt *stmt, int param, const char *str, int len)
 {
   if (stmt == NULL || str == NULL)
     return SEER_EPARAM;
   size_t n = (len < 0) ? strlen(str) : (size_t)len;
+  if (wants_temp_lob(stmt, n))
+    return bind_temp_lob(stmt, param, false, (const uint8_t *)str, n);
+  clear_temp_lob(stmt, param);
   uint8_t *rxd = NULL;
   size_t rl = 0;
   SeerStatus st = encode_chr((const uint8_t *)str, n, stmt->conn->field_version, &rxd, &rl);
@@ -1972,6 +2105,9 @@ SeerStatus seer_stmt_bind_raw(SeerStmt *stmt, int param, const void *data, int l
   if (stmt == NULL || (data == NULL && len > 0))
     return SEER_EPARAM;
   size_t n = (len < 0) ? 0 : (size_t)len;
+  if (wants_temp_lob(stmt, n))
+    return bind_temp_lob(stmt, param, true, (const uint8_t *)data, n);
+  clear_temp_lob(stmt, param);
   uint8_t *rxd = NULL;
   size_t rl = 0;
   SeerStatus st = encode_chr((const uint8_t *)data, n, stmt->conn->field_version, &rxd, &rl);
@@ -2233,6 +2369,8 @@ SeerStatus seer_stmt_bind_set_inout(SeerStmt *stmt, int param, int max_size)
   if (stmt == NULL || param < 1 || param > stmt->npbinds || stmt->pbinds[param - 1].oac_type == 0)
     return SEER_EPARAM;
   SeerBind *b = &stmt->pbinds[param - 1];
+  if (b->temp_lob)
+    return SEER_ENOTIMPL; /* an IN OUT LOB comes back as a locator, not handled */
   b->is_out = true;
   /* Room for the returned value, which can outgrow the value sent in; only
    * the variable-width types size by value (NUMBER / DATE / ... are fixed). */
@@ -2372,6 +2510,13 @@ static bool starts_with_word(const char *p, const char *kw)
  * blocks and CALL are PL/SQL (a CALL ... INTO's target is an ordinary OUT
  * bind - read as DML RETURNING, the client sent no value and the call hung);
  * everything else (DML, DDL) is a "change". */
+static StmtKind classify_sql(const char *sql);
+
+static bool sql_is_block(const char *sql)
+{
+  return sql != NULL && classify_sql(sql) == STMT_BLOCK;
+}
+
 static StmtKind classify_sql(const char *sql)
 {
   const char *p = sql_first_keyword(sql);
