@@ -394,6 +394,48 @@ int main(void)
   }
 
   {
+    /* A large VECTOR ahead of another bind: its image rides in place (it is
+     * not a LONG-class value, whatever its size), and past 64 KiB its length
+     * needs the 3-byte field. 5000 FLOAT64 dimensions = ~40 KB, 30000 = ~240 KB. */
+    const char *name = "native VECTOR bind, large, ahead of another bind";
+    run(c, "DROP TABLE seervl");
+    run(c, "CREATE TABLE seervl (v VECTOR(*, FLOAT64), id NUMBER) TABLESPACE USERS");
+    static const int sizes[] = {5000, 30000};
+    static double big[30000];
+    for (int i = 0; i < 30000; i++)
+      big[i] = i * 0.5;
+    const char *why = NULL;
+    SeerStatus b = SEER_OK;
+    for (size_t k = 0; k < sizeof sizes / sizeof sizes[0] && why == NULL; k++) {
+      SeerStmt *s = NULL;
+      seer_stmt_prepare(c, "INSERT INTO seervl (v, id) VALUES (:1, :2)", &s);
+      b = seer_stmt_bind_vector_f64(s, 1, big, sizes[k]);
+      SeerStatus e = b == SEER_OK ? seer_stmt_bind_int64(s, 2, sizes[k]) : b;
+      if (e == SEER_OK)
+        e = seer_stmt_execute(s);
+      seer_stmt_close(s);
+      seer_commit(c);
+      char q[128], want[32];
+      snprintf(q, sizeof q,
+               "SELECT id || ':' || VECTOR_DIMENSION_COUNT(v) FROM seervl WHERE id = %d", sizes[k]);
+      snprintf(want, sizeof want, "%d:%d", sizes[k], sizes[k]);
+      if (b == SEER_ENOTIMPL)
+        break;
+      if (e != SEER_OK)
+        why = seer_last_error(c) ? seer_last_error(c) : "bind/exec";
+      else if (!readback_has(c, q, want, want))
+        why = sizes[k] == 5000 ? "5000 dims: readback mismatch" : "30000 dims: readback mismatch";
+    }
+    if (b == SEER_ENOTIMPL)
+      skip(name, "native VECTOR bind requires a 23ai server");
+    else if (why != NULL)
+      fail(name, why);
+    else
+      pass(name);
+    run(c, "DROP TABLE seervl");
+  }
+
+  {
     const char *name = "native VECTOR bind (binary/sparse)";
     run(c, "DROP TABLE seervbin");
     run(c, "DROP TABLE seervsp");

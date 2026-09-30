@@ -2585,7 +2585,11 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
           SeerBind *b = &stmt->pbinds[i];
           if (stmt->returning && b->is_out)
             continue; /* return bind: server-filled */
-          bool long_class = b->oac_size > max_str;
+          /* A bind with a prebuilt OAC - native JSON / VECTOR, a SQL object -
+           * carries its own descriptor framing and rides in place whatever
+           * its size (seerdb PROTOCOL.md §17.2b): moving it last swapped it
+           * with the binds after it. */
+          bool long_class = b->oac_size > max_str && b->oac_override == NULL;
           if (passes == 2 && long_class != (pass == 1))
             continue;
           uint8_t *rxd = (b->rxd != NULL) ? b->rxd[it] : NULL;
@@ -5409,17 +5413,22 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
 static SeerStatus native_lob_bind(SeerStmt *stmt, int param, uint8_t ora_type, const uint8_t *image,
                                   size_t imagelen, const uint8_t *oac_bytes, size_t oac_len)
 {
-  if (imagelen > 0xFFFF)
+  /* The 18-byte descriptor, then the image length as THREE bytes - not a
+   * 19-byte descriptor + ub2: identical below 64 KiB (the 19th byte is the
+   * length's high byte), but a ub2 can't carry a bigger image, e.g. a float64
+   * vector past ~8190 dimensions (seerdb/seerdb@d15e421). */
+  if (imagelen > 0xFFFFFF)
     return SEER_EPARAM;
   uint8_t fv = stmt->conn->field_version;
-  static const uint8_t DESC[19] = {
-      0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08, 0x00,
-      0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  static const uint8_t DESC[18] = {
+      0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08,
+      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
   };
   SeerWriter v;
   if (!seer_writer_init(&v, 64 + imagelen))
     return SEER_ENOMEM;
   seer_writer_bytes(&v, DESC, sizeof DESC);
+  seer_writer_u8(&v, (uint8_t)(imagelen >> 16));
   seer_writer_u8(&v, (uint8_t)(imagelen >> 8));
   seer_writer_u8(&v, (uint8_t)(imagelen & 0xFF));
   for (int i = 0; i < 22; i++)
