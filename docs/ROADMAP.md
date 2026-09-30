@@ -12,31 +12,9 @@ and exercised (most against the live 9i/10g/11g/18c/21c/23ai matrix, see
 
 ## Server versions (negotiated TTC field version)
 
-- [x] Oracle 10g — fv4 (DES verifier, fv4 describe). **Local-only for CI**: it can
-      be containerized but its image isn't redistributable, so like 9i it stays out
-      of public GitHub CI (tested locally via `run-matrix.sh`).
-- [x] Oracle 11g — fv6 (the long-standing baseline).  ┐ public-CI tier
-- [x] Oracle 21c — fv16 (native 12c wire forms).      │ (11g XE / 21c XE /
-- [x] Oracle 23ai — **fv24 native** (fast-auth), default cap.  ┘ 23ai FREE images)
-      The live 23ai bed (release 23.1.162) advertises fv27 - the 26ai level - and
-      is capped to fv24; the CI job runs a genuine 23.x image.
-- [x] Oracle 18c — fv11, live-validated (18c XE; full integration + object /
-      temp-LOB / inline-LOB checks). **Local-only** like 10g.
-- [~] Oracle 12.1 / 12.2 / 19c — no live server; they negotiate the same 12c wire
-      forms (fv7–14) the 18c / 21c tiers exercise, and the 12.1 level itself is
-      tested by capping a 21c session with `SEER_MAX_FV=7`. Expected to work,
-      not proven against the real releases.
 - [ ] Oracle 8i (8.1.7) — a distinct older protocol dialect; a live 8i VM exists
       but the driver does not speak it yet.
-- [x] 26ai with native network encryption **required** (AES256 + SHA256) —
-      validated live on the 26ai encryption bed. A server error there arrives as
-      a break/reset marker exchange, after which both peers re-derive the
-      data-integrity keystreams (`seer_ano_reset`); before that fix the first
-      SQL error desynced the session. A multi-packet reply's encrypted
-      fragments are whole AES blocks, so they can fall up to a block short of
-      (or a byte over) the fragment size; both are read as fragments. The full
-      integration suite passes on that bed.
-- [x] Oracle 9i — **fv2, live-validated against a 9i VM** (127.0.0.1:1526, SID=orcl;
+- [x] Oracle 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
       TTI_ALL8 we send 10g+), DML/DDL, binds, PL/SQL blocks (IN/OUT), CLOB/BLOB/BFILE
@@ -47,6 +25,31 @@ and exercised (most against the live 9i/10g/11g/18c/21c/23ai matrix, see
       a meson `test()` so `meson test` / GitHub CI never reference 9i (9i and 10g
       stay local; 11g/21c/23ai are the intended public-CI tier). Override the
       endpoint with `SEER_9I_*`.
+- [x] Oracle 10g — fv4 (DES verifier, fv4 describe). **Local-only for CI**: it can
+      be containerized but its image isn't redistributable, so like 9i it stays out
+      of public GitHub CI (tested locally via `run-matrix.sh`).
+- [x] Oracle 11g — fv6 (the long-standing baseline). Public-CI tier (11g XE image).
+- [~] Oracle 12.1 / 12.2 — no live server; they negotiate the same 12c wire
+      forms (fv7–14) the 18c / 21c tiers exercise, and the 12.1 level itself is
+      tested by capping a 21c session with `SEER_MAX_FV=7`. Expected to work,
+      not proven against the real releases.
+- [x] Oracle 18c — fv11, live-validated (18c XE; full integration + object /
+      temp-LOB / inline-LOB checks). **Local-only** like 10g.
+- [~] Oracle 19c — no live server; negotiates the same 12c wire forms the
+      18c / 21c tiers exercise. Expected to work, not proven against the real
+      release.
+- [x] Oracle 21c — fv16 (native 12c wire forms). Public-CI tier (21c XE image).
+- [x] Oracle 23ai — **fv24 native** (fast-auth), default cap. Public-CI tier
+      (23ai FREE image). The live 23ai bed (release 23.1.162) advertises fv27 -
+      the 26ai level - and is capped to fv24; the CI job runs a genuine 23.x image.
+- [x] Oracle 26ai with native network encryption **required** (AES256 + SHA256) —
+      validated live on the 26ai encryption bed. A server error there arrives as
+      a break/reset marker exchange, after which both peers re-derive the
+      data-integrity keystreams (`seer_ano_reset`); before that fix the first
+      SQL error desynced the session. A multi-packet reply's encrypted
+      fragments are whole AES blocks, so they can fall up to a block short of
+      (or a byte over) the fragment size; both are read as fragments. The full
+      integration suite passes on that bed.
 
 Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 `min(server_fv, cap)`. `SEER_MAX_FV` overrides for development.
