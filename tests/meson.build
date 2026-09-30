@@ -105,6 +105,14 @@ if host_machine.system() != 'windows'
     dependencies : [common_dep],
   )
   test('no SIGPIPE on a closed peer', test_sigpipe)
+
+  # A reply that ends in a packet of exactly the fragment size must not wait
+  # out the socket timeout for a continuation that never comes (§1.3).
+  test_fragment_wait = executable('test_fragment_wait',
+    'unit/test_fragment_wait.c',
+    dependencies : [seertns_dep],
+  )
+  test('exact-size final packet', test_fragment_wait, timeout : 60)
 endif
 
 # Live two-phase-commit (XA/TPC) test against the core API. Self-gating: exits 77
