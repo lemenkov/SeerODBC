@@ -17,12 +17,12 @@ protocol variant with no feature behind it is not a gap.
 
 ## Server versions (negotiated TTC field version)
 
-- [~] Oracle 8i (8.1.7) — **login + queries, live-validated against an 8i VM**
+- [~] 8i (8.1.7) — **login + queries, live-validated against an 8i VM**
       (its own dialect: the OSESSKEY-envelope O3LOGON, a 9.2-era OALL8, fixed-width
       little-endian describe / rows / status, WE8ISO8859P1 text). Not spoken:
       DML / DDL / PL/SQL / transaction control and LOB columns (refused with
       SEER_ENOTIMPL).
-- [x] Oracle 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
+- [x] 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
       TTI_ALL8 we send 10g+), DML/DDL, binds, PL/SQL blocks (IN/OUT), CLOB/BLOB/BFILE
@@ -33,24 +33,24 @@ protocol variant with no feature behind it is not a gap.
       a meson `test()` so `meson test` / GitHub CI never reference 9i (9i and 10g
       stay local; 11g/21c/23ai are the intended public-CI tier). Override the
       endpoint with `SEER_9I_*`.
-- [x] Oracle 10g — fv4 (DES verifier, fv4 describe). **Local-only for CI**: it can
+- [x] 10g — fv4 (DES verifier, fv4 describe). **Local-only for CI**: it can
       be containerized but its image isn't redistributable, so like 9i it stays out
       of public GitHub CI (tested locally via `run-matrix.sh`).
-- [x] Oracle 11g — fv6 (the long-standing baseline). Public-CI tier (11g XE image).
-- [~] Oracle 12.1 / 12.2 — no live server; they negotiate the same 12c wire
+- [x] 11g — fv6 (the long-standing baseline). Public-CI tier (11g XE image).
+- [~] 12.1 / 12.2 — no live server; they negotiate the same 12c wire
       forms (fv7–14) the 18c / 21c tiers exercise, and the 12.1 level itself is
       tested by capping a 21c session with `SEER_MAX_FV=7`. Expected to work,
       not proven against the real releases.
-- [x] Oracle 18c — fv11, live-validated (18c XE; full integration + object /
+- [x] 18c — fv11, live-validated (18c XE; full integration + object /
       temp-LOB / inline-LOB checks). **Local-only** like 10g.
-- [~] Oracle 19c — no live server; negotiates the same 12c wire forms the
+- [~] 19c — no live server; negotiates the same 12c wire forms the
       18c / 21c tiers exercise. Expected to work, not proven against the real
       release.
-- [x] Oracle 21c — fv16 (native 12c wire forms). Public-CI tier (21c XE image).
-- [x] Oracle 23ai — **fv24 native** (fast-auth), default cap. Public-CI tier
+- [x] 21c — fv16 (native 12c wire forms). Public-CI tier (21c XE image).
+- [x] 23ai — **fv24 native** (fast-auth), default cap. Public-CI tier
       (23ai FREE image). The live 23ai bed (release 23.1.162) advertises fv27 -
       the 26ai level - and is capped to fv24; the CI job runs a genuine 23.x image.
-- [x] Oracle 26ai with native network encryption **required** (AES256 + SHA256) —
+- [x] 26ai with native network encryption **required** (AES256 + SHA256) —
       validated live on the 26ai encryption bed. A server error there arrives as
       a break/reset marker exchange, after which both peers re-derive the
       data-integrity keystreams (`seer_ano_reset`); before that fix the first
@@ -425,7 +425,7 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 The object/collection arc (incl. the deep tail: collections-of-objects,
 objects-with-collection-attributes, OUT associative arrays), Advanced Queuing,
 XA/2PC, TLS/TCPS, proxy auth + DRCP, native JSON/VECTOR binds, XMLType fetch/bind
-(incl. LOB-backed), statement caching, **Oracle 9i (fv2 / O3LOGON / TTI_ALL7)**,
+(incl. LOB-backed), statement caching, **9i (fv2 / O3LOGON / TTI_ALL7)**,
 **ANO native encryption (§33)**, **request boundaries (§35)**, **sessionless
 transactions (§31)** and **request pipelining (§32, incl. the single-round-trip
 burst)** have all landed — matrix-validated. The driver spans field versions

@@ -12,7 +12,7 @@ assignees: ''
 
 ## Environment
 
-- **Oracle release** (9i / 10g / 11g / 21c / 23ai, and patch level if known):
+- **Server release** (9i / 10g / 11g / 21c / 23ai, and patch level if known):
 - **How you reached the driver:**
   - [ ] ODBC — Driver Manager (unixODBC / iODBC) + version:
   - [ ] core `seer_*` API directly / `seersql`

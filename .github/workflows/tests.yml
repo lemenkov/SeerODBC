@@ -135,7 +135,7 @@ jobs:
       - name: Unit tests
         run: meson test -C build --print-errorlogs
 
-  # Integration tests against a real Oracle server, run across the three public
+  # Integration tests against a real database server, run across the three public
   # tiers via redistributable gvenzl images: 11g (:1521/XE), 21c (:1521/XEPDB1)
   # and 23ai Free (:1521/FREEPDB1). (10g and 9i can't ship to public CI — 10g's
   # image isn't redistributable and 9i needs an old kernel/glibc — so they stay
@@ -150,13 +150,13 @@ jobs:
       fail-fast: false
       matrix:
         db:
-          - name: "Oracle XE 11g"
+          - name: "XE 11g"
             image: "gvenzl/oracle-xe:11-slim"
             service: "XE"
-          - name: "Oracle XE 21c"
+          - name: "XE 21c"
             image: "gvenzl/oracle-xe:21-slim"
             service: "XEPDB1"
-          - name: "Oracle 23ai Free"
+          - name: "23ai Free"
             image: "gvenzl/oracle-free:23-slim"
             service: "FREEPDB1"
     services:

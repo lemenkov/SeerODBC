@@ -12,8 +12,8 @@ SeerODBC. For the project's clean-room posture and contribution rules, read
 
 ## Scope: connect, don't collect protocols
 
-SeerODBC's goal is to connect to Oracle databases and support their features,
-not to implement every protocol Oracle speaks (README, *Goals*). When syncing
+SeerODBC's goal is to connect to databases and support their features, not to
+implement every wire protocol the vendor speaks (README, *Goals*). When syncing
 with seerdb's `docs/PROTOCOL.md` or weighing a new finding:
 
 - take what changes what a user sees — a connection that fails or hangs, wrong
@@ -55,7 +55,7 @@ never to merge or tag it. The steps:
    (`git log <last-tag>..master`, or the full history for the first release),
    skipping dependabot / pure-CI noise. Bold the headline phrase of each entry
    and cite the issue/PR as `(#NNN)`. State validation status **honestly**:
-   which Oracle tiers (10g / 11g / 21c / 23ai) were exercised live, and call out
+   which server tiers (10g / 11g / 21c / 23ai) were exercised live, and call out
    anything proved only against a local bed, a proxy, or CI containers rather
    than a real server.
 

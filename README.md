@@ -6,21 +6,26 @@ SPDX-License-Identifier: Apache-2.0
 
 # SeerODBC
 
-A clean-room **ODBC driver for Oracle Database**, written in C.
+A clean-room **ODBC driver for a proprietary database**, written in C.
 
-A *seer* is an oracle — hence the name. SeerODBC lets ODBC consumers (BI
-tools, Microsoft-stack applications, anything that speaks ODBC) talk to an
-Oracle database **without** the Oracle Instant Client, by speaking Oracle's
-TNS/TTC wire protocol directly.
+SeerODBC lets ODBC consumers (BI tools, Microsoft-stack applications,
+anything that speaks ODBC) talk to the database by speaking its native wire
+protocol (TNS/TTC) directly. No vendor client libraries are required.
+
+> **Independent project — not affiliated with Oracle.** SeerODBC is a
+> clean-room, independent effort and is not affiliated with, endorsed by, or
+> sponsored by Oracle Corporation. Oracle®, Oracle Database, and related names
+> are trademarks of Oracle and/or its affiliates. SeerODBC reimplements the
+> wire protocol for interoperability only.
 
 > **Status: working driver.** Connects, queries, and does DML in transactions
-> against live Oracle through unixODBC. See
+> against live servers through unixODBC. See
 > [`docs/ODBC_CONFORMANCE.md`](docs/ODBC_CONFORMANCE.md) for the function set and
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design and progress log.
 
 ## What works
 
-Validated live across six Oracle releases — **9i, 10g, 11g, 18c, 21c and 23ai**
+Validated live across six server releases — **9i, 10g, 11g, 18c, 21c and 23ai**
 (TTC field versions 2 through 24) — via `tests/odbc/run-matrix.sh`. The 10g–23ai
 tier runs the full ODBC surface through unixODBC; 9i (the legacy fv2 / `TTI_ALL7`
 dialect) is validated through the core API. 11g/21c/23ai are the public-CI tier;
@@ -61,21 +66,21 @@ LOB columns are refused with "not implemented".
 ## Goals
 
 - **Connect to the database and support its features — not implement every
-  protocol.** The aim is that an ODBC application can reach every Oracle
-  database in the supported range and use what that database offers. Oracle's
+  protocol.** The aim is that an ODBC application can reach every
+  database in the supported range and use what that database offers. The
   wire protocols are the means, not the product: a dialect is implemented as
   far as the features need it and no further, and an alternative wire form
   that does a job already done (for example, OCI's native forms where the thin
   form works) is out of scope. An old release is supported as far as its
-  realistic use needs — Oracle 8i logs in and runs queries, and stops there.
+  realistic use needs — 8i logs in and runs queries, and stops there.
   When a choice has to be made, a fix a user would see wins over protocol
   fidelity.
-- Support the Oracle release range **9i through 23ai** (field versions 2–24),
+- Support the release range **9i through 23ai** (field versions 2–24),
   negotiating the wire form down to each server; **11g** remains the reference
   target.
 - Implement the ODBC 3.x functions that cover real consumer usage, driven by
   the public **Microsoft ODBC Programmer's Reference**.
-- Stay **clean-room**: no Oracle source, no decompiled binaries, no code
+- Stay **clean-room**: no vendor source, no decompiled binaries, no code
   copied from any other driver. Public references and our own packet
   captures only. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -88,7 +93,7 @@ exists):
   +-----------------------------+   src/odbc/   ODBC shim (the SQL* entry points)
   |  ODBC shim                  |
   +-----------------------------+
-  |  TNS/TTC protocol core      |   src/tns/    speaks Oracle's wire protocol
+  |  TNS/TTC protocol core      |   src/tns/    speaks the TNS/TTC protocol
   +-----------------------------+
 ```
 

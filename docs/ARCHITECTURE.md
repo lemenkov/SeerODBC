@@ -19,7 +19,7 @@ Two layers, strictly separated. The rule that everything else follows from:
                     | uses include/seer/seertns.h only
                     v
   +------------------------------------------+
-  |  TNS/TTC protocol core   src/tns/        |   speaks Oracle's wire protocol
+  |  TNS/TTC protocol core   src/tns/        |   speaks the TNS/TTC protocol
   |  - reader/writer, packet, transport,     |   native C types only;
   |    auth, ttc, types, session             |   no sql.h anywhere here
   +------------------------------------------+
@@ -120,7 +120,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   (`handles.c`, `diag.c`); `SQLConnect`/`SQLDriverConnect` parse the connection
   string and resolve the DSN's HOST/PORT/SERVICE from `odbc.ini` via
   `SQLGetPrivateProfileString` (`connect.c`); env/conn/stmt attributes
-  (`attrs.c`); the `SQLGetInfo` Oracle answer table + `SQLGetFunctions`
+  (`attrs.c`); the `SQLGetInfo` server-specific answer table + `SQLGetFunctions`
   (`info.c`); `SQLPrepare`/`SQLExecute`/`SQLExecDirect` (`exec.c`); and
   `SQLNumResultCols`/`SQLDescribeCol`/`SQLColAttribute`/`SQLBindCol`/`SQLFetch`/
   `SQLGetData`/`SQLRowCount`/`SQLFreeStmt`/`SQLCloseCursor` (`results.c`). Values
@@ -146,7 +146,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   ODBC `SQLDescribeCol`/`SQLColAttribute` map each to its SQL type / type name /
   display size. Verified end-to-end: a mixed `NUMBER, VARCHAR2, BINARY_FLOAT,
   TIMESTAMP` row decodes to `42, hi, 1.5, 2026-06-18 14:30:00`.
-- **Validated against a live Oracle 11g XE (11.2.0.2).** `seersql` and stock
+- **Validated against a live 11g XE (11.2.0.2).** `seersql` and stock
   `isql` (through unixODBC) both log in and run literal + parameterized,
   single- and multi-row SELECTs returning NUMBER / VARCHAR2 / DATE /
   BINARY_DOUBLE, against a real server. The live run surfaced and fixed two
@@ -520,7 +520,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   Advanced Queuing, XA / two-phase commit, proxy auth + DRCP, TLS / TCPS, and
   statement caching — each matrix-validated and ASan/UBSan-clean. `docs/ROADMAP.md`
   is the live per-feature inventory.
-- **Done — Oracle 9i (fv2).** The legacy tier landed too: O3LOGON DES auth and the
+- **Done — 9i (fv2).** The legacy tier landed too: O3LOGON DES auth and the
   `TTI_ALL7` (`0x47`) query/DML/PL-SQL/LOB dialect (distinct from the `TTI_ALL8` we
   send 10g+), all fv-gated so 10g+ is untouched. Validated against a 9i VM (not
   containerizable) and wired into `run-matrix.sh` as a local-only core-API row, so

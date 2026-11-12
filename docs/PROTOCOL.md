@@ -4,7 +4,7 @@ SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Oracle TNS/TTC wire protocol notes
+# TNS/TTC wire protocol notes
 
 This document is the **shared protocol asset** between SeerODBC and the
 sibling project [`seerdb`](https://github.com/seerdb/seerdb). seerdb's [`PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) is the more
@@ -13,7 +13,7 @@ specification, not by copying seerdb's Python.
 
 > Clean-room reminder: everything here is derived from public references and
 > our own packet captures of a stock client talking to an authorized server.
-> No Oracle source, no decompiled binaries. See `CONTRIBUTING.md`.
+> No vendor source, no decompiled binaries. See `CONTRIBUTING.md`.
 
 ## Scope
 
@@ -33,7 +33,7 @@ specification, not by copying seerdb's Python.
 4. **Type decoding** — NUMBER, DATE/TIMESTAMP, VARCHAR2/CHAR, RAW, the LOB
    locators, etc. (the wire <-> native mapping in `src/tns/types.c`).
 
-## Not TLS: Oracle Native Network Encryption
+## Not TLS: Native Network Encryption
 
 Distinct from TCPS/TLS. It is a proprietary scheme negotiated inside the TNS
 handshake (Diffie-Hellman key exchange, then AES/3DES/RC4). OpenSSL provides

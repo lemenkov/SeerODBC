@@ -20,7 +20,7 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 | [x] | SQLConnect / SQLDriverConnect | DSN from odbc.ini; HOST/PORT/SERVICE keys |
 | [x] | SQLDisconnect | |
 | [x] | SQLSetConnectAttr / SQLGetConnectAttr | autocommit |
-| [x] | SQLGetInfo | Oracle answer table (identifier quote, schemas-not-catalogs, txn, scroll options, …) |
+| [x] | SQLGetInfo | server-specific answer table (identifier quote, schemas-not-catalogs, txn, scroll options, …) |
 | [x] | SQLGetFunctions | incl. SQL_API_ODBC3_ALL_FUNCTIONS |
 | [x] | SQLGetDiagRec / SQLGetDiagField | ORA-code → SQLSTATE mapping; multi-record queue (array-DML row errors carry SQL_DIAG_ROW_NUMBER) |
 | [x] | SQLEndTran | commit / rollback |
@@ -73,7 +73,7 @@ value/type halves of `SQLBindParameter` (APD/IPD); the IRD is read-only (`HY016`
 
 ## SeerODBC-specific identifiers
 
-Oracle features with no standard ODBC surface are exposed through
+Server features with no standard ODBC surface are exposed through
 driver-specific identifiers. An application defines the numbers itself (they
 are not in any Driver Manager header):
 
@@ -85,7 +85,7 @@ are not in any Driver Manager header):
 | `SQL_DESC_SEER_VECTOR_DIMENSIONS` | 19114 | `SQLColAttribute` (numeric) | a VECTOR column's declared dimensions (0 = flexible) |
 | `SQL_DESC_SEER_VECTOR_FORMAT` | 19115 | `SQLColAttribute` (numeric) | its element format: 2 FLOAT32, 3 FLOAT64, 4 INT8, 5 BINARY (0 = flexible) |
 
-Diagnostics also follow Oracle's own clients: the native error of a failed
+Diagnostics also follow the vendor's own clients: the native error of a failed
 statement is its ORA number, and creating a PL/SQL object that compiled with
 errors returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01000`, native 24344.
 
@@ -120,7 +120,7 @@ for any function where only one width is exported.
   SEER_TEST_HOST=127.0.0.1 SEER_TEST_SERVICE=XE \
   SEER_TEST_USER=pyo SEER_TEST_PASS=pyo123 meson test -C build 'odbc integration'
   ```
-  `tests/odbc/run-matrix.sh` runs it across every reachable Oracle version and
+  `tests/odbc/run-matrix.sh` runs it across every reachable server version and
   prints a support matrix — **10g, 11g, 21c and 23ai all pass** (10g at fv4, 23ai
   natively at fv24; the earlier 10g-login and 23ai-framing gaps are closed). The
   script also runs a local-only **9i** row via a dedicated core-API test

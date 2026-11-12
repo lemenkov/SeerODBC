@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Security Policy
 
-SeerODBC is a database driver: it handles credentials, implements Oracle's
+SeerODBC is a database driver: it handles credentials, implements the database's
 authentication crypto (O5LOGON / O3LOGON), parses untrusted data off the wire in
 C, and can carry the session over TLS. Security reports are taken seriously.
 
@@ -26,7 +26,7 @@ or by email to **lemenkov@gmail.com**.
 Helpful details:
 
 - the affected component (auth/crypto, the TNS/TTC parser, TLS transport, the
-  ODBC shim) and the Oracle release involved;
+  ODBC shim) and the server release involved;
 - a reproduction or proof of concept, and the impact you observed;
 - any relevant `SEER_LOG=debug` output, a backtrace, or a sanitizer report.
 
