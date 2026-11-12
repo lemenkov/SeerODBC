@@ -108,9 +108,23 @@ jobs:
   # path to a green Windows CI); an MSVC leg comes later. The ODBC shim + live
   # integration land in subsequent phases of the port.
   build-windows:
-    name: Build + unit (Windows/MinGW)
+    # 64-bit, and 32-bit for 32-bit applications: on Windows a driver's bitness
+    # must match the application's, not the system's (#62).
+    name: Build + unit (${{ matrix.name }})
     runs-on: windows-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows/MinGW
+            msystem: MINGW64
+            pkg: mingw-w64-x86_64
+            arch: x64
+          - name: Windows/MinGW 32-bit
+            msystem: MINGW32
+            pkg: mingw-w64-i686
+            arch: x86
     defaults:
       run:
         shell: msys2 {0}
@@ -119,15 +133,15 @@ jobs:
       - name: Set up MSYS2 / MinGW-w64
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-libiconv
+            ${{ matrix.pkg }}-gcc
+            ${{ matrix.pkg }}-meson
+            ${{ matrix.pkg }}-ninja
+            ${{ matrix.pkg }}-pkgconf
+            ${{ matrix.pkg }}-openssl
+            ${{ matrix.pkg }}-libiconv
             zip
       - name: Configure
         run: meson setup build
@@ -135,6 +149,21 @@ jobs:
         run: meson compile -C build
       - name: Unit tests
         run: meson test -C build --print-errorlogs
+      # The ODBC Driver Manager looks the entry points up by their plain names
+      # (SQLConnect); a 32-bit __stdcall build must not export them decorated
+      # (_SQLConnect@28).
+      - name: Check the DLL's exports
+        run: |
+          objdump -p build/src/odbc/seerodbc.dll |
+            sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p' > exports.txt
+          n=$(grep -c ' SQL' exports.txt)
+          bad=$(grep -E ' _?SQL[A-Za-z]*@[0-9]+' exports.txt || true)
+          echo "$n SQL exports"
+          if [ "$n" -lt 60 ] || [ -n "$bad" ]; then
+            echo "::error::unexpected exports: $n SQL names, decorated: $bad"
+            cat exports.txt
+            exit 1
+          fi
       # The release zip, as release.yml builds it, so a change that breaks the
       # packaging shows here and every PR has a zip to try on Windows.
       - name: Package the Windows zip
@@ -142,7 +171,7 @@ jobs:
       - name: Upload the Windows zip
         uses: actions/upload-artifact@v7
         with:
-          name: seerodbc-windows-x64
+          name: seerodbc-windows-${{ matrix.arch }}
           path: dist/*.zip
           retention-days: 14
 

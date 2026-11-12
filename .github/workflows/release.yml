@@ -20,12 +20,22 @@ permissions:
   contents: read
 
 jobs:
-  # The Windows build (MSYS2 MINGW64): seerodbc.dll and what it needs, as a zip
-  # (packaging/windows/make-zip.sh), handed to the release job.
+  # The Windows builds (MSYS2 MINGW64 and MINGW32): seerodbc.dll and what it
+  # needs, as a zip per architecture (packaging/windows/make-zip.sh), handed to
+  # the release job.
   windows:
-    name: Windows zip (x64)
+    name: Windows zip (${{ matrix.arch }})
     runs-on: windows-latest
     timeout-minutes: 25
+    strategy:
+      matrix:
+        include:
+          - msystem: MINGW64
+            pkg: mingw-w64-x86_64
+            arch: x64
+          - msystem: MINGW32 # for 32-bit applications (#62)
+            pkg: mingw-w64-i686
+            arch: x86
     defaults:
       run:
         shell: msys2 {0}
@@ -34,15 +44,15 @@ jobs:
       - name: Set up MSYS2 / MinGW-w64
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-openssl
-            mingw-w64-x86_64-libiconv
+            ${{ matrix.pkg }}-gcc
+            ${{ matrix.pkg }}-meson
+            ${{ matrix.pkg }}-ninja
+            ${{ matrix.pkg }}-pkgconf
+            ${{ matrix.pkg }}-openssl
+            ${{ matrix.pkg }}-libiconv
             zip
       - name: Configure
         run: meson setup build --buildtype=release
@@ -54,7 +64,7 @@ jobs:
         run: packaging/windows/make-zip.sh build dist
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x64
+          name: windows-${{ matrix.arch }}
           path: dist/*.zip
 
   release:
@@ -122,10 +132,11 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch the Windows zip
+      - name: Fetch the Windows zips
         uses: actions/download-artifact@v8
         with:
-          name: windows-x64
+          pattern: windows-*
+          merge-multiple: true
           path: build/windows
 
       - name: Keep a dry run's artifacts
