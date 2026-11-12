@@ -128,12 +128,23 @@ jobs:
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-libiconv
+            zip
       - name: Configure
         run: meson setup build
       - name: Compile
         run: meson compile -C build
       - name: Unit tests
         run: meson test -C build --print-errorlogs
+      # The release zip, as release.yml builds it, so a change that breaks the
+      # packaging shows here and every PR has a zip to try on Windows.
+      - name: Package the Windows zip
+        run: packaging/windows/make-zip.sh build dist
+      - name: Upload the Windows zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: seerodbc-windows-x64
+          path: dist/*.zip
+          retention-days: 14
 
   # Integration tests against a real database server, run across the three public
   # tiers via redistributable gvenzl images: 11g (:1521/XE), 21c (:1521/XEPDB1)

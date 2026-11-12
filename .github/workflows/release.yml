@@ -4,6 +4,10 @@
 name: Release
 
 on:
+  # A manual run (Actions -> Release -> Run workflow) is a dry run: it builds
+  # and tests everything a release would, and keeps the artifacts on the run,
+  # but creates no Release. Use it before tagging.
+  workflow_dispatch:
   push:
     tags:
       # Unprefixed x.y.z only. AGENTS.md ("Tag naming") requires bare tags
@@ -16,8 +20,46 @@ permissions:
   contents: read
 
 jobs:
+  # The Windows build (MSYS2 MINGW64): seerodbc.dll and what it needs, as a zip
+  # (packaging/windows/make-zip.sh), handed to the release job.
+  windows:
+    name: Windows zip (x64)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up MSYS2 / MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-libiconv
+            zip
+      - name: Configure
+        run: meson setup build --buildtype=release
+      - name: Compile
+        run: meson compile -C build
+      - name: Unit tests
+        run: meson test -C build --print-errorlogs
+      - name: Package
+        run: packaging/windows/make-zip.sh build dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: dist/*.zip
+
   release:
     name: Build and create the GitHub Release
+    needs: [windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required by `gh release create`
@@ -38,6 +80,7 @@ jobs:
         run: meson setup build
 
       - name: Verify the tag matches the meson project version
+        if: github.event_name == 'push'
         # Enforces the version sync AGENTS.md requires: a release tag must equal
         # the version bumped in meson.build (which is kept in lockstep with
         # include/seer/seertns.h and packaging/seerodbc.spec). Catches a tag
@@ -68,6 +111,7 @@ jobs:
         run: meson dist -C build
 
       - name: Check the curated release notes
+        if: github.event_name == 'push'
         # The Release body is the in-tree docs/releases/<tag>.md, written in the
         # release PR (AGENTS.md step 3). Refuse to publish a release without it
         # rather than fall back to the bare PR list.
@@ -78,7 +122,23 @@ jobs:
             exit 1
           fi
 
+      - name: Fetch the Windows zip
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: build/windows
+
+      - name: Keep a dry run's artifacts
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dry-run
+          path: |
+            build/meson-dist/*
+            build/windows/*.zip
+
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -92,4 +152,4 @@ jobs:
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
             --generate-notes \
             --verify-tag \
-            build/meson-dist/*
+            build/meson-dist/* build/windows/*.zip
