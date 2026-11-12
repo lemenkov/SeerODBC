@@ -1,4 +1,4 @@
-/* freeoracle - a tsql-style CLI that links the protocol core DIRECTLY,
+/* seersql - a tsql-style CLI that links the protocol core DIRECTLY,
  * bypassing ODBC and the Driver Manager entirely. It exists to prove the
  * wire protocol against a real server before (and independently of) the
  * ODBC shim - the same role FreeTDS's `tsql` plays for libtds.
@@ -16,7 +16,7 @@
 static void usage(const char *argv0)
 {
   fprintf(stderr,
-          "freeoracle (SeerODBC %d.%d.%d) - direct TNS protocol client\n"
+          "seersql (SeerODBC %d.%d.%d) - direct TNS protocol client\n"
           "usage: %s -H host [-p port] -s service [-u user] [-P password] [-q SQL] [-N int] [-T "
           "text] [-v]\n"
           "  -q SQL   run a SELECT and print the rows\n"

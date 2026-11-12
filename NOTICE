@@ -10,7 +10,9 @@ references and the project's own packet captures. It contains no Oracle
 source code and no code copied from any other ODBC driver. See
 CONTRIBUTING.md for the clean-room development rules.
 
-"Oracle" is a registered trademark of Oracle Corporation. This project is
-not affiliated with, endorsed by, or sponsored by Oracle Corporation. The
-name is used only nominatively, to describe the database this driver
-connects to.
+Oracle and Oracle Database are trademarks or registered trademarks of Oracle
+Corporation and/or its affiliates. This project is an independent, unaffiliated,
+clean-room implementation. It is not endorsed by, sponsored by, or affiliated
+with Oracle Corporation. Every reference to "Oracle" in this project is
+nominative — used solely to describe the database this software interoperates
+with — and no trademark ownership is claimed or implied.

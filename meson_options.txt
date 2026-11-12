@@ -4,11 +4,11 @@
 
 option('with_tls',
   type : 'boolean', value : true,
-  description : 'TLS transport (Oracle TCPS) and crypto primitives via OpenSSL')
+  description : 'TLS transport (TCPS) and crypto primitives via OpenSSL')
 
 option('build_tools',
   type : 'boolean', value : true,
-  description : 'Build the freeoracle CLI (direct TNS client, no ODBC)')
+  description : 'Build the seersql CLI (direct TNS client, no ODBC)')
 
 option('build_tests',
   type : 'boolean', value : true,

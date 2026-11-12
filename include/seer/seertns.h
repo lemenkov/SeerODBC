@@ -1,6 +1,6 @@
 /* SeerODBC - protocol core public API.
  *
- * This is the entire surface the ODBC shim (and freeoracle, and any future
+ * This is the entire surface the ODBC shim (and seersql, and any future
  * binding) is allowed to use. It deals only in native C types: there is
  * deliberately nothing ODBC-shaped here. The core does not know ODBC exists.
  *

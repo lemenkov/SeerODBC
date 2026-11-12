@@ -24,7 +24,7 @@ query-filters:
   - exclude:
       id: cpp/stack-address-escape
 
-  # Oracle's O5LOGON pre-11g authentication handshake mandates DES-CBC for the
+  # The O5LOGON pre-11g authentication handshake mandates DES-CBC for the
   # session-key exchange. It is a wire-protocol requirement, not data-at-rest
   # encryption, and cannot be substituted without breaking 9i/10g auth.
   - exclude:
@@ -32,7 +32,7 @@ query-filters:
 
   # The "system data" flowing into the socket send() is the caller's own
   # connection configuration (host / service / credentials / TNS options)
-  # being transmitted to the very Oracle server it is connecting to — the
+  # being transmitted to the very server it is connecting to — the
   # intended destination, not an unintended disclosure.
   - exclude:
       id: cpp/system-data-exposure

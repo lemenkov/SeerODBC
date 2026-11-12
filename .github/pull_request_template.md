@@ -8,7 +8,7 @@
 
 ## Testing
 
-<!-- How was this validated? Which Oracle tiers did you run against
+<!-- How was this validated? Which server tiers did you run against
      (tests/odbc/run-matrix.sh), and did the sanitizer build stay clean? -->
 
 - [ ] Ran the relevant tests / integration matrix
@@ -16,7 +16,7 @@
 
 ## Checklist
 
-- [ ] **Clean-room**: no Oracle source, no decompiled binaries, no code copied
+- [ ] **Clean-room**: no vendor source, no decompiled binaries, no code copied
       from any other driver — public references and own packet captures only
       (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
 - [ ] REUSE-compliant: new files carry SPDX copyright + license tags.

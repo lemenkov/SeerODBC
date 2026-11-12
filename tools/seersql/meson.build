@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-executable('freeoracle',
+executable('seersql',
   'main.c',
   dependencies : [seertns_dep],
   install : true,

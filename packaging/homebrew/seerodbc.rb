@@ -10,7 +10,7 @@
 #   brew install <you>/seerodbc/seerodbc
 # On each release bump `url` to the new tag and `sha256` to its tarball's hash.
 class Seerodbc < Formula
-  desc "Clean-room thin ODBC driver for Oracle Database (no Oracle client needed)"
+  desc "Clean-room ODBC driver for a proprietary database, no vendor client needed"
   homepage "https://github.com/seerdb/SeerODBC"
   url "https://github.com/seerdb/SeerODBC/archive/refs/tags/0.2.0.tar.gz"
   sha256 "295faf23cbfb0ff3cbd4d1ea50efa417b5b78474ce6b98a9565f5bdab3e52da1"
@@ -29,7 +29,7 @@ class Seerodbc < Formula
     system "meson", "install", "-C", "build"
     (pkgshare/"odbcinst.ini.sample").write <<~EOS
       [SeerODBC]
-      Description = Clean-room ODBC driver for Oracle Database
+      Description = Clean-room ODBC driver for a proprietary database
       Driver      = #{opt_lib}/odbc/libseerodbc.dylib
     EOS
   end

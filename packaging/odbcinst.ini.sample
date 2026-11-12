@@ -9,7 +9,7 @@
 ; Driver=          -> path to the installed libseerodbc.so
 
 [SeerODBC]
-Description = Clean-room ODBC driver for Oracle Database
+Description = Clean-room ODBC driver for a proprietary database
 Driver      = /usr/lib64/libseerodbc.so
 ; Threading   = 1
 ; FileUsage   = 0
@@ -17,7 +17,7 @@ Driver      = /usr/lib64/libseerodbc.so
 ; ---------------------------------------------------------------------------
 ; A matching DSN goes in odbcinst's odbc.ini (system) or ~/.odbc.ini (user):
 ;
-; [myoracle]
+; [mydb]
 ; Driver      = SeerODBC
 ; Host        = db.example.com
 ; Port        = 1521

@@ -98,7 +98,7 @@ test_fv2_status = executable('test_fv2_status',
 )
 test('fv2 dml status', test_fv2_status)
 
-# Oracle 8i login: OSESSKEY / OAUTH at 8i's fixed little-endian widths, byte for
+# 8i login: OSESSKEY / OAUTH at 8i's fixed little-endian widths, byte for
 # byte against seerdb's encoders, and reading the pairs reply.
 test_o8i_login = executable('test_o8i_login',
   'unit/test_o8i_login.c',
@@ -106,7 +106,7 @@ test_o8i_login = executable('test_o8i_login',
 )
 test('8i login', test_o8i_login)
 
-# Oracle 8i OALL8 query / fetch calls, byte for byte against seerdb's encoders.
+# 8i OALL8 query / fetch calls, byte for byte against seerdb's encoders.
 test_o8i_stmt = executable('test_o8i_stmt',
   'unit/test_o8i_stmt.c',
   dependencies : [seertns_dep],
@@ -198,7 +198,7 @@ test_aq = executable('test_aq',
 )
 test('advanced queuing (live)', test_aq, is_parallel : false, timeout : 60)
 
-# Oracle 9i (fv2) core-API integration test. LOCAL ONLY: 9i can't be
+# 9i (fv2) core-API integration test. LOCAL ONLY: 9i can't be
 # containerized (old kernel/glibc), so it is validated by us against a local 9i
 # VM via tests/odbc/run-matrix.sh - and deliberately NOT registered as a meson
 # test() so `meson test` / GitHub CI never reference 9i.
@@ -207,7 +207,7 @@ test_9i = executable('test_9i',
   dependencies : [seertns_dep],
 )
 
-# Oracle 8i (8.1.7) core-API integration test: LOCAL ONLY, as test_9i (8i is a
+# 8i (8.1.7) core-API integration test: LOCAL ONLY, as test_9i (8i is a
 # VM), run by tests/odbc/run-matrix.sh and not registered as a meson test().
 test_8i = executable('test_8i',
   'odbc/test_8i.c',

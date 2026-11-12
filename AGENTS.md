@@ -12,8 +12,8 @@ SeerODBC. For the project's clean-room posture and contribution rules, read
 
 ## Scope: connect, don't collect protocols
 
-SeerODBC's goal is to connect to Oracle databases and support their features,
-not to implement every protocol Oracle speaks (README, *Goals*). When syncing
+SeerODBC's goal is to connect to databases and support their features, not to
+implement every wire protocol the vendor speaks (README, *Goals*). When syncing
 with seerdb's `docs/PROTOCOL.md` or weighing a new finding:
 
 - take what changes what a user sees — a connection that fails or hangs, wrong
@@ -42,7 +42,7 @@ never to merge or tag it. The steps:
    - [`packaging/seerodbc.spec`](packaging/seerodbc.spec) → `Version: x.y.z`
 
    The `SEERTNS_VERSION_*` macros are the public API's advertised version for
-   consumers (the ODBC shim, freeoracle, any future binding). They are **not**
+   consumers (the ODBC shim, seersql, any future binding). They are **not**
    packed onto the wire — the driver announces a bare `PROGRAM=seerodbc` /
    `AUTH_PROGRAM_NM` with no version — so a stale macro is a cosmetic bug, not a
    protocol one. Keep them in sync anyway; a consumer may read them.
@@ -55,7 +55,7 @@ never to merge or tag it. The steps:
    (`git log <last-tag>..master`, or the full history for the first release),
    skipping dependabot / pure-CI noise. Bold the headline phrase of each entry
    and cite the issue/PR as `(#NNN)`. State validation status **honestly**:
-   which Oracle tiers (10g / 11g / 21c / 23ai) were exercised live, and call out
+   which server tiers (10g / 11g / 21c / 23ai) were exercised live, and call out
    anything proved only against a local bed, a proxy, or CI containers rather
    than a real server.
 

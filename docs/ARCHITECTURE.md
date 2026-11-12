@@ -19,7 +19,7 @@ Two layers, strictly separated. The rule that everything else follows from:
                     | uses include/seer/seertns.h only
                     v
   +------------------------------------------+
-  |  TNS/TTC protocol core   src/tns/        |   speaks Oracle's wire protocol
+  |  TNS/TTC protocol core   src/tns/        |   speaks the TNS/TTC protocol
   |  - reader/writer, packet, transport,     |   native C types only;
   |    auth, ttc, types, session             |   no sql.h anywhere here
   +------------------------------------------+
@@ -30,7 +30,7 @@ Two layers, strictly separated. The rule that everything else follows from:
   +------------------------------------------+
 ```
 
-`tools/freeoracle/` links the **core directly**, with no ODBC in the picture —
+`tools/seersql/` links the **core directly**, with no ODBC in the picture —
 the DM-independent test path (our `tsql`).
 
 ## The five rules
@@ -49,7 +49,7 @@ the DM-independent test path (our `tsql`).
 4. **The driver exports only `SQL*` symbols** (`src/odbc/seerodbc.map`).
    The core and OpenSSL stay out of the host process's dynamic symbol table —
    the same "don't pollute the host process" reasoning that ruled out GLib.
-5. **`freeoracle` links the core, not the shim** — so the protocol can be
+5. **`seersql` links the core, not the shim** — so the protocol can be
    proven end-to-end before the ODBC layer exists, and kept honest after.
 
 ## Build graph
@@ -58,7 +58,7 @@ the DM-independent test path (our `tsql`).
   src/common  -> static_library(seercommon)          => common_dep
   src/tns     -> static_library(seertns)  [+openssl]  => seertns_dep
   src/odbc    -> shared_library(seerodbc)  [version-script]   (the driver)
-  tools/...   -> executable(freeoracle)    [links seertns_dep]
+  tools/...   -> executable(seersql)       [links seertns_dep]
   tests/...   -> executable(test_reader)   [links seertns_dep]
 ```
 
@@ -97,7 +97,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   - Crypto lives in `auth.c` (OpenSSL EVP: AES-192-CBC / SHA-1 / MD5 / CSPRNG),
     unit-tested against the reference client's known-answer vectors. The
     `marshal` codec and the byte-identical 1190-byte TTI_DTY are likewise
-    pinned. The whole login is proven end-to-end via `freeoracle` against a
+    pinned. The whole login is proven end-to-end via `seersql` against a
     crypto-faithful mock server (mutual `SERVER_TO_CLIENT` validation passes).
   - Variants still stubbed (return `SEER_ENOTIMPL`): 10g (DES verifier, no
     salt), 12c+ (256-bit PBKDF2). 11g is the validated target.
@@ -109,7 +109,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   end-of-fetch masking. Multi-packet reassembly (SDU-37/-81 size test) is in
   `seer_ttc_recv`. Values are rendered to text in `types.c` — NUMBER (base-100)
   and DATE decoders, VARCHAR2/CHAR as AL32UTF8 — unit-tested against reference
-  vectors. Proven end-to-end via `freeoracle -q` against a mock that serves a
+  vectors. Proven end-to-end via `seersql -q` against a mock that serves a
   describe + rows. Columns accessible via `seer_stmt_num_cols` /
   `seer_stmt_col_name` / `seer_stmt_get_string`; `seer_last_error` surfaces the
   ORA-NNNNN text.
@@ -120,7 +120,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   (`handles.c`, `diag.c`); `SQLConnect`/`SQLDriverConnect` parse the connection
   string and resolve the DSN's HOST/PORT/SERVICE from `odbc.ini` via
   `SQLGetPrivateProfileString` (`connect.c`); env/conn/stmt attributes
-  (`attrs.c`); the `SQLGetInfo` Oracle answer table + `SQLGetFunctions`
+  (`attrs.c`); the `SQLGetInfo` server-specific answer table + `SQLGetFunctions`
   (`info.c`); `SQLPrepare`/`SQLExecute`/`SQLExecDirect` (`exec.c`); and
   `SQLNumResultCols`/`SQLDescribeCol`/`SQLColAttribute`/`SQLBindCol`/`SQLFetch`/
   `SQLGetData`/`SQLRowCount`/`SQLFreeStmt`/`SQLCloseCursor` (`results.c`). Values
@@ -138,7 +138,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   execute, converted by C type — integers → NUMBER, char/float → text for
   Oracle implicit conversion) and `SQLNumParams`. Proven end-to-end: a mock
   decodes the bind section from the wire (`['42','hello']`) for both
-  `freeoracle -N/-T` and a C client using `SQLBindParameter` through the DM.
+  `seersql -N/-T` and a C client using `SQLBindParameter` through the DM.
 - **Done — more column types.** The result decoder (`decode_cell` + `types.c`)
   now handles BINARY_FLOAT / BINARY_DOUBLE (order-preserving IEEE-754, §11.7,
   unit-tested), RAW (hex), and TIMESTAMP / TIMESTAMP WITH (LOCAL) TIME ZONE
@@ -146,7 +146,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   ODBC `SQLDescribeCol`/`SQLColAttribute` map each to its SQL type / type name /
   display size. Verified end-to-end: a mixed `NUMBER, VARCHAR2, BINARY_FLOAT,
   TIMESTAMP` row decodes to `42, hi, 1.5, 2026-06-18 14:30:00`.
-- **Validated against a live Oracle 11g XE (11.2.0.2).** `freeoracle` and stock
+- **Validated against a live 11g XE (11.2.0.2).** `seersql` and stock
   `isql` (through unixODBC) both log in and run literal + parameterized,
   single- and multi-row SELECTs returning NUMBER / VARCHAR2 / DATE /
   BINARY_DOUBLE, against a real server. The live run surfaced and fixed two
@@ -173,7 +173,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   the `TTI_LOB` content chunks. CLOB content (UTF-16BE on the wire) is converted
   to UTF-8 via the now-real `seer_iconv` (`charset.c`, iconv); BLOB is rendered
   as hex. Deferring the reads to post-fetch avoids interleaving a LOBOPS call
-  while the cursor still has rows pending. Verified live (freeoracle + isql):
+  while the cursor still has rows pending. Verified live (seersql + isql):
   `TO_CLOB('…')`, multi-hundred-char CLOBs, `TO_BLOB(...)`, and LOBs mixed with
   scalar columns all round-trip.
 - **Done — binary-safe cells, BLOB/LONG, more catalog.** The core row model is
@@ -366,7 +366,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   amount-or-mode), with the chunk accumulator shared with the CLOB/BLOB READ.
   The shim maps type 114 to `SQL_LONGVARBINARY` / `"BFILE"`; content is served
   as raw bytes (`SQL_C_BINARY`) or hex (`SQL_C_CHAR`), exactly like BLOB.
-  Verified live (freeoracle + isql through unixODBC) against a real 11g XE
+  Verified live (seersql + isql through unixODBC) against a real 11g XE
   `SELECT BFILENAME('SEERBFILE', …)`: a text file and a binary file round-trip
   byte-exact, a missing file (ORA-22288) fails the read gracefully (NULL cell,
   no session desync), and a missing-then-valid two-BFILE row proves the failed
@@ -520,7 +520,7 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   Advanced Queuing, XA / two-phase commit, proxy auth + DRCP, TLS / TCPS, and
   statement caching — each matrix-validated and ASan/UBSan-clean. `docs/ROADMAP.md`
   is the live per-feature inventory.
-- **Done — Oracle 9i (fv2).** The legacy tier landed too: O3LOGON DES auth and the
+- **Done — 9i (fv2).** The legacy tier landed too: O3LOGON DES auth and the
   `TTI_ALL7` (`0x47`) query/DML/PL-SQL/LOB dialect (distinct from the `TTI_ALL8` we
   send 10g+), all fv-gated so 10g+ is untouched. Validated against a 9i VM (not
   containerizable) and wired into `run-matrix.sh` as a local-only core-API row, so

@@ -58,7 +58,7 @@ jobs:
           config-file: ./.github/codeql/codeql-config.yml
 
       # Manual build mode: CodeQL traces this compile to build its database, so it
-      # sees the whole driver (protocol core + ODBC shim + freeoracle).
+      # sees the whole driver (protocol core + ODBC shim + seersql).
       - name: Build
         run: |
           meson setup build

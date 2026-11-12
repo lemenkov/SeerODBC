@@ -6,7 +6,7 @@
 Name:           seerodbc
 Version:        0.2.0
 Release:        %autorelease
-Summary:        Clean-room ODBC driver for Oracle Database
+Summary:        Clean-room ODBC driver for a proprietary database
 License:        Apache-2.0
 URL:            https://github.com/seerdb/SeerODBC
 VCS:            git:%{url}.git
@@ -19,9 +19,10 @@ BuildRequires:  unixODBC-devel
 Requires:       odbcinst-generate
 
 %description
-SeerODBC lets ODBC consumers talk to an Oracle database by speaking the
-Oracle TNS/TTC wire protocol directly, with no Oracle Instant Client.
-It is a clean-room implementation (see CONTRIBUTING.md).
+SeerODBC lets ODBC consumers talk to a proprietary database by speaking its
+native TNS/TTC wire protocol directly, with no vendor client libraries.
+It is an independent, clean-room implementation (see CONTRIBUTING.md and
+NOTICE).
 
 %prep
 %autosetup -p1 -n %{name}-%{version}
@@ -37,7 +38,7 @@ It is a clean-room implementation (see CONTRIBUTING.md).
 %license LICENSE
 %doc README.md NOTICE packaging/odbcinst.ini.sample docs/*.md
 %{_libdir}/odbc/libseerodbc.so
-%{_bindir}/freeoracle
+%{_bindir}/seersql
 
 %changelog
 %autochangelog
