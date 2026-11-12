@@ -2,9 +2,12 @@
  *
  * Exporting these makes the unixODBC Driver Manager treat SeerODBC as a
  * Unicode driver: it routes wide application calls here and uses the ANSI
- * functions for ANSI apps. Each wrapper converts its SQLWCHAR (UTF-16, host
- * byte order) string arguments to/from the UTF-8 the ANSI functions speak -
- * which is also Oracle's AL32UTF8 - so there is no lossy locale round-trip.
+ * functions for ANSI apps. Microsoft's Driver Manager goes further: it calls
+ * the W form of every function a Unicode driver supports and never falls back
+ * to the ANSI one, so the W surface below must be complete. Each wrapper
+ * converts its SQLWCHAR (UTF-16, host byte order) string arguments to/from the
+ * UTF-8 the ANSI functions speak - which is also Oracle's AL32UTF8 - so there
+ * is no lossy locale round-trip.
  *
  * Input-string functions convert their arguments and delegate to the matching
  * ANSI function; output-string functions call the ANSI function into a UTF-8
@@ -297,4 +300,247 @@ SQLRETURN SQL_API SQLColumnsW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat, S
 SQLRETURN SQL_API SQLGetTypeInfoW(SQLHSTMT hstmt, SQLSMALLINT DataType)
 {
   return SQLGetTypeInfo(hstmt, DataType); /* no string arguments */
+}
+
+/* --------------------------------------------- the rest of the W surface
+ *
+ * Microsoft's Driver Manager treats a driver exporting SQLConnectW as Unicode
+ * and then calls the *W form of EVERY function that has one, without falling
+ * back to the ANSI export: a missing SQLSetStmtAttrW is a NULL call inside
+ * odbc32.dll. So every function SQLGetFunctions reports, if ODBC defines a W
+ * form for it, has one here. */
+
+/* (SQLCHAR *)s, length: the ANSI argument pair for a converted string. */
+#define U8ARG(s) (SQLCHAR *)(s), (SQLSMALLINT)((s) ? SQL_NTS : 0)
+
+SQLRETURN SQL_API SQLBrowseConnectW(SQLHDBC hdbc, SQLWCHAR *szIn, SQLSMALLINT cbIn, SQLWCHAR *szOut,
+                                    SQLSMALLINT cbOutMax, SQLSMALLINT *pcbOut)
+{
+  char *in = w_to_utf8(szIn, cbIn);
+  char outbuf[2048];
+  outbuf[0] = '\0';
+  SQLSMALLINT alen = 0;
+  SQLRETURN r =
+      SQLBrowseConnect(hdbc, U8ARG(in), (SQLCHAR *)outbuf, (SQLSMALLINT)sizeof outbuf, &alen);
+  free(in);
+  if (SQL_SUCCEEDED(r) || r == SQL_NEED_DATA) {
+    SQLLEN oc = 0;
+    SQLRETURN r2 = emit_w(outbuf, szOut, cbOutMax, &oc);
+    if (pcbOut)
+      *pcbOut = (SQLSMALLINT)oc;
+    if (r == SQL_SUCCESS && r2 == SQL_SUCCESS_WITH_INFO)
+      r = r2;
+  }
+  return r;
+}
+
+SQLRETURN SQL_API SQLNativeSqlW(SQLHDBC hdbc, SQLWCHAR *szIn, SQLINTEGER cbIn, SQLWCHAR *szOut,
+                                SQLINTEGER cbOutMax, SQLINTEGER *pcbOut)
+{
+  char *in = w_to_utf8(szIn, cbIn);
+  if (in == NULL)
+    return SQLNativeSql(hdbc, NULL, 0, NULL, 0, NULL); /* reports HY009 */
+  SQLINTEGER alen = 0;
+  SQLRETURN r = SQLNativeSql(hdbc, (SQLCHAR *)in, SQL_NTS, NULL, 0, &alen);
+  char *out = SQL_SUCCEEDED(r) ? malloc((size_t)alen + 1) : NULL;
+  if (out != NULL)
+    r = SQLNativeSql(hdbc, (SQLCHAR *)in, SQL_NTS, (SQLCHAR *)out, alen + 1, &alen);
+  free(in);
+  if (SQL_SUCCEEDED(r) && out != NULL) {
+    SQLLEN oc = 0;
+    SQLRETURN r2 = emit_w(out, szOut, cbOutMax, &oc);
+    if (pcbOut)
+      *pcbOut = (SQLINTEGER)oc;
+    r = (r == SQL_SUCCESS) ? r2 : r;
+  }
+  free(out);
+  return r;
+}
+
+/* Attributes: none of the connection or statement attributes we keep is a
+ * string (the string-valued ones are accepted and ignored, or read back as 0,
+ * which is also an empty wide string), so these pass straight through. */
+SQLRETURN SQL_API SQLSetConnectAttrW(SQLHDBC hdbc, SQLINTEGER attr, SQLPOINTER val, SQLINTEGER len)
+{
+  return SQLSetConnectAttr(hdbc, attr, val, len);
+}
+
+SQLRETURN SQL_API SQLGetConnectAttrW(SQLHDBC hdbc, SQLINTEGER attr, SQLPOINTER val, SQLINTEGER cap,
+                                     SQLINTEGER *len)
+{
+  return SQLGetConnectAttr(hdbc, attr, val, cap, len);
+}
+
+SQLRETURN SQL_API SQLSetStmtAttrW(SQLHSTMT hstmt, SQLINTEGER attr, SQLPOINTER val, SQLINTEGER len)
+{
+  return SQLSetStmtAttr(hstmt, attr, val, len);
+}
+
+SQLRETURN SQL_API SQLGetStmtAttrW(SQLHSTMT hstmt, SQLINTEGER attr, SQLPOINTER val, SQLINTEGER cap,
+                                  SQLINTEGER *len)
+{
+  return SQLGetStmtAttr(hstmt, attr, val, cap, len);
+}
+
+/* Descriptors. SQLSetDescField ignores the string fields, so its W form needs
+ * no conversion; the read side widens the ones SQLGetDescField answers. */
+SQLRETURN SQL_API SQLSetDescFieldW(SQLHDESC hdesc, SQLSMALLINT rec, SQLSMALLINT field,
+                                   SQLPOINTER val, SQLINTEGER len)
+{
+  return SQLSetDescField(hdesc, rec, field, val, len);
+}
+
+static int is_string_desc_field(SQLSMALLINT f)
+{
+  switch (f) {
+  case SQL_DESC_NAME:
+  case SQL_DESC_LABEL:
+  case SQL_DESC_BASE_COLUMN_NAME:
+  case SQL_DESC_BASE_TABLE_NAME:
+  case SQL_DESC_CATALOG_NAME:
+  case SQL_DESC_SCHEMA_NAME:
+  case SQL_DESC_TABLE_NAME:
+  case SQL_DESC_TYPE_NAME:
+  case SQL_DESC_LOCAL_TYPE_NAME:
+  case SQL_DESC_LITERAL_PREFIX:
+  case SQL_DESC_LITERAL_SUFFIX:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+SQLRETURN SQL_API SQLGetDescFieldW(SQLHDESC hdesc, SQLSMALLINT rec, SQLSMALLINT field,
+                                   SQLPOINTER val, SQLINTEGER cap, SQLINTEGER *len)
+{
+  if (!is_string_desc_field(field))
+    return SQLGetDescField(hdesc, rec, field, val, cap, len);
+  SQLCHAR tmp[512] = {0};
+  SQLINTEGER alen = 0;
+  SQLRETURN r = SQLGetDescField(hdesc, rec, field, tmp, (SQLINTEGER)sizeof tmp, &alen);
+  if (!SQL_SUCCEEDED(r))
+    return r;
+  SQLLEN oc = 0;
+  SQLRETURN r2 = emit_w((char *)tmp, (SQLWCHAR *)val, cap / (SQLINTEGER)sizeof(SQLWCHAR), &oc);
+  if (len)
+    *len = (SQLINTEGER)(oc * (SQLLEN)sizeof(SQLWCHAR)); /* bytes */
+  return (r == SQL_SUCCESS) ? r2 : r;
+}
+
+SQLRETURN SQL_API SQLGetDescRecW(SQLHDESC hdesc, SQLSMALLINT rec, SQLWCHAR *szName,
+                                 SQLSMALLINT cbNameMax, SQLSMALLINT *pcbName, SQLSMALLINT *pType,
+                                 SQLSMALLINT *pSubType, SQLLEN *pLength, SQLSMALLINT *pPrecision,
+                                 SQLSMALLINT *pScale, SQLSMALLINT *pNullable)
+{
+  SQLCHAR name[256] = {0};
+  SQLSMALLINT nlen = 0;
+  SQLRETURN r = SQLGetDescRec(hdesc, rec, name, (SQLSMALLINT)sizeof name, &nlen, pType, pSubType,
+                              pLength, pPrecision, pScale, pNullable);
+  if (!SQL_SUCCEEDED(r))
+    return r;
+  SQLLEN oc = 0;
+  SQLRETURN r2 = emit_w((char *)name, szName, cbNameMax, &oc); /* length in chars */
+  if (pcbName)
+    *pcbName = (SQLSMALLINT)oc;
+  return (r == SQL_SUCCESS && r2 == SQL_SUCCESS_WITH_INFO) ? r2 : r;
+}
+
+SQLRETURN SQL_API SQLGetDiagFieldW(SQLSMALLINT htype, SQLHANDLE handle, SQLSMALLINT rec,
+                                   SQLSMALLINT field, SQLPOINTER val, SQLSMALLINT cap,
+                                   SQLSMALLINT *len)
+{
+  if (field != SQL_DIAG_SQLSTATE && field != SQL_DIAG_MESSAGE_TEXT)
+    return SQLGetDiagField(htype, handle, rec, field, val, cap, len);
+  SQLCHAR tmp[1024] = {0};
+  SQLSMALLINT alen = 0;
+  SQLRETURN r = SQLGetDiagField(htype, handle, rec, field, tmp, (SQLSMALLINT)sizeof tmp, &alen);
+  if (!SQL_SUCCEEDED(r))
+    return r;
+  SQLSMALLINT ob = 0;
+  SQLRETURN r2 = emit_w_bytes((char *)tmp, val, cap, &ob);
+  if (len)
+    *len = ob;
+  return (r == SQL_SUCCESS) ? r2 : r;
+}
+
+/* Catalog functions: identifier and pattern arguments in, a result set out. */
+SQLRETURN SQL_API SQLPrimaryKeysW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat, SQLWCHAR *sch,
+                                  SQLSMALLINT lsch, SQLWCHAR *tab, SQLSMALLINT ltab)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch), *t = w_to_utf8(tab, ltab);
+  SQLRETURN r = SQLPrimaryKeys(hstmt, U8ARG(c), U8ARG(s), U8ARG(t));
+  free(c);
+  free(s);
+  free(t);
+  return r;
+}
+
+SQLRETURN SQL_API SQLStatisticsW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat, SQLWCHAR *sch,
+                                 SQLSMALLINT lsch, SQLWCHAR *tab, SQLSMALLINT ltab,
+                                 SQLUSMALLINT unique, SQLUSMALLINT reserved)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch), *t = w_to_utf8(tab, ltab);
+  SQLRETURN r = SQLStatistics(hstmt, U8ARG(c), U8ARG(s), U8ARG(t), unique, reserved);
+  free(c);
+  free(s);
+  free(t);
+  return r;
+}
+
+SQLRETURN SQL_API SQLSpecialColumnsW(SQLHSTMT hstmt, SQLUSMALLINT idtype, SQLWCHAR *cat,
+                                     SQLSMALLINT lcat, SQLWCHAR *sch, SQLSMALLINT lsch,
+                                     SQLWCHAR *tab, SQLSMALLINT ltab, SQLUSMALLINT scope,
+                                     SQLUSMALLINT nullable)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch), *t = w_to_utf8(tab, ltab);
+  SQLRETURN r = SQLSpecialColumns(hstmt, idtype, U8ARG(c), U8ARG(s), U8ARG(t), scope, nullable);
+  free(c);
+  free(s);
+  free(t);
+  return r;
+}
+
+SQLRETURN SQL_API SQLForeignKeysW(SQLHSTMT hstmt, SQLWCHAR *pkcat, SQLSMALLINT lpkcat,
+                                  SQLWCHAR *pksch, SQLSMALLINT lpksch, SQLWCHAR *pktab,
+                                  SQLSMALLINT lpktab, SQLWCHAR *fkcat, SQLSMALLINT lfkcat,
+                                  SQLWCHAR *fksch, SQLSMALLINT lfksch, SQLWCHAR *fktab,
+                                  SQLSMALLINT lfktab)
+{
+  char *pc = w_to_utf8(pkcat, lpkcat), *ps = w_to_utf8(pksch, lpksch);
+  char *pt = w_to_utf8(pktab, lpktab), *fc = w_to_utf8(fkcat, lfkcat);
+  char *fs = w_to_utf8(fksch, lfksch), *ft = w_to_utf8(fktab, lfktab);
+  SQLRETURN r =
+      SQLForeignKeys(hstmt, U8ARG(pc), U8ARG(ps), U8ARG(pt), U8ARG(fc), U8ARG(fs), U8ARG(ft));
+  free(pc);
+  free(ps);
+  free(pt);
+  free(fc);
+  free(fs);
+  free(ft);
+  return r;
+}
+
+SQLRETURN SQL_API SQLProceduresW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat, SQLWCHAR *sch,
+                                 SQLSMALLINT lsch, SQLWCHAR *proc, SQLSMALLINT lproc)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch), *p = w_to_utf8(proc, lproc);
+  SQLRETURN r = SQLProcedures(hstmt, U8ARG(c), U8ARG(s), U8ARG(p));
+  free(c);
+  free(s);
+  free(p);
+  return r;
+}
+
+SQLRETURN SQL_API SQLProcedureColumnsW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat,
+                                       SQLWCHAR *sch, SQLSMALLINT lsch, SQLWCHAR *proc,
+                                       SQLSMALLINT lproc, SQLWCHAR *col, SQLSMALLINT lcol)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch);
+  char *p = w_to_utf8(proc, lproc), *o = w_to_utf8(col, lcol);
+  SQLRETURN r = SQLProcedureColumns(hstmt, U8ARG(c), U8ARG(s), U8ARG(p), U8ARG(o));
+  free(c);
+  free(s);
+  free(p);
+  free(o);
+  return r;
 }

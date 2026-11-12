@@ -164,6 +164,25 @@ jobs:
             cat exports.txt
             exit 1
           fi
+          # Microsoft's Driver Manager calls the W form of every function a
+          # Unicode driver exports, with no ANSI fallback: each export that
+          # has a W form in ODBC (sqlucode.h) needs its W export too.
+          missing=
+          for f in BrowseConnect ColAttribute ColAttributes ColumnPrivileges Columns \
+                   Connect DescribeCol DriverConnect Error ExecDirect ForeignKeys \
+                   GetConnectAttr GetConnectOption GetCursorName GetDescField GetDescRec \
+                   GetDiagField GetDiagRec GetInfo GetStmtAttr GetTypeInfo NativeSql \
+                   Prepare PrimaryKeys ProcedureColumns Procedures SetConnectAttr \
+                   SetConnectOption SetCursorName SetDescField SetStmtAttr SpecialColumns \
+                   Statistics TablePrivileges Tables; do
+            if grep -qE " SQL$f\$" exports.txt && ! grep -qE " SQL${f}W\$" exports.txt; then
+              missing="$missing SQL${f}W"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::exported without their W form:$missing"
+            exit 1
+          fi
       # selftest.ps1 can only run on a Windows machine with a server to reach,
       # but its syntax is checked here, by PowerShell's own parser.
       - name: Parse selftest.ps1
