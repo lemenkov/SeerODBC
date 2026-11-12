@@ -10,6 +10,21 @@ This file collects repeatable procedures for automated / AI agents working on
 SeerODBC. For the project's clean-room posture and contribution rules, read
 [`CONTRIBUTING.md`](CONTRIBUTING.md) first — those requirements always apply.
 
+## Scope: connect, don't collect protocols
+
+SeerODBC's goal is to connect to Oracle databases and support their features,
+not to implement every protocol Oracle speaks (README, *Goals*). When syncing
+with seerdb's `docs/PROTOCOL.md` or weighing a new finding:
+
+- take what changes what a user sees — a connection that fails or hangs, wrong
+  data, a wrong or missing error, a feature that can't be used;
+- leave out byte-level divergences no server rejects, and alternative wire forms
+  for something that already works (seerdb's opt-in OCI "native" forms, say);
+- stop a legacy dialect once it is usable for its realistic purpose (8i: login
+  and queries);
+- when unsure whether a gap matters to a user, ask the maintainer rather than
+  implement it.
+
 ## Cutting a release
 
 SeerODBC has no automated package publishing: a release **is** an annotated,
