@@ -54,6 +54,7 @@ struct SeerConn {
    * on this connection (client-side tracking, like seerdb). */
   bool sessionless_active;
   uint32_t server_release; /* packed AUTH_VERSION_NO                  */
+  uint32_t max_iden_len;   /* AUTH_MAX_IDEN_LENGTH, 0 if not sent      */
   char *last_error;        /* last ORA-NNNNN message (malloc'd)       */
   long last_error_offset;  /* its parse offset into the SQL text, 0 if none */
   volatile bool in_call;   /* blocked in seer_ttc_recv (cancel window) */

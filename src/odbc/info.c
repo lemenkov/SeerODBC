@@ -56,6 +56,14 @@ static void format_dbms_ver(const int v[5], char *out, size_t n)
 /* The connected server's release. 10g+ sends it at login; a 9i login does
  * not, so it is asked for once (product_component_version, readable by every
  * user). Cached on the connection; "00.00.0000" if it cannot be had. */
+/* The longest identifier: what the server stated at login (128 from 12.2 on),
+ * else 30, the limit of 8i to 12.1, which state none. */
+static SQLUSMALLINT max_identifier_len(OdbcDbc *c)
+{
+  int n = c->conn != NULL ? seer_max_identifier_length(c->conn) : 0;
+  return (SQLUSMALLINT)(n > 0 && n <= 0xFFFF ? n : 30);
+}
+
 static const char *dbms_ver(OdbcDbc *c)
 {
   if (c == NULL || c->conn == NULL)
@@ -144,13 +152,10 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
   case SQL_GETDATA_EXTENSIONS:
     return info_u32(SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER | SQL_GD_BOUND, InfoValuePtr);
   case SQL_MAX_COLUMN_NAME_LEN:
-    return info_u16(30, InfoValuePtr);
   case SQL_MAX_IDENTIFIER_LEN:
-    return info_u16(30, InfoValuePtr);
   case SQL_MAX_TABLE_NAME_LEN:
-    return info_u16(30, InfoValuePtr);
   case SQL_MAX_SCHEMA_NAME_LEN:
-    return info_u16(30, InfoValuePtr);
+    return info_u16(max_identifier_len(c), InfoValuePtr);
   case SQL_CATALOG_LOCATION:
     return info_u16(0, InfoValuePtr);
   case SQL_CONCAT_NULL_BEHAVIOR:
