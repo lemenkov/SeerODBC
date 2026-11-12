@@ -1044,6 +1044,8 @@ static SeerStatus fast_auth_login(SeerConn *conn, const SeerConnParams *params,
     }
     seer_auth_challenge_free(&tmp);
   }
+  if (st != SEER_OK && seer_conn_error_from_reply(conn, resp, rlen, 0))
+    st = SEER_EAUTH;
   free(resp);
   if (st != SEER_OK)
     seer_log(SEER_LOG_ERROR, "fast-auth: no challenge RPA in bundled reply");
@@ -1230,6 +1232,8 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   if (st != SEER_OK)
     return st;
   st = parse_challenge(resp, rlen, out_challenge);
+  if (st != SEER_OK)
+    seer_conn_error_from_reply(conn, resp, rlen, 0);
   free(resp);
   if (st != SEER_OK)
     return st;
@@ -1306,11 +1310,16 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
   st = seer_ttc_recv(conn, &resp, &rlen);
   if (st != SEER_OK)
     return st;
-  /* RPA: [TTI_RPA][ub1 count][ub1 hexlen][<hexlen ASCII-hex chars>]. */
+  /* RPA: [TTI_RPA][ub1 count][ub1 hexlen][<hexlen ASCII-hex chars>]. A user the
+   * server refuses at once (an unknown one: ORA-01017) gets a status with the
+   * message instead. */
   if (rlen < 3 || resp[0] != TTI_RPA) {
-    seer_log(SEER_LOG_ERROR, "o3logon: phase-1 reply not RPA (token %u)", rlen ? resp[0] : 0);
+    bool refused =
+        rlen > 0 && resp[0] == TTI_OER && seer_conn_error_from_reply(conn, resp, rlen, 1);
+    if (!refused)
+      seer_log(SEER_LOG_ERROR, "o3logon: phase-1 reply not RPA (token %u)", rlen ? resp[0] : 0);
     free(resp);
-    return SEER_EPROTO;
+    return refused ? SEER_EAUTH : SEER_EPROTO;
   }
   size_t hexlen = resp[2];
   if (hexlen == 0 || 3 + hexlen > rlen) {
@@ -1371,7 +1380,16 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
   if (st != SEER_OK)
     return st;
   /* Short pre-10g OER: token, then ub4 call_status, seq, rowcount, then the ub4
-   * ORA code (no batch-error arrays, no message). 0 / 1403 = authenticated. */
+   * ORA code. 0 / 1403 = authenticated. A refusal (a wrong password) is a
+   * longer status that ends with the message, "ORA-01017: invalid
+   * username/password; logon denied", and keeps its code in another field, so
+   * the message is what tells it: measured on 9.2.0.4, where a success has no
+   * text and the code read below stayed 0 for a wrong password - the login
+   * "succeeded" and every call then failed with ORA-01012. */
+  if (rlen > 0 && resp[0] == TTI_OER && seer_conn_error_from_reply(conn, resp, rlen, 1)) {
+    free(resp);
+    return SEER_EAUTH;
+  }
   if (rlen < 1 || resp[0] != TTI_OER) {
     seer_log(SEER_LOG_ERROR, "o3logon: phase-2 reply not OER (token %u)", rlen ? resp[0] : 0);
     free(resp);
@@ -1388,7 +1406,8 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
     return SEER_EPROTO;
   if (code != 0 && code != 1403) {
     seer_log(SEER_LOG_ERROR, "o3logon: authentication failed (ORA-%05ld)", (long)code);
-    return SEER_EDB;
+    seer_conn_error_code(conn, (long)code);
+    return SEER_EAUTH;
   }
   conn->authenticated = true;
   seer_log(SEER_LOG_INFO, "TTC: authenticated (O3LOGON / 9i, fv=%u)", conn->field_version);
@@ -1616,6 +1635,8 @@ static SeerStatus o8i_login(SeerConn *conn, const SeerConnParams *params)
   if (st != SEER_OK || skhex == NULL) {
     free(skhex);
     seer_log(SEER_LOG_ERROR, "o8i: no AUTH_SESSKEY in the OSESSKEY reply (ORA-%05ld)", (long)code);
+    if (code != 0)
+      seer_conn_error_code(conn, (long)code);
     return code ? SEER_EAUTH : SEER_EPROTO;
   }
   uint8_t *sesskey = NULL;
@@ -1654,6 +1675,8 @@ static SeerStatus o8i_login(SeerConn *conn, const SeerConnParams *params)
     code = o8i_status_code(resp, rlen);
     free(resp);
     seer_log(SEER_LOG_ERROR, "o8i: authentication failed (ORA-%05ld)", (long)code);
+    if (code != 0)
+      seer_conn_error_code(conn, (long)code);
     return SEER_EAUTH;
   }
   char *ver = NULL;
@@ -1906,6 +1929,8 @@ SeerStatus seer_ttc_authenticate(SeerConn *conn, const SeerConnParams *params,
 
   uint32_t release = 0, max_iden = 0;
   st = parse_auth_result(resp, rlen, conn_key, conn_key_len, &release, &max_iden);
+  if (st != SEER_OK)
+    seer_conn_error_from_reply(conn, resp, rlen, 0);
   free(resp);
   memset(conn_key, 0, sizeof conn_key);
   if (st != SEER_OK)

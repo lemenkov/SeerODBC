@@ -118,6 +118,13 @@ SeerStatus seer_o8i_build_login(SeerConn *conn, SeerWriter *w, uint8_t op, const
                                 uint32_t mode, const char *password_field, const char *host,
                                 const char *pid);
 SeerStatus seer_o8i_auth_value(const uint8_t *b, size_t n, const char *key, char **val);
+
+/* Put the first "ORA-NNNNN: ..." message found in `buf` at or after `from` on
+ * c->last_error. true if one was found. */
+bool seer_conn_error_from_reply(SeerConn *c, const uint8_t *buf, size_t len, size_t from);
+/* Put a bare "ORA-NNNNN" on c->last_error, for a reply that carries the code
+ * and no message (the 8i and 9i logins). */
+void seer_conn_error_code(SeerConn *c, long code);
 SeerStatus seer_test_o8i_all8(uint8_t seq, bool fetch, uint32_t cursor, const char *sql,
                               uint32_t rows, uint8_t **out, size_t *outlen);
 

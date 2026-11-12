@@ -266,6 +266,27 @@ static void check_cursor_hygiene(void)
   }
 }
 
+/* A wrong password is refused, and says so as the server did: ORA-01017,
+ * not a connection that seems to work and then fails every call. */
+static void check_wrong_password(const SeerConnParams *good)
+{
+  const char *name = "a wrong password is refused with ORA-01017";
+  SeerConnParams p = *good;
+  p.password = "not-the-password";
+  SeerConn *c = NULL;
+  char why[256];
+  SeerStatus st = seer_connect_diag(&p, &c, why, sizeof why);
+  if (c != NULL)
+    seer_disconnect(c);
+  if (st == SEER_EAUTH && strncmp(why, "ORA-01017", 9) == 0) {
+    pass(name);
+  } else {
+    char m[320];
+    snprintf(m, sizeof m, "status %d, '%s'", (int)st, why);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -291,6 +312,7 @@ int main(void)
   check_long_sql();
   check_rowid();
   check_cursor_hygiene();
+  check_wrong_password(&p);
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
   return fail_n > 0 ? 1 : 0;

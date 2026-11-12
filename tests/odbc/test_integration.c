@@ -2444,9 +2444,56 @@ static void check_proxy_auth(SQLHDBC dbc, const char *drv, const char *host, con
   exec_do(dbc, "DROP USER seerproxy_p CASCADE", err, sizeof err);
 }
 
+/* A connect that fails says why, as the server put it: a wrong password is the
+ * server's ORA-01017 (its native error 1017), a service the listener doesn't
+ * know is its ORA-12514 - not a bare "authentication failed". */
+static void check_connect_error(const char *drv, const char *host, const char *port,
+                                const char *svc, const char *user)
+{
+  const char *name = "a failed connect reports the server's error";
+  struct {
+    const char *svc, *pwd;
+    long code;
+  } cases[2] = {{svc, "not-the-password", 1017}, {"SEER_NO_SUCH_SERVICE", "x", 12514}};
+  for (int k = 0; k < 2; k++) {
+    SQLHENV e;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+    SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+    SQLHDBC d;
+    SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+    char cs[640];
+    snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;", drv, host,
+             port ? port : "1521", cases[k].svc, user, cases[k].pwd);
+    SQLCHAR o[256], state[6] = "", msg[400] = "";
+    SQLSMALLINT ol, len = 0;
+    SQLINTEGER native = 0;
+    SQLRETURN rc =
+        SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
+    if (!SQL_SUCCEEDED(rc))
+      SQLGetDiagRec(SQL_HANDLE_DBC, d, 1, state, &native, msg, sizeof msg, &len);
+    else
+      SQLDisconnect(d);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+    SQLFreeHandle(SQL_HANDLE_ENV, e);
+    char want[16];
+    snprintf(want, sizeof want, "ORA-%05ld", cases[k].code);
+    if (SQL_SUCCEEDED(rc) || native != cases[k].code || strncmp((char *)msg, want, 9) != 0) {
+      char m[600];
+      snprintf(m, sizeof m, "want %s: rc=%d native=%ld '%s'", want, (int)rc, (long)native,
+               (char *)msg);
+      fail(name, m);
+      return;
+    }
+  }
+  pass(name);
+}
+
 /* DRCP: a pooled connection (CCLASS + PURITY) routes via (SERVER=POOLED) and the
  * AUTH_KPPL_* pairs; a query on it exercises the server-side piggyback handling.
- * Skips where DRCP isn't available (pre-11g, or the pool isn't running). */
+ * Skips where the server won't pool this client, with the server's own answer:
+ * 10g has no pool, a pool may not be started, and 11g's pool serves only a
+ * client speaking OCI's native form throughout (seerdb PROTOCOL.md §4.1.4),
+ * which the driver doesn't. */
 static void check_drcp(SQLHDBC dbc, const char *drv, const char *host, const char *port,
                        const char *svc, const char *user, const char *pwd)
 {
@@ -2468,7 +2515,10 @@ static void check_drcp(SQLHDBC dbc, const char *drv, const char *host, const cha
   SQLSMALLINT ol;
   if (!SQL_SUCCEEDED(SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol,
                                       SQL_DRIVER_NOPROMPT))) {
-    skip(name, "DRCP pool not available (pre-11g or not started)");
+    char why[300], m[360];
+    diag_text(SQL_HANDLE_DBC, d, why, sizeof why);
+    snprintf(m, sizeof m, "no pooled session: %s", why[0] ? why : "connect failed");
+    skip(name, m);
   } else {
     char one[16];
     if (SQL_SUCCEEDED(exec_scalar(d, "SELECT 1 FROM dual", one, sizeof one, err, sizeof err)) &&
@@ -3213,6 +3263,7 @@ int main(void)
   check_browse_connect(browse_dir, user, pwd);
   check_proxy_auth(dbc, drv, host, port, svc);
   check_drcp(dbc, drv, host, port, svc, user, pwd);
+  check_connect_error(drv, host, port, svc, user);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 
