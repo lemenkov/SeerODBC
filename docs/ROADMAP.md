@@ -97,6 +97,11 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       attrs add (SERVER=POOLED) + AUTH_KPPL_CONN_CLASS/PURITY auth pairs; the
       pooled session's server-side piggyback (TTI_SVR_PIGGYBACK 23) is consumed.
       Validated genuinely pooled on 21c/23ai (V$CPOOL_CONN_INFO).
+- [x] Dead-connection detection (`EXPIRE_TIME=<minutes>`) — TCP keepalive with
+      its first probe after that many minutes of quiet, so an idle connection
+      behind a firewall stays open and one whose peer is gone fails instead of
+      hanging; `(EXPIRE_TIME=...)` goes in the connect descriptor as
+      python-oracledb writes it (seerdb PROTOCOL.md §2.1).
 - [ ] Connection failover / TAF
 - [x] 9i O3LOGON handshake — **live-authenticated to a 9i VM** (127.0.0.1:1526,
       SID=orcl). `seer_o3logon` (DES-decrypt AUTH_SESSKEY under the DES verifier,

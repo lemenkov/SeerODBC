@@ -2488,6 +2488,60 @@ static void check_connect_error(const char *drv, const char *host, const char *p
   pass(name);
 }
 
+/* EXPIRE_TIME: a connection with dead-connection detection on logs in and runs
+ * (the descriptor carries (EXPIRE_TIME=n), the socket TCP keepalive), and a
+ * value that isn't a whole number of minutes is refused before connecting. */
+static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
+                              const char *user, const char *pwd)
+{
+  const char *name = "EXPIRE_TIME (TCP keepalive)";
+  const char *vals[2] = {"5", "soon"};
+  for (int k = 0; k < 2; k++) {
+    SQLHENV e;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+    SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+    SQLHDBC d;
+    SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+    char cs[640], m[400], err[256] = "", one[16] = "";
+    snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;EXPIRE_TIME=%s;",
+             drv, host, port ? port : "1521", svc, user, pwd, vals[k]);
+    SQLCHAR o[256];
+    SQLSMALLINT ol;
+    SQLRETURN rc =
+        SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
+    int ok;
+    if (k == 0) {
+      ok = SQL_SUCCEEDED(rc) &&
+           SQL_SUCCEEDED(exec_scalar(d, "SELECT 1 FROM dual", one, sizeof one, err, sizeof err)) &&
+           strcmp(one, "1") == 0;
+      if (!ok) {
+        if (!SQL_SUCCEEDED(rc))
+          diag_text(SQL_HANDLE_DBC, d, err, sizeof err);
+        snprintf(m, sizeof m, "EXPIRE_TIME=5: %s", err[0] ? err : "query failed");
+      }
+    } else {
+      SQLCHAR state[6] = "";
+      SQLINTEGER native = 0;
+      SQLSMALLINT len = 0;
+      SQLCHAR msg[256] = "";
+      if (!SQL_SUCCEEDED(rc))
+        SQLGetDiagRec(SQL_HANDLE_DBC, d, 1, state, &native, msg, sizeof msg, &len);
+      ok = !SQL_SUCCEEDED(rc) && strcmp((char *)state, "HY024") == 0;
+      if (!ok)
+        snprintf(m, sizeof m, "EXPIRE_TIME=soon: rc=%d state '%s'", (int)rc, (char *)state);
+    }
+    if (SQL_SUCCEEDED(rc))
+      SQLDisconnect(d);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+    SQLFreeHandle(SQL_HANDLE_ENV, e);
+    if (!ok) {
+      fail(name, m);
+      return;
+    }
+  }
+  pass(name);
+}
+
 /* DRCP: a pooled connection (CCLASS + PURITY) routes via (SERVER=POOLED) and the
  * AUTH_KPPL_* pairs; a query on it exercises the server-side piggyback handling.
  * Skips where the server won't pool this client, with the server's own answer:
@@ -3263,6 +3317,7 @@ int main(void)
   check_browse_connect(browse_dir, user, pwd);
   check_proxy_auth(dbc, drv, host, port, svc);
   check_drcp(dbc, drv, host, port, svc, user, pwd);
+  check_expire_time(drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);

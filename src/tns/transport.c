@@ -101,6 +101,12 @@ void seer_transport_set_io_timeout(SeerTransport *t, int timeout_ms)
   seer_sock_set_io_timeout(t->fd, timeout_ms);
 }
 
+void seer_transport_set_keepalive(SeerTransport *t, int idle_s)
+{
+  if (t != NULL && idle_s > 0)
+    seer_sock_set_keepalive(t->fd, idle_s);
+}
+
 int seer_transport_wait_readable(SeerTransport *t, int timeout_ms)
 {
   if (t == NULL)

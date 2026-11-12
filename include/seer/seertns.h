@@ -71,6 +71,12 @@ typedef struct {
    * columns are plain scalars; NCLOB, BFILE, JSON, VECTOR and object columns
    * are always read through their locators. */
   int lob_inline;
+  /* Dead-connection detection, in minutes (EXPIRE_TIME). Above 0, TCP
+   * keepalive is turned on with its first probe after that many minutes of
+   * quiet, so a connection idle behind a firewall stays open and one whose
+   * peer is gone fails instead of hanging; the descriptor carries
+   * (EXPIRE_TIME=<minutes>) too, as python-oracledb writes it. 0: off. */
+  int expire_time;
 } SeerConnParams;
 
 #define SEER_PURITY_NEW 1
