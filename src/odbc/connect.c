@@ -125,6 +125,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   char *ctlsca = cs ? conn_str_get(cs, "TLSCA") : NULL;
   char *ctlsverify = cs ? conn_str_get(cs, "TLSVERIFY") : NULL;
   char *clobinline = cs ? conn_str_get(cs, "LOBINLINE") : NULL;
+  char *cexpire = cs ? conn_str_get(cs, "EXPIRE_TIME") : NULL; /* TCP keepalive */
 
   /* Fill any gaps from the DSN section of odbc.ini. */
   if (dsn != NULL) {
@@ -160,6 +161,8 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       ctlsverify = dsn_get(dsn, "TLSVERIFY");
     if (clobinline == NULL)
       clobinline = dsn_get(dsn, "LOBINLINE");
+    if (cexpire == NULL)
+      cexpire = dsn_get(dsn, "EXPIRE_TIME");
   }
 
   /* TLS is requested by SSL=1/yes/true or PROTOCOL=TCPS; verification is on by
@@ -171,6 +174,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
                        : 1;
   if (ctlsca && !ctlsca[0]) {
     free(ctlsca);
+    free(cexpire);
     ctlsca = NULL;
   } /* empty -> system roots */
 
@@ -182,6 +186,20 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
     ret = seer_odbc_diag(c, "08001", 0, "Missing HOST or SERVICE in DSN/connection string",
                          SQL_ERROR);
     goto out;
+  }
+
+  /* EXPIRE_TIME is whole minutes, 0 (off) to a day; anything else is refused
+   * rather than read as some other number. */
+  int expire_time = 0;
+  if (cexpire != NULL && cexpire[0] != '\0') {
+    char *end = NULL;
+    long v = strtol(cexpire, &end, 10);
+    if (*end != '\0' || v < 0 || v > 1440) {
+      ret = seer_odbc_diag(c, "HY024", 0,
+                           "EXPIRE_TIME must be a whole number of minutes, 0 to 1440", SQL_ERROR);
+      goto out;
+    }
+    expire_time = (int)v;
   }
 
   SeerConnParams p = {
@@ -196,6 +214,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       .cclass = cclass,
       .purity = parse_purity(cpurity),
       .lob_inline = flag_is_on(clobinline),
+      .expire_time = expire_time,
   };
 
   SeerConn *conn = NULL;

@@ -31,6 +31,10 @@ void seer_transport_close(SeerTransport *t);
  * server answers), a negative value the connect default. */
 void seer_transport_set_io_timeout(SeerTransport *t, int timeout_ms);
 
+/* Turn TCP keepalive on, its first probe after idle_s seconds (EXPIRE_TIME).
+ * idle_s <= 0 leaves the socket as it is. */
+void seer_transport_set_keepalive(SeerTransport *t, int idle_s);
+
 /* Wrap an already-connected transport in TLS (TCPS): perform a client TLS
  * handshake, after which read/write transparently encrypt. `sni_host` is the
  * server name (SNI + hostname verification). When `verify` is non-zero the peer

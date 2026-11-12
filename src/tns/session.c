@@ -83,15 +83,21 @@ static SeerStatus build_connect_body(const SeerConnParams *p, SeerWriter *w)
   else
     snprintf(target, sizeof target, "(SERVICE_NAME=%s)", p->service_name ? p->service_name : "");
 
+  /* EXPIRE_TIME opens the DESCRIPTION, where python-oracledb 26.1 writes it. */
+  char expire[32] = "";
+  if (p->expire_time > 0)
+    snprintf(expire, sizeof expire, "(EXPIRE_TIME=%d)", p->expire_time);
+
   char desc[1024];
   int dlen = snprintf(desc, sizeof desc,
                       "(DESCRIPTION="
+                      "%s"
                       "(CONNECT_DATA="
                       "%s"
                       "%s"
                       "(CID=(PROGRAM=seerodbc)(HOST=%s)(USER=%s)))"
                       "(ADDRESS=(PROTOCOL=%s)(HOST=%s)(PORT=%u)))",
-                      target, pooled, hostname, user, proto, p->host ? p->host : "",
+                      expire, target, pooled, hostname, user, proto, p->host ? p->host : "",
                       (unsigned)(p->port ? p->port : 1521));
   if (dlen < 0 || (size_t)dlen >= sizeof desc)
     return SEER_EPARAM;
@@ -288,6 +294,8 @@ SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char 
       st = seer_transport_connect(cur_host, cur_port, 0, &conn->t);
       if (st != SEER_OK)
         goto fail;
+      if (params->expire_time > 0) /* minutes -> seconds; each socket, redirects too */
+        seer_transport_set_keepalive(conn->t, params->expire_time * 60);
       /* TCPS: wrap the (possibly redirected) socket in TLS before any TNS
        * bytes flow. The SNI / verified hostname is the host we dialled. */
       if (params->use_tls) {

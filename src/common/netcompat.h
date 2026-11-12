@@ -45,6 +45,8 @@ static inline int seer_sock_errno(void)
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -146,6 +148,31 @@ static inline void seer_sock_set_io_timeout(seer_socket_t s, int timeout_ms)
   };
   setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+}
+
+/* TCP keepalive, its first probe after idle_s seconds of quiet (where the
+ * platform lets the idle time be set; elsewhere at the system's default). */
+static inline void seer_sock_set_keepalive(seer_socket_t s, int idle_s)
+{
+  int on = 1;
+#ifdef _WIN32
+  DWORD idle = (DWORD)idle_s;
+  setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof on);
+#ifdef TCP_KEEPIDLE
+  setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, (const char *)&idle, sizeof idle);
+#else
+  (void)idle;
+#endif
+#else
+  setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on);
+#if defined(TCP_KEEPIDLE)
+  setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s);
+#elif defined(TCP_KEEPALIVE) /* macOS */
+  setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &idle_s, sizeof idle_s);
+#else
+  (void)idle_s;
+#endif
 #endif
 }
 
