@@ -114,9 +114,9 @@ static void load_legacy_provider(void)
 #endif
   /* Without it DES is unavailable and a 10g login fails; say why. */
   if (OSSL_PROVIDER_load(NULL, "legacy") == NULL)
-    seer_log(SEER_LOG_ERROR, "OpenSSL's legacy provider could not be loaded: DES, which a 10g "
-                             "login needs, is unavailable (set OPENSSL_MODULES to the directory "
-                             "holding legacy.dll / legacy.so)");
+    seer_log(SEER_LOG_WARNING, "OpenSSL's legacy provider could not be loaded: DES, which a 10g "
+                               "login needs, is unavailable (set OPENSSL_MODULES to the directory "
+                               "holding legacy.dll / legacy.so)");
   OSSL_PROVIDER_load(NULL, "default");
 }
 
