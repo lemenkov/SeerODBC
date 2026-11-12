@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
+#
+# SPDX-License-Identifier: CC0-1.0
+
+# Windows batch files need CRLF: cmd can misread labels (goto) in LF-only ones.
+*.cmd text eol=crlf
