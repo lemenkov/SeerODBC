@@ -10,6 +10,11 @@ and exercised (most against the live 9i/10g/11g/18c/21c/23ai matrix, see
 `tests/odbc/run-matrix.sh`); `[~]` = expected to work but not proven live;
 `[ ]` = not yet. Keep this in sync as features land.
 
+The checklist tracks **features**, not protocol coverage: the goal is to
+connect to every supported database and support what it offers, implementing
+each wire dialect only as far as that needs (see the README's *Goals*). A
+protocol variant with no feature behind it is not a gap.
+
 ## Server versions (negotiated TTC field version)
 
 - [~] Oracle 8i (8.1.7) — **login + queries, live-validated against an 8i VM**

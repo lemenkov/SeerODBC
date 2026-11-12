@@ -60,6 +60,16 @@ LOB columns are refused with "not implemented".
 
 ## Goals
 
+- **Connect to the database and support its features — not implement every
+  protocol.** The aim is that an ODBC application can reach every Oracle
+  database in the supported range and use what that database offers. Oracle's
+  wire protocols are the means, not the product: a dialect is implemented as
+  far as the features need it and no further, and an alternative wire form
+  that does a job already done (for example, OCI's native forms where the thin
+  form works) is out of scope. An old release is supported as far as its
+  realistic use needs — Oracle 8i logs in and runs queries, and stops there.
+  When a choice has to be made, a fix a user would see wins over protocol
+  fidelity.
 - Support the Oracle release range **9i through 23ai** (field versions 2–24),
   negotiating the wire form down to each server; **11g** remains the reference
   target.
