@@ -22,15 +22,22 @@ odbc_sources = files(
 # and the odbc.ini reader), in a static library so the offline unit tests can
 # link it directly. Folded into the shim below; these symbols stay internal (the
 # version script exports only SQL*).
+# On Windows odbcini.c asks the installer DLL every Windows has (odbccp32) for
+# DSN settings, which live in the registry there (see odbcini.c).
+odbc_platform_deps = [common_dep]
+if host_machine.system() == 'windows'
+  odbc_platform_deps += cc.find_library('odbccp32')
+endif
+
 odbc_pure = static_library('seerodbcpure',
   files('sqlprep.c', 'convert.c', 'odbcini.c'),
   include_directories : include_directories('.'),
-  dependencies : [common_dep],
+  dependencies : odbc_platform_deps,
 )
 odbc_pure_dep = declare_dependency(
   link_with : odbc_pure,
   include_directories : include_directories('.'),
-  dependencies : [common_dep],
+  dependencies : odbc_platform_deps,
 )
 
 odbc_map = meson.current_source_dir() / 'seerodbc.map'   # GNU ld version script
@@ -77,8 +84,11 @@ else
   odbc_export_depends = odbc_map
 endif
 
+# On Windows a driver DLL is seerodbc.dll, as ODBC registrations name it, not
+# MinGW's default libseerodbc.dll.
 seerodbc_lib = shared_library('seerodbc',
   odbc_sources,
+  name_prefix : host_machine.system() == 'windows' ? '' : [],
   include_directories : include_directories('.'),
   dependencies : [seertns_dep, common_dep, odbc_pure_dep],
   link_args : odbc_export_args,

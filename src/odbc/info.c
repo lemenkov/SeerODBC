@@ -102,7 +102,13 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
   switch (InfoType) {
   /* --- identification --- */
   case SQL_DRIVER_NAME:
+#if defined(_WIN32)
+    return info_string("seerodbc.dll", InfoValuePtr, BufferLength, StringLengthPtr);
+#elif defined(__APPLE__)
+    return info_string("libseerodbc.dylib", InfoValuePtr, BufferLength, StringLengthPtr);
+#else
     return info_string("libseerodbc.so", InfoValuePtr, BufferLength, StringLengthPtr);
+#endif
   case SQL_DRIVER_VER:
     return info_string("00.00.0000", InfoValuePtr, BufferLength, StringLengthPtr);
   case SQL_DRIVER_ODBC_VER:

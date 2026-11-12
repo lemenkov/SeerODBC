@@ -260,4 +260,14 @@ if build_driver
     test('odbc integration', test_integration,
          depends : seerodbc_lib, is_parallel : false, timeout : 120)
   endif
+
+  # seer_smoke: a short check of an installed driver through the platform's
+  # Driver Manager (odbc32 on Windows), by connection string or DSN - the one
+  # to run on Windows after registering the driver (packaging/windows/). It
+  # skips (77) without SEER_SMOKE_CONNECT.
+  smoke_dm_dep = host_machine.system() == 'windows' ? cc.find_library('odbc32', required : false) : odbc_dm_dep
+  if smoke_dm_dep.found()
+    seer_smoke = executable('seer_smoke', 'odbc/smoke.c', dependencies : [smoke_dm_dep])
+    test('odbc smoke', seer_smoke, depends : seerodbc_lib, is_parallel : false, timeout : 60)
+  endif
 endif

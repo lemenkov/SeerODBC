@@ -11,7 +11,9 @@
 #include <openssl/provider.h>
 #include <openssl/rand.h>
 
-#include <pthread.h>
+#include "log.h"
+#include "once.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,20 +65,64 @@ static SeerStatus aes_cbc(int enc, const uint8_t *key, size_t keylen, const uint
 
 /* DES moved to OpenSSL 3's legacy provider, which is not active by default.
  * Load it (plus default, since an explicit load suppresses implicit default
- * activation) the first time the 10g path needs DES. pthread_once makes this
+ * activation) the first time the 10g path needs DES. seer_once makes this
  * race-free: concurrent first-time connects all block until the load completes,
  * so no thread can use DES before the provider is active. */
-static pthread_once_t g_legacy_once = PTHREAD_ONCE_INIT;
+static SeerOnce g_legacy_once = SEER_ONCE_INIT;
+
+#ifdef _WIN32
+/* OpenSSL looks for its provider modules (legacy.dll) in the directory it was
+ * built for, which on Windows is the build machine's. The driver ships them in
+ * ossl-modules\ beside its own DLL, so point OpenSSL there when legacy.dll is
+ * in it - unless the user set OPENSSL_MODULES, which wins. The module asked
+ * about is the one holding this code: seerodbc.dll, or seersql.exe. */
+static const char g_module_anchor = 0; /* an address inside this module */
+
+static void use_bundled_modules(void)
+{
+  const char *env = getenv("OPENSSL_MODULES");
+  if (env != NULL && env[0] != '\0')
+    return;
+  HMODULE self = NULL;
+  if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          &g_module_anchor, &self))
+    return;
+  char path[MAX_PATH];
+  DWORD n = GetModuleFileNameA(self, path, sizeof path);
+  if (n == 0 || n >= sizeof path)
+    return;
+  char *slash = strrchr(path, '\\');
+  if (slash == NULL)
+    return;
+  size_t room = sizeof path - (size_t)(slash + 1 - path);
+  if (snprintf(slash + 1, room, "ossl-modules\\legacy.dll") >= (int)room)
+    return;
+  /* Only where the modules are: elsewhere (a build tree, an MSYS2 install)
+   * OpenSSL's own directory is the right one. */
+  if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+    return;
+  *strrchr(path, '\\') = '\0';
+  OSSL_PROVIDER_set_default_search_path(NULL, path);
+}
+#endif
 
 static void load_legacy_provider(void)
 {
-  OSSL_PROVIDER_load(NULL, "legacy");
+#ifdef _WIN32
+  use_bundled_modules();
+#endif
+  /* Without it DES is unavailable and a 10g login fails; say why. */
+  if (OSSL_PROVIDER_load(NULL, "legacy") == NULL)
+    seer_log(SEER_LOG_ERROR, "OpenSSL's legacy provider could not be loaded: DES, which a 10g "
+                             "login needs, is unavailable (set OPENSSL_MODULES to the directory "
+                             "holding legacy.dll / legacy.so)");
   OSSL_PROVIDER_load(NULL, "default");
 }
 
 static void ensure_legacy_provider(void)
 {
-  pthread_once(&g_legacy_once, load_legacy_provider);
+  seer_once(&g_legacy_once, load_legacy_provider);
 }
 
 /* DES-CBC, zero IV, no padding (input a multiple of 8). */
