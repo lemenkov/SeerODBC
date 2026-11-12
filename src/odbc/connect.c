@@ -199,10 +199,13 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   };
 
   SeerConn *conn = NULL;
-  SeerStatus st = seer_connect(&p, &conn);
+  char why[512];
+  SeerStatus st = seer_connect_diag(&p, &conn, why, sizeof why);
   if (st != SEER_OK) {
-    const char *ora = (conn != NULL) ? seer_last_error(conn) : NULL;
-    ret = seer_odbc_diag(c, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
+    /* The server's own error, its ORA number the native error, when it gave one. */
+    SQLINTEGER native = strncmp(why, "ORA-", 4) == 0 ? (SQLINTEGER)atoi(why + 4) : 0;
+    ret = seer_odbc_diag(c, seer_odbc_sqlstate(st), native, why[0] ? why : seer_strerror(st),
+                         SQL_ERROR);
     goto out;
   }
 

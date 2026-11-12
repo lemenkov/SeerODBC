@@ -207,7 +207,10 @@ static bool parse_redirect(const uint8_t *body, size_t len, char *host, size_t h
   return ok;
 }
 
-static void log_refuse(const uint8_t *body, size_t len)
+/* Log a listener's REFUSE, and put its error on the connection: the
+ * descriptor it carries names the code, "(ERR=12514)", and no message text,
+ * so the connection gets "ORA-12514: the listener refused the connection". */
+static void log_refuse(SeerConn *conn, const uint8_t *body, size_t len)
 {
   if (body == NULL || len < 4) {
     seer_log(SEER_LOG_ERROR, "TNS: REFUSE (no detail)");
@@ -218,12 +221,32 @@ static void log_refuse(const uint8_t *body, size_t len)
   if (errlen > avail)
     errlen = avail;
   seer_log(SEER_LOG_ERROR, "TNS: REFUSE: %.*s", (int)errlen, (const char *)(body + 4));
+  const char *text = (const char *)(body + 4);
+  for (size_t i = 0; i + 5 < errlen; i++) {
+    if (memcmp(text + i, "(ERR=", 5) != 0)
+      continue;
+    long code = 0;
+    for (size_t k = i + 5; k < errlen && text[k] >= '0' && text[k] <= '9' && code < 100000; k++)
+      code = code * 10 + (text[k] - '0');
+    if (code > 0) {
+      char m[64];
+      snprintf(m, sizeof m, "ORA-%05ld: the listener refused the connection", code);
+      char *d = strdup(m);
+      if (d != NULL) {
+        free(conn->last_error);
+        conn->last_error = d;
+      }
+    }
+    return;
+  }
 }
 
 /* ------------------------------------------------------------- public API */
 
-SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)
+SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char *err, size_t errlen)
 {
+  if (err != NULL && errlen > 0)
+    err[0] = '\0';
   if (params == NULL || out == NULL || params->host == NULL)
     return SEER_EPARAM;
   *out = NULL;
@@ -364,7 +387,7 @@ SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)
     }
 
     if (type == TNS_PT_REFUSE) {
-      log_refuse(rbody, rlen);
+      log_refuse(conn, rbody, rlen);
       free(rbody);
       st = SEER_EPROTO;
       goto fail;
@@ -385,8 +408,7 @@ SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)
   if (ano_gate) {
     st = seer_ttc_ano_negotiate(conn);
     if (st != SEER_OK) {
-      seer_disconnect(conn);
-      return st;
+      goto fail;
     }
   }
 
@@ -394,16 +416,14 @@ SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)
   SeerAuthChallenge challenge;
   st = seer_ttc_login(conn, params, &challenge);
   if (st != SEER_OK) {
-    seer_disconnect(conn);
-    return st;
+    goto fail;
   }
 
   /* O5LOGON: answer the challenge, send TTI_AUTH, validate the response. */
   st = seer_ttc_authenticate(conn, params, &challenge);
   seer_auth_challenge_free(&challenge);
   if (st != SEER_OK) {
-    seer_disconnect(conn);
-    return st;
+    goto fail;
   }
 
   /* The connect timeout bounds connecting and logging in, not every later
@@ -416,8 +436,16 @@ SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)
 
 fail:
   seer_writer_free(&body);
+  /* Hand back why, before the connection and its error go. */
+  if (err != NULL && errlen > 0 && conn->last_error != NULL)
+    snprintf(err, errlen, "%s", conn->last_error);
   seer_disconnect(conn);
   return st;
+}
+
+SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)
+{
+  return seer_connect_diag(params, out, NULL, 0);
 }
 
 void seer_disconnect(SeerConn *conn)

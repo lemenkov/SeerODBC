@@ -78,6 +78,12 @@ typedef struct {
 
 /* Connection lifecycle. */
 SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out);
+/* seer_connect, and when it fails, why: the server's own error, such as
+ * "ORA-01017: invalid username/password; logon denied" or a listener's
+ * refusal, into `err` (NUL-terminated, cut to errlen). `err` is left empty
+ * when the failure has no server error behind it (a network error, say). */
+SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char *err,
+                             size_t errlen);
 void seer_disconnect(SeerConn *conn);
 
 /* Transaction control. autocommit (default on) commits each statement; with it
