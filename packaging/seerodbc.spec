@@ -37,7 +37,7 @@ It is a clean-room implementation (see CONTRIBUTING.md).
 %license LICENSE
 %doc README.md NOTICE packaging/odbcinst.ini.sample docs/*.md
 %{_libdir}/odbc/libseerodbc.so
-%{_bindir}/freeoracle
+%{_bindir}/seersql
 
 %changelog
 %autochangelog

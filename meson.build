@@ -72,7 +72,7 @@ subdir('src/tns')
 
 # The ODBC shim needs the Driver Manager headers (sql.h, from unixODBC or
 # iODBC). Build it only when those headers are present, so the protocol core
-# and freeoracle still configure on a machine without unixODBC-devel.
+# and seersql still configure on a machine without unixODBC-devel.
 build_driver = cc.has_header('sql.h')
 if build_driver
   subdir('src/odbc')
@@ -82,7 +82,7 @@ else
 endif
 
 if get_option('build_tools')
-  subdir('tools/freeoracle')
+  subdir('tools/seersql')
 endif
 
 if get_option('build_tests')
@@ -92,6 +92,6 @@ endif
 summary({
     'TLS / crypto (OpenSSL)' : openssl_dep.found(),
     'ODBC driver shim'       : build_driver,
-    'freeoracle CLI'         : get_option('build_tools'),
+    'seersql CLI'            : get_option('build_tools'),
     'tests'                  : get_option('build_tests'),
   }, section : 'SeerODBC')

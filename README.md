@@ -93,7 +93,7 @@ exists):
 ```
 
 The core is also exercised directly — without a Driver Manager — by the
-`freeoracle` CLI (`tools/freeoracle/`), a `tsql`-style client for proving the
+`seersql` CLI (`tools/seersql/`), a `tsql`-style client for proving the
 protocol against a real server.
 
 ## Building
@@ -112,7 +112,7 @@ and `-Ddriver_libdir=<path>` to override where the driver shim installs (default
 `<libdir>/odbc`, e.g. `/usr/lib64/odbc`).
 
 If the ODBC headers (`sql.h`) are not installed, the build skips the driver
-shim and still builds the protocol core and `freeoracle`.
+shim and still builds the protocol core and `seersql`.
 
 ### Linux
 

@@ -8,7 +8,7 @@ option('with_tls',
 
 option('build_tools',
   type : 'boolean', value : true,
-  description : 'Build the freeoracle CLI (direct TNS client, no ODBC)')
+  description : 'Build the seersql CLI (direct TNS client, no ODBC)')
 
 option('build_tests',
   type : 'boolean', value : true,

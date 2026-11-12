@@ -15,7 +15,7 @@ assignees: ''
 - **Oracle release** (9i / 10g / 11g / 21c / 23ai, and patch level if known):
 - **How you reached the driver:**
   - [ ] ODBC — Driver Manager (unixODBC / iODBC) + version:
-  - [ ] core `seer_*` API directly / `freeoracle`
+  - [ ] core `seer_*` API directly / `seersql`
 - **OS + architecture:**
 - **Compiler + OpenSSL version:**
 - **SeerODBC version / commit:**

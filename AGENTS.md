@@ -42,7 +42,7 @@ never to merge or tag it. The steps:
    - [`packaging/seerodbc.spec`](packaging/seerodbc.spec) → `Version: x.y.z`
 
    The `SEERTNS_VERSION_*` macros are the public API's advertised version for
-   consumers (the ODBC shim, freeoracle, any future binding). They are **not**
+   consumers (the ODBC shim, seersql, any future binding). They are **not**
    packed onto the wire — the driver announces a bare `PROGRAM=seerodbc` /
    `AUTH_PROGRAM_NM` with no version — so a stale macro is a cosmetic bug, not a
    protocol one. Keep them in sync anyway; a consumer may read them.

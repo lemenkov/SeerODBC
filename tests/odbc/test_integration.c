@@ -3276,7 +3276,7 @@ int main(void)
   }
   check_scalar(dbc, "CLOB fetch", "SELECT TO_CLOB('clobdata') FROM DUAL", "clobdata");
   /* SQL_C_CHAR from binary is uppercase hex (the ODBC convention, per
-   * convert.c - the core's freeoracle path renders lowercase). */
+   * convert.c - the core's seersql path renders lowercase). */
   check_scalar(dbc, "BLOB fetch (hex)", "SELECT TO_BLOB(HEXTORAW('DEADBEEF')) FROM DUAL",
                "DEADBEEF");
   check_rowid(dbc);

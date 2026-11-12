@@ -20,7 +20,7 @@
 #include "sqlprep.h"
 
 /* Opt-in protocol logging for debugging the driver under a Driver Manager,
- * which (unlike freeoracle) has no -v flag: set SEERODBC_DEBUG=1. */
+ * which (unlike seersql) has no -v flag: set SEERODBC_DEBUG=1. */
 __attribute__((constructor)) static void seerodbc_log_init(void)
 {
   const char *e = getenv("SEERODBC_DEBUG");
