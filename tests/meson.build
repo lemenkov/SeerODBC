@@ -14,39 +14,46 @@ add_test_setup('seer',
   env : ['LSAN_OPTIONS=suppressions=' + (meson.current_source_dir() / 'lsan.supp')],
 )
 
+# The tests check with assert(), often around the call under test, so they keep
+# their assertions in every build type: a release build defines NDEBUG, which
+# would compile those calls away and leave the tests crashing on what they never
+# filled in (release.yml builds --buildtype=release). The driver itself has no
+# assert().
+test_dep = declare_dependency(compile_args : ['-UNDEBUG'])
+
 test_reader = executable('test_reader',
   'unit/test_reader.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('reader bounds-checking', test_reader)
 
 test_writer = executable('test_writer',
   'unit/test_writer.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('writer round-trip', test_writer)
 
 test_marshal = executable('test_marshal',
   'unit/test_marshal.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('marshal codec', test_marshal)
 
 test_auth = executable('test_auth',
   'unit/test_auth.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('o5logon crypto', test_auth)
 
 test_number = executable('test_number',
   'unit/test_number.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('number/date decode', test_number)
 
 test_json = executable('test_json',
   'unit/test_json.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('json->oson encoder', test_json)
 
@@ -55,7 +62,7 @@ test('json->oson encoder', test_json)
 test_ano = executable('test_ano',
   'unit/test_ano.c',
   c_args : ['-DSEER_ANO_FIXTURE="' + meson.current_source_dir() + '/fixtures/ano_server_response.bin"'],
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('ano native encryption', test_ano)
 
@@ -64,21 +71,21 @@ test('ano native encryption', test_ano)
 test_ano_reset = executable('test_ano_reset',
   'unit/test_ano_reset.c',
   c_args : ['-DSEER_ANO_RESET_FIXTURE="' + meson.current_source_dir() + '/fixtures/ano_reset_session.txt"'],
-  dependencies : [seertns_dep, openssl_dep],
+  dependencies : [test_dep, seertns_dep, openssl_dep],
 )
 test('ano break/reset re-derivation', test_ano_reset)
 
 # Request-boundary (session-state) piggyback known-answer test (§35).
 test_reqbound = executable('test_reqbound',
   'unit/test_reqbound.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('request boundaries', test_reqbound)
 
 # Sessionless-transaction TXN_SWITCH framing known-answer test (§31).
 test_sessionless = executable('test_sessionless',
   'unit/test_sessionless.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('sessionless transactions', test_sessionless)
 
@@ -86,7 +93,7 @@ test('sessionless transactions', test_sessionless)
 # 0x04 collided with the OER token and desynced the old skip_rpa heuristic.
 test_rpa_skip = executable('test_rpa_skip',
   'unit/test_rpa_skip.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('rpa skip (fv27)', test_rpa_skip)
 
@@ -94,7 +101,7 @@ test('rpa skip (fv27)', test_rpa_skip)
 # has a 0x04 length byte (== the OER token) once the instance ages past 2^24.
 test_fv2_status = executable('test_fv2_status',
   'unit/test_fv2_status.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('fv2 dml status', test_fv2_status)
 
@@ -102,14 +109,14 @@ test('fv2 dml status', test_fv2_status)
 # byte against seerdb's encoders, and reading the pairs reply.
 test_o8i_login = executable('test_o8i_login',
   'unit/test_o8i_login.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('8i login', test_o8i_login)
 
 # 8i OALL8 query / fetch calls, byte for byte against seerdb's encoders.
 test_o8i_stmt = executable('test_o8i_stmt',
   'unit/test_o8i_stmt.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('8i oall8', test_o8i_stmt)
 
@@ -117,7 +124,7 @@ test('8i oall8', test_o8i_stmt)
 # a silently truncated LOB).
 test_lob_content = executable('test_lob_content',
   'unit/test_lob_content.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('lob content', test_lob_content)
 
@@ -125,7 +132,7 @@ test('lob content', test_lob_content)
 # frame a live 11g answered (seerdb #1462).
 test_fetch_only = executable('test_fetch_only',
   'unit/test_fetch_only.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('fetch-only oall8', test_fetch_only)
 
@@ -133,7 +140,7 @@ test('fetch-only oall8', test_fetch_only)
 # (§38). Pure offline: the reject paths take no network.
 test_stubs = executable('test_stubs',
   'unit/test_stubs.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('sharding + cqn stubs', test_stubs)
 
@@ -142,7 +149,7 @@ test('sharding + cqn stubs', test_stubs)
 if host_machine.system() != 'windows'
   test_sigpipe = executable('test_sigpipe',
     'unit/test_sigpipe.c',
-    dependencies : [common_dep],
+    dependencies : [test_dep, common_dep],
   )
   test('no SIGPIPE on a closed peer', test_sigpipe)
 
@@ -150,7 +157,7 @@ if host_machine.system() != 'windows'
   # out the socket timeout for a continuation that never comes (§1.3).
   test_fragment_wait = executable('test_fragment_wait',
     'unit/test_fragment_wait.c',
-    dependencies : [seertns_dep],
+    dependencies : [test_dep, seertns_dep],
   )
   test('exact-size final packet', test_fragment_wait, timeout : 60)
 endif
@@ -159,42 +166,42 @@ endif
 # (skip) unless SEER_TEST_HOST/SERVICE/USER are set, so it is a no-op offline.
 test_tpc = executable('test_tpc',
   'odbc/tpc_test.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('two-phase commit (live)', test_tpc, is_parallel : false, timeout : 60)
 
 # Live request-boundary test (§35, core API). Self-gating: exits 77 offline.
 test_reqbound_live = executable('reqbound_test',
   'odbc/reqbound_test.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('request boundaries (live)', test_reqbound_live, is_parallel : false, timeout : 60)
 
 # Live sessionless-transaction test (§31, core API). Self-gating: exits 77 offline.
 test_sessionless_live = executable('sessionless_test',
   'odbc/sessionless_test.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('sessionless transactions (live)', test_sessionless_live, is_parallel : false, timeout : 60)
 
 # Live request-pipelining test (§32, core API). Self-gating: exits 77 offline.
 test_pipeline_live = executable('pipeline_test',
   'odbc/pipeline_test.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('request pipelining (live)', test_pipeline_live, is_parallel : false, timeout : 60)
 
 # Live SQL OBJECT bind test (core API). Self-gating: exits 77 (skip) offline.
 test_objbind = executable('test_objbind',
   'odbc/objbind_test.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('object bind (live)', test_objbind, is_parallel : false, timeout : 60)
 
 # Live Advanced Queuing (AQ) enqueue test (core API). Self-gating: exits 77 offline.
 test_aq = executable('test_aq',
   'odbc/aq_test.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 test('advanced queuing (live)', test_aq, is_parallel : false, timeout : 60)
 
@@ -204,14 +211,14 @@ test('advanced queuing (live)', test_aq, is_parallel : false, timeout : 60)
 # test() so `meson test` / GitHub CI never reference 9i.
 test_9i = executable('test_9i',
   'odbc/test_9i.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 
 # 8i (8.1.7) core-API integration test: LOCAL ONLY, as test_9i (8i is a
 # VM), run by tests/odbc/run-matrix.sh and not registered as a meson test().
 test_8i = executable('test_8i',
   'odbc/test_8i.c',
-  dependencies : [seertns_dep],
+  dependencies : [test_dep, seertns_dep],
 )
 
 # ODBC-shim pure logic (only when the driver is built). These link the
@@ -219,13 +226,13 @@ test_8i = executable('test_8i',
 if build_driver
   test_sqlprep = executable('test_sqlprep',
     'unit/test_sqlprep.c',
-    dependencies : [odbc_pure_dep],
+    dependencies : [test_dep, odbc_pure_dep],
   )
   test('sql preprocessing', test_sqlprep)
 
   test_convert = executable('test_convert',
     'unit/test_convert.c',
-    dependencies : [odbc_pure_dep],
+    dependencies : [test_dep, odbc_pure_dep],
   )
   test('type conversion', test_convert)
 
@@ -236,7 +243,7 @@ if build_driver
   if host_machine.system() != 'windows'
     test_odbcini = executable('test_odbcini',
       'unit/test_odbcini.c',
-      dependencies : [odbc_pure_dep],
+      dependencies : [test_dep, odbc_pure_dep],
     )
     test('odbc.ini reader', test_odbcini)
   endif
@@ -251,7 +258,7 @@ if build_driver
   if odbc_dm_dep.found()
     test_integration = executable('test_integration',
       'odbc/test_integration.c',
-      dependencies : [odbc_dm_dep],
+      dependencies : [test_dep, odbc_dm_dep],
       c_args : ['-DSEER_DRIVER_PATH="' + seerodbc_lib.full_path() + '"'],
     )
     # `depends` (not link_with) so the .so is built first but loaded only by the
@@ -267,7 +274,7 @@ if build_driver
   # skips (77) without SEER_SMOKE_CONNECT.
   smoke_dm_dep = host_machine.system() == 'windows' ? cc.find_library('odbc32', required : false) : odbc_dm_dep
   if smoke_dm_dep.found()
-    seer_smoke = executable('seer_smoke', 'odbc/smoke.c', dependencies : [smoke_dm_dep])
+    seer_smoke = executable('seer_smoke', 'odbc/smoke.c', dependencies : [test_dep, smoke_dm_dep])
     test('odbc smoke', seer_smoke, depends : seerodbc_lib, is_parallel : false, timeout : 60)
   endif
 endif
