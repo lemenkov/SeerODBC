@@ -207,6 +207,10 @@ void seer_cancel(SeerConn *c)
 /* How long to wait, after a packet sized like a non-final fragment, for the
  * continuation before deciding the message ended with it. */
 #define FRAGMENT_WAIT_MS 2000
+/* How long to wait for it when the reply is known to go on: with
+ * end-of-response framing, until the TTI_END_OF_RESPONSE token has come. Long
+ * enough for a slow server, short of hanging on an assumption gone wrong. */
+#define EOR_FRAGMENT_WAIT_MS 60000
 
 /* Whether the message continues past a DATA packet of `total` bytes. The
  * server marks nothing: a non-final fragment is filled to exactly SDU-37 (or
@@ -237,12 +241,24 @@ static bool fragment_sized(const SeerConn *c, size_t total)
   return false;
 }
 
-static bool more_fragments(SeerConn *c, size_t total)
+/* `acc` is the reply so far. With end-of-response framing (23ai and later) a
+ * reply that doesn't yet end with TTI_END_OF_RESPONSE isn't over, so a
+ * fragment-sized packet there is surely followed by another, and it is waited
+ * for as long as a slow server may take: the 2 s guess cut a LOB read short on
+ * a busy CI runner, whose next fragment came later than that, and the reply
+ * failed to decode ("protocol error"). Without that framing, or once the last
+ * byte is the token (a real end, or the token value at a fragment's edge), the
+ * short wait decides as before. */
+static bool more_fragments(SeerConn *c, size_t total, const SeerWriter *acc)
 {
   if (c->sdu == 0 || !fragment_sized(c, total))
     return false;
-  if (seer_transport_wait_readable(c->t, FRAGMENT_WAIT_MS) == 0) {
-    seer_log(SEER_LOG_DEBUG, "ttc: a %zu-byte packet ended its message", total);
+  bool open = c->supports_eor && acc->len > 0 && acc->buf[acc->len - 1] != TTI_END_OF_RESPONSE;
+  if (seer_transport_wait_readable(c->t, open ? EOR_FRAGMENT_WAIT_MS : FRAGMENT_WAIT_MS) == 0) {
+    seer_log(open ? SEER_LOG_ERROR : SEER_LOG_DEBUG,
+             open ? "ttc: no continuation of an unfinished %zu-byte reply fragment"
+                  : "ttc: a %zu-byte packet ended its message",
+             total);
     return false;
   }
   return true; /* data (or an error the next read reports) */
@@ -321,7 +337,7 @@ static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
       free(body);
     }
 
-    if (!more_fragments(c, total))
+    if (!more_fragments(c, total, &acc))
       break;
   }
   c->in_call = false;
@@ -466,7 +482,7 @@ SeerStatus seer_ttc_recv_pipeline(SeerConn *c, uint8_t **out, size_t *outlen)
     size_t total = blen + TNS_HEADER_LEN;
     free(body);
 
-    if (!more_fragments(c, total))
+    if (!more_fragments(c, total, &acc))
       break;
   }
   if (!seer_writer_ok(&acc)) {
