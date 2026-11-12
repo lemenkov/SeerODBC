@@ -1776,12 +1776,17 @@ out:
   return st;
 }
 
-/* Parse the auth result RPA: validate AUTH_SVR_RESPONSE and decode the packed
- * AUTH_VERSION_NO. */
+/* Parse the auth result RPA: validate AUTH_SVR_RESPONSE, decode the packed
+ * AUTH_VERSION_NO, and take AUTH_MAX_IDEN_LENGTH, the longest identifier the
+ * server takes. That one comes from a session at field version 12.2 or later
+ * (128 on 18c, 21c and 23ai); 10g and 11g never send it (seerdb PROTOCOL.md
+ * §4.6), and it stays 0. */
 static SeerStatus parse_auth_result(const uint8_t *b, size_t n, const uint8_t *conn_key,
-                                    size_t conn_key_len, uint32_t *server_release)
+                                    size_t conn_key_len, uint32_t *server_release,
+                                    uint32_t *max_iden_len)
 {
   *server_release = 0;
+  *max_iden_len = 0;
   if (n < 1)
     return SEER_EPROTO;
   if (b[0] == TTI_OER) {
@@ -1833,6 +1838,11 @@ static SeerStatus parse_auth_result(const uint8_t *b, size_t n, const uint8_t *c
     } else if (key_is(k, kl, "AUTH_VERSION_NO") && vl > 0 && vl < sizeof verbuf) {
       memcpy(verbuf, v, vl);
       verbuf[vl] = '\0';
+    } else if (key_is(k, kl, "AUTH_MAX_IDEN_LENGTH") && vl > 0 && vl < 8) {
+      char num[8];
+      memcpy(num, v, vl);
+      num[vl] = '\0';
+      *max_iden_len = (uint32_t)strtoul(num, NULL, 10);
     }
 
     free(k);
@@ -1894,14 +1904,15 @@ SeerStatus seer_ttc_authenticate(SeerConn *conn, const SeerConnParams *params,
     return st;
   }
 
-  uint32_t release = 0;
-  st = parse_auth_result(resp, rlen, conn_key, conn_key_len, &release);
+  uint32_t release = 0, max_iden = 0;
+  st = parse_auth_result(resp, rlen, conn_key, conn_key_len, &release, &max_iden);
   free(resp);
   memset(conn_key, 0, sizeof conn_key);
   if (st != SEER_OK)
     return st;
 
   conn->server_release = release;
+  conn->max_iden_len = max_iden;
   conn->authenticated = true;
   int v[5];
   seer_release_fields(release, v);

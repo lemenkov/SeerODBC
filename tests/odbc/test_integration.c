@@ -1269,6 +1269,46 @@ static void check_dbms_ver(SQLHDBC dbc)
   }
 }
 
+/* SQL_MAX_IDENTIFIER_LEN (and the column / table / schema name lengths) is the
+ * server's own limit: 128 from 12.2 on, as the server states it at login, and
+ * 30 before. The server is the judge: an alias that long is taken, and one a
+ * character longer is refused (ORA-00972) where the limit is below 128. */
+static void check_max_identifier_len(SQLHDBC dbc)
+{
+  const char *name = "SQL_MAX_IDENTIFIER_LEN is the server's limit";
+  SQLUSMALLINT iden = 0, col = 0, tab = 0, sch = 0;
+  SQLGetInfo(dbc, SQL_MAX_IDENTIFIER_LEN, &iden, sizeof iden, NULL);
+  SQLGetInfo(dbc, SQL_MAX_COLUMN_NAME_LEN, &col, sizeof col, NULL);
+  SQLGetInfo(dbc, SQL_MAX_TABLE_NAME_LEN, &tab, sizeof tab, NULL);
+  SQLGetInfo(dbc, SQL_MAX_SCHEMA_NAME_LEN, &sch, sizeof sch, NULL);
+  char m[300];
+  if ((iden != 30 && iden != 128) || col != iden || tab != iden || sch != iden) {
+    snprintf(m, sizeof m, "identifier %u, column %u, table %u, schema %u", iden, col, tab, sch);
+    fail(name, m);
+    return;
+  }
+  /* The server is asked with an alias of the reported length, then (below 128)
+   * one character longer. */
+  for (unsigned len = iden; len <= iden + (iden < 128 ? 1u : 0u); len++) {
+    char alias[130], sql[200], out[16], err[256] = "";
+    memset(alias, 'A', len);
+    alias[len] = '\0';
+    snprintf(sql, sizeof sql, "SELECT 1 AS \"%s\" FROM dual", alias);
+    int taken = SQL_SUCCEEDED(exec_scalar(dbc, sql, out, sizeof out, err, sizeof err));
+    if (len == iden && !taken) {
+      snprintf(m, sizeof m, "a %u-character alias was refused: %s", len, err);
+      fail(name, m);
+      return;
+    }
+    if (len > iden && taken) {
+      snprintf(m, sizeof m, "reported %u, but a %u-character alias was taken", iden, len);
+      fail(name, m);
+      return;
+    }
+  }
+  pass(name);
+}
+
 /* Whether the server is 12c or later (SQL_DBMS_VER is a fixed string, so ask
  * the server). */
 static int server_is_12c(SQLHDBC dbc)
@@ -3081,6 +3121,7 @@ int main(void)
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_dbms_ver(dbc);
+  check_max_identifier_len(dbc);
   check_zero_length_columns(dbc);
   check_timestamp_zero_fraction_bind(dbc);
   check_batch_resume_repeated_column(dbc);

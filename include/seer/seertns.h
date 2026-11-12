@@ -437,6 +437,11 @@ long seer_last_error_offset(SeerConn *conn);
  * when the server sent none (Oracle 9i). */
 SeerStatus seer_server_version(SeerConn *conn, int version[5]);
 
+/* The longest identifier the server takes, in bytes, as it states it at login
+ * (AUTH_MAX_IDEN_LENGTH: 128 from 12.2 on). 0 when the server stated none, as
+ * 8i to 11g never do; their limit is 30. */
+int seer_max_identifier_length(SeerConn *conn);
+
 /* Advance to the next row. SEER_OK if a row is now current, SEER_ENODATA when
  * the result set is exhausted. */
 SeerStatus seer_stmt_fetch(SeerStmt *stmt);

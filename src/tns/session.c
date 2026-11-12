@@ -461,6 +461,11 @@ SeerStatus seer_server_version(SeerConn *conn, int version[5])
   return SEER_OK;
 }
 
+int seer_max_identifier_length(SeerConn *conn)
+{
+  return conn != NULL ? (int)conn->max_iden_len : 0;
+}
+
 /* Continuous Query Notification (§38): not on the thin wire. CQN needs the server
  * to open a callback connection back to a client-hosted listener, which a
  * pure-protocol request/response client cannot host. Accepted for API parity and
