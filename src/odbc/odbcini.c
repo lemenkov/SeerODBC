@@ -1,6 +1,7 @@
 /* Self-contained odbc.ini / odbcinst.ini reader. See odbcini.h for the rationale
  * (loading identically under unixODBC and iODBC with no instlib at run time) and
- * the SQLGetPrivateProfileString-compatible contract.
+ * the SQLGetPrivateProfileString-compatible contract. On Windows it defers to
+ * odbccp32 instead, as DSNs live in the registry there.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -14,6 +15,12 @@
 #include "compat.h"
 #include "odbcini.h"
 
+#ifdef _WIN32
+#include <windows.h> /* before <odbcinst.h>, which needs its types */
+#include <odbcinst.h>
+#endif
+
+#ifndef _WIN32
 /* Trim leading whitespace by advancing the pointer; trailing whitespace
  * (including the CR of a CRLF file) by writing a NUL. Returns the new start. */
 static char *trim(char *s)
@@ -25,6 +32,8 @@ static char *trim(char *s)
     *--end = '\0';
   return s;
 }
+
+#endif
 
 /* Copy val (NULL treated as "") into retbuf per the ODBC contract; return the
  * number of bytes written, excluding the NUL. */
@@ -42,15 +51,12 @@ static int copy_out(const char *val, char *retbuf, int retbuf_len)
   return n;
 }
 
+#ifndef _WIN32
 /* Scan one INI file for section/entry (both case-insensitive). Returns a
  * malloc'd value, or NULL if the file or key is absent. */
 static char *lookup_in_file(const char *path, const char *section, const char *entry)
 {
-#ifdef _WIN32
-  FILE *f = fopen(path, "r"); /* no close-on-exec concept on Windows */
-#else
   FILE *f = fopen(path, "re"); /* 'e' = O_CLOEXEC */
-#endif
   if (f == NULL)
     return NULL;
 
@@ -93,6 +99,27 @@ static const char *system_dir(void)
   return (d != NULL && d[0] != '\0') ? d : "/etc";
 }
 
+#endif
+
+#ifdef _WIN32
+/* On Windows DSNs live in the registry (HKCU, then HKLM, under
+ * Software\ODBC\ODBC.INI; the 32-bit view under WOW6432Node for a 32-bit
+ * process), as the ODBC Data Source Administrator writes them, not in INI
+ * files. The installer DLL every Windows has, odbccp32, reads them in that
+ * order - and a file DSN's file too - so the driver asks it. The reason for
+ * reading odbc.ini ourselves elsewhere (not pinning the driver to one Driver
+ * Manager's instlib) doesn't arise on Windows, which has one. */
+int seer_get_private_profile_string(const char *section, const char *entry, const char *defstr,
+                                    char *retbuf, int retbuf_len, const char *filename)
+{
+  if (retbuf == NULL || retbuf_len <= 0)
+    return 0;
+  if (section == NULL || entry == NULL || filename == NULL)
+    return copy_out(defstr, retbuf, retbuf_len);
+  return SQLGetPrivateProfileString(section, entry, defstr != NULL ? defstr : "", retbuf,
+                                    retbuf_len, filename);
+}
+#else
 int seer_get_private_profile_string(const char *section, const char *entry, const char *defstr,
                                     char *retbuf, int retbuf_len, const char *filename)
 {
@@ -138,3 +165,4 @@ int seer_get_private_profile_string(const char *section, const char *entry, cons
   free(val);
   return n;
 }
+#endif

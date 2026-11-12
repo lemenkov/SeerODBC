@@ -22,7 +22,10 @@ tns_sources = files(
 
 tns_inc = include_directories('.')
 
-threads_dep = dependency('threads')   # pthread_once for race-free lazy init
+# pthreads: pthread_once (once.h) and the SIGPIPE mask around TLS writes
+# (transport.c). Windows needs neither - once.h uses kernel32's one-time init,
+# and there is no SIGPIPE - so the DLL ships without a pthreads runtime.
+threads_dep = host_machine.system() == 'windows' ? [] : dependency('threads')
 
 libseertns = static_library('seertns',
   tns_sources,
