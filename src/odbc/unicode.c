@@ -247,7 +247,7 @@ SQLRETURN SQL_API SQLDescribeColW(SQLHSTMT hstmt, SQLUSMALLINT col, SQLWCHAR *sz
 
 SQLRETURN SQL_API SQLColAttributeW(SQLHSTMT hstmt, SQLUSMALLINT col, SQLUSMALLINT field,
                                    SQLPOINTER pCharAttr, SQLSMALLINT cbCharMax,
-                                   SQLSMALLINT *pcbChar, SQLLEN *pNumAttr)
+                                   SQLSMALLINT *pcbChar, SEER_COLATTR_NUMERIC pNumAttr)
 {
   SQLCHAR tmp[512] = {0};
   SQLSMALLINT slen = 0;

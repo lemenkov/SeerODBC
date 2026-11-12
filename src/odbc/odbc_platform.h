@@ -22,4 +22,13 @@
 #include <windows.h>
 #endif
 
+/* SQLColAttribute[W]'s NumericAttribute: SQLLEN * everywhere but 32-bit
+ * Windows, whose headers keep ODBC 3.0's SQLPOINTER there. Either way it points
+ * at an SQLLEN, which on 32-bit Windows is 4 bytes. */
+#if defined(_WIN32) && !defined(_WIN64)
+#define SEER_COLATTR_NUMERIC SQLPOINTER
+#else
+#define SEER_COLATTR_NUMERIC SQLLEN *
+#endif
+
 #endif /* SEERODBC_PLATFORM_H */

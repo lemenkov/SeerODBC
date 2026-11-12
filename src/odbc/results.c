@@ -177,8 +177,9 @@ SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNu
 SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber,
                                   SQLUSMALLINT FieldIdentifier, SQLPOINTER CharacterAttributePtr,
                                   SQLSMALLINT BufferLength, SQLSMALLINT *StringLengthPtr,
-                                  SQLLEN *NumericAttributePtr)
+                                  SEER_COLATTR_NUMERIC NumericAttribute)
 {
+  SQLLEN *NumericAttributePtr = (SQLLEN *)NumericAttribute;
   OdbcStmt *s = (OdbcStmt *)StatementHandle;
   if (s == NULL)
     return SQL_INVALID_HANDLE;
