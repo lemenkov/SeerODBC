@@ -77,6 +77,19 @@ seer_smoke.exe "DSN=MyDb;UID=scott;PWD=tiger;"
 
 It ends with `SUMMARY pass=6 fail=0` when all is well.
 
+`selftest.ps1` checks the whole install in one go, from an elevated PowerShell
+in the unpacked folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\selftest.ps1 `
+  -Server db.example.com:1521/ORCLPDB1 -User scott -Password tiger
+```
+
+It registers the driver, checks that Windows' ODBC tooling (`Get-OdbcDriver`)
+lists it for this zip's bitness, makes a DSN for each `-Server`, and runs
+`seer_smoke.exe` by connection string and by DSN. It removes what it added
+unless given `-Keep`, and ends with a `SUMMARY` line.
+
 For a trace of what the driver does, set `SEERODBC_DEBUG=1` in the
 environment of the application, or of `seer_smoke.exe`.
 

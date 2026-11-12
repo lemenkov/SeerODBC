@@ -10,7 +10,8 @@
 # need that Windows doesn't ship (found by walking their imports, as the
 # toolchains name them differently: MSYS2's libiconv-2.dll is Fedora's
 # iconv.dll, and OpenSSL brings zlib1.dll), OpenSSL's ossl-modules\legacy.dll
-# (DES, for 10g logins), the registration scripts, README, LICENSE and NOTICE.
+# (DES, for 10g logins), the registration scripts, selftest.ps1, README,
+# LICENSE and NOTICE.
 #
 # Runs under MSYS2 (MINGW64 / MINGW32) and on Linux with a MinGW-w64 cross
 # toolchain. MINGW_BIN names the directory holding the runtime DLLs when it
@@ -74,7 +75,7 @@ while [ ${#queue[@]} -gt 0 ]; do
   done < <("$objdump" -p "$f" | sed -n 's/^\s*DLL Name: //p')
 done
 
-cp "$here/register.cmd" "$here/add-dsn.cmd" "$here/README.md" "$dest/"
+cp "$here/register.cmd" "$here/add-dsn.cmd" "$here/selftest.ps1" "$here/README.md" "$dest/"
 cp "$top/LICENSE" "$top/NOTICE" "$dest/"
 # Batch files must be CRLF on Windows, whatever the checkout did.
 sed -i 's/\r*$/\r/' "$dest"/*.cmd
