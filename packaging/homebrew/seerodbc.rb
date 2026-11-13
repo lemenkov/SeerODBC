@@ -12,8 +12,8 @@
 class Seerodbc < Formula
   desc "Clean-room ODBC driver for a proprietary database, no vendor client needed"
   homepage "https://github.com/seerdb/SeerODBC"
-  url "https://github.com/seerdb/SeerODBC/archive/refs/tags/0.2.0.tar.gz"
-  sha256 "295faf23cbfb0ff3cbd4d1ea50efa417b5b78474ce6b98a9565f5bdab3e52da1"
+  url "https://github.com/seerdb/SeerODBC/archive/refs/tags/0.3.0.tar.gz"
+  sha256 "6a59c4e34e95f4b9663e86818b029e9a6caa2f80d6c7c237efa837f37345d566"
   license "Apache-2.0"
   head "https://github.com/seerdb/SeerODBC.git", branch: "master"
 
