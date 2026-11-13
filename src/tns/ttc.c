@@ -1879,10 +1879,10 @@ static SeerStatus parse_auth_result(const uint8_t *b, size_t n, const uint8_t *c
       memcpy(verbuf, v, vl);
       verbuf[vl] = '\0';
     } else if (key_is(k, kl, "AUTH_MAX_IDEN_LENGTH") && vl > 0 && vl < 8) {
-      char num[8];
-      memcpy(num, v, vl);
-      num[vl] = '\0';
-      *max_iden_len = (uint32_t)strtoul(num, NULL, 10);
+      char digits[8];
+      memcpy(digits, v, vl);
+      digits[vl] = '\0';
+      *max_iden_len = (uint32_t)strtoul(digits, NULL, 10);
     }
 
     free(k);

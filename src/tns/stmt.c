@@ -5938,23 +5938,23 @@ static int fv2_placeholder_order(const char *sql, int *order, int max)
 {
   char seen[64][32];
   int n = 0;
-  for (const char *p = sql; *p != '\0' && n < max && n < 64; p++) {
+  const char *p = sql;
+  while (*p != '\0' && n < max && n < 64) {
     if (*p == '\'' || *p == '"') { /* literal / quoted identifier */
-      char q = *p;
-      for (p++; *p != '\0' && *p != q; p++)
-        ;
-      if (*p == '\0')
+      const char *e = strchr(p + 1, *p);
+      if (e == NULL)
         break;
+      p = e + 1;
     } else if (p[0] == '-' && p[1] == '-') {
-      while (*p != '\0' && *p != '\n')
-        p++;
-      if (*p == '\0')
+      const char *e = strchr(p, '\n');
+      if (e == NULL)
         break;
+      p = e + 1;
     } else if (p[0] == '/' && p[1] == '*') {
       const char *e = strstr(p + 2, "*/");
       if (e == NULL)
         break;
-      p = e + 1;
+      p = e + 2;
     } else if (*p == ':' && (isalnum((unsigned char)p[1]) || p[1] == '_')) {
       const char *b = p + 1, *e = b;
       while (isalnum((unsigned char)*e) || *e == '_' || *e == '$' || *e == '#')
@@ -5969,7 +5969,9 @@ static int fv2_placeholder_order(const char *sql, int *order, int max)
         order[n] = isdigit((unsigned char)*b) ? atoi(seen[n]) - 1 : n;
         n++;
       }
-      p = e - 1;
+      p = e;
+    } else {
+      p++;
     }
   }
   return n;
