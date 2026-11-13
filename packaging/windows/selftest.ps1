@@ -12,13 +12,18 @@
 #     -User scott -Password tiger
 #
 # -Keep leaves the driver registered and the test DSN in place afterwards.
+# -Installed checks a copy the installer put in place: the driver is already
+# registered, so it is neither registered nor unregistered here, only checked.
+# Run the selftest.ps1 inside the installed folder (Program Files\SeerODBC, or
+# Program Files (x86)\SeerODBC for the 32-bit driver).
 # Exit status: 0 when every check passed, 1 otherwise.
 
 param(
   [Parameter(Mandatory = $true)] [string[]] $Server, # host:port/service
   [Parameter(Mandatory = $true)] [string] $User,
   [Parameter(Mandatory = $true)] [string] $Password,
-  [switch] $Keep
+  [switch] $Keep,
+  [switch] $Installed
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,9 +66,11 @@ if (-not $admin) {
   exit 1
 }
 
-# 1. register
-$out = Run "$here\register.cmd"
-Note 'register.cmd' ($LASTEXITCODE -eq 0) ($out -join ' ')
+# 1. register (an installed copy is registered already)
+if (-not $Installed) {
+  $out = Run "$here\register.cmd"
+  Note 'register.cmd' ($LASTEXITCODE -eq 0) ($out -join ' ')
+}
 
 # 2. Windows sees it
 try {
@@ -104,8 +111,8 @@ foreach ($s in $Server) {
   }
 }
 
-# 4. unregister, unless asked to keep it
-if (-not $Keep) {
+# 4. unregister, unless asked to keep it (or the installer owns it)
+if (-not $Keep -and -not $Installed) {
   $out = Run "$here\register.cmd" /remove
   Note 'register.cmd /remove' ($LASTEXITCODE -eq 0) ($out -join ' ')
 }
