@@ -117,6 +117,11 @@ void seer_test_fv2_decode_dml(const uint8_t *buf, size_t len, int64_t *rowcount,
 
 /* Oracle 8i login (defined in ttc.c): build an OSESSKEY / OAUTH call at 8i's
  * fixed little-endian widths, and read one value of its reply. */
+/* The operating-system account running the client (getpwuid, else $USER /
+ * $LOGNAME / $USERNAME, else "unknown"): the CONNECT descriptor's CID USER and
+ * the 10g+ login's AUTH_SID. */
+void seer_client_os_user(char *out, size_t n);
+
 SeerStatus seer_o8i_build_login(SeerConn *conn, SeerWriter *w, uint8_t op, const char *user,
                                 uint32_t mode, const char *password_field, const char *host,
                                 const char *pid);
