@@ -62,6 +62,9 @@ struct SeerConn {
    * in front of the next execute so they don't leak until session end. */
   int close_cursors[256];
   int n_close;
+  /* 9i (fv2): the one server cursor every statement is parsed on, opened by
+   * the first statement that needs it; 0 until then. */
+  uint32_t fv2_cursor;
   /* Temporary LOBs (bind promotions) no longer referenced, to free with a
    * FREE_TEMP piggyback in front of the next execute (like close_cursors). */
   uint8_t **free_lobs;
