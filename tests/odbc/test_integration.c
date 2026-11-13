@@ -53,8 +53,6 @@ static const KnownGap known_gaps[] = {
      "REF CURSOR binds are not supported before 10g"},
     {10, "large CLOB OUT parameter; CLOB + BLOB via RETURNING",
      "LOB OUT parameters and RETURNING are not supported before 10g"},
-    {10, "OS user reported to the server",
-     "the pre-10g login sends a fixed client environment (seerdb #2342)"},
     {10, "large text bind ahead of another bind (5000 / 40000 bytes)",
      "9i takes text binds up to 32512 bytes (in a block): 40000 is refused"},
     {10, "BINARY_FLOAT bind", "BINARY_FLOAT is a 10g type"},
