@@ -187,5 +187,7 @@
 
 /* Oracle character set id: AL32UTF8 (real UTF-8). */
 #define ORA_CHARSET_AL32UTF8 873
+/* Oracle character set id: AL16UTF16 (UTF-16BE), the national charset. */
+#define ORA_CHARSET_AL16UTF16 2000
 
 #endif /* SEER_TNS_TNS_CONSTS_H */
