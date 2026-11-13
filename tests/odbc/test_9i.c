@@ -876,6 +876,46 @@ static void check_long_text_bind(void)
   }
 }
 
+/* RAW binds past 2000 bytes take the same route as long text: a PL/SQL block,
+ * declared RAW 32767, values up to 32512 bytes (seerdb PROTOCOL.md §19.3.1). */
+static void check_long_raw_bind(void)
+{
+  const char *name = "RAW bind over 2000 bytes into a BLOB (5000; 32513 refused)";
+  run("DROP TABLE seer9w");
+  run("CREATE TABLE seer9w (b BLOB, id NUMBER)");
+  static unsigned char big[32513];
+  for (size_t i = 0; i < sizeof big; i++)
+    big[i] = (unsigned char)(i * 7);
+  SeerStatus sts[2] = {SEER_EPARAM, SEER_EPARAM};
+  for (int k = 0; k < 2; k++) {
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(C, "INSERT INTO seer9w (b, id) VALUES (:1, :2)", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_raw(s, 1, big, k == 0 ? 5000 : 32513);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 2, 42 + k);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    sts[k] = st;
+    seer_stmt_close(s);
+  }
+  seer_commit(C);
+  char out[64] = "";
+  /* the length, the id, and the last byte: 4999 * 7 mod 256 = 0xB1 */
+  scalar("SELECT COUNT(*) || ':' || MAX(id) || ':' || MAX(DBMS_LOB.GETLENGTH(b)) || ':' || "
+         "MAX(RAWTOHEX(DBMS_LOB.SUBSTR(b, 1, 5000))) FROM seer9w",
+         out, sizeof out);
+  run("DROP TABLE seer9w");
+  if (sts[0] == SEER_OK && sts[1] == SEER_ENOTIMPL && strcmp(out, "1:42:5000:B1") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "5000: status %d; 32513: status %d; table '%s' (want 1:42:5000:B1)",
+             (int)sts[0], (int)sts[1], out);
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -1184,6 +1224,7 @@ int main(void)
   check_describe_before_execute();
   check_returning();
   check_long_text_bind();
+  check_long_raw_bind();
   check_cursor_hygiene();
   check_wrong_password(&p);
 
