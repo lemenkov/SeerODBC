@@ -4530,10 +4530,15 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
           (void)seer_reader_u8(&r); /* present indicator (0x00) */
           if (vlen > 0) {
             /* A rowid column was defined as VARCHAR (fv2_define_entry): its
-             * value is the rowid's text, not the native form. */
-            uint8_t dt = (ct == ORA_TYPE_RID || ct == ORA_TYPE_ROWID || ct == ORA_TYPE_UROWID)
-                             ? ORA_TYPE_VARCHAR
-                             : ct;
+             * value is the rowid's text, not the native form. A LONG is text
+             * and a LONG RAW bytes, which decode_scalar knows as VARCHAR and
+             * RAW; as themselves they fell to its unknown-type hex. */
+            uint8_t dt = ct;
+            if (ct == ORA_TYPE_RID || ct == ORA_TYPE_ROWID || ct == ORA_TYPE_UROWID ||
+                ct == ORA_TYPE_LONG)
+              dt = ORA_TYPE_VARCHAR;
+            else if (ct == ORA_TYPE_LONGRAW)
+              dt = ORA_TYPE_RAW;
             if (decode_scalar(dt, val, vlen, &row[ci]) == SEER_OK)
               national_to_utf8(&stmt->cols[ci], &row[ci]);
           }
@@ -4589,6 +4594,19 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
       charset = 31;
       csfrm = 0;
       break;
+    case ORA_TYPE_TIMESTAMP:
+    case ORA_TYPE_TIMESTAMPTZ:
+    case ORA_TYPE_TIMESTAMPLTZ:
+    case ORA_TYPE_INTERVAL_YM:
+    case ORA_TYPE_INTERVAL_DS:
+      /* Declared as the type the value is (7-13 bytes, sized as on 10g+):
+       * declared VARCHAR, 9i reads the binary value as text (seerdb
+       * PROTOCOL.md §19.3, #172, #173). */
+      type = b->oac_type;
+      maxsize = b->oac_size;
+      charset = 31;
+      csfrm = 0;
+      break;
     default:
       break; /* VARCHAR / LONG / unbound -> str */
     }
@@ -4605,8 +4623,9 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
 
 /* Build the TTI_ALL7 parse message (shared by SELECT and DML). With input binds
  * the option word flips to 0x29, a bind-count field precedes the SQL, and each
- * bind's OAC + one RXD carrying all values are appended (the RXD value bytes are
- * exactly what the TTI_ALL8 path stored in b->rxd). */
+ * bind's OAC follows, then one RXD a row (an array DML sends them all in this
+ * one call, the tail counting the rows; seerdb #2245). The RXD value bytes are
+ * exactly what the TTI_ALL8 path stored in b->rxd. */
 static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
 {
   size_t qlen = strlen(stmt->sql);
@@ -4635,21 +4654,25 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
     seer_writer_u8(w, 0);
   }
   seer_writer_bytes(w, (const uint8_t *)stmt->sql, qlen);
-  {
-    static const uint8_t tl[] = {0x01, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0};
-    seer_writer_bytes(w, tl, sizeof tl);
-  }
+  int rows = (nb > 0 && stmt->n_iters > 1) ? stmt->n_iters : 1;
+  seer_writer_u8(w, 0x01);
+  seer_writer_u8(w, 0x01);
+  seer_enc_sb4(w, (uint32_t)rows); /* the rows: 1, or an array DML's */
+  for (int i = 0; i < 5; i++)
+    seer_writer_u8(w, 0);
   if (nb > 0) {
     for (int i = 0; i < nb; i++)
       fv2_bind_oac(w, &stmt->pbinds[i]);
-    seer_writer_u8(w, TTI_RXD);
-    for (int i = 0; i < nb; i++) {
-      SeerBind *b = &stmt->pbinds[i];
-      uint8_t *rxd = (b->rxd != NULL) ? b->rxd[0] : NULL;
-      if (rxd != NULL)
-        seer_writer_bytes(w, rxd, b->rxd_len[0]);
-      else
-        seer_writer_u8(w, 0); /* unbound -> NULL value */
+    for (int row = 0; row < rows; row++) {
+      seer_writer_u8(w, TTI_RXD);
+      for (int i = 0; i < nb; i++) {
+        SeerBind *b = &stmt->pbinds[i];
+        uint8_t *rxd = (b->rxd != NULL) ? b->rxd[row] : NULL;
+        if (rxd != NULL)
+          seer_writer_bytes(w, rxd, b->rxd_len[row]);
+        else
+          seer_writer_u8(w, 0); /* unbound -> NULL value */
+      }
     }
   }
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
