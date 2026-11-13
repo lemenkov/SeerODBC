@@ -1309,15 +1309,21 @@ static void check_max_identifier_len(SQLHDBC dbc)
   pass(name);
 }
 
-/* Whether the server is 12c or later (SQL_DBMS_VER is a fixed string, so ask
- * the server). */
-static int server_is_12c(SQLHDBC dbc)
+/* The server's major release (10, 11, 18, ...), asked of the server itself; 0
+ * if the query fails. */
+static int server_major(SQLHDBC dbc)
 {
   char ver[64] = "", err[256];
   exec_scalar(dbc,
               "SELECT MAX(version) FROM product_component_version WHERE product LIKE 'Oracle%'",
               ver, sizeof ver, err, sizeof err);
-  return atoi(ver) >= 12;
+  return atoi(ver);
+}
+
+/* Whether the server is 12c or later. */
+static int server_is_12c(SQLHDBC dbc)
+{
+  return server_major(dbc) >= 12;
 }
 
 /* A value over 32767 bytes bound to a PL/SQL CLOB / BLOB parameter: a LONG
@@ -2373,11 +2379,7 @@ static void check_lob_inline(const char *drv, const char *host, const char *port
     diag_text(SQL_HANDLE_DBC, d, m, sizeof m);
     fail("CLOB / BLOB columns across fetch batches (LOBINLINE)", m[0] ? m : "connect failed");
   } else {
-    char ver[16] = "", err[256];
-    exec_scalar(d,
-                "SELECT MAX(version) FROM product_component_version WHERE product LIKE 'Oracle%'",
-                ver, sizeof ver, err, sizeof err);
-    if (atoi(ver) < 12) /* before 12.1 the option has no effect */
+    if (!server_is_12c(d)) /* before 12.1 the option has no effect */
       skip("CLOB / BLOB columns across fetch batches (LOBINLINE)", "inline LOB fetch is 12.1+");
     else
       check_lob_columns_batched(d, 1);
@@ -2553,6 +2555,13 @@ static void check_drcp(SQLHDBC dbc, const char *drv, const char *host, const cha
 {
   const char *name = "DRCP (pooled session)";
   char err[256];
+  /* 10g has no pool: its listener ignores SERVER=POOLED and hands out a
+   * dedicated session, which would pass the check below without testing it. */
+  int major = server_major(dbc);
+  if (major > 0 && major < 11) {
+    skip(name, "no DRCP before 11g");
+    return;
+  }
   /* Best-effort: start the pool (needs DBA; harmless if already up / denied). */
   exec_do(dbc, "BEGIN DBMS_CONNECTION_POOL.START_POOL; END;", err, sizeof err);
 

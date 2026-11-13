@@ -67,6 +67,9 @@ BIN="$BUILD/tests/test_integration"
 TPC_BIN="$BUILD/tests/test_tpc"
 OBJBIND_BIN="$BUILD/tests/test_objbind"
 AQ_BIN="$BUILD/tests/test_aq"
+REQBOUND_BIN="$BUILD/tests/reqbound_test"
+SESSIONLESS_BIN="$BUILD/tests/sessionless_test"
+PIPELINE_BIN="$BUILD/tests/pipeline_test"
 NINE_BIN="$BUILD/tests/test_9i"
 EIGHT_BIN="$BUILD/tests/test_8i"
 if [[ ! -x "$BIN" ]]; then
@@ -106,6 +109,10 @@ in_list() {   # $1 word  $2 space-separated list
 }
 
 upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
+count() {     # $1 PASS|FAIL|SKIP  $2 log -> number of check lines with that verdict
+    sed 's/\x1b\[[0-9;]*m//g' "$2" | grep -cE "^ *$1 "
+}
 
 override() {  # $1 tier  $2 field  $3 default -> value
     local var; var="SEER_$(upper "$1")_$2"
@@ -194,14 +201,16 @@ for row in "${TIERS[@]}"; do
         SEER_TEST_SERVICE="$target" "$EIGHT_BIN" >"$log" 2>/dev/null
         grep -v '^SUMMARY' "$log" | sed 's/^/  /'
     else
-        # ODBC integration test (+ core-API extras: two-phase commit, object
-        # bind, AQ), service-name addressed, with an optional TLS-proxy leg.
+        # ODBC integration test (+ the core-API suites CI runs too: two-phase
+        # commit, object bind, AQ, request boundaries, sessionless transactions,
+        # pipelining), service-name addressed, with an optional TLS-proxy leg.
         start_tls_proxy "$host" "$port"
         SEER_TEST_SERVICE="$target" SEER_TLS_PROXY_PORT="$TLS_PORT" SEER_TLS_CA="$TLS_CA" \
             "$BIN" >"$log" 2>/dev/null
         [[ -n "$TLS_PID" ]] && kill "$TLS_PID" 2>/dev/null
         grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
-        for extra in "$TPC_BIN" "$OBJBIND_BIN" "$AQ_BIN"; do
+        for extra in "$TPC_BIN" "$OBJBIND_BIN" "$AQ_BIN" "$REQBOUND_BIN" "$SESSIONLESS_BIN" \
+                     "$PIPELINE_BIN"; do
             [[ -x "$extra" ]] || continue
             SEER_TEST_SERVICE="$target" "$extra" 2>/dev/null | grep -v '^SUMMARY' \
                 | tee -a "$xlog" | sed 's/^/  /'
@@ -209,12 +218,21 @@ for row in "${TIERS[@]}"; do
     fi
     unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS
 
+    # The tier's main suite must have finished (its SUMMARY line); the totals
+    # count every PASS / FAIL / SKIP line, the main suite's and the extras'.
     summary=$(grep '^SUMMARY' "$log")
-    result="${summary:-no summary (connect failed)}"
-    if [[ -z "$summary" || "$summary" != *"fail=0"* ]]; then any_fail=1; fi
-    if grep -q 'FAIL' "$xlog"; then
-        result="$result; core-API extras FAILED"
+    if [[ -z "$summary" ]]; then
+        result="no summary (connect failed)"
         any_fail=1
+    else
+        main="$(count PASS "$log")/$(count FAIL "$log")/$(count SKIP "$log")"
+        np=$(( $(count PASS "$log") + $(count PASS "$xlog") ))
+        nf=$(( $(count FAIL "$log") + $(count FAIL "$xlog") ))
+        ns=$(( $(count SKIP "$log") + $(count SKIP "$xlog") ))
+        result="pass=$np fail=$nf skip=$ns"
+        [[ -s "$xlog" ]] && result="$result  (ODBC $main, core API" \
+            && result="$result $(count PASS "$xlog")/$(count FAIL "$xlog")/$(count SKIP "$xlog"))"
+        if [[ $nf -ne 0 || "$summary" != *"fail=0"* ]]; then any_fail=1; fi
     fi
     set_result "$name" "$result"
     printf '%-6s %s\n' "$name" "$result"
