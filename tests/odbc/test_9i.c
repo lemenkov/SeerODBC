@@ -568,6 +568,75 @@ static void check_cursor_hygiene(void)
   }
 }
 
+/* Array DML: three rows in one execute. The 9i parse carried only the first
+ * row's values and a row count of 1, so one row went in and the rest were
+ * dropped without an error (seerdb #2245: one RXD a row, the count in the
+ * call's tail). */
+static void check_array_dml(void)
+{
+  const char *name = "array DML (3 rows, one execute)";
+  run("DROP TABLE seer9a");
+  run("CREATE TABLE seer9a (n NUMBER, s VARCHAR2(10))");
+  static const char *const txt[3] = {"one", "two", "three"};
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, "INSERT INTO seer9a VALUES (:1, :2)", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_set_array_size(s, 3);
+  for (int row = 0; row < 3 && st == SEER_OK; row++) {
+    st = seer_stmt_bind_row(s, row);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 1, row + 1);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_text(s, 2, txt[row], -1);
+  }
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  seer_stmt_close(s);
+  seer_commit(C);
+  char out[64] = "";
+  scalar("SELECT COUNT(*) || ':' || SUM(n) || ':' || MAX(s) FROM seer9a", out, sizeof out);
+  run("DROP TABLE seer9a");
+  if (st == SEER_OK && strcmp(out, "3:6:two") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "status %d, got '%s' want '3:6:two' (%s)", (int)st, out,
+             seer_last_error(C) ? seer_last_error(C) : "");
+    fail(name, m);
+  }
+}
+
+/* A LONG column comes back as its text: it fell to the unknown-type branch
+ * and came back as hex, twice its length. */
+static void check_long_fetch(void)
+{
+  const char *name = "LONG column (1000 chars) fetched as text";
+  run("DROP TABLE seer9l");
+  run("CREATE TABLE seer9l (l LONG)");
+  run("INSERT INTO seer9l VALUES (RPAD('q', 999, 'q') || 'Z')");
+  seer_commit(C);
+  SeerStmt *s = NULL;
+  size_t len = 0;
+  char last = 0;
+  if (seer_stmt_prepare(C, "SELECT l FROM seer9l", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+    const char *v = NULL;
+    int is_null = 0;
+    seer_stmt_get_string(s, 0, &v, &is_null);
+    len = v ? strlen(v) : 0;
+    last = len ? v[len - 1] : 0;
+  }
+  seer_stmt_close(s);
+  run("DROP TABLE seer9l");
+  if (len == 1000 && last == 'Z')
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "length %zu, last '%c' (want 1000, 'Z')", len, last ? last : '-');
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -868,6 +937,8 @@ int main(void)
   check_lob();
   check_bfile();
   check_national();
+  check_array_dml();
+  check_long_fetch();
   check_cursor_hygiene();
   check_wrong_password(&p);
 
