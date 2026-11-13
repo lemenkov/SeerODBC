@@ -8,6 +8,7 @@
 #include "log.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 /* Largest body we frame in a single 16-bit-length packet. */
 #define TNS_MAX_PAYLOAD (0xFFFFu - TNS_HEADER_LEN)
@@ -23,7 +24,19 @@ SeerStatus seer_packet_send(SeerTransport *t, uint8_t type, const void *payload,
    * length + ub2 checksum) or large-SDU (ub4 length, replacing the legacy
    * length + checksum) once the negotiated version >= 315 (§1.1, #155). */
   uint32_t total = (uint32_t)(TNS_HEADER_LEN + payload_len);
-  uint8_t hdr[TNS_HEADER_LEN];
+
+  /* The whole packet goes out in one write: 18c's DRCP broker closes a
+   * connection whose CONNECT (the one resent after RESEND) arrives as the
+   * header and then the body (seerdb PROTOCOL.md §2.5). A packet up to one
+   * SDU fits the stack buffer; a larger one is allocated. */
+  uint8_t small[TNS_HEADER_LEN + 8192];
+  uint8_t *pkt = small;
+  if (total > sizeof small) {
+    pkt = malloc(total);
+    if (pkt == NULL)
+      return SEER_ENOMEM;
+  }
+  uint8_t *hdr = pkt;
   if (seer_transport_large_frames(t)) {
     hdr[0] = (uint8_t)(total >> 24);
     hdr[1] = (uint8_t)(total >> 16);
@@ -40,11 +53,11 @@ SeerStatus seer_packet_send(SeerTransport *t, uint8_t type, const void *payload,
   hdr[6] = 0x00;
   hdr[7] = 0x00; /* header checksum */
 
-  SeerStatus st = seer_transport_write_all(t, hdr, sizeof hdr);
-  if (st != SEER_OK)
-    return st;
   if (payload_len > 0)
-    st = seer_transport_write_all(t, payload, payload_len);
+    memcpy(pkt + TNS_HEADER_LEN, payload, payload_len);
+  SeerStatus st = seer_transport_write_all(t, pkt, total);
+  if (pkt != small)
+    free(pkt);
   return st;
 }
 
