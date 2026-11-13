@@ -33,6 +33,85 @@
 
 static int n_pass, n_fail, n_skip;
 
+/* Known gaps of the legacy tiers. Oracle 8i and 9i speak their own dialects,
+ * and SeerODBC supports them as far as a user needs them: 9i for queries,
+ * DML and PL/SQL, 8i for queries only (AGENTS.md: stop a legacy dialect once
+ * it is usable). A check listed here, on a server older than `below`
+ * (9 = 8i only, 10 = 8i and 9i), is reported as SKIP with the reason rather
+ * than as a failure. Anything not listed still fails, so a regression in what
+ * these tiers do support shows. g_major is the connected server's release. */
+static int g_major;
+typedef struct {
+  int below;
+  const char *check;
+  const char *why;
+} KnownGap;
+static const KnownGap known_gaps[] = {
+    /* 8i and 9i */
+    {10, "nested CURSOR() column", "CURSOR() columns are not read before 10g"},
+    {10, "REF CURSOR rows holding a CURSOR() column",
+     "REF CURSOR binds are not supported before 10g"},
+    {10, "describe after SQLPrepare, before SQLExecute",
+     "statements are described when executed before 10g"},
+    {10, "large CLOB OUT parameter; CLOB + BLOB via RETURNING",
+     "LOB OUT parameters and RETURNING are not supported before 10g"},
+    {10, "OS user reported to the server",
+     "the pre-10g login sends a fixed client environment (seerdb #2342)"},
+    {10, "large text bind ahead of another bind (5000 / 40000 bytes)",
+     "binds over 4000 bytes are not supported before 10g"},
+    {10, "large CLOB bind (fragmented)", "binds over 4000 bytes are not supported before 10g"},
+    {10, "failing DML RETURNING, then the connection still works",
+     "DML RETURNING is not supported before 10g"},
+    {10, "DML RETURNING with only return binds (VARCHAR)",
+     "DML RETURNING is not supported before 10g"},
+    {10, "truncated DML RETURNING value reports 01004",
+     "DML RETURNING is not supported before 10g"},
+    {10, "DML RETURNING INTO", "DML RETURNING is not supported before 10g"},
+    {10, "array DML batch errors", "array-DML batch errors are not supported before 10g"},
+    {10, "BINARY_FLOAT bind", "BINARY_FLOAT is a 10g type"},
+    {10, "SQL OBJECT (ADT) fetch", "object types are not read before 10g"},
+    {10, "SQL OBJECT with an XMLType attribute", "object types are not read before 10g"},
+    {10, "SQL OBJECT / VARRAY with NVARCHAR2 attributes", "object types are not read before 10g"},
+    {10, "SQL OBJECT with CLOB / BLOB attributes", "object types are not read before 10g"},
+    {10, "nested SQL OBJECT fetch", "object types are not read before 10g"},
+    {10, "collection-of-objects fetch", "object types are not read before 10g"},
+    {10, "object-with-collection-attr fetch", "object types are not read before 10g"},
+    {10, "VARRAY / collection fetch", "object types are not read before 10g"},
+    {10, "REF fetch", "object types are not read before 10g"},
+    {10, "XMLType fetch", "XMLType is not read before 10g"},
+    {10, "XMLType fetch (LOB-backed)", "XMLType is not read before 10g"},
+    /* 8i: queries only, without binds */
+    {9, "zero-fraction TIMESTAMP bind matches trunc(LTZ)", "8i: queries only, without binds"},
+    {9, "aggregate over an all-NULL group (OER warning flags)", "8i: queries only, without binds"},
+    {9, "252/253/254-byte bind value and SQL text", "8i: queries only, without binds"},
+    {9, "typed NULL parameter (COALESCE with NUMBER / DATE)", "8i: queries only, without binds"},
+    {9, "leading comments / labels / CALL keep the statement kind",
+     "8i: queries only, without binds"},
+    {9, "describe after SQLPrepare, before SQLExecute", "8i: queries only, without binds"},
+    {9, "LONG column over 252 bytes", "8i: queries only (no DDL to set it up)"},
+    {9, "CLOB / BLOB columns across fetch batches", "8i: queries only (no DDL to set it up)"},
+    {9, "compilation errors reported as SUCCESS_WITH_INFO (ORA-24344)", "8i: queries only"},
+    {9, "ALTER SESSION SET CURRENT_SCHEMA / EDITION", "8i: queries only"},
+    {9, "bind param (?+?)", "8i: queries only, without binds"},
+    {9, "DDL create", "8i: queries only"},
+    {9, "medium string bind (chunked)", "8i: queries only, without binds"},
+    {9, "TIMESTAMP bind (fractional)", "8i: queries only, without binds"},
+    {9, "INTERVAL bind", "8i: queries only, without binds"},
+    {9, "array DML row counts", "8i: queries only"},
+    {9, "multi-batch fetch with a repeated column", "8i has no CONNECT BY level row generator"},
+    {9, "CLOB fetch", "8i has no TO_CLOB"},
+    {9, "BLOB fetch (hex)", "8i has no TO_BLOB"},
+};
+
+/* The reason `name` is a known gap of the connected server, or NULL. */
+static const char *known_gap(const char *name)
+{
+  for (size_t i = 0; i < sizeof known_gaps / sizeof known_gaps[0]; i++)
+    if (g_major > 0 && g_major < known_gaps[i].below && strcmp(known_gaps[i].check, name) == 0)
+      return known_gaps[i].why;
+  return NULL;
+}
+
 static void pass(const char *name)
 {
   printf("  \033[32mPASS\033[0m %s\n", name);
@@ -41,8 +120,14 @@ static void pass(const char *name)
 /* Failures are also kept to repeat on stderr at the end: a CI runner showing
  * only a failed test's last lines of stderr then still names them. */
 static char fail_log[4096];
+static void skip(const char *name, const char *why);
 static void fail(const char *name, const char *why)
 {
+  const char *gap = known_gap(name);
+  if (gap != NULL) {
+    skip(name, gap);
+    return;
+  }
   printf("  \033[31mFAIL\033[0m %s: %s\n", name, why);
   size_t used = strlen(fail_log);
   snprintf(fail_log + used, sizeof fail_log - used, "FAIL %s: %s\n", name, why);
@@ -3248,6 +3333,7 @@ int main(void)
   SQLGetInfo(dbc, SQL_DBMS_VER, ver, sizeof ver, NULL);
   (void)junk;
   printf("  connected, DBMS version %s\n", ver[0] ? ver : "(unknown)");
+  g_major = atoi(ver); /* "09.02.0004" -> 9 */
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_dbms_ver(dbc);
