@@ -6,21 +6,50 @@ SPDX-License-Identifier: Apache-2.0
 
 # SeerODBC on Windows
 
-SeerODBC is a 64-bit Windows ODBC driver, `seerodbc.dll`. It is loaded by the
-Windows ODBC Driver Manager (`odbc32.dll`). Applications and tools that use
-ODBC (Excel, Power BI, LibreOffice, scripting languages' ODBC modules) reach
-the database through it.
+SeerODBC is a Windows ODBC driver, `seerodbc.dll`, built for 64-bit and for
+32-bit applications. It is loaded by the Windows ODBC Driver Manager
+(`odbc32.dll`). Applications and tools that use ODBC (Excel, Power BI,
+LibreOffice, scripting languages' ODBC modules) reach the database through it.
 
 A driver's bitness must match the *application's*, not the system's: a 64-bit
-application needs this 64-bit driver. A 32-bit build for 32-bit applications is
-tracked in seerdb/SeerODBC#62.
+application needs the 64-bit driver, and a 32-bit one (32-bit Office, older BI
+tools) needs the 32-bit driver, even on 64-bit Windows.
 
-## Install
+Each release ships both as one installer, `seerodbc-<version>-windows-setup.exe`,
+and as a zip per bitness, `seerodbc-<version>-windows-x64.zip` and `-x86.zip`.
 
-1. Unpack the release zip into a folder of your choice. For example,
-   `C:\Program Files\SeerODBC`. Keep the files together: `seerodbc.dll` loads
-   the DLLs beside it and OpenSSL's `ossl-modules\legacy.dll` (needed for
-   10g's DES-based login).
+## Install with the installer
+
+Run `seerodbc-<version>-windows-setup.exe`. It asks for administrator rights,
+because drivers are registered machine-wide. It installs:
+
+- the 64-bit driver in `C:\Program Files\SeerODBC`, registered for 64-bit
+  applications;
+- the 32-bit driver in `C:\Program Files (x86)\SeerODBC`, registered for 32-bit
+  applications.
+
+Both are selected by default; untick the one you don't need. On 32-bit Windows
+only the 32-bit driver is offered. Each folder holds the same tools as the zip
+(`seer_smoke.exe`, `seersql.exe`, `add-dsn.cmd`, `selftest.ps1`).
+
+The installer is unsigned for now, so Windows SmartScreen may warn before it
+runs.
+
+Remove it from *Settings > Apps > Installed apps* (**SeerODBC**), or run
+`uninstall.exe` in `C:\Program Files\SeerODBC`. Data sources (DSNs) are left
+as they are.
+
+For scripted installs: `setup.exe /S` installs both drivers silently, and
+`"C:\Program Files\SeerODBC\uninstall.exe" /S` removes them.
+
+## Install from the zip
+
+The zip needs no installer, which suits a portable copy or a machine where the
+installer can't run.
+
+1. Unpack the zip that matches your application's bitness into a folder of your
+   choice. Keep the files together: `seerodbc.dll` loads the DLLs beside it and
+   OpenSSL's `ossl-modules\legacy.dll` (needed for 10g's DES-based login).
 2. Open an **elevated** Command Prompt (*Run as administrator*) in that folder
    and register the driver:
 
@@ -29,11 +58,12 @@ tracked in seerdb/SeerODBC#62.
    ```
 
    It records `seerodbc.dll` by its full path under
-   `HKLM\SOFTWARE\ODBC\ODBCINST.INI`, so the folder must stay where it is. Run
-   it again after moving the folder. `register.cmd /remove` unregisters it.
+   `HKLM\SOFTWARE\ODBC\ODBCINST.INI`, in the registry view of the zip's
+   bitness, so the folder must stay where it is. Run it again after moving the
+   folder. `register.cmd /remove` unregisters it.
 
-The driver now appears in the *ODBC Data Source Administrator (64-bit)*, on the
-*Drivers* tab, as **SeerODBC**.
+The driver now appears in the *ODBC Data Source Administrator* of the matching
+bitness, on the *Drivers* tab, as **SeerODBC**.
 
 ## Connect
 
@@ -63,7 +93,7 @@ be added as string values under the DSN's registry key, which is
 
 The Data Source Administrator lists these DSNs but cannot edit them yet. That
 needs a driver setup DLL (`ConfigDSN`), which is still to come
-(seerdb/SeerODBC#60).
+(seerdb/SeerODBC#104).
 
 ## Check the install
 
@@ -88,7 +118,9 @@ powershell -ExecutionPolicy Bypass -File .\selftest.ps1 `
 It registers the driver, checks that Windows' ODBC tooling (`Get-OdbcDriver`)
 lists it for this zip's bitness, makes a DSN for each `-Server`, and runs
 `seer_smoke.exe` by connection string and by DSN. It removes what it added
-unless given `-Keep`, and ends with a `SUMMARY` line.
+unless given `-Keep`, and ends with a `SUMMARY` line. For a copy the installer
+put in place, add `-Installed`: the driver is then checked as registered, not
+registered or removed, so run the `selftest.ps1` inside that installed folder.
 
 For a trace of what the driver does, set `SEERODBC_DEBUG=1` in the
 environment of the application, or of `seer_smoke.exe`.

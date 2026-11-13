@@ -67,9 +67,35 @@ jobs:
           name: windows-${{ matrix.arch }}
           path: dist/*.zip
 
+  # The Windows installer: one setup.exe carrying both drivers
+  # (packaging/windows/seerodbc.nsi), built on Linux with Fedora's NSIS from
+  # the zips above. Built only here, for a tag or a dry run - not per PR.
+  installer:
+    name: Windows installer
+    needs: [windows]
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 15
+    steps:
+      - name: Install NSIS
+        run: dnf -y install mingw32-nsis unzip
+      - uses: actions/checkout@v7
+      - name: Fetch the Windows zips
+        uses: actions/download-artifact@v8
+        with:
+          pattern: windows-*
+          merge-multiple: true
+          path: zips
+      - name: Build the installer
+        run: packaging/windows/make-installer.sh zips/*-windows-x64.zip zips/*-windows-x86.zip dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: dist/*.exe
+
   release:
     name: Build and create the GitHub Release
-    needs: [windows]
+    needs: [windows, installer]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # required by `gh release create`
@@ -132,7 +158,7 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch the Windows zips
+      - name: Fetch the Windows zips and installer
         uses: actions/download-artifact@v8
         with:
           pattern: windows-*
@@ -147,6 +173,7 @@ jobs:
           path: |
             build/meson-dist/*
             build/windows/*.zip
+            build/windows/*.exe
 
       - name: Create GitHub Release
         if: github.event_name == 'push'
@@ -163,4 +190,4 @@ jobs:
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md" \
             --generate-notes \
             --verify-tag \
-            build/meson-dist/* build/windows/*.zip
+            build/meson-dist/* build/windows/*.zip build/windows/*.exe
