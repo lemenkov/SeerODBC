@@ -4156,8 +4156,9 @@ static void resolve_pending_lobs(SeerStmt *stmt)
 /* ========= Oracle 9i (field version 2): the TTI_ALL7 query dialect ===========
  * 9i speaks an older execute RPC than TTI_ALL8. A SELECT is a four-call sequence
  * (seerdb PROTOCOL.md §19): OOPEN -> parse -> describe -> exec/fetch* -> close.
- * All calls carry sequence byte 0 and cursor field 0 (the server tracks the one
- * cursor OOPEN allocated). RE'd from the Oracle JDBC thin driver. */
+ * The OOPEN is the session's, once: every statement is parsed, described,
+ * executed and closed on that one cursor, named by its id in each call (see
+ * fv2_shared_cursor). RE'd from the Oracle JDBC thin driver. */
 
 /* Send one fv2 message; receive the reply into resp/rlen (caller frees resp). */
 static SeerStatus fv2_txn(SeerConn *c, const uint8_t *msg, size_t mlen, uint8_t **resp,
@@ -4167,6 +4168,56 @@ static SeerStatus fv2_txn(SeerConn *c, const uint8_t *msg, size_t mlen, uint8_t 
   if (st != SEER_OK)
     return st;
   return seer_ttc_recv(c, resp, rlen);
+}
+
+/* The server cursor every 9i statement runs on, opened by the first one that
+ * needs it. Each OOPEN allocates a cursor; one per statement, all parsed on
+ * cursor 1, left one open a statement until the session hit open_cursors
+ * (ORA-01000; seerdb #2288). The reply is `08 <ub4 id>`. A close (O7_CLOSE)
+ * ends a statement on it but keeps the cursor allocated for the next. */
+static SeerStatus fv2_shared_cursor(SeerConn *c, uint32_t *out)
+{
+  if (c->fv2_cursor == 0) {
+    static const uint8_t open[] = {TTI_FUN, O7_OPEN, 0, 0x01, 0x00};
+    uint8_t *resp = NULL;
+    size_t rlen = 0;
+    SeerStatus st = fv2_txn(c, open, sizeof open, &resp, &rlen);
+    if (st != SEER_OK)
+      return st;
+    int64_t id = 0;
+    if (rlen > 1 && resp[0] == TTI_RPA) {
+      SeerReader r;
+      seer_reader_init(&r, resp + 1, rlen - 1);
+      id = seer_dec_sb4(&r);
+      if (!seer_reader_ok(&r))
+        id = 0;
+    }
+    free(resp);
+    if (id <= 0) {
+      seer_log(SEER_LOG_ERROR, "fv2: OOPEN reply carries no cursor id");
+      return SEER_EPROTO;
+    }
+    c->fv2_cursor = (uint32_t)id;
+  }
+  *out = c->fv2_cursor;
+  return SEER_OK;
+}
+
+/* End a statement on the shared cursor (best-effort). */
+static void fv2_close_cursor(SeerConn *c, uint32_t cursor)
+{
+  SeerWriter w;
+  if (!seer_writer_init(&w, 16))
+    return;
+  seer_writer_u8(&w, TTI_FUN);
+  seer_writer_u8(&w, O7_CLOSE);
+  seer_writer_u8(&w, 0);
+  seer_enc_sb4(&w, cursor);
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  if (seer_writer_ok(&w) && fv2_txn(c, w.buf, w.len, &resp, &rlen) == SEER_OK)
+    free(resp);
+  seer_writer_free(&w);
 }
 
 /* The ORA code carried by a short pre-10g OER (token, ub4 rows, ub4 code); 0 if
@@ -4568,8 +4619,7 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
   seer_writer_u8(w, 0x02);
   seer_writer_u8(w, 0x80);
   seer_writer_u8(w, nb > 0 ? 0x29 : 0x21);
-  seer_writer_u8(w, 0x01);
-  seer_writer_u8(w, 0x01);
+  seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
   seer_writer_u8(w, 0x01);
   seer_enc_sb4(w, (uint32_t)qlen);
   {
@@ -4626,8 +4676,7 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
     seer_writer_u8(w, 0x01);
     seer_writer_u8(w, 0x21);
   }
-  seer_writer_u8(w, 0x01);
-  seer_writer_u8(w, 0x01);
+  seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
   seer_writer_u8(w, 0x01);
   seer_enc_sb4(w, (uint32_t)qlen);
   {
@@ -5660,20 +5709,11 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
   SeerStatus st;
   SeerWriter w;
 
-  /* Call 0: OOPEN (allocate the server cursor). */
-  if (!seer_writer_init(&w, 8))
-    return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_OPEN);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x01);
-  seer_writer_u8(&w, 0x00);
-  st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
-  seer_writer_free(&w);
+  /* Call 0: the session's cursor (OOPEN on first use). */
+  uint32_t cursor = 0;
+  st = fv2_shared_cursor(c, &cursor);
   if (st != SEER_OK)
     return st;
-  free(resp);
-  resp = NULL;
 
   /* Call 1: parse (TTI_ALL7, with any binds). */
   st = fv2_emit_parse(stmt, &w);
@@ -5699,8 +5739,10 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
   seer_writer_u8(&w, TTI_FUN);
   seer_writer_u8(&w, O7_DESCRIBE);
   seer_writer_u8(&w, 0);
+  seer_writer_u8(&w, 0x07);
+  seer_enc_sb4(&w, cursor);
   {
-    static const uint8_t d[] = {0x07, 0x01, 0x01, 0, 0, 0x01, 0x02, 0x01, 0x01};
+    static const uint8_t d[] = {0, 0, 0x01, 0x02, 0x01, 0x01};
     seer_writer_bytes(&w, d, sizeof d);
   }
   st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
@@ -5732,8 +5774,10 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
     seer_writer_u8(&w, TTI_ALL7);
     seer_writer_u8(&w, 0);
     {
-      static const uint8_t h[] = {0x02, 0x80, 0x50, 0x01, 0x01, 0,    0,    0,
-                                  0,    0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0};
+      static const uint8_t opt[] = {0x02, 0x80, 0x50}; /* execute + fetch */
+      static const uint8_t h[] = {0, 0, 0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0};
+      seer_writer_bytes(&w, opt, sizeof opt);
+      seer_enc_sb4(&w, cursor);
       seer_writer_bytes(&w, h, sizeof h);
     }
     seer_writer_u8(&w, 0x01); /* defines pointer present */
@@ -5766,21 +5810,8 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
   if (stmt->nplobs > 0)
     fv2_resolve_lobs(stmt);
 
-  /* Call 4: close the cursor (best-effort). */
-  if (seer_writer_init(&w, 8)) {
-    seer_writer_u8(&w, TTI_FUN);
-    seer_writer_u8(&w, O7_CLOSE);
-    seer_writer_u8(&w, 0);
-    seer_writer_u8(&w, 0x01);
-    seer_writer_u8(&w, 0x01);
-    if (seer_ttc_send(c, w.buf, w.len) == SEER_OK) {
-      seer_writer_free(&w);
-      if (seer_ttc_recv(c, &resp, &rlen) == SEER_OK)
-        free(resp);
-    } else {
-      seer_writer_free(&w);
-    }
-  }
+  /* End the statement on the cursor (best-effort). */
+  fv2_close_cursor(c, cursor);
 
   if (errcode != 0 && errcode != 1403) {
     seer_log(SEER_LOG_DEBUG, "fv2: fetch failed (ORA-%05ld)", (long)errcode);
@@ -5847,20 +5878,11 @@ static SeerStatus fv2_execute_dml(SeerStmt *stmt)
   SeerStatus st;
   SeerWriter w;
 
-  /* OOPEN. */
-  if (!seer_writer_init(&w, 8))
-    return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_OPEN);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x01);
-  seer_writer_u8(&w, 0x00);
-  st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
-  seer_writer_free(&w);
+  /* The session's cursor (OOPEN on first use). */
+  uint32_t cursor = 0;
+  st = fv2_shared_cursor(c, &cursor);
   if (st != SEER_OK)
     return st;
-  free(resp);
-  resp = NULL;
 
   /* Parse (also executes). */
   st = fv2_emit_parse(stmt, &w);
@@ -5881,21 +5903,8 @@ static SeerStatus fv2_execute_dml(SeerStmt *stmt)
   free(resp);
   resp = NULL;
 
-  /* Close (best-effort). */
-  if (seer_writer_init(&w, 8)) {
-    seer_writer_u8(&w, TTI_FUN);
-    seer_writer_u8(&w, O7_CLOSE);
-    seer_writer_u8(&w, 0);
-    seer_writer_u8(&w, 0x01);
-    seer_writer_u8(&w, 0x01);
-    if (seer_ttc_send(c, w.buf, w.len) == SEER_OK) {
-      seer_writer_free(&w);
-      if (seer_ttc_recv(c, &resp, &rlen) == SEER_OK)
-        free(resp);
-    } else {
-      seer_writer_free(&w);
-    }
-  }
+  /* End the statement on the cursor (best-effort). */
+  fv2_close_cursor(c, cursor);
   if (failed)
     return SEER_EDB;
 
@@ -6048,20 +6057,11 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
       n_in++;
   }
 
-  /* OOPEN. */
-  if (!seer_writer_init(&w, 8))
-    return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_OPEN);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x01);
-  seer_writer_u8(&w, 0x00);
-  st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
-  seer_writer_free(&w);
+  /* The session's cursor (OOPEN on first use). */
+  uint32_t cursor = 0;
+  st = fv2_shared_cursor(c, &cursor);
   if (st != SEER_OK)
     return st;
-  free(resp);
-  resp = NULL;
 
   /* Block parse (OACs, no inline values). */
   st = fv2_emit_block(stmt, &w);
@@ -6163,21 +6163,8 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   free(resp);
   resp = NULL;
 
-  /* Close (best-effort). */
-  if (seer_writer_init(&w, 8)) {
-    seer_writer_u8(&w, TTI_FUN);
-    seer_writer_u8(&w, O7_CLOSE);
-    seer_writer_u8(&w, 0);
-    seer_writer_u8(&w, 0x01);
-    seer_writer_u8(&w, 0x01);
-    if (seer_ttc_send(c, w.buf, w.len) == SEER_OK) {
-      seer_writer_free(&w);
-      if (seer_ttc_recv(c, &resp, &rlen) == SEER_OK)
-        free(resp);
-    } else {
-      seer_writer_free(&w);
-    }
-  }
+  /* End the statement on the cursor (best-effort). */
+  fv2_close_cursor(c, cursor);
   if (failed)
     return SEER_EDB;
 

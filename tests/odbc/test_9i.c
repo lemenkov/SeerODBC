@@ -514,6 +514,60 @@ static void check_multibatch_fetch(void)
   }
 }
 
+/* Many statements in one session, then a DDL. Each 9i statement used to OOPEN
+ * a cursor of its own and leave it open. Past open_cursors the OOPEN itself
+ * failed, unseen: plain queries still ran on cursor 1, but whatever needed the
+ * server's own recursive SQL - a CREATE TABLE - failed with ORA-00604 /
+ * ORA-01000. Queries, DML and blocks alternate, good and failing, 400 in all,
+ * past this bed's open_cursors of 300. */
+static void check_cursor_hygiene(void)
+{
+  const char *name = "400 statements, then a DDL, in one session (cursors closed)";
+  static const char *const bad[] = {"SELECT * FROM seer9_no_such_table",
+                                    "INSERT INTO seer9_no_such_table VALUES (1)",
+                                    "BEGIN seer9_no_such_proc; END;"};
+  long refused = 0, ok = 0;
+  run("DROP TABLE seer9g");
+  run("CREATE TABLE seer9g (n NUMBER)");
+  for (int i = 0; i < 100; i++) {
+    SeerStmt *s = NULL;
+    if (seer_stmt_prepare(C, bad[i % 3], &s) != SEER_OK || seer_stmt_execute(s) != SEER_OK)
+      refused++;
+    seer_stmt_close(s);
+    s = NULL;
+    if (seer_stmt_prepare(C, "SELECT 1 FROM dual", &s) == SEER_OK &&
+        seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+      ok++;
+    seer_stmt_close(s);
+    s = NULL;
+    if (seer_stmt_prepare(C, "BEGIN NULL; END;", &s) == SEER_OK && seer_stmt_execute(s) == SEER_OK)
+      ok++;
+    seer_stmt_close(s);
+    s = NULL;
+    if (seer_stmt_prepare(C, "UPDATE seer9g SET n = n + 1", &s) == SEER_OK &&
+        seer_stmt_execute(s) == SEER_OK)
+      ok++;
+    seer_stmt_close(s);
+  }
+  run("DROP TABLE seer9g");
+  run("DROP TABLE seer9h");
+  SeerStmt *d = NULL;
+  int ddl = seer_stmt_prepare(C, "CREATE TABLE seer9h (n NUMBER)", &d) == SEER_OK &&
+            seer_stmt_execute(d) == SEER_OK;
+  char err[256];
+  snprintf(err, sizeof err, "%s", seer_last_error(C) ? seer_last_error(C) : "");
+  seer_stmt_close(d);
+  run("DROP TABLE seer9h");
+  if (refused == 100 && ok == 300 && ddl)
+    pass(name);
+  else {
+    char m[360];
+    snprintf(m, sizeof m, "%ld/100 refused, %ld/300 ran, CREATE TABLE %s (%s)", refused, ok,
+             ddl ? "ok" : "failed", err);
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -814,6 +868,7 @@ int main(void)
   check_lob();
   check_bfile();
   check_national();
+  check_cursor_hygiene();
   check_wrong_password(&p);
 
   seer_disconnect(C);
