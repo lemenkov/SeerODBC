@@ -225,9 +225,11 @@ static void check_fetch_in_txn(SQLHDBC dbc)
   exec_do(dbc, "INSERT INTO " TBL " VALUES (98, 'txnopen')", err, sizeof err);
   SQLHSTMT st;
   long n = 0;
+  /* In an inline view: 9i ends a bare CONNECT BY on dual after the first
+   * fetch batch, which looked like a fetch that stopped at 10 rows. */
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
-  SQLRETURN rc =
-      SQLExecDirect(st, (SQLCHAR *)"SELECT level FROM dual CONNECT BY level <= 250", SQL_NTS);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"SELECT * FROM (SELECT level FROM dual CONNECT BY level <= 250)", SQL_NTS);
   if (SQL_SUCCEEDED(rc))
     while (SQL_SUCCEEDED(SQLFetch(st)))
       n++;
@@ -310,9 +312,12 @@ static void check_batch_resume_repeated_column(SQLHDBC dbc)
   const char *name = "multi-batch fetch with a repeated column";
   SQLHSTMT st;
   char err[256] = "";
+  /* An inline view, as in check_fetch_in_txn: 9i ends a bare CONNECT BY on
+   * dual after one batch. */
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLRETURN rc = SQLExecDirect(
-      st, (SQLCHAR *)"SELECT level a, 'tail' t FROM dual CONNECT BY level <= 250", SQL_NTS);
+      st, (SQLCHAR *)"SELECT * FROM (SELECT level a, 'tail' t FROM dual CONNECT BY level <= 250)",
+      SQL_NTS);
   int rows = 0, good = SQL_SUCCEEDED(rc);
   while (good && SQL_SUCCEEDED(rc = SQLFetch(st))) {
     char a[16] = "", t[16] = "";
@@ -353,6 +358,16 @@ static void check_timestamp_zero_fraction_bind(SQLHDBC dbc)
   }
   exec_do(dbc, "INSERT INTO seer_tsz VALUES (1, TIMESTAMP '2026-09-25 13:45:06.123456')", err,
           sizeof err);
+  /* 9i's TRUNC takes no TIMESTAMP WITH LOCAL TIME ZONE (ORA-00932 even for a
+   * literal), so there is nothing for the bind to match. */
+  char lit[16];
+  if (!SQL_SUCCEEDED(exec_scalar(
+          dbc, "SELECT COUNT(*) FROM seer_tsz WHERE TRUNC(l) = TIMESTAMP '2026-09-25 00:00:00'",
+          lit, sizeof lit, err, sizeof err))) {
+    skip(name, "the server can't TRUNC a TIMESTAMP WITH LOCAL TIME ZONE");
+    exec_do(dbc, "DROP TABLE seer_tsz", err, sizeof err);
+    return;
+  }
   SQLHSTMT st;
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   TIMESTAMP_STRUCT ts = {2026, 9, 25, 0, 0, 0, 0};
@@ -1416,6 +1431,8 @@ static void check_long_column(SQLHDBC dbc)
  * connection, 12.1+) the rows come after a DEFINE call asking for the LOBs as
  * LONG / LONG RAW, content inline, and the later batches keep that framing -
  * and there an empty LOB reads as NULL, the one thing that form can't tell. */
+/* The character is é: two bytes in UTF-8 like any non-ASCII one, and held by a
+ * Latin-1 database too (9i's WE8ISO8859P1 had no ж and stored ¿). */
 static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
 {
   const char *name = lob_inline ? "CLOB / BLOB columns across fetch batches (LOBINLINE)"
@@ -1434,7 +1451,7 @@ static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
           "r := UTL_RAW.COPIES(HEXTORAW(LPAD(TRIM(TO_CHAR(MOD(i, 256), 'XX')), 2, '0')), 2000); "
           "DBMS_LOB.CREATETEMPORARY(cc, TRUE); DBMS_LOB.CREATETEMPORARY(bb, TRUE); "
           "k := nc; WHILE k > 0 LOOP DBMS_LOB.WRITEAPPEND(cc, LEAST(k, 1000), "
-          "RPAD(UNISTR('\\0436'), LEAST(k, 1000), UNISTR('\\0436'))); k := k - 1000; END LOOP; "
+          "RPAD(UNISTR('\\00E9'), LEAST(k, 1000), UNISTR('\\00E9'))); k := k - 1000; END LOOP; "
           "k := nb; WHILE k > 0 LOOP DBMS_LOB.WRITEAPPEND(bb, LEAST(k, 2000), "
           "UTL_RAW.SUBSTR(r, 1, LEAST(k, 2000))); k := k - 2000; END LOOP; "
           "INSERT INTO seer_ld VALUES (i, cc, bb); "
@@ -1464,7 +1481,7 @@ static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
                 : id % 50 == 1 ? (lob_inline ? SQL_NULL_DATA : 0)
                                : (id > 115 ? 30000 : id * 7) * 2;
       long wb = id % 50 == 0 ? SQL_NULL_DATA : (id > 115 ? 20000 : id * 5);
-      if ((long)cind != wc || (wc > 0 && memcmp(cbuf + wc - 2, "\xd0\xb6", 2) != 0))
+      if ((long)cind != wc || (wc > 0 && memcmp(cbuf + wc - 2, "\xc3\xa9", 2) != 0))
         snprintf(why, sizeof why, "pass %d row %d: CLOB length %ld, want %ld", pass_no + 1, (int)id,
                  (long)cind, wc);
       else if ((long)bind != wb || (wb > 0 && bbuf[wb - 1] != (unsigned char)(id & 0xFF)))
