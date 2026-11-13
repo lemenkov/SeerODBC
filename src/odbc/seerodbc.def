@@ -12,8 +12,11 @@
 ; SQLConnect, not _SQLConnect@N, which the Driver Manager could not resolve.
 ;
 ; Keep in sync with the SQL* set exported by seerodbc.map (the ELF source of
-; truth): every entry point defined with SQL_API in src/odbc/*.c belongs here.
+; truth): every entry point defined with SQL_API in src/odbc/*.c belongs here,
+; plus the setup entry points of setup.c (ConfigDSN, ConfigDriver), Windows only.
 EXPORTS
+    ConfigDSN
+    ConfigDriver
     SQLAllocHandle
     SQLBindCol
     SQLBindParameter

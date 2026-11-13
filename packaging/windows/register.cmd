@@ -24,6 +24,7 @@ if not exist "%DLL%" (
 )
 reg add "%INST%\ODBC Drivers" /v SeerODBC /t REG_SZ /d Installed /f %VIEW% >nul || goto :denied
 reg add "%INST%\SeerODBC" /v Driver /t REG_SZ /d "%DLL%" /f %VIEW% >nul || goto :denied
+reg add "%INST%\SeerODBC" /v Setup /t REG_SZ /d "%DLL%" /f %VIEW% >nul || goto :denied
 reg add "%INST%\SeerODBC" /v APILevel /t REG_SZ /d 1 /f %VIEW% >nul || goto :denied
 reg add "%INST%\SeerODBC" /v ConnectFunctions /t REG_SZ /d YYN /f %VIEW% >nul || goto :denied
 reg add "%INST%\SeerODBC" /v DriverODBCVer /t REG_SZ /d 03.80 /f %VIEW% >nul || goto :denied

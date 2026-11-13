@@ -56,11 +56,12 @@ VIAddVersionKey "LegalCopyright" "Peter Lemenkov and the SeerODBC contributors, 
 !insertmacro MUI_LANGUAGE "English"
 
 ; Register the driver in DIR with the ODBC Driver Manager, in the registry view
-; already selected (SetRegView): the same values as register.cmd. No Setup=
-; value yet: the driver exports no ConfigDSN (#104).
+; already selected (SetRegView): the same values as register.cmd. The driver
+; is its own setup DLL (ConfigDSN, for the ODBC Data Source Administrator).
 !macro RegisterDriver DIR
   WriteRegStr HKLM "${INST}\ODBC Drivers" "${PRODUCT}" "Installed"
   WriteRegStr HKLM "${INST}\${PRODUCT}" "Driver" "${DIR}\seerodbc.dll"
+  WriteRegStr HKLM "${INST}\${PRODUCT}" "Setup" "${DIR}\seerodbc.dll"
   WriteRegStr HKLM "${INST}\${PRODUCT}" "APILevel" "1"
   WriteRegStr HKLM "${INST}\${PRODUCT}" "ConnectFunctions" "YYN"
   WriteRegStr HKLM "${INST}\${PRODUCT}" "DriverODBCVer" "03.80"

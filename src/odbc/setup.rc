@@ -1,0 +1,65 @@
+// The DSN setup dialog the ODBC Data Source Administrator shows (setup.c).
+//
+// SPDX-FileCopyrightText: 2026 Peter Lemenkov and the SeerODBC contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include <windows.h>
+#include "setup.h"
+#include "seer_rc_version.h" /* generated from the project version (meson.build) */
+
+IDD_DSN DIALOGEX 0, 0, 260, 196
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "SeerODBC data source"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Data source name:", -1, 8, 10, 76, 9
+    EDITTEXT        IDC_DSN, 88, 8, 164, 13, ES_AUTOHSCROLL
+    LTEXT           "Description:", -1, 8, 28, 76, 9
+    EDITTEXT        IDC_DESC, 88, 26, 164, 13, ES_AUTOHSCROLL
+
+    GROUPBOX        "Server", -1, 4, 46, 252, 64
+    LTEXT           "Host:", -1, 12, 60, 72, 9
+    EDITTEXT        IDC_HOST, 88, 58, 160, 13, ES_AUTOHSCROLL
+    LTEXT           "Port:", -1, 12, 76, 72, 9
+    EDITTEXT        IDC_PORT, 88, 74, 40, 13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Service name:", -1, 12, 92, 72, 9
+    EDITTEXT        IDC_SERVICE, 88, 90, 160, 13, ES_AUTOHSCROLL
+
+    GROUPBOX        "Login", -1, 4, 114, 252, 56
+    LTEXT           "User ID:", -1, 12, 128, 72, 9
+    EDITTEXT        IDC_UID, 88, 126, 160, 13, ES_AUTOHSCROLL
+    LTEXT           "Password:", -1, 12, 144, 72, 9
+    EDITTEXT        IDC_PWD, 88, 142, 100, 13, ES_AUTOHSCROLL | ES_PASSWORD
+    LTEXT           "(for the test only; not saved)", -1, 88, 157, 160, 9
+
+    PUSHBUTTON      "&Test connection", IDC_TEST, 4, 176, 72, 14
+    DEFPUSHBUTTON   "OK", IDOK, 148, 176, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 204, 176, 50, 14
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     SEER_VER_MAJOR, SEER_VER_MINOR, SEER_VER_PATCH, 0
+PRODUCTVERSION  SEER_VER_MAJOR, SEER_VER_MINOR, SEER_VER_PATCH, 0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "The SeerODBC contributors"
+            VALUE "FileDescription",  "SeerODBC ODBC driver"
+            VALUE "FileVersion",      SEER_VER_STR
+            VALUE "InternalName",     "seerodbc"
+            VALUE "LegalCopyright",   "Peter Lemenkov and the SeerODBC contributors, Apache-2.0"
+            VALUE "OriginalFilename", "seerodbc.dll"
+            VALUE "ProductName",      "SeerODBC"
+            VALUE "ProductVersion",   SEER_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
