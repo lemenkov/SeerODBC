@@ -735,6 +735,46 @@ static void check_batch_errors(void)
   }
 }
 
+/* A prepared query is described before it executes (SQLPrepare, then
+ * SQLNumResultCols / SQLDescribeCol), placeholders and all: a parse without
+ * the EXECUTE bit needs no bind values, where with it 9i answered ORA-01008.
+ * The execute that follows, with its bind, still returns the row. */
+static void check_describe_before_execute(void)
+{
+  const char *name = "describe before execute, with a placeholder";
+  SeerStmt *s = NULL;
+  SeerStatus st =
+      seer_stmt_prepare(C, "SELECT 42 AS answer, 'x' AS letter FROM dual WHERE 1 = :1", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_describe(s);
+  int described = seer_stmt_num_cols(s);
+  const char *cname = seer_stmt_col_name(s, 1);
+  char col2[32] = "";
+  snprintf(col2, sizeof col2, "%s", cname ? cname : "");
+  SeerStatus dst = st;
+  if (st == SEER_OK)
+    st = seer_stmt_bind_int64(s, 1, 1);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  char v[16] = "";
+  if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+    const char *val = NULL;
+    int is_null = 0;
+    seer_stmt_get_string(s, 0, &val, &is_null);
+    snprintf(v, sizeof v, "%s", val ? val : "");
+  }
+  seer_stmt_close(s);
+  if (dst == SEER_OK && described == 2 && strcmp(col2, "LETTER") == 0 && st == SEER_OK &&
+      strcmp(v, "42") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "describe %d (%d cols, col 2 '%s'), execute %d value '%s' (%s)", (int)dst,
+             described, col2, (int)st, v, seer_last_error(C) ? seer_last_error(C) : "");
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -1040,6 +1080,7 @@ int main(void)
   check_error_offset();
   check_compile_warning();
   check_batch_errors();
+  check_describe_before_execute();
   check_cursor_hygiene();
   check_wrong_password(&p);
 
