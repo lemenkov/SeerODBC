@@ -4282,7 +4282,12 @@ typedef struct {
 
 /* Read the status of a 9i reply: an optional RPA piggyback, then the OER.
  * False when the reply carries none. */
-static bool fv2_read_status(const uint8_t *data, size_t dlen, Fv2Status *out)
+static void fv2_read_batch_errors(SeerReader *r, SeerStmt *stmt);
+
+/* Read the status of a 9i reply: an optional RPA piggyback, then the OER.
+ * With `batch` set, the status is read on to its end and the per-row errors a
+ * batch-errors array DML collected are stored on that statement. */
+static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out, SeerStmt *batch)
 {
   memset(out, 0, sizeof *out);
   if (dlen == 0)
@@ -4336,8 +4341,127 @@ static bool fv2_read_status(const uint8_t *data, size_t dlen, Fv2Status *out)
   if (seer_reader_ok(&r)) { /* a short status ends after the code */
     out->position = position > 0 ? position : 0;
     out->warnings = warnings;
+    if (batch != NULL)
+      fv2_read_batch_errors(&r, batch);
   }
   return true;
+}
+
+static bool fv2_read_status(const uint8_t *data, size_t dlen, Fv2Status *out)
+{
+  return fv2_read_status_ex(data, dlen, out, NULL);
+}
+
+/* `count` TTC ub4s packed in a batch-error array's value; NULL on a short one. */
+static uint32_t *fv2_ub4s(const uint8_t *blob, size_t len, int64_t count)
+{
+  if (count <= 0 || count > 65536)
+    return NULL;
+  uint32_t *v = calloc((size_t)count, sizeof *v);
+  if (v == NULL)
+    return NULL;
+  SeerReader r;
+  seer_reader_init(&r, blob, len);
+  for (int64_t i = 0; i < count; i++)
+    v[i] = (uint32_t)seer_dec_sb4(&r);
+  if (!seer_reader_ok(&r)) {
+    free(v);
+    return NULL;
+  }
+  return v;
+}
+
+/* The rest of a 9i status, from after the warning flags (seerdb PROTOCOL.md
+ * §19.3, _O7_STATUS_HEAD's rowid and _O7_STATUS_TAIL; #2247): the rowid
+ * (object, file, a reserved byte, block, slot), the OS error, statement and
+ * call numbers (a byte each), padding (a ub2), the iterations, the oerrdd
+ * (a ub4 length, then the value), then a batch-errors call's three arrays:
+ * the codes and the row offsets, each a ub4 count and one value packing that
+ * many ub4s, and the messages, a ub4 count, an indicator byte when there are
+ * any, and per message a ub4 length, the text and two bytes. Error i hit row
+ * offsets[i] with codes[i]. A status cut short stores nothing. */
+static void fv2_read_batch_errors(SeerReader *r, SeerStmt *stmt)
+{
+  (void)seer_dec_sb4(r);   /* rowid: data object */
+  (void)seer_dec_sb4(r);   /* relative file */
+  (void)seer_reader_u8(r); /* reserved */
+  (void)seer_dec_sb4(r);   /* block */
+  (void)seer_dec_sb4(r);   /* slot */
+  (void)seer_dec_sb4(r);   /* OS error */
+  (void)seer_reader_u8(r); /* statement number */
+  (void)seer_reader_u8(r); /* call number */
+  (void)seer_dec_sb4(r);   /* padding (ub2) */
+  (void)seer_dec_sb4(r);   /* iterations */
+  uint8_t *blob = NULL;
+  size_t blen = 0;
+  if (seer_dec_sb4(r) > 0) { /* oerrdd */
+    if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
+      return;
+    free(blob);
+  }
+  uint32_t *codes = NULL, *offsets = NULL;
+  int64_t ncodes = seer_dec_sb4(r);
+  if (ncodes > 0) {
+    blob = NULL;
+    if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
+      return;
+    codes = fv2_ub4s(blob, blen, ncodes);
+    free(blob);
+  }
+  int64_t noffsets = seer_dec_sb4(r);
+  if (noffsets > 0) {
+    blob = NULL;
+    if (seer_dec_dalc(r, &blob, &blen) == SEER_OK)
+      offsets = fv2_ub4s(blob, blen, noffsets);
+    free(blob);
+  }
+  int64_t nmsgs = seer_dec_sb4(r);
+  char **msgs = NULL;
+  if (nmsgs > 0 && nmsgs <= 65536 && seer_reader_ok(r)) {
+    (void)seer_reader_u8(r); /* indicator */
+    msgs = calloc((size_t)nmsgs, sizeof *msgs);
+    for (int64_t i = 0; msgs != NULL && i < nmsgs && seer_reader_ok(r); i++) {
+      if (seer_dec_sb4(r) > 0) {
+        uint8_t *t = NULL;
+        size_t tl = 0;
+        if (seer_dec_dalc(r, &t, &tl) != SEER_OK)
+          break;
+        msgs[i] = malloc(tl + 1);
+        if (msgs[i] != NULL) {
+          memcpy(msgs[i], t, tl);
+          msgs[i][tl] = '\0';
+        }
+        free(t);
+      }
+      (void)seer_reader_bytes(r, 2);
+    }
+  } else
+    nmsgs = 0;
+  size_t nb = 0;
+  if (codes != NULL)
+    nb = (size_t)ncodes;
+  if (offsets != NULL && (size_t)noffsets > nb)
+    nb = (size_t)noffsets;
+  if (nb > 0 && seer_reader_ok(r)) {
+    free_batch_errors(stmt);
+    stmt->berrs = calloc(nb, sizeof *stmt->berrs);
+    if (stmt->berrs != NULL) {
+      stmt->nberrs = nb;
+      for (size_t i = 0; i < nb; i++) {
+        stmt->berrs[i].row = (offsets != NULL && i < (size_t)noffsets) ? offsets[i] : 0;
+        stmt->berrs[i].code = (codes != NULL && i < (size_t)ncodes) ? codes[i] : 0;
+        if (msgs != NULL && i < (size_t)nmsgs) {
+          stmt->berrs[i].message = msgs[i]; /* ownership moved */
+          msgs[i] = NULL;
+        }
+      }
+    }
+  }
+  free(codes);
+  free(offsets);
+  for (int64_t i = 0; msgs != NULL && i < nmsgs; i++)
+    free(msgs[i]);
+  free(msgs);
 }
 
 /* A 9i DML / block reply's affected-row count and ORA code (0 when absent). */
@@ -4751,9 +4875,12 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
   seer_writer_u8(w, TTI_FUN);
   seer_writer_u8(w, TTI_ALL7);
   seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0x02);
-  seer_writer_u8(w, 0x80);
-  seer_writer_u8(w, nb > 0 ? 0x29 : 0x21);
+  /* The option word: parse (+ binds); with batch errors armed on an array
+   * DML, the 10g+ batch-errors bit, which 9.2 honours too (seerdb #2247). */
+  uint32_t opt = nb > 0 ? 0x8029u : 0x8021u;
+  if (stmt->batch_errors && stmt->n_iters > 1)
+    opt |= 0x80000u;
+  seer_enc_sb4(w, opt);
   seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
   seer_writer_u8(w, 0x01);
   seer_enc_sb4(w, (uint32_t)qlen);
@@ -5988,9 +6115,12 @@ static SeerStatus fv2_execute_dml(SeerStmt *stmt)
     return st;
 
   Fv2Status status;
-  fv2_read_status(resp, rlen, &status);
+  free_batch_errors(stmt); /* clear any prior execute's failures */
+  fv2_read_status_ex(resp, rlen, &status, stmt);
   int64_t rowcount = status.rows, code = status.code;
-  bool failed = (code != 0 && code != 1403);
+  /* ORA-24381 is the summary of a batch-errors array DML: the good rows were
+   * applied and each failure is in stmt->berrs, as on 10g+. */
+  bool failed = (code != 0 && code != 1403 && !(code == 24381 && stmt->nberrs > 0));
   /* A CREATE whose object compiled with errors succeeds; only the warning
    * flags say so (seerdb #2262), as on 10g+. */
   stmt->compile_warning = !failed && (status.warnings & 0x20) != 0;
