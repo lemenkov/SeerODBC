@@ -18,6 +18,7 @@ EXPORTS
     SQLBindCol
     SQLBindParameter
     SQLBrowseConnect
+    SQLBrowseConnectW
     SQLBulkOperations
     SQLCancel
     SQLCloseCursor
@@ -40,13 +41,18 @@ EXPORTS
     SQLFetch
     SQLFetchScroll
     SQLForeignKeys
+    SQLForeignKeysW
     SQLFreeHandle
     SQLFreeStmt
     SQLGetConnectAttr
+    SQLGetConnectAttrW
     SQLGetData
     SQLGetDescField
+    SQLGetDescFieldW
     SQLGetDescRec
+    SQLGetDescRecW
     SQLGetDiagField
+    SQLGetDiagFieldW
     SQLGetDiagRec
     SQLGetDiagRecW
     SQLGetEnvAttr
@@ -54,27 +60,37 @@ EXPORTS
     SQLGetInfo
     SQLGetInfoW
     SQLGetStmtAttr
+    SQLGetStmtAttrW
     SQLGetTypeInfo
     SQLGetTypeInfoW
     SQLMoreResults
     SQLNativeSql
+    SQLNativeSqlW
     SQLNumParams
     SQLNumResultCols
     SQLParamData
     SQLPrepare
     SQLPrepareW
     SQLPrimaryKeys
+    SQLPrimaryKeysW
     SQLProcedureColumns
+    SQLProcedureColumnsW
     SQLProcedures
+    SQLProceduresW
     SQLPutData
     SQLRowCount
     SQLSetConnectAttr
+    SQLSetConnectAttrW
     SQLSetDescField
+    SQLSetDescFieldW
     SQLSetDescRec
     SQLSetEnvAttr
     SQLSetPos
     SQLSetStmtAttr
+    SQLSetStmtAttrW
     SQLSpecialColumns
+    SQLSpecialColumnsW
     SQLStatistics
+    SQLStatisticsW
     SQLTables
     SQLTablesW
