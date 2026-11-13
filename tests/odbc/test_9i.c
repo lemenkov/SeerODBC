@@ -828,6 +828,54 @@ static void check_returning(void)
   }
 }
 
+/* Text binds past 4000 bytes: 9.2 has no form for one in a plain statement,
+ * and takes it in a PL/SQL block, declared VARCHAR 32767 (seerdb PROTOCOL.md
+ * §19.3.1), so such a DML runs as a block. A 5000-byte value goes into a CLOB
+ * ahead of a NUMBER bind (the two must not swap), the row count is the DML's,
+ * and past the 32512 bytes measured to work the bind is refused. */
+static void check_long_text_bind(void)
+{
+  const char *name = "text bind over 4000 bytes into a CLOB (5000; 32513 refused)";
+  run("DROP TABLE seer9t");
+  run("CREATE TABLE seer9t (c CLOB, id NUMBER)");
+  static char big[32514];
+  memset(big, 'x', sizeof big - 1);
+  big[sizeof big - 1] = '\0';
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, "INSERT INTO seer9t (c, id) VALUES (:1, :2)", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(s, 1, big, 5000);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_int64(s, 2, 42);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  long rows = st == SEER_OK ? seer_stmt_row_count(s) : -1;
+  seer_stmt_close(s);
+  s = NULL;
+  SeerStatus too_long = seer_stmt_prepare(C, "INSERT INTO seer9t (c, id) VALUES (:1, :2)", &s);
+  if (too_long == SEER_OK)
+    too_long = seer_stmt_bind_text(s, 1, big, 32513);
+  if (too_long == SEER_OK)
+    too_long = seer_stmt_bind_int64(s, 2, 43);
+  if (too_long == SEER_OK)
+    too_long = seer_stmt_execute(s);
+  seer_stmt_close(s);
+  seer_commit(C);
+  char out[32] = "";
+  scalar("SELECT COUNT(*) || ':' || MAX(id) || ':' || MAX(DBMS_LOB.GETLENGTH(c)) FROM seer9t", out,
+         sizeof out);
+  run("DROP TABLE seer9t");
+  if (st == SEER_OK && rows == 1 && strcmp(out, "1:42:5000") == 0 && too_long == SEER_ENOTIMPL)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m,
+             "5000: status %d, %ld row(s); 32513: status %d; table '%s' (want 1:42:5000)", (int)st,
+             rows, (int)too_long, out);
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -1135,6 +1183,7 @@ int main(void)
   check_batch_errors();
   check_describe_before_execute();
   check_returning();
+  check_long_text_bind();
   check_cursor_hygiene();
   check_wrong_password(&p);
 
