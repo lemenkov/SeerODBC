@@ -51,8 +51,6 @@ static const KnownGap known_gaps[] = {
     {10, "nested CURSOR() column", "CURSOR() columns are not read before 10g"},
     {10, "REF CURSOR rows holding a CURSOR() column",
      "REF CURSOR binds are not supported before 10g"},
-    {10, "describe after SQLPrepare, before SQLExecute",
-     "statements are described when executed before 10g"},
     {10, "large CLOB OUT parameter; CLOB + BLOB via RETURNING",
      "LOB OUT parameters and RETURNING are not supported before 10g"},
     {10, "OS user reported to the server",

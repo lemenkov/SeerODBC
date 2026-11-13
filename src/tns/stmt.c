@@ -4875,9 +4875,15 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
   seer_writer_u8(w, TTI_FUN);
   seer_writer_u8(w, TTI_ALL7);
   seer_writer_u8(w, 0);
-  /* The option word: parse (+ binds); with batch errors armed on an array
-   * DML, the 10g+ batch-errors bit, which 9.2 honours too (seerdb #2247). */
+  /* The option word: NOT_PLSQL | EXECUTE | PARSE, + BIND with binds. The
+   * EXECUTE bit makes this call run the statement as well, so a describe
+   * (seer_stmt_describe) drops it: a parse alone needs no bind values, where
+   * with it a statement with placeholders answers ORA-01008. With batch errors
+   * armed on an array DML, the 10g+ batch-errors bit, which 9.2 honours too
+   * (seerdb #2247). */
   uint32_t opt = nb > 0 ? 0x8029u : 0x8021u;
+  if (stmt->describe_only)
+    opt &= ~0x20u;
   if (stmt->batch_errors && stmt->n_iters > 1)
     opt |= 0x80000u;
   seer_enc_sb4(w, opt);
@@ -5962,22 +5968,19 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   return SEER_OK;
 }
 
-static SeerStatus fv2_execute_select(SeerStmt *stmt)
+/* The first calls of a 9i query: the session's cursor, the parse (with any
+ * binds) and the describe, which sets the statement's columns. The cursor is
+ * left open on the parsed statement for the caller to execute or close. */
+static SeerStatus fv2_parse_describe(SeerStmt *stmt, uint32_t *out_cursor)
 {
   SeerConn *c = stmt->conn;
-  free_rows(stmt);
-  free_columns(stmt->cols, stmt->ncols);
-  stmt->cols = NULL;
-  stmt->ncols = 0;
-
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  SeerStatus st;
   SeerWriter w;
 
   /* Call 0: the session's cursor (OOPEN on first use). */
   uint32_t cursor = 0;
-  st = fv2_shared_cursor(c, &cursor);
+  SeerStatus st = fv2_shared_cursor(c, &cursor);
   if (st != SEER_OK)
     return st;
 
@@ -6030,6 +6033,45 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
     return st;
   stmt->cols = cols;
   stmt->ncols = ncols;
+  *out_cursor = cursor;
+  return SEER_OK;
+}
+
+/* Describe a prepared 9i query without executing it (seer_stmt_describe): a
+ * parse without the EXECUTE bit, the describe, then the cursor closed. A parse
+ * alone needs no bind values; the execute parses and describes afresh, with
+ * them. */
+static SeerStatus fv2_describe_only(SeerStmt *stmt)
+{
+  uint32_t cursor = 0;
+  stmt->describe_only = true; /* fv2_emit_parse: parse, don't execute */
+  SeerStatus st = fv2_parse_describe(stmt, &cursor);
+  stmt->describe_only = false;
+  if (st != SEER_OK)
+    return st;
+  fv2_close_cursor(stmt->conn, cursor);
+  return SEER_OK;
+}
+
+static SeerStatus fv2_execute_select(SeerStmt *stmt)
+{
+  SeerConn *c = stmt->conn;
+  free_rows(stmt);
+  free_columns(stmt->cols, stmt->ncols);
+  stmt->cols = NULL;
+  stmt->ncols = 0;
+
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  SeerStatus st;
+  SeerWriter w;
+
+  /* Calls 0-2: the cursor, the parse and the describe. */
+  uint32_t cursor = 0;
+  st = fv2_parse_describe(stmt, &cursor);
+  if (st != SEER_OK)
+    return st;
+  int ncols = stmt->ncols;
 
   /* Call 3: execute + fetch (re-sent per batch until ORA-01403 / no rows). */
   int64_t errcode = 0;
@@ -6053,7 +6095,7 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
       seer_writer_bytes(&w, h2, sizeof h2);
     }
     for (int i = 0; i < ncols; i++)
-      fv2_define_entry(&w, &cols[i]);
+      fv2_define_entry(&w, &stmt->cols[i]);
     if (!seer_writer_ok(&w)) {
       seer_writer_free(&w);
       return SEER_ENOMEM;
@@ -6424,11 +6466,17 @@ SeerStatus seer_stmt_describe(SeerStmt *stmt)
   if (stmt == NULL)
     return SEER_EPARAM;
   /* Already known (a cached cursor brings its describe), or nothing to
-   * describe: only a query has a result set to describe. 9i's ALL7 dialect has
-   * no parse-only call here; there the columns appear at execute. */
+   * describe: only a query has a result set to describe. 8i describes at
+   * execute only. */
   if (stmt->ncols > 0 || stmt->executed || classify_sql(stmt->sql) != STMT_SELECT ||
-      stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+      stmt->conn->is_8i)
     return SEER_OK;
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2) { /* 9i: parse + describe */
+    SeerStatus fst = fv2_describe_only(stmt);
+    if (fst == SEER_OK)
+      stmt->described_only = true;
+    return fst;
+  }
 
   SeerWriter w;
   stmt->describe_only = true;

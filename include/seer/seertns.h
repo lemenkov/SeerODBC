@@ -428,7 +428,8 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt);
  * parse-only round trip; binds need not be set). Afterwards seer_stmt_num_cols
  * and the column accessors report them; seer_stmt_execute then parses and
  * describes afresh as usual. A no-op for a statement that is not a
- * query, one already described or executed, and on 9i. */
+ * query, one already described or executed, and on 8i. On 9i it is a parse
+ * without the EXECUTE bit plus a describe. */
 SeerStatus seer_stmt_describe(SeerStmt *stmt);
 /* Non-zero when the last execute created a PL/SQL object (procedure, function,
  * package, trigger, ...) that compiled with errors: the statement succeeded
