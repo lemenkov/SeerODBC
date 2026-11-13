@@ -89,8 +89,10 @@ DEF_PASS="${SEER_MATRIX_PASS:-pyo123}"
 #   group=local  -> ours to test only (10g's image can't be redistributed, the
 #                   26ai native-encryption bed is lab-specific, 9i is a VM)
 #   kind=odbc    -> ODBC integration test (+ core-API extras); target = SERVICE_NAME
-#   kind=fv2     -> Oracle 9i core-API test (test_9i);          target = SID
-#   kind=o8i     -> Oracle 8i core-API test (test_8i);          target = SERVICE_NAME
+#   kind=fv2     -> ODBC integration test + Oracle 9i core-API test (test_9i);
+#                   target = SID
+#   kind=o8i     -> ODBC integration test + Oracle 8i core-API test (test_8i);
+#                   target = SERVICE_NAME
 TIERS=(
     "11g|public|$CONTAINER_HOST|1521|XE|odbc"
     "18c|public|$CONTAINER_HOST|1527|XEPDB1|odbc"
@@ -192,14 +194,17 @@ for row in "${TIERS[@]}"; do
 
     export SEER_TEST_HOST="$host" SEER_TEST_PORT="$port" \
            SEER_TEST_USER="$user" SEER_TEST_PASS="$pass"
-    if [[ "$kind" == "fv2" ]]; then
-        # Oracle 9i: its own core-API test, SID-addressed.
-        SEER_TEST_SID="$target" "$NINE_BIN" >"$log" 2>/dev/null
-        grep -v '^SUMMARY' "$log" | sed 's/^/  /'
-    elif [[ "$kind" == "o8i" ]]; then
-        # Oracle 8i: its own core-API test.
-        SEER_TEST_SERVICE="$target" "$EIGHT_BIN" >"$log" 2>/dev/null
-        grep -v '^SUMMARY' "$log" | sed 's/^/  /'
+    if [[ "$kind" == "fv2" || "$kind" == "o8i" ]]; then
+        # Oracle 9i / 8i: the ODBC integration test, whose checks outside what
+        # these tiers support skip with the reason (its known_gaps table), then
+        # the tier's own core-API test (9i addressed by SID).
+        SEER_TEST_SERVICE="$target" "$BIN" >"$log" 2>/dev/null
+        grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
+        if [[ "$kind" == "fv2" ]]; then
+            SEER_TEST_SID="$target" "$NINE_BIN" 2>/dev/null
+        else
+            SEER_TEST_SERVICE="$target" "$EIGHT_BIN" 2>/dev/null
+        fi | grep -v '^SUMMARY' | tee -a "$xlog" | sed 's/^/  /'
     else
         # ODBC integration test (+ the core-API suites CI runs too: two-phase
         # commit, object bind, AQ, request boundaries, sessionless transactions,
