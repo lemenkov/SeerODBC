@@ -219,14 +219,14 @@ static bool parse_redirect(const uint8_t *body, size_t len, char *host, size_t h
 static void log_refuse(SeerConn *conn, const uint8_t *body, size_t len)
 {
   if (body == NULL || len < 4) {
-    seer_log(SEER_LOG_ERROR, "TNS: REFUSE (no detail)");
+    seer_log(SEER_LOG_DEBUG, "TNS: REFUSE (no detail)");
     return;
   }
   size_t errlen = ((size_t)body[2] << 8) | body[3];
   size_t avail = len - 4;
   if (errlen > avail)
     errlen = avail;
-  seer_log(SEER_LOG_ERROR, "TNS: REFUSE: %.*s", (int)errlen, (const char *)(body + 4));
+  seer_log(SEER_LOG_DEBUG, "TNS: REFUSE: %.*s", (int)errlen, (const char *)(body + 4));
   const char *text = (const char *)(body + 4);
   for (size_t i = 0; i + 5 < errlen; i++) {
     if (memcmp(text + i, "(ERR=", 5) != 0)
@@ -262,8 +262,8 @@ SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char 
    * Reject up front (accepted for API parity) rather than connect and mislead. */
   if ((params->shardingkey && params->shardingkey[0]) ||
       (params->supershardingkey && params->supershardingkey[0])) {
-    seer_log(SEER_LOG_ERROR, "sharding keys are not supported in thin mode (§37): shard "
-                             "routing is available only through the OCI-based client");
+    seer_log(SEER_LOG_WARNING, "sharding keys are not supported in thin mode (§37): shard "
+                               "routing is available only through the OCI-based client");
     return SEER_ENOTIMPL;
   }
 

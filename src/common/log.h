@@ -6,9 +6,20 @@
 #ifndef SEER_COMMON_LOG_H
 #define SEER_COMMON_LOG_H
 
+/* The usual levels, most severe first. What each is for:
+ *   ERROR    the driver failed at its job: a reply it can't decode, a lost
+ *            connection, a TLS or protocol failure.
+ *   WARNING  unexpected but survivable, or a request refused for a reason the
+ *            caller would not otherwise see (a value decoded as NULL, a
+ *            feature this server or mode lacks).
+ *   INFO     connection milestones: connected, negotiated, authenticated.
+ *   DEBUG    the rest: per-call detail, wire tracing, and server errors (an
+ *            ORA-nnnnn), which reach the caller through the API anyway.
+ * The default threshold is WARNING. SEERODBC_DEBUG=1 lowers it to DEBUG in the
+ * ODBC driver; seersql shows INFO, and DEBUG with -v. */
 typedef enum {
   SEER_LOG_ERROR = 0,
-  SEER_LOG_WARN,
+  SEER_LOG_WARNING,
   SEER_LOG_INFO,
   SEER_LOG_DEBUG,
 } SeerLogLevel;

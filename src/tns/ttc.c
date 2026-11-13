@@ -912,7 +912,7 @@ static SeerStatus parse_challenge(const uint8_t *b, size_t n, SeerAuthChallenge 
     return SEER_EPROTO;
   }
   if (b[0] == TTI_OER) {
-    seer_log(SEER_LOG_ERROR, "ttc: server returned an error to session setup");
+    seer_log(SEER_LOG_DEBUG, "ttc: server returned an error to session setup");
     return SEER_EAUTH;
   }
   if (b[0] != TTI_RPA) {
@@ -968,7 +968,7 @@ static SeerStatus parse_challenge(const uint8_t *b, size_t n, SeerAuthChallenge 
     goto out;
   }
   if (ch->sesskey == NULL) {
-    seer_log(SEER_LOG_ERROR, "ttc: challenge missing AUTH_SESSKEY");
+    seer_log(SEER_LOG_DEBUG, "ttc: an RPA without AUTH_SESSKEY: not the challenge");
     st = SEER_EPROTO;
     goto out;
   }
@@ -1063,10 +1063,10 @@ static SeerStatus fast_auth_login(SeerConn *conn, const SeerConnParams *params,
   if (st != SEER_OK && seer_conn_error_from_reply(conn, resp, rlen, 0))
     st = SEER_EAUTH;
   free(resp);
-  if (st != SEER_OK)
+  if (st == SEER_EPROTO)
     seer_log(SEER_LOG_ERROR, "fast-auth: no challenge RPA in bundled reply");
   else
-    seer_log(SEER_LOG_INFO, "TTC: fast-auth challenge received (fv=%u)", conn->field_version);
+    seer_log(SEER_LOG_DEBUG, "TTC: fast-auth challenge received (fv=%u)", conn->field_version);
   return st;
 }
 
@@ -1226,7 +1226,7 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
     return SEER_EPROTO;
   }
   free(resp);
-  seer_log(SEER_LOG_INFO, "TTC: data types negotiated");
+  seer_log(SEER_LOG_DEBUG, "TTC: data types negotiated");
 
   /* Oracle 9i (fv2): the pre-10g O3LOGON DES flow, not the O5LOGON TTI_SESS
    * challenge. o3logon_login authenticates the connection in place. */
@@ -1254,7 +1254,7 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   if (st != SEER_OK)
     return st;
 
-  seer_log(SEER_LOG_INFO, "TTC: auth challenge received (sesskey=%zu, salt=%zu bytes)",
+  seer_log(SEER_LOG_DEBUG, "TTC: auth challenge received (sesskey=%zu, salt=%zu bytes)",
            out_challenge->sesskey_len, out_challenge->salt_len);
   return SEER_OK;
 }
@@ -1421,7 +1421,7 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
   if (!seer_reader_ok(&r))
     return SEER_EPROTO;
   if (code != 0 && code != 1403) {
-    seer_log(SEER_LOG_ERROR, "o3logon: authentication failed (ORA-%05ld)", (long)code);
+    seer_log(SEER_LOG_DEBUG, "o3logon: authentication failed (ORA-%05ld)", (long)code);
     seer_conn_error_code(conn, (long)code);
     return SEER_EAUTH;
   }
@@ -1650,7 +1650,8 @@ static SeerStatus o8i_login(SeerConn *conn, const SeerConnParams *params)
   free(resp);
   if (st != SEER_OK || skhex == NULL) {
     free(skhex);
-    seer_log(SEER_LOG_ERROR, "o8i: no AUTH_SESSKEY in the OSESSKEY reply (ORA-%05ld)", (long)code);
+    seer_log(code ? SEER_LOG_DEBUG : SEER_LOG_ERROR,
+             "o8i: no AUTH_SESSKEY in the OSESSKEY reply (ORA-%05ld)", (long)code);
     if (code != 0)
       seer_conn_error_code(conn, (long)code);
     return code ? SEER_EAUTH : SEER_EPROTO;
@@ -1690,7 +1691,7 @@ static SeerStatus o8i_login(SeerConn *conn, const SeerConnParams *params)
   if (rlen < 1 || resp[0] != TTI_RPA) {
     code = o8i_status_code(resp, rlen);
     free(resp);
-    seer_log(SEER_LOG_ERROR, "o8i: authentication failed (ORA-%05ld)", (long)code);
+    seer_log(SEER_LOG_DEBUG, "o8i: authentication failed (ORA-%05ld)", (long)code);
     if (code != 0)
       seer_conn_error_code(conn, (long)code);
     return SEER_EAUTH;
@@ -1829,7 +1830,7 @@ static SeerStatus parse_auth_result(const uint8_t *b, size_t n, const uint8_t *c
   if (n < 1)
     return SEER_EPROTO;
   if (b[0] == TTI_OER) {
-    seer_log(SEER_LOG_ERROR, "auth: server rejected the login (ORA error)");
+    seer_log(SEER_LOG_DEBUG, "auth: server rejected the login (ORA error)");
     return SEER_EAUTH;
   }
   if (b[0] != TTI_RPA) {

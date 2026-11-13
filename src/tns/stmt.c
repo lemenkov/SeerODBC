@@ -1767,7 +1767,7 @@ bool seer_conn_error_from_reply(SeerConn *c, const uint8_t *buf, size_t len, siz
     free(c->last_error);
     c->last_error = m;
     c->last_error_offset = 0;
-    seer_log(SEER_LOG_ERROR, "the server reported: %s", m);
+    seer_log(SEER_LOG_DEBUG, "the server reported: %s", m);
     return true;
   }
   return false;
@@ -2086,7 +2086,7 @@ static SeerStatus lobops_status(SeerConn *c, const uint8_t *resp, size_t rlen)
     parse_oer(&r, &tmp, &oer);
     free_batch_errors(&tmp);
     if (oer.err_code != 0) {
-      seer_log(SEER_LOG_ERROR, "lob: WRITE failed (ORA-%05ld)", (long)oer.err_code);
+      seer_log(SEER_LOG_DEBUG, "lob: WRITE failed (ORA-%05ld)", (long)oer.err_code);
       return SEER_EDB;
     }
     return SEER_OK;
@@ -4014,7 +4014,7 @@ static void resolve_pending_objs(SeerStmt *stmt)
     SeerStatus st = decode_typed_image(stmt->conn, &stmt->cols[p->col], p->image, p->imagelen,
                                        &stmt->rows[p->row][p->col]);
     if (st != SEER_OK && st != SEER_ENOTIMPL)
-      seer_log(SEER_LOG_WARN, "stmt: OBJECT/collection decode failed (row %zu col %d)", p->row,
+      seer_log(SEER_LOG_WARNING, "stmt: OBJECT/collection decode failed (row %zu col %d)", p->row,
                p->col);
   }
 }
@@ -4089,7 +4089,7 @@ static SeerStatus fetch_all_rows(SeerStmt *stmt)
     if (st != SEER_OK)
       return st;
     if (f.err_code != 0 && f.err_code != 1403) {
-      seer_log(SEER_LOG_ERROR, "stmt: fetch failed (ORA-%05ld)", (long)f.err_code);
+      seer_log(SEER_LOG_DEBUG, "stmt: fetch failed (ORA-%05ld)", (long)f.err_code);
       return SEER_EDB;
     }
     rc.err_code = f.err_code;
@@ -4111,7 +4111,7 @@ static void resolve_pending_lobs(SeerStmt *stmt)
                          ? seer_bfile_read(stmt->conn, p->locator, p->loclen, &raw, &rawlen)
                          : seer_lob_read(stmt->conn, p->locator, p->loclen, &raw, &rawlen);
     if (lst != SEER_OK) {
-      seer_log(SEER_LOG_WARN, "stmt: LOB read failed for row %zu col %d", p->row, p->col);
+      seer_log(SEER_LOG_WARNING, "stmt: LOB read failed for row %zu col %d", p->row, p->col);
       continue;
     }
     SeerCell *cell = &stmt->rows[p->row][p->col];
@@ -4132,13 +4132,13 @@ static void resolve_pending_lobs(SeerStmt *stmt)
       }
     } else if (p->ora_type == ORA_TYPE_VECTOR) { /* VECTOR -> "[e1, e2, ...]" text */
       if (decode_vector_image(raw, rawlen, cell) != SEER_OK)
-        seer_log(SEER_LOG_WARN, "stmt: VECTOR decode failed (row %zu col %d)", p->row, p->col);
+        seer_log(SEER_LOG_WARNING, "stmt: VECTOR decode failed (row %zu col %d)", p->row, p->col);
     } else if (p->ora_type == ORA_TYPE_JSON) { /* JSON (OSON) -> JSON text */
       char *json = NULL;
       if (seer_decode_oson(raw, rawlen, &json) == SEER_OK)
         cell_set_text(cell, json);
       else
-        seer_log(SEER_LOG_WARN, "stmt: JSON decode failed (row %zu col %d)", p->row, p->col);
+        seer_log(SEER_LOG_WARNING, "stmt: JSON decode failed (row %zu col %d)", p->row, p->col);
     } else { /* BLOB: raw binary bytes */
       cell_set_bytes(cell, raw, rawlen, true);
     }
@@ -5436,7 +5436,7 @@ static SeerStatus o8i_fail(SeerConn *c, O8iStatus *s)
     c->last_error = strdup(m);
   }
   c->last_error_offset = (long)s->position;
-  seer_log(SEER_LOG_ERROR, "o8i: %s", c->last_error ? c->last_error : "error");
+  seer_log(SEER_LOG_DEBUG, "o8i: %s", c->last_error ? c->last_error : "error");
   return SEER_EDB;
 }
 
@@ -5576,7 +5576,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   for (int i = 0; st == SEER_OK && i < stmt->ncols; i++) {
     uint8_t t = stmt->cols[i].ora_type;
     if (t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE) {
-      seer_log(SEER_LOG_ERROR, "o8i: LOB columns are not supported");
+      seer_log(SEER_LOG_WARNING, "o8i: LOB columns are not supported");
       st = SEER_ENOTIMPL;
     }
   }
@@ -5632,7 +5632,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   stmt->cursor_id = 0; /* closed with the next call; 8i keeps no statement cache */
   stmt->executed = true;
   stmt->cur = -1;
-  seer_log(SEER_LOG_INFO, "o8i: query done (%d columns, %zu rows)", stmt->ncols, stmt->nrows);
+  seer_log(SEER_LOG_DEBUG, "o8i: query done (%d columns, %zu rows)", stmt->ncols, stmt->nrows);
   return SEER_OK;
 }
 
@@ -5675,7 +5675,7 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
   int64_t pcode = fv2_oer_code(resp, rlen);
   if (pcode != 0 && pcode != 1403) {
     fv2_set_error(c, resp, rlen);
-    seer_log(SEER_LOG_ERROR, "fv2: parse failed (ORA-%05ld)", (long)pcode);
+    seer_log(SEER_LOG_DEBUG, "fv2: parse failed (ORA-%05ld)", (long)pcode);
     free(resp);
     return SEER_EDB;
   }
@@ -5772,7 +5772,7 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
   }
 
   if (errcode != 0 && errcode != 1403) {
-    seer_log(SEER_LOG_ERROR, "fv2: fetch failed (ORA-%05ld)", (long)errcode);
+    seer_log(SEER_LOG_DEBUG, "fv2: fetch failed (ORA-%05ld)", (long)errcode);
     return SEER_EDB;
   }
   stmt->executed = true;
@@ -5865,7 +5865,7 @@ static SeerStatus fv2_execute_dml(SeerStmt *stmt)
   bool failed = (code != 0 && code != 1403);
   if (failed) {
     fv2_set_error(c, resp, rlen);
-    seer_log(SEER_LOG_ERROR, "fv2: DML failed (ORA-%05ld)", (long)code);
+    seer_log(SEER_LOG_DEBUG, "fv2: DML failed (ORA-%05ld)", (long)code);
   }
   free(resp);
   resp = NULL;
@@ -6098,7 +6098,7 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
     int64_t pc = prompted ? 0 : fv2_oer_code(resp, rlen);
     if (pc != 0 && pc != 1403) {
       fv2_set_error(c, resp, rlen);
-      seer_log(SEER_LOG_ERROR, "fv2: block compile failed (ORA-%05ld)", (long)pc);
+      seer_log(SEER_LOG_DEBUG, "fv2: block compile failed (ORA-%05ld)", (long)pc);
       free(resp);
       free(dirs);
       free(order);
@@ -6145,7 +6145,7 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   bool failed = (code != 0 && code != 1403);
   if (failed) {
     fv2_set_error(c, resp, rlen);
-    seer_log(SEER_LOG_ERROR, "fv2: block failed (ORA-%05ld)", (long)code);
+    seer_log(SEER_LOG_DEBUG, "fv2: block failed (ORA-%05ld)", (long)code);
   }
   free(resp);
   resp = NULL;
@@ -6224,7 +6224,7 @@ SeerStatus seer_stmt_describe(SeerStmt *stmt)
     return st;
   if (oer.err_code != 0) {
     queue_cursor_close(stmt->conn, oer.cursor_id);
-    seer_log(SEER_LOG_ERROR, "stmt: describe failed (ORA-%05ld)", (long)oer.err_code);
+    seer_log(SEER_LOG_DEBUG, "stmt: describe failed (ORA-%05ld)", (long)oer.err_code);
     return SEER_EDB;
   }
   /* The reply is the describe and a success status - no rows, and no drain:
@@ -6253,7 +6253,7 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
      * ALL7, which 8i never answers. */
     if (classify_sql(stmt->sql) == STMT_SELECT)
       return o8i_execute_select(stmt);
-    seer_log(SEER_LOG_ERROR, "stmt: Oracle 8i: only queries are supported");
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: only queries are supported");
     return SEER_ENOTIMPL;
   }
 
@@ -6366,7 +6366,7 @@ retry_exec:
     queue_cursor_close(stmt->conn, oer.cursor_id);
     stmt->cursor_id = 0;
     stmt->conn->last_error_offset = (long)oer.err_offset;
-    seer_log(SEER_LOG_ERROR, "stmt: execute failed (ORA-%05ld)", (long)oer.err_code);
+    seer_log(SEER_LOG_DEBUG, "stmt: execute failed (ORA-%05ld)", (long)oer.err_code);
     return SEER_EDB;
   }
   stmt->cursor_id = (int)oer.cursor_id;
@@ -6400,7 +6400,7 @@ retry_exec:
     if (st != SEER_OK)
       return st;
     if (more.err_code != 0 && more.err_code != 1403) {
-      seer_log(SEER_LOG_ERROR, "stmt: fetch failed (ORA-%05ld)", (long)more.err_code);
+      seer_log(SEER_LOG_DEBUG, "stmt: fetch failed (ORA-%05ld)", (long)more.err_code);
       return SEER_EDB;
     }
     oer.err_code = more.err_code;
@@ -6428,7 +6428,7 @@ retry_exec:
 
   stmt->executed = true;
   stmt->cur = -1;
-  seer_log(SEER_LOG_INFO, "stmt: executed (%d columns, %zu rows%s)", stmt->ncols, stmt->nrows,
+  seer_log(SEER_LOG_DEBUG, "stmt: executed (%d columns, %zu rows%s)", stmt->ncols, stmt->nrows,
            stmt->nplobs ? ", LOBs resolved" : "");
   return SEER_OK;
 }
@@ -6584,7 +6584,7 @@ SeerStatus seer_stmt_next_result(SeerStmt *stmt)
   resolve_pending_objs(stmt);
   stmt->executed = true;
   stmt->cur = -1;
-  seer_log(SEER_LOG_INFO, "stmt: implicit result set now current (%d cols, %zu rows)", stmt->ncols,
+  seer_log(SEER_LOG_DEBUG, "stmt: implicit result set now current (%d cols, %zu rows)", stmt->ncols,
            stmt->nrows);
   return SEER_OK;
 }
@@ -6970,8 +6970,8 @@ static SeerStatus obj_encode_field(SeerWriter *body, uint8_t ora_type, const cha
     int off = 0;
     if (ora_type == ORA_TYPE_TIMESTAMPTZ) {
       if (!parse_utc_offset(val, &off)) {
-        seer_log(SEER_LOG_ERROR, "obj: a TIMESTAMP WITH TIME ZONE value needs its UTC offset "
-                                 "(e.g. \"2020-01-01 10:00:00 +02:00\")");
+        seer_log(SEER_LOG_WARNING, "obj: a TIMESTAMP WITH TIME ZONE value needs its UTC offset "
+                                   "(e.g. \"2020-01-01 10:00:00 +02:00\")");
         return SEER_EPARAM;
       }
       /* the wire carries the UTC instant: shift the wall clock back by the offset */

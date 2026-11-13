@@ -224,7 +224,7 @@ SeerStatus seer_bfile_read(SeerConn *conn, const uint8_t *locator, size_t loclen
   SeerReader r;
   seer_reader_init(&r, resp, rlen);
   if (seer_reader_u8(&r) != TTI_RPA) {
-    seer_log(SEER_LOG_WARN, "bfile: FILE_OPEN not acknowledged");
+    seer_log(SEER_LOG_ERROR, "bfile: FILE_OPEN not acknowledged");
     free(resp);
     return SEER_EPROTO;
   }
@@ -316,7 +316,7 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
   SeerReader r;
   seer_reader_init(&r, resp, rlen);
   if (seer_reader_u8(&r) != TTI_RPA) {
-    seer_log(SEER_LOG_ERROR, "lob: CREATE_TEMP refused");
+    seer_log(SEER_LOG_DEBUG, "lob: CREATE_TEMP refused");
     free(resp);
     return SEER_EDB;
   }
