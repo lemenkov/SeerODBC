@@ -149,40 +149,10 @@ jobs:
         run: meson compile -C build
       - name: Unit tests
         run: meson test -C build --print-errorlogs
-      # The ODBC Driver Manager looks the entry points up by their plain names
-      # (SQLConnect); a 32-bit __stdcall build must not export them decorated
-      # (_SQLConnect@28).
+      # Undecorated names (a 32-bit __stdcall build must not export
+      # _SQLConnect@28), and every W form Microsoft's Driver Manager calls.
       - name: Check the DLL's exports
-        run: |
-          objdump -p build/src/odbc/seerodbc.dll |
-            sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p' > exports.txt
-          n=$(grep -c ' SQL' exports.txt)
-          bad=$(grep -E ' _?SQL[A-Za-z]*@[0-9]+' exports.txt || true)
-          echo "$n SQL exports"
-          if [ "$n" -lt 60 ] || [ -n "$bad" ]; then
-            echo "::error::unexpected exports: $n SQL names, decorated: $bad"
-            cat exports.txt
-            exit 1
-          fi
-          # Microsoft's Driver Manager calls the W form of every function a
-          # Unicode driver exports, with no ANSI fallback: each export that
-          # has a W form in ODBC (sqlucode.h) needs its W export too.
-          missing=
-          for f in BrowseConnect ColAttribute ColAttributes ColumnPrivileges Columns \
-                   Connect DescribeCol DriverConnect Error ExecDirect ForeignKeys \
-                   GetConnectAttr GetConnectOption GetCursorName GetDescField GetDescRec \
-                   GetDiagField GetDiagRec GetInfo GetStmtAttr GetTypeInfo NativeSql \
-                   Prepare PrimaryKeys ProcedureColumns Procedures SetConnectAttr \
-                   SetConnectOption SetCursorName SetDescField SetStmtAttr SpecialColumns \
-                   Statistics TablePrivileges Tables; do
-            if grep -qE " SQL$f\$" exports.txt && ! grep -qE " SQL${f}W\$" exports.txt; then
-              missing="$missing SQL${f}W"
-            fi
-          done
-          if [ -n "$missing" ]; then
-            echo "::error::exported without their W form:$missing"
-            exit 1
-          fi
+        run: packaging/windows/check-exports.sh build/src/odbc/seerodbc.dll
       # selftest.ps1 can only run on a Windows machine with a server to reach,
       # but its syntax is checked here, by PowerShell's own parser.
       - name: Parse selftest.ps1
@@ -201,6 +171,45 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: seerodbc-windows-${{ matrix.arch }}
+          path: dist/*.zip
+          retention-days: 14
+
+  # The same Windows driver, cross-compiled on Linux with Fedora's MinGW-w64
+  # toolchains: the way day-to-day Windows work is built, and what a Fedora
+  # mingw package would do. Fedora's mingw libraries differ from MSYS2's (win-
+  # iconv's iconv.dll, an OpenSSL that pulls in zlib1.dll), so this catches
+  # what the native job can't. Build, export check and zip only: the zips
+  # tested on Windows and released come from the native job.
+  cross-windows:
+    name: Cross-build (Fedora MinGW-w64, ${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    container: fedora:44
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: mingw64
+          - arch: x86
+            target: mingw32
+    steps:
+      - name: Install the toolchain
+        run: >-
+          dnf -y install git meson ninja-build zip
+          ${{ matrix.target }}-gcc ${{ matrix.target }}-openssl ${{ matrix.target }}-win-iconv
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: meson setup --cross-file /usr/share/mingw/toolchain-${{ matrix.target }}.meson build
+      - name: Compile
+        run: meson compile -C build
+      - name: Check the DLL's exports
+        run: packaging/windows/check-exports.sh build/src/odbc/seerodbc.dll
+      - name: Package the Windows zip
+        run: packaging/windows/make-zip.sh build dist
+      - name: Upload the Windows zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: seerodbc-windows-cross-${{ matrix.arch }}
           path: dist/*.zip
           retention-days: 14
 
