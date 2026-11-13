@@ -688,6 +688,53 @@ static void check_compile_warning(void)
   }
 }
 
+/* Array DML in batch-errors mode: a failing row no longer aborts the execute;
+ * the good rows apply and each failure comes back with its row (seerdb #2247,
+ * whose capture this is: 1, 2, 1, 4, 5 into a primary key, ORA-00001 at row
+ * 2). Without it the first failure aborted the batch. */
+static void check_batch_errors(void)
+{
+  const char *name = "array DML batch errors (ORA-00001 at row 2)";
+  run("DROP TABLE seer9e");
+  run("CREATE TABLE seer9e (n NUMBER PRIMARY KEY)");
+  static const int vals[5] = {1, 2, 1, 4, 5};
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, "INSERT INTO seer9e VALUES (:1)", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_set_array_size(s, 5);
+  if (st == SEER_OK)
+    st = seer_stmt_set_batch_errors(s, 1);
+  for (int row = 0; row < 5 && st == SEER_OK; row++) {
+    st = seer_stmt_bind_row(s, row);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 1, vals[row]);
+  }
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  size_t n = seer_stmt_batch_error_count(s);
+  unsigned erow = 99, ecode = 0;
+  const char *emsg = NULL;
+  if (n > 0)
+    seer_stmt_batch_error(s, 0, &erow, &ecode, &emsg);
+  char msg[64] = ""; /* the message is the statement's: copy it before the close */
+  snprintf(msg, sizeof msg, "%s", emsg ? emsg : "");
+  seer_stmt_close(s);
+  seer_commit(C);
+  char out[32] = "";
+  scalar("SELECT COUNT(*) || ':' || SUM(n) FROM seer9e", out, sizeof out);
+  run("DROP TABLE seer9e");
+  int msg_ok = strncmp(msg, "ORA-00001", 9) == 0;
+  if (st == SEER_OK && n == 1 && erow == 2 && ecode == 1 && msg_ok && strcmp(out, "4:12") == 0)
+    pass(name);
+  else {
+    char m[240];
+    snprintf(m, sizeof m,
+             "status %d, %zu error(s), first row %u code %u '%.40s', table '%s' (want 4:12)",
+             (int)st, n, erow, ecode, msg, out);
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -992,6 +1039,7 @@ int main(void)
   check_long_fetch();
   check_error_offset();
   check_compile_warning();
+  check_batch_errors();
   check_cursor_hygiene();
   check_wrong_password(&p);
 

@@ -67,7 +67,6 @@ static const KnownGap known_gaps[] = {
     {10, "truncated DML RETURNING value reports 01004",
      "DML RETURNING is not supported before 10g"},
     {10, "DML RETURNING INTO", "DML RETURNING is not supported before 10g"},
-    {10, "array DML batch errors", "array-DML batch errors are not supported before 10g"},
     {10, "BINARY_FLOAT bind", "BINARY_FLOAT is a 10g type"},
     {10, "SQL OBJECT (ADT) fetch", "object types are not read before 10g"},
     {10, "SQL OBJECT with an XMLType attribute", "object types are not read before 10g"},
