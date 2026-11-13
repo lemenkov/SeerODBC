@@ -28,12 +28,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which jobs this change needs (.github/scripts/changed-areas.sh): a PR that
+  # touches only the Homebrew formula runs the macOS build, one that touches only
+  # Windows packaging runs the Windows builds, and anything under src/, tests/
+  # or the build runs everything; a push to master is classified the same way.
+  # A job skipped here shows as skipped, which GitHub counts as passing.
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.areas.outputs.code }}
+      windows: ${{ steps.areas.outputs.windows }}
+      macos: ${{ steps.areas.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: areas
+        name: Classify the changed files
+        env:
+          # A PR checks out its merge commit, whose first parent is the base it
+          # merges into; a push compares with the ref's previous tip.
+          BASE: ${{ github.event_name == 'pull_request' && 'HEAD^1' || github.event.before }}
+        run: |
+          if git rev-parse -q --verify "$BASE^{commit}" >/dev/null; then
+            git diff --name-only "$BASE" HEAD | tee changed.txt
+            .github/scripts/changed-areas.sh < changed.txt >> "$GITHUB_OUTPUT"
+          else
+            # No usable base (a new branch, a force-push): run everything.
+            echo "no base '$BASE': running every job"
+            printf 'code=true\nwindows=true\nmacos=true\n' >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
   # Offline build + unit tests, once plainly and once under ASan/UBSan. Needs no
   # database: the live meson tests self-gate (exit 77 = skip) without SEER_TEST_*,
   # so `meson test` here exercises only the offline protocol-core + ODBC-shim unit
   # tests. The sanitizer leg brings the previously-manual `build-asan` run into CI.
   build:
     name: Build + unit (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -66,6 +102,8 @@ jobs:
   # Oracle here: the live meson tests self-gate (exit 77) without SEER_TEST_*.
   build-macos:
     name: Build + unit (macOS)
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -111,6 +149,8 @@ jobs:
     # 64-bit, and 32-bit for 32-bit applications: on Windows a driver's bitness
     # must match the application's, not the system's (#62).
     name: Build + unit (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 25
     strategy:
@@ -182,6 +222,8 @@ jobs:
   # tested on Windows and released come from the native job.
   cross-windows:
     name: Cross-build (Fedora MinGW-w64, ${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     runs-on: ubuntu-latest
     container: fedora:44
     strategy:
@@ -222,6 +264,8 @@ jobs:
   # 21c/23ai containers from OOM-stalling under the suite.
   integration:
     name: Integration (${{ matrix.db.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

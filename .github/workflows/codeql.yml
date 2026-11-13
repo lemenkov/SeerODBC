@@ -4,19 +4,31 @@
 name: CodeQL
 
 on:
+  # CodeQL analyses the C sources only: a change elsewhere (docs, packaging,
+  # other workflows) has nothing for it to look at. The weekly run still covers
+  # the whole tree against updated queries.
   push:
     branches: [master]
-    # Docs-only changes have no code for CodeQL to analyse — skip them.
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSES/**'
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'tools/**'
+      - '**/meson.build'
+      - 'meson_options.txt'
+      - '.github/codeql/**'
+      - '.github/workflows/codeql.yml'
   pull_request:
     branches: [master]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSES/**'
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'tools/**'
+      - '**/meson.build'
+      - 'meson_options.txt'
+      - '.github/codeql/**'
+      - '.github/workflows/codeql.yml'
   schedule:
     # Weekly Monday 06:17 UTC — off the hour to dodge cron spikes.
     - cron: '17 6 * * 1'
