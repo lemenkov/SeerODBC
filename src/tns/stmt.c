@@ -4651,6 +4651,36 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
 /* Append one fv2 bind OAC (the client's declared type for an input bind), derived
  * from the stored bind's Oracle type. Char binds declare AL32UTF8 (the session is
  * UTF-8 and the 9i server converts to its DB charset); NUMBER rides as VARNUM. */
+/* Whether a 9i SQL statement has an IN bind past the inline limits: text over
+ * 4000 bytes, RAW over 2000. The 9i parse declares text binds at 4000; a
+ * longer value drew ORA-00600 [koklgloblen: arrlen] at 4001 bytes and
+ * ORA-01483 past it, and declared at its own size (VARCHAR or LONG) the
+ * server dropped the connection. Refused until that form is known. */
+static bool fv2_has_long_bind(const SeerStmt *stmt)
+{
+  for (int i = 0; i < stmt->npbinds; i++) {
+    const SeerBind *b = &stmt->pbinds[i];
+    if (b->is_out || b->oac_charset == 2000)
+      continue;
+    switch (b->oac_type) {
+    case ORA_TYPE_RAW:
+    case ORA_TYPE_LONGRAW:
+      if (b->oac_size > 2000)
+        return true;
+      break;
+    case ORA_TYPE_VARCHAR:
+    case ORA_TYPE_CHAR:
+    case ORA_TYPE_LONG:
+      if (b->oac_size > 4000)
+        return true;
+      break;
+    default:
+      break;
+    }
+  }
+  return false;
+}
+
 static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
 {
   uint8_t type = ORA_TYPE_VARCHAR;
@@ -6319,10 +6349,17 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
     /* Oracle 8i: its own 9.2-era OALL8 dialect (seerdb §19.9-19.10). Queries
      * are spoken; DML, DDL and PL/SQL are not - refuse rather than send 9i's
      * ALL7, which 8i never answers. */
-    if (classify_sql(stmt->sql) == STMT_SELECT)
-      return o8i_execute_select(stmt);
-    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: only queries are supported");
-    return SEER_ENOTIMPL;
+    if (classify_sql(stmt->sql) != STMT_SELECT) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: only queries are supported");
+      return SEER_ENOTIMPL;
+    }
+    /* Its queries go without binds: sent anyway, the server answered
+     * ORA-01008 (not all variables bound), as if the caller had not bound. */
+    if (stmt->npbinds > 0) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: queries with bind parameters are not supported");
+      return SEER_ENOTIMPL;
+    }
+    return o8i_execute_select(stmt);
   }
 
   /* Oracle 9i (fv2) speaks the TTI_ALL7 dialect, not TTI_ALL8: SELECT is a
@@ -6330,6 +6367,11 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
    * the next fv2 slice. */
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2) {
     StmtKind kind = classify_sql(stmt->sql);
+    if ((kind == STMT_SELECT || kind == STMT_CHANGE) && fv2_has_long_bind(stmt)) {
+      seer_log(SEER_LOG_WARNING,
+               "stmt: Oracle 9i: a bind over 4000 bytes of text or 2000 of RAW is not supported");
+      return SEER_ENOTIMPL;
+    }
     if (kind == STMT_SELECT)
       return fv2_execute_select(stmt);
     if (kind == STMT_CHANGE)
