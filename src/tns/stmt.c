@@ -6285,6 +6285,18 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
       SeerBind *b = &stmt->pbinds[i];
       if (dirs != NULL ? !(dirs[k] & FV2_DIR_OUT) : !b->is_out)
         continue;
+      /* An OUT bind the block never assigned - what a RETURNING ... INTO that
+       * matched no row leaves - is four fixed bytes, neither a value with its
+       * indicator nor an assigned NULL (empty value + 81 01). Read as a value,
+       * it desynced every OUT bind after it (seerdb #801). */
+      static const uint8_t UNASSIGNED[] = {0xFF, 0x02, 0x0C, 0x21};
+      if (seer_reader_remaining(&r) >= sizeof UNASSIGNED &&
+          memcmp(r.buf + r.pos, UNASSIGNED, sizeof UNASSIGNED) == 0) {
+        r.pos += sizeof UNASSIGNED;
+        free(b->out.data);
+        b->out = (SeerCell){0}; /* NULL */
+        continue;
+      }
       uint8_t *val = NULL;
       size_t vlen = 0;
       if (seer_dec_dalc(&r, &val, &vlen) != SEER_OK) {
@@ -6305,6 +6317,96 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
     }
   }
   fv2_decode_dml_response(r.buf + r.pos, seer_reader_remaining(&r), rowcount, code);
+}
+
+/* Release one bind's buffers (free_binds' per-bind part). */
+static void free_one_bind(SeerStmt *s, SeerBind *b)
+{
+  int iters = s->n_iters > 0 ? s->n_iters : 1;
+  if (b->rxd != NULL)
+    for (int k = 0; k < iters; k++)
+      free(b->rxd[k]);
+  free(b->rxd);
+  free(b->rxd_len);
+  free(b->out.data);
+  free(b->ret_locator);
+  for (int k = 0; k < b->out_arr_n; k++)
+    free(b->out_arr[k].data);
+  free(b->out_arr);
+  free(b->oac_override);
+  free(b->out_image);
+  queue_temp_lob_free(s->conn, b->temp_locator, b->temp_loclen);
+  free_columns(b->obj_type, b->obj_type ? 1 : 0);
+  memset(b, 0, sizeof *b);
+}
+
+/* Oracle 9i DML RETURNING ... INTO: 9.2 refuses the clause in a TTI_ALL7
+ * statement (ORA-00439: feature not enabled: RETURNING clause from this client
+ * type) but runs the same statement in an anonymous block, where the INTO
+ * targets are ordinary OUT binds (seerdb PROTOCOL.md §19.3, #801):
+ *
+ *   BEGIN <dml>; :seer_rowcount := SQL%ROWCOUNT; END;
+ *
+ * The appended OUT bind carries the DML's row count; the block's own is 1.
+ * Two differences from the 10g+ form are made up for here: a value longer
+ * than its bind's declared size is cut to it with the full length recorded
+ * (seer_stmt_out_truncated, 01004), where a PL/SQL OUT variable would raise
+ * ORA-06502 - the block declares text at 4000; and a LOB target, which needs a
+ * 9i LOB OUT bind, is refused, as is an array RETURNING. */
+static SeerStatus fv2_execute_block(SeerStmt *stmt);
+static SeerStatus fv2_execute_returning(SeerStmt *stmt)
+{
+  if (stmt->n_iters > 1) {
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: an array DML RETURNING is not supported");
+    return SEER_ENOTIMPL;
+  }
+  for (int i = 0; i < stmt->npbinds; i++)
+    if (stmt->pbinds[i].is_out && stmt->pbinds[i].ret_lob) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: RETURNING into a LOB is not supported");
+      return SEER_ENOTIMPL;
+    }
+
+  size_t n = strlen(stmt->sql);
+  while (n > 0 && (isspace((unsigned char)stmt->sql[n - 1]) || stmt->sql[n - 1] == ';'))
+    n--; /* a trailing ';' would close the statement early inside the block */
+  static const char RC[] = "seer_rowcount";
+  size_t wlen = n + sizeof RC + 48;
+  char *wrapped = malloc(wlen);
+  if (wrapped == NULL)
+    return SEER_ENOMEM;
+  snprintf(wrapped, wlen, "BEGIN %.*s; :%s := SQL%%ROWCOUNT; END;", (int)n, stmt->sql, RC);
+
+  int nuser = stmt->npbinds;
+  SeerStatus st = seer_stmt_bind_out(stmt, nuser + 1, ORA_TYPE_NUMBER, 22);
+  if (st != SEER_OK) {
+    free(wrapped);
+    return st;
+  }
+  char *orig = stmt->sql;
+  stmt->sql = wrapped;
+  st = fv2_execute_block(stmt);
+  stmt->sql = orig;
+  free(wrapped);
+
+  SeerBind *rcb = &stmt->pbinds[nuser];
+  long rows = (rcb->out.data != NULL && rcb->out.len > 0) ? atol(rcb->out.data) : 0;
+  free_one_bind(stmt, rcb);
+  stmt->npbinds = nuser;
+  if (st != SEER_OK)
+    return st;
+  stmt->affected = rows;
+
+  for (int i = 0; i < nuser; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    bool sized = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
+                 b->oac_type == ORA_TYPE_RAW;
+    if (b->is_out && sized && b->oac_size > 0 && b->out.data != NULL && b->out.len > b->oac_size) {
+      b->out_full_len = (int64_t)b->out.len;
+      b->out.len = b->oac_size;
+      b->out.data[b->out.len] = '\0';
+    }
+  }
+  return SEER_OK;
 }
 
 /* Oracle 9i anonymous PL/SQL block over TTI_ALL7 (PROTOCOL §19.6/§19.7): OOPEN,
@@ -6552,8 +6654,12 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
     }
     if (kind == STMT_SELECT)
       return fv2_execute_select(stmt);
-    if (kind == STMT_CHANGE)
+    if (kind == STMT_CHANGE) {
+      for (int i = 0; i < stmt->npbinds; i++)
+        if (stmt->pbinds[i].is_out) /* OUT binds on a DML: RETURNING ... INTO */
+          return fv2_execute_returning(stmt);
       return fv2_execute_dml(stmt);
+    }
     return fv2_execute_block(stmt); /* BEGIN / DECLARE */
   }
 

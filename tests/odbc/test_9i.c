@@ -775,6 +775,59 @@ static void check_describe_before_execute(void)
   }
 }
 
+/* DML RETURNING ... INTO: 9.2 refuses it in a plain statement (ORA-00439),
+ * so it runs as an anonymous block whose INTO targets are OUT binds, and an
+ * appended bind brings back SQL%ROWCOUNT (seerdb #801) - the block's own count
+ * is 1 whatever the DML touched. One UPDATE matching a row, one matching none. */
+static void check_returning(void)
+{
+  const char *name = "DML RETURNING ... INTO, with the row count";
+  run("DROP TABLE seer9r");
+  run("CREATE TABLE seer9r (id NUMBER, v VARCHAR2(20))");
+  run("INSERT INTO seer9r VALUES (7, 'seven')");
+  seer_commit(C);
+  long rows[2] = {-1, -1};
+  char got[2][32] = {"", ""};
+  SeerStatus sts[2] = {SEER_EPARAM, SEER_EPARAM};
+  for (int k = 0; k < 2; k++) {
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(
+        C, "UPDATE seer9r SET v = v || '!' WHERE id = :1 RETURNING id + 100, v INTO :2, :3", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 1, k == 0 ? 7 : 8);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_out(s, 2, 2, 22);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_out(s, 3, 1, 20);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    sts[k] = st;
+    if (st == SEER_OK) {
+      rows[k] = seer_stmt_row_count(s);
+      const void *a = NULL, *b = NULL;
+      size_t al = 0, bl = 0;
+      int an = 0, bn = 0, ab = 0, bb = 0;
+      seer_stmt_out_data(s, 2, &a, &al, &an, &ab);
+      seer_stmt_out_data(s, 3, &b, &bl, &bn, &bb);
+      snprintf(got[k], sizeof got[k], "%.*s:%.*s", an ? 4 : (int)al, an ? "NULL" : (const char *)a,
+               bn ? 4 : (int)bl, bn ? "NULL" : (const char *)b);
+    }
+    seer_stmt_close(s);
+  }
+  seer_commit(C);
+  run("DROP TABLE seer9r");
+  if (sts[0] == SEER_OK && rows[0] == 1 && strcmp(got[0], "107:seven!") == 0 && sts[1] == SEER_OK &&
+      rows[1] == 0 && strcmp(got[1], "NULL:NULL") == 0)
+    pass(name);
+  else {
+    char m[240];
+    snprintf(m, sizeof m, "match: %d, %ld row(s), '%s'; no match: %d, %ld row(s), '%s' (%s)",
+             (int)sts[0], rows[0], got[0], (int)sts[1], rows[1], got[1],
+             seer_last_error(C) ? seer_last_error(C) : "");
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -1081,6 +1134,7 @@ int main(void)
   check_compile_warning();
   check_batch_errors();
   check_describe_before_execute();
+  check_returning();
   check_cursor_hygiene();
   check_wrong_password(&p);
 
