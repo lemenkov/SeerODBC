@@ -4269,6 +4269,87 @@ static char *fv2_chunked_message(const uint8_t *resp, size_t rlen, size_t i)
  * length-prefixed run or - past 64 bytes - a chunked one (0xFE, 64-byte
  * chunks, a zero length; seerdb PROTOCOL.md §19, ccd3ee7). Matching only the
  * plain form took the last chunk alone for a long message. */
+/* What a 9i status says (seerdb PROTOCOL.md §19.3, its _O7_STATUS_HEAD): the
+ * OER token, then rows, ORA code, two array-error fields, cursor and error
+ * position (a ub4 each), then sql type and fatal (a byte each), flags (a ub2),
+ * cursor options and UPI parameter (a byte each), and the warning flags. */
+typedef struct {
+  int64_t rows;
+  int64_t code;
+  int64_t position; /* 0-based offset of the error in the SQL text, 0 if none */
+  uint8_t warnings; /* 0x20: the object a CREATE made compiled with errors */
+} Fv2Status;
+
+/* Read the status of a 9i reply: an optional RPA piggyback, then the OER.
+ * False when the reply carries none. */
+static bool fv2_read_status(const uint8_t *data, size_t dlen, Fv2Status *out)
+{
+  memset(out, 0, sizeof *out);
+  if (dlen == 0)
+    return false;
+  SeerReader r;
+  seer_reader_init(&r, data, dlen);
+  if (data[0] == TTI_RPA) { /* skip the RPA piggyback */
+    r.pos = 1;
+    int64_t num = seer_dec_sb4(&r);
+    /* The parameters are consumed by count: the first is a counter that grows
+     * with the instance, and once past 2^24 its length byte is 0x04 - the OER
+     * token - so stopping at a token-valued byte took the counter for the
+     * status and made every successful DML/DDL on an aged 9i report a garbled
+     * negative ORA code (seerdb/seerdb@0babf60). Only when the counted walk
+     * doesn't land on the OER is the old token-sniffing walk used. */
+    size_t start = r.pos;
+    for (int64_t i = 0; i < num && i < 100000 && seer_reader_ok(&r); i++)
+      (void)seer_dec_sb4(&r);
+    while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
+      r.pos++;
+    if (!seer_reader_ok(&r) || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
+      seer_reader_init(&r, data, dlen);
+      r.pos = start;
+      for (int64_t i = 0; i < num && i < 100000 && seer_reader_remaining(&r) > 0; i++) {
+        uint8_t t = r.buf[r.pos];
+        if (t == TTI_OER || t == TTI_RXH || t == TTI_RXD)
+          break;
+        (void)seer_dec_sb4(&r);
+      }
+      while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
+        r.pos++;
+    }
+  }
+  if (seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER)
+    return false;
+  r.pos += 1;
+  out->rows = seer_dec_sb4(&r);
+  out->code = seer_dec_sb4(&r);
+  if (!seer_reader_ok(&r))
+    return false;
+  (void)seer_dec_sb4(&r); /* array error */
+  (void)seer_dec_sb4(&r); /* array error 2 */
+  (void)seer_dec_sb4(&r); /* cursor */
+  int64_t position = seer_dec_sb4(&r);
+  (void)seer_reader_u8(&r); /* sql type */
+  (void)seer_reader_u8(&r); /* fatal */
+  (void)seer_dec_sb4(&r);   /* flags (ub2) */
+  (void)seer_reader_u8(&r); /* cursor options */
+  (void)seer_reader_u8(&r); /* UPI parameter */
+  uint8_t warnings = seer_reader_u8(&r);
+  if (seer_reader_ok(&r)) { /* a short status ends after the code */
+    out->position = position > 0 ? position : 0;
+    out->warnings = warnings;
+  }
+  return true;
+}
+
+/* A 9i DML / block reply's affected-row count and ORA code (0 when absent). */
+static void fv2_decode_dml_response(const uint8_t *data, size_t dlen, int64_t *rowcount,
+                                    int64_t *code)
+{
+  Fv2Status status;
+  fv2_read_status(data, dlen, &status);
+  *rowcount = status.rows;
+  *code = status.code;
+}
+
 static void fv2_set_error(SeerConn *c, const uint8_t *resp, size_t rlen)
 {
   char *msg = NULL;
@@ -4288,6 +4369,11 @@ static void fv2_set_error(SeerConn *c, const uint8_t *resp, size_t rlen)
     free(c->last_error);
     c->last_error = msg;
   }
+  /* Where in the statement the error is, as 10g+ reports it (seerdb #2263:
+   * `select nosuch from dual` is ORA-00904 at 7). */
+  Fv2Status status;
+  if (fv2_read_status(resp, rlen, &status))
+    c->last_error_offset = (long)status.position;
 }
 
 /* Append one fv2 define entry: the client's requested return type for a column. */
@@ -5845,51 +5931,6 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
   return SEER_OK;
 }
 
-/* Decode a 9i DML parse-execute response: an optional RPA piggyback then the
- * short OER whose first field is the affected-row count and second the ORA code. */
-static void fv2_decode_dml_response(const uint8_t *data, size_t dlen, int64_t *rowcount,
-                                    int64_t *code)
-{
-  *rowcount = 0;
-  *code = 0;
-  if (dlen == 0)
-    return;
-  SeerReader r;
-  seer_reader_init(&r, data, dlen);
-  if (data[0] == TTI_RPA) { /* skip the RPA piggyback */
-    r.pos = 1;
-    int64_t num = seer_dec_sb4(&r);
-    /* The parameters are consumed by count: the first is a counter that grows
-     * with the instance, and once past 2^24 its length byte is 0x04 - the OER
-     * token - so stopping at a token-valued byte took the counter for the
-     * status and made every successful DML/DDL on an aged 9i report a garbled
-     * negative ORA code (seerdb/seerdb@0babf60). Only when the counted walk
-     * doesn't land on the OER is the old token-sniffing walk used. */
-    size_t start = r.pos;
-    for (int64_t i = 0; i < num && i < 100000 && seer_reader_ok(&r); i++)
-      (void)seer_dec_sb4(&r);
-    while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
-      r.pos++;
-    if (!seer_reader_ok(&r) || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
-      seer_reader_init(&r, data, dlen);
-      r.pos = start;
-      for (int64_t i = 0; i < num && i < 100000 && seer_reader_remaining(&r) > 0; i++) {
-        uint8_t t = r.buf[r.pos];
-        if (t == TTI_OER || t == TTI_RXH || t == TTI_RXD)
-          break;
-        (void)seer_dec_sb4(&r);
-      }
-      while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
-        r.pos++;
-    }
-  }
-  if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_OER) {
-    r.pos += 1;
-    *rowcount = seer_dec_sb4(&r);
-    *code = seer_dec_sb4(&r);
-  }
-}
-
 /* Oracle 9i DML / DDL over TTI_ALL7: OOPEN, a single parse that ALSO executes
  * (no describe/fetch), then close. 9i's parse carries no autocommit bit, so we
  * commit explicitly when autocommit is on. */
@@ -5916,9 +5957,13 @@ static SeerStatus fv2_execute_dml(SeerStmt *stmt)
   if (st != SEER_OK)
     return st;
 
-  int64_t rowcount = 0, code = 0;
-  fv2_decode_dml_response(resp, rlen, &rowcount, &code);
+  Fv2Status status;
+  fv2_read_status(resp, rlen, &status);
+  int64_t rowcount = status.rows, code = status.code;
   bool failed = (code != 0 && code != 1403);
+  /* A CREATE whose object compiled with errors succeeds; only the warning
+   * flags say so (seerdb #2262), as on 10g+. */
+  stmt->compile_warning = !failed && (status.warnings & 0x20) != 0;
   if (failed) {
     fv2_set_error(c, resp, rlen);
     seer_log(SEER_LOG_DEBUG, "fv2: DML failed (ORA-%05ld)", (long)code);

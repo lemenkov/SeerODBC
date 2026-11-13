@@ -637,6 +637,57 @@ static void check_long_fetch(void)
   }
 }
 
+/* Where in the statement an error is: 9i's status carries it as 10g+'s does
+ * (seerdb #2263: `select nosuch from dual` is ORA-00904 at 7), and it was
+ * never read. */
+static void check_error_offset(void)
+{
+  const char *name = "error offset (ORA-00904 at 7)";
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, "SELECT nosuch FROM dual", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  long off = seer_last_error_offset(C);
+  const char *e = seer_last_error(C);
+  int is904 = e != NULL && strncmp(e, "ORA-00904", 9) == 0;
+  seer_stmt_close(s);
+  if (st == SEER_EDB && is904 && off == 7)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "status %d, offset %ld, '%.60s'", (int)st, off, e ? e : "");
+    fail(name, m);
+  }
+}
+
+/* A CREATE whose object compiles with errors succeeds; only the status's
+ * warning flags (0x20) say so (seerdb #2262). */
+static void check_compile_warning(void)
+{
+  const char *name = "CREATE with compilation errors flagged";
+  SeerStmt *s = NULL;
+  int warned = -1, clean = -1;
+  if (seer_stmt_prepare(C, "CREATE OR REPLACE PROCEDURE seer9w AS BEGIN no_such_thing; END;", &s) ==
+          SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK)
+    warned = seer_stmt_compile_warning(s);
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "CREATE OR REPLACE PROCEDURE seer9w AS BEGIN NULL; END;", &s) ==
+          SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK)
+    clean = seer_stmt_compile_warning(s);
+  seer_stmt_close(s);
+  run("DROP PROCEDURE seer9w");
+  if (warned == 1 && clean == 0)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "broken body warned=%d, clean body warned=%d (want 1, 0)", warned, clean);
+    fail(name, m);
+  }
+}
+
 static void check_date_bind(void)
 {
   /* DATE bind (fv2 OAC type 12/7) round-trips to second precision. */
@@ -939,6 +990,8 @@ int main(void)
   check_national();
   check_array_dml();
   check_long_fetch();
+  check_error_offset();
+  check_compile_warning();
   check_cursor_hygiene();
   check_wrong_password(&p);
 
