@@ -77,7 +77,36 @@ The keywords are the same as on Linux and macOS. They include `SID=` for old
 servers, `SSL=1` / `TLSCA=` for TCPS, `CCLASS=` / `PURITY=` for DRCP,
 `EXPIRE_TIME=` and `LOBINLINE=1`.
 
-**With a data source (DSN)**:
+**With a data source (DSN)**, made in the *ODBC Data Source Administrator*
+(`odbcad32.exe`, or *ODBC Data Sources* in the Start menu; the 64-bit one for
+64-bit applications, the 32-bit one for 32-bit applications). On the *User DSN*
+or *System DSN* tab, *Add...*, pick **SeerODBC**, and fill in:
+
+- **Data source name** and an optional description;
+- **Host**, **Port** (1521 unless the listener says otherwise) and **Service
+  name**;
+- **User ID**, optional. The password is never stored: applications pass it as
+  `PWD=` when they connect. The dialog's password box is only for **Test
+  connection**, which logs in with the values shown and reports the server's
+  version or its error.
+
+*Configure...* edits a DSN (renaming it keeps every value), and *Remove*
+deletes it. Other keywords (`SSL=1`, `EXPIRE_TIME=`, ...) can be set as string
+values under the DSN's registry key: `HKCU\SOFTWARE\ODBC\ODBC.INI\<name>` for a
+user DSN, `HKLM\SOFTWARE\ODBC\ODBC.INI\<name>` for a system DSN. The dialog
+keeps them.
+
+The same works from PowerShell, and from scripts and installers that call
+`SQLConfigDataSource`:
+
+```powershell
+Add-OdbcDsn -Name MyDb -DriverName SeerODBC -DsnType User -Platform 64-bit `
+  -SetPropertyValue 'HOST=db.example.com', 'PORT=1521', 'SERVICE=ORCLPDB1'
+Set-OdbcDsn -Name MyDb -DsnType User -Platform 64-bit -SetPropertyValue 'EXPIRE_TIME=10'
+Remove-OdbcDsn -Name MyDb -DsnType User -Platform 64-bit
+```
+
+From the zip, without the Administrator, `add-dsn.cmd` does the same:
 
 ```bat
 add-dsn.cmd MyDb db.example.com 1521 ORCLPDB1
@@ -86,14 +115,8 @@ add-dsn.cmd MyDb db.example.com 1521 ORCLPDB1 /system
 
 The first creates a DSN for the current user. The second creates a system DSN,
 visible to every account and to services, and needs an elevated prompt.
-Applications then connect with `DSN=MyDb;UID=...;PWD=...;`. Other keywords can
-be added as string values under the DSN's registry key, which is
-`HKCU\SOFTWARE\ODBC\ODBC.INI\MyDb` or, for a system DSN,
-`HKLM\SOFTWARE\ODBC\ODBC.INI\MyDb`.
 
-The Data Source Administrator lists these DSNs but cannot edit them yet. That
-needs a driver setup DLL (`ConfigDSN`), which is still to come
-(seerdb/SeerODBC#104).
+Applications then connect with `DSN=MyDb;UID=...;PWD=...;`.
 
 ## Check the install
 

@@ -12,6 +12,7 @@
 #   driver exports, with no ANSI fallback (a missing one is a NULL call inside
 #   odbc32.dll): each export that has a W form in ODBC (sqlucode.h) needs its
 #   W export too.
+# - The setup entry points ConfigDSN and ConfigDriver are there.
 #
 # Runs under MSYS2 and on Linux with a MinGW-w64 cross toolchain.
 set -euo pipefail
@@ -49,4 +50,9 @@ if [ -n "$missing" ]; then
   echo "::error::exported without their W form:$missing"
   exit 1
 fi
-echo "exports OK: undecorated, every W form present"
+# The driver is its own setup DLL: the ODBC installer and Data Source
+# Administrator call these to add, change and remove DSNs.
+for f in ConfigDSN ConfigDriver; do
+  grep -qE " $f\$" <<<"$exports" || { echo "::error::$f is not exported"; exit 1; }
+done
+echo "exports OK: undecorated, every W form present, ConfigDSN / ConfigDriver"

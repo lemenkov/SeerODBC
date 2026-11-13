@@ -84,13 +84,33 @@ else
   odbc_export_depends = odbc_map
 endif
 
+# Windows: the driver is also its own setup DLL (setup.c, ConfigDSN /
+# ConfigDriver), with the DSN dialog compiled from setup.rc.
+if host_machine.system() == 'windows'
+  odbc_sources += files('setup.c')
+  # The DLL's VERSIONINFO (shown by the Data Source Administrator) takes its
+  # numbers from the project version, so it can't drift from meson.build.
+  ver = meson.project_version().split('.')
+  rc_conf = configuration_data()
+  rc_conf.set('SEER_VER_MAJOR', ver[0])
+  rc_conf.set('SEER_VER_MINOR', ver[1])
+  rc_conf.set('SEER_VER_PATCH', ver[2])
+  rc_conf.set_quoted('SEER_VER_STR', meson.project_version())
+  configure_file(output : 'seer_rc_version.h', configuration : rc_conf)
+  odbc_sources += import('windows').compile_resources('setup.rc',
+    include_directories : include_directories('.'),
+    depend_files : files('setup.h'),
+  )
+  odbc_platform_deps += cc.find_library('user32')
+endif
+
 # On Windows a driver DLL is seerodbc.dll, as ODBC registrations name it, not
 # MinGW's default libseerodbc.dll.
 seerodbc_lib = shared_library('seerodbc',
   odbc_sources,
   name_prefix : host_machine.system() == 'windows' ? '' : [],
   include_directories : include_directories('.'),
-  dependencies : [seertns_dep, common_dep, odbc_pure_dep],
+  dependencies : [seertns_dep, common_dep, odbc_pure_dep] + odbc_platform_deps,
   link_args : odbc_export_args,
   link_depends : odbc_export_depends,
   install : true,
