@@ -22,9 +22,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#ifndef _WIN32
-#include <pwd.h>
-#endif
 
 /* ---------------------------------------------------------- static messages */
 
@@ -798,23 +795,10 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
 
   /* AUTH_SID is the operating-system account running the client - the server
    * shows it as v$session.OSUSER / SYS_CONTEXT('USERENV','OS_USER') - not the
-   * database user (seerdb/seerdb@dd06c5d). */
-  char osuser[128] = "";
-#ifndef _WIN32
-  struct passwd pw, *pwres = NULL;
-  char pwbuf[1024];
-  if (getpwuid_r(geteuid(), &pw, pwbuf, sizeof pwbuf, &pwres) == 0 && pwres != NULL &&
-      pwres->pw_name != NULL)
-    snprintf(osuser, sizeof osuser, "%s", pwres->pw_name);
-#endif
-  if (!osuser[0]) {
-    const char *e = getenv("USER");
-    if (e == NULL || !e[0])
-      e = getenv("LOGNAME");
-    if (e == NULL || !e[0])
-      e = getenv("USERNAME"); /* Windows */
-    snprintf(osuser, sizeof osuser, "%s", (e != NULL && e[0]) ? e : "unknown");
-  }
+   * database user (seerdb/seerdb@dd06c5d). 10g+ take it over the CONNECT
+   * descriptor's CID USER, which carries the same. */
+  char osuser[128];
+  seer_client_os_user(osuser, sizeof osuser);
 
   static const char APP[] = "seerodbc";
 

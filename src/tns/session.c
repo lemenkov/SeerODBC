@@ -29,6 +29,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <pwd.h>
+#endif
 
 /* TNS_CONNECT fixed-header constants (PROTOCOL.md §2.1). */
 #define TNS_VERSION_DESIRED 0x013F /* 319 - large-SDU handshake (#155) */
@@ -62,6 +65,26 @@
 
 /* ------------------------------------------------------------------ helpers */
 
+void seer_client_os_user(char *out, size_t n)
+{
+  out[0] = '\0';
+#ifndef _WIN32
+  struct passwd pw, *pwres = NULL;
+  char pwbuf[1024];
+  if (getpwuid_r(geteuid(), &pw, pwbuf, sizeof pwbuf, &pwres) == 0 && pwres != NULL &&
+      pwres->pw_name != NULL)
+    snprintf(out, n, "%s", pwres->pw_name);
+#endif
+  if (!out[0]) {
+    const char *e = getenv("USER");
+    if (e == NULL || !e[0])
+      e = getenv("LOGNAME");
+    if (e == NULL || !e[0])
+      e = getenv("USERNAME"); /* Windows */
+    snprintf(out, n, "%s", (e != NULL && e[0]) ? e : "unknown");
+  }
+}
+
 /* Build the TNS_CONNECT body (everything after the 8-byte TNS header): the
  * 50-byte fixed header followed by the connect descriptor string. */
 static SeerStatus build_connect_body(const SeerConnParams *p, SeerWriter *w)
@@ -71,7 +94,16 @@ static SeerStatus build_connect_body(const SeerConnParams *p, SeerWriter *w)
     strcpy(hostname, "localhost");
   hostname[sizeof hostname - 1] = '\0';
 
-  const char *user = (p->username && *p->username) ? p->username : "seerodbc";
+  /* CID USER is the client's OS account, as python-oracledb writes it - not
+   * the database user. 8i and 9i take v$session.osuser from it before the
+   * login's (seerdb PROTOCOL.md §19.8.1): with the database user there, both
+   * reported that as the OS user. 10g+ take AUTH_SID over it. A '(' ')' or '='
+   * would end the field, so they are replaced. */
+  char osuser[128];
+  seer_client_os_user(osuser, sizeof osuser);
+  for (char *c = osuser; *c; c++)
+    if (*c == '(' || *c == ')' || *c == '=')
+      *c = '_';
   const char *proto = p->use_tls ? "TCPS" : "TCP";
   /* DRCP: route to the connection broker's pooled server (#130). */
   const char *pooled = ((p->cclass && p->cclass[0]) || p->purity) ? "(SERVER=POOLED)" : "";
@@ -97,7 +129,7 @@ static SeerStatus build_connect_body(const SeerConnParams *p, SeerWriter *w)
                       "%s"
                       "(CID=(PROGRAM=seerodbc)(HOST=%s)(USER=%s)))"
                       "(ADDRESS=(PROTOCOL=%s)(HOST=%s)(PORT=%u)))",
-                      expire, target, pooled, hostname, user, proto, p->host ? p->host : "",
+                      expire, target, pooled, hostname, osuser, proto, p->host ? p->host : "",
                       (unsigned)(p->port ? p->port : 1521));
   if (dlen < 0 || (size_t)dlen >= sizeof desc)
     return SEER_EPARAM;
