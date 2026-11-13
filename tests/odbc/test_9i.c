@@ -363,26 +363,31 @@ static void check_bfile(void)
 
 static void check_national(void)
 {
-  const char *name = "national-charset bind (NVARCHAR2)";
-  char out[64];
+  /* U+00C4 and U+4E2D: the first has a Latin-1 form, the second has none, so
+   * any detour through the WE8ISO8859P1 database charset shows. */
+  static const char text[] = "\xC3\x84\xE4\xB8\xAD-9i";
+  const char *name = "national charset: NVARCHAR2 bind + fetch, UNISTR";
+  char out[64], lit[64];
   run("DROP TABLE seer9n");
   run("CREATE TABLE seer9n (n NVARCHAR2(20))");
   SeerStmt *s = NULL;
   SeerStatus b = SEER_EPARAM, e = SEER_EPARAM;
   if (seer_stmt_prepare(C, "INSERT INTO seer9n VALUES (:1)", &s) == SEER_OK) {
-    b = seer_stmt_bind_ntext(s, 1, "hello-9i", -1);
+    b = seer_stmt_bind_ntext(s, 1, text, -1);
     e = (b == SEER_OK) ? seer_stmt_execute(s) : b;
   }
   seer_stmt_close(s);
   seer_commit(C);
-  /* Read back via TO_CHAR (server converts national->DB charset -> UTF-8). */
-  scalar("SELECT TO_CHAR(n) FROM seer9n WHERE n = N'hello-9i'", out, sizeof out);
+  /* The column itself, not TO_CHAR(n): a national value is fetched in the
+   * national form, so it must come back whole. */
+  scalar("SELECT n FROM seer9n", out, sizeof out);
+  scalar("SELECT UNISTR('\\00C4\\4E2D') FROM dual", lit, sizeof lit);
   run("DROP TABLE seer9n");
-  if (e == SEER_OK && strcmp(out, "hello-9i") == 0)
+  if (e == SEER_OK && strcmp(out, text) == 0 && strcmp(lit, "\xC3\x84\xE4\xB8\xAD") == 0)
     pass(name);
   else {
-    char m[96];
-    snprintf(m, sizeof m, "exec=%d got '%s'", e, out);
+    char m[160];
+    snprintf(m, sizeof m, "exec=%d column='%s' unistr='%s'", e, out, lit);
     fail(name, m);
   }
 }

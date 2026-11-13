@@ -603,6 +603,23 @@ static SeerStatus decode_scalar(uint8_t ora_type, const uint8_t *val, size_t vle
   return (cell->data != NULL) ? SEER_OK : SEER_ENOMEM;
 }
 
+/* A national char column (NVARCHAR2 / NCHAR) declares charset AL16UTF16: its
+ * value is UTF-16BE on the wire. Convert the decoded cell to UTF-8 so it reads
+ * as text, like every other character column. */
+static void national_to_utf8(const SeerColumn *col, SeerCell *cell)
+{
+  if (col->charset != ORA_CHARSET_AL16UTF16 || cell->data == NULL || cell->len == 0 ||
+      (col->ora_type != ORA_TYPE_VARCHAR && col->ora_type != ORA_TYPE_CHAR))
+    return;
+  char *u8 = NULL;
+  size_t u8len = 0;
+  if (seer_iconv("UTF-16BE", "UTF-8", cell->data, cell->len, &u8, &u8len) == 0) {
+    free(cell->data);
+    cell->data = u8;
+    cell->len = u8len;
+  }
+}
+
 static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *cell)
 {
   switch (col->ora_type) {
@@ -629,18 +646,8 @@ static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *ce
     return st;
   st = decode_scalar(col->ora_type, val, vlen, cell);
   free(val);
-  /* A national char column (NVARCHAR2 / NCHAR) declares charset AL16UTF16 (2000):
-   * its value is UTF-16BE on the wire. Convert to UTF-8 so it reads as text. */
-  if (st == SEER_OK && col->charset == 2000 && cell->data != NULL && cell->len > 0 &&
-      (col->ora_type == ORA_TYPE_VARCHAR || col->ora_type == ORA_TYPE_CHAR)) {
-    char *u8 = NULL;
-    size_t u8len = 0;
-    if (seer_iconv("UTF-16BE", "UTF-8", cell->data, cell->len, &u8, &u8len) == 0) {
-      free(cell->data);
-      cell->data = u8;
-      cell->len = u8len;
-    }
-  }
+  if (st == SEER_OK)
+    national_to_utf8(col, cell);
   return st;
 }
 
@@ -4281,7 +4288,10 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
   for (int i = 0; i < 4; i++)
     seer_writer_u8(w, 0);
   seer_enc_sb4(w, charset);
-  seer_writer_u8(w, 0); /* csfrm */
+  /* The charset form: a national column (described in AL16UTF16) must be
+   * defined in the national form, 2. Form 0 makes 9i convert its value to the
+   * database charset - lossy, and not the UTF-16BE the decoder expects. */
+  seer_writer_u8(w, charset == ORA_CHARSET_AL16UTF16 ? 2 : 0);
 }
 
 /* Decode one fv2 column descriptor (OAC-fv2 + name) into `col`. */
@@ -4473,7 +4483,8 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
             uint8_t dt = (ct == ORA_TYPE_RID || ct == ORA_TYPE_ROWID || ct == ORA_TYPE_UROWID)
                              ? ORA_TYPE_VARCHAR
                              : ct;
-            decode_scalar(dt, val, vlen, &row[ci]);
+            if (decode_scalar(dt, val, vlen, &row[ci]) == SEER_OK)
+              national_to_utf8(&stmt->cols[ci], &row[ci]);
           }
         }
         free(val);
