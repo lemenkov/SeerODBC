@@ -4775,21 +4775,21 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
 /* Append one fv2 bind OAC (the client's declared type for an input bind), derived
  * from the stored bind's Oracle type. Char binds declare AL32UTF8 (the session is
  * UTF-8 and the 9i server converts to its DB charset); NUMBER rides as VARNUM. */
-/* Text binds past the 4000-byte inline limit, as a 9i PL/SQL block takes them
- * (seerdb PROTOCOL.md §19.3.1, measured against ojdbc14): declared VARCHAR at
- * 32767, whatever the value's size, their values in the chunked form. Measured
- * on 9.2.0.4 with this driver's 252-byte chunks, values up to 32512 bytes are
- * stored and from 32513 the server answers ORA-01460, so longer ones are
- * refused here. */
-#define FV2_BLOCK_TEXT_DECLARED 32767u
-#define FV2_BLOCK_TEXT_MAX 32512u
+/* Binds past the inline limits (text past 4000 bytes, RAW past 2000), as a 9i
+ * PL/SQL block takes them (seerdb PROTOCOL.md §19.3.1, measured against
+ * ojdbc14): declared VARCHAR or RAW at 32767, whatever the value's size, their
+ * values in the chunked form. The server stores at most 32512 bytes of either;
+ * from 32513 it answers ORA-01460 whatever the declaration (measured on
+ * 9.2.0.4 by seerdb and here), so longer ones are refused. */
+#define FV2_BLOCK_WIDE_DECLARED 32767u
+#define FV2_BLOCK_WIDE_MAX 32512u
 
 /* What a 9i statement's IN binds need (seerdb PROTOCOL.md §19.3.1):
  *   FV2_BINDS_INLINE  none past the inline limits;
- *   FV2_BINDS_BLOCK   text past 4000 bytes, up to FV2_BLOCK_TEXT_MAX: 9.2
- *                     takes it only in a PL/SQL block, so a DML runs as one;
- *   FV2_BINDS_NONE    a form 9.2 has none for here: longer text, or RAW
- *                     past 2000 (not measured).
+ *   FV2_BINDS_BLOCK   text past 4000 bytes or RAW past 2000, up to
+ *                     FV2_BLOCK_WIDE_MAX: 9.2 takes them only in a PL/SQL
+ *                     block, so a DML runs as one;
+ *   FV2_BINDS_NONE    longer ones, which 9.2 has no form for.
  * In a plain statement, text past 4000 drew ORA-00600 [koklgloblen: arrlen]
  * at 4001 bytes and ORA-01483 past it; declared at its own size (VARCHAR or
  * LONG) the server closed the connection, and ojdbc14 itself refuses it. */
@@ -4804,13 +4804,15 @@ static int fv2_long_binds(const SeerStmt *stmt)
     switch (b->oac_type) {
     case ORA_TYPE_RAW:
     case ORA_TYPE_LONGRAW:
-      if (b->oac_size > 2000)
+      if (b->oac_size > FV2_BLOCK_WIDE_MAX)
         return FV2_BINDS_NONE;
+      if (b->oac_size > 2000)
+        need = FV2_BINDS_BLOCK;
       break;
     case ORA_TYPE_VARCHAR:
     case ORA_TYPE_CHAR:
     case ORA_TYPE_LONG:
-      if (b->oac_size > FV2_BLOCK_TEXT_MAX)
+      if (b->oac_size > FV2_BLOCK_WIDE_MAX)
         return FV2_BINDS_NONE;
       if (b->oac_size > 4000)
         need = FV2_BINDS_BLOCK;
@@ -4822,12 +4824,16 @@ static int fv2_long_binds(const SeerStmt *stmt)
   return need;
 }
 
-/* Whether a 9i IN bind is text past 4000 bytes: declared VARCHAR 32767. */
-static bool fv2_block_text(const SeerBind *b)
+/* Whether a 9i IN bind is past the inline limits - text past 4000 bytes, RAW
+ * past 2000 - and so declared at a block's 32767. */
+static bool fv2_block_wide(const SeerBind *b)
 {
-  return !b->is_out && b->oac_charset != 2000 && b->oac_size > 4000 &&
-         (b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
-          b->oac_type == ORA_TYPE_LONG);
+  if (b->is_out || b->oac_charset == 2000)
+    return false;
+  if (b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW)
+    return b->oac_size > 2000;
+  return b->oac_size > 4000 && (b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
+                                b->oac_type == ORA_TYPE_LONG);
 }
 
 static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
@@ -4875,8 +4881,8 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
     default:
       break; /* VARCHAR / LONG / unbound -> str */
     }
-  if (fv2_block_text(b)) /* past 4000 bytes: a block's 32767 (§19.3.1) */
-    maxsize = FV2_BLOCK_TEXT_DECLARED;
+  if (fv2_block_wide(b)) /* past the inline limits: a block's 32767 (§19.3.1) */
+    maxsize = FV2_BLOCK_WIDE_DECLARED;
   seer_writer_u8(w, type);
   seer_writer_u8(w, 0x01);
   seer_writer_u8(w, 0);
@@ -6680,8 +6686,8 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
     int binds = fv2_long_binds(stmt);
     bool sql = kind == STMT_SELECT || kind == STMT_CHANGE; /* a block goes as it is */
     if (sql && (binds == FV2_BINDS_NONE || (binds == FV2_BINDS_BLOCK && kind == STMT_SELECT))) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: a bind over 32512 bytes of text or 2000 of "
-                                 "RAW, or over 4000 of text in a query, is not supported");
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: a bind over 32512 bytes, or over 4000 of "
+                                 "text / 2000 of RAW in a query, is not supported");
       return SEER_ENOTIMPL;
     }
     if (kind == STMT_SELECT)
