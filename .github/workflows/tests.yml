@@ -164,6 +164,16 @@ jobs:
             cat exports.txt
             exit 1
           fi
+      # selftest.ps1 can only run on a Windows machine with a server to reach,
+      # but its syntax is checked here, by PowerShell's own parser.
+      - name: Parse selftest.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/packaging/windows/selftest.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          'selftest.ps1 parses'
       # The release zip, as release.yml builds it, so a change that breaks the
       # packaging shows here and every PR has a zip to try on Windows.
       - name: Package the Windows zip
