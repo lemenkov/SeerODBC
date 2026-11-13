@@ -4775,13 +4775,28 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
 /* Append one fv2 bind OAC (the client's declared type for an input bind), derived
  * from the stored bind's Oracle type. Char binds declare AL32UTF8 (the session is
  * UTF-8 and the 9i server converts to its DB charset); NUMBER rides as VARNUM. */
-/* Whether a 9i SQL statement has an IN bind past the inline limits: text over
- * 4000 bytes, RAW over 2000. The 9i parse declares text binds at 4000; a
- * longer value drew ORA-00600 [koklgloblen: arrlen] at 4001 bytes and
- * ORA-01483 past it, and declared at its own size (VARCHAR or LONG) the
- * server dropped the connection. Refused until that form is known. */
-static bool fv2_has_long_bind(const SeerStmt *stmt)
+/* Text binds past the 4000-byte inline limit, as a 9i PL/SQL block takes them
+ * (seerdb PROTOCOL.md §19.3.1, measured against ojdbc14): declared VARCHAR at
+ * 32767, whatever the value's size, their values in the chunked form. Measured
+ * on 9.2.0.4 with this driver's 252-byte chunks, values up to 32512 bytes are
+ * stored and from 32513 the server answers ORA-01460, so longer ones are
+ * refused here. */
+#define FV2_BLOCK_TEXT_DECLARED 32767u
+#define FV2_BLOCK_TEXT_MAX 32512u
+
+/* What a 9i statement's IN binds need (seerdb PROTOCOL.md §19.3.1):
+ *   FV2_BINDS_INLINE  none past the inline limits;
+ *   FV2_BINDS_BLOCK   text past 4000 bytes, up to FV2_BLOCK_TEXT_MAX: 9.2
+ *                     takes it only in a PL/SQL block, so a DML runs as one;
+ *   FV2_BINDS_NONE    a form 9.2 has none for here: longer text, or RAW
+ *                     past 2000 (not measured).
+ * In a plain statement, text past 4000 drew ORA-00600 [koklgloblen: arrlen]
+ * at 4001 bytes and ORA-01483 past it; declared at its own size (VARCHAR or
+ * LONG) the server closed the connection, and ojdbc14 itself refuses it. */
+enum { FV2_BINDS_INLINE, FV2_BINDS_BLOCK, FV2_BINDS_NONE };
+static int fv2_long_binds(const SeerStmt *stmt)
 {
+  int need = FV2_BINDS_INLINE;
   for (int i = 0; i < stmt->npbinds; i++) {
     const SeerBind *b = &stmt->pbinds[i];
     if (b->is_out || b->oac_charset == 2000)
@@ -4790,19 +4805,29 @@ static bool fv2_has_long_bind(const SeerStmt *stmt)
     case ORA_TYPE_RAW:
     case ORA_TYPE_LONGRAW:
       if (b->oac_size > 2000)
-        return true;
+        return FV2_BINDS_NONE;
       break;
     case ORA_TYPE_VARCHAR:
     case ORA_TYPE_CHAR:
     case ORA_TYPE_LONG:
+      if (b->oac_size > FV2_BLOCK_TEXT_MAX)
+        return FV2_BINDS_NONE;
       if (b->oac_size > 4000)
-        return true;
+        need = FV2_BINDS_BLOCK;
       break;
     default:
       break;
     }
   }
-  return false;
+  return need;
+}
+
+/* Whether a 9i IN bind is text past 4000 bytes: declared VARCHAR 32767. */
+static bool fv2_block_text(const SeerBind *b)
+{
+  return !b->is_out && b->oac_charset != 2000 && b->oac_size > 4000 &&
+         (b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
+          b->oac_type == ORA_TYPE_LONG);
 }
 
 static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
@@ -4850,6 +4875,8 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
     default:
       break; /* VARCHAR / LONG / unbound -> str */
     }
+  if (fv2_block_text(b)) /* past 4000 bytes: a block's 32767 (§19.3.1) */
+    maxsize = FV2_BLOCK_TEXT_DECLARED;
   seer_writer_u8(w, type);
   seer_writer_u8(w, 0x01);
   seer_writer_u8(w, 0);
@@ -6340,10 +6367,12 @@ static void free_one_bind(SeerStmt *s, SeerBind *b)
   memset(b, 0, sizeof *b);
 }
 
-/* Oracle 9i DML RETURNING ... INTO: 9.2 refuses the clause in a TTI_ALL7
- * statement (ORA-00439: feature not enabled: RETURNING clause from this client
- * type) but runs the same statement in an anonymous block, where the INTO
- * targets are ordinary OUT binds (seerdb PROTOCOL.md §19.3, #801):
+/* A 9i DML that only a PL/SQL block can run: a RETURNING ... INTO, which 9.2
+ * refuses in a TTI_ALL7 statement (ORA-00439: feature not enabled: RETURNING
+ * clause from this client type), and one with a text bind past 4000 bytes,
+ * which it takes only in a block, declared at 32767 (seerdb PROTOCOL.md
+ * §19.3.1). In the block the INTO targets are ordinary OUT binds (§19.3,
+ * #801):
  *
  *   BEGIN <dml>; :seer_rowcount := SQL%ROWCOUNT; END;
  *
@@ -6354,10 +6383,11 @@ static void free_one_bind(SeerStmt *s, SeerBind *b)
  * ORA-06502 - the block declares text at 4000; and a LOB target, which needs a
  * 9i LOB OUT bind, is refused, as is an array RETURNING. */
 static SeerStatus fv2_execute_block(SeerStmt *stmt);
-static SeerStatus fv2_execute_returning(SeerStmt *stmt)
+static SeerStatus fv2_execute_in_block(SeerStmt *stmt)
 {
   if (stmt->n_iters > 1) {
-    seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: an array DML RETURNING is not supported");
+    seer_log(SEER_LOG_WARNING,
+             "stmt: Oracle 9i: an array DML with RETURNING or long binds is not supported");
     return SEER_ENOTIMPL;
   }
   for (int i = 0; i < stmt->npbinds; i++)
@@ -6647,17 +6677,21 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
    * the next fv2 slice. */
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2) {
     StmtKind kind = classify_sql(stmt->sql);
-    if ((kind == STMT_SELECT || kind == STMT_CHANGE) && fv2_has_long_bind(stmt)) {
-      seer_log(SEER_LOG_WARNING,
-               "stmt: Oracle 9i: a bind over 4000 bytes of text or 2000 of RAW is not supported");
+    int binds = fv2_long_binds(stmt);
+    bool sql = kind == STMT_SELECT || kind == STMT_CHANGE; /* a block goes as it is */
+    if (sql && (binds == FV2_BINDS_NONE || (binds == FV2_BINDS_BLOCK && kind == STMT_SELECT))) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: a bind over 32512 bytes of text or 2000 of "
+                                 "RAW, or over 4000 of text in a query, is not supported");
       return SEER_ENOTIMPL;
     }
     if (kind == STMT_SELECT)
       return fv2_execute_select(stmt);
     if (kind == STMT_CHANGE) {
+      if (binds == FV2_BINDS_BLOCK) /* long text: only a block takes it */
+        return fv2_execute_in_block(stmt);
       for (int i = 0; i < stmt->npbinds; i++)
         if (stmt->pbinds[i].is_out) /* OUT binds on a DML: RETURNING ... INTO */
-          return fv2_execute_returning(stmt);
+          return fv2_execute_in_block(stmt);
       return fv2_execute_dml(stmt);
     }
     return fv2_execute_block(stmt); /* BEGIN / DECLARE */
