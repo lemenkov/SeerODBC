@@ -2050,14 +2050,14 @@ SeerStatus seer_request_end(SeerConn *conn)
 SeerStatus seer_commit(SeerConn *conn)
 {
   if (conn != NULL && conn->is_8i)
-    return SEER_ENOTIMPL; /* 8i has no TTI_COMMIT: COMMIT rides its OALL8 */
+    return seer_o8i_tran(conn, true); /* 8i has no TTI_COMMIT: COMMIT rides its OALL8 */
   return seer_ttc_tran(conn, TTI_COMMIT);
 }
 
 SeerStatus seer_rollback(SeerConn *conn)
 {
   if (conn != NULL && conn->is_8i)
-    return SEER_ENOTIMPL; /* likewise ROLLBACK */
+    return seer_o8i_tran(conn, false); /* likewise ROLLBACK */
   return seer_ttc_tran(conn, TTI_ROLLBACK);
 }
 

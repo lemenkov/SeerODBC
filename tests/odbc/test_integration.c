@@ -35,11 +35,11 @@ static int n_pass, n_fail, n_skip;
 
 /* Known gaps of the legacy tiers. Oracle 8i and 9i speak their own dialects,
  * and some checks need what those releases lack, or what SeerODBC doesn't
- * speak to them yet (8i: DML, DDL and PL/SQL, #133-#134). A check listed
- * here, on a server older than `below` (9 = 8i only, 10 = 8i and 9i), is
- * reported as SKIP with the reason rather than as a failure. Anything not
- * listed still fails, so a regression in what these tiers do support shows.
- * g_major is the connected server's release. */
+ * speak to them yet (8i: PL/SQL, LOB and UROWID columns, #134-#136). A
+ * check listed here, on a server older than `below` (9 = 8i only, 10 = 8i and
+ * 9i), is reported as SKIP with the reason rather than as a failure. Anything
+ * not listed still fails, so a regression in what these tiers do support
+ * shows. g_major is the connected server's release. */
 static int g_major;
 typedef struct {
   int below;
@@ -76,19 +76,20 @@ static const KnownGap known_gaps[] = {
     {9, "CLOB fetch", "8i has no TO_CLOB"},
     {9, "BLOB fetch (hex)", "8i has no TO_BLOB"},
     {9, "describe after SQLPrepare, before SQLExecute", "8i describes a query as it executes"},
-    /* 8i: not spoken yet - DML / DDL (#133), PL/SQL blocks (#134) */
-    {9, "aggregate over an all-NULL group (OER warning flags)", "8i: no DDL yet (#133)"},
-    {9, "medium string bind (chunked)", "8i: no DDL yet (#133)"},
-    {9, "LONG column over 252 bytes", "8i: no DDL yet (#133)"},
-    {9, "CLOB / BLOB columns across fetch batches", "8i: no DDL yet (#133)"},
-    {9, "ALTER SESSION SET CURRENT_SCHEMA / EDITION", "8i: no ALTER SESSION yet (#133)"},
-    {9, "DDL create", "8i: no DDL yet (#133)"},
-    {9, "large CLOB bind (fragmented)", "8i: no DML yet (#133)"},
-    {9, "array DML row counts", "8i: no DML yet (#133)"},
-    {9, "compilation errors reported as SUCCESS_WITH_INFO (ORA-24344)", "8i: no DDL yet (#133)"},
+    {9, "fetch all rows inside an open transaction", "8i has no CONNECT BY level row generator"},
+    /* 8i: not spoken yet - PL/SQL blocks (#134), LOB columns (#135), UROWID (#136) */
     {9, "leading comments / labels / CALL keep the statement kind",
      "8i: no PL/SQL blocks yet (#134)"},
     {9, "DML RETURNING INTO", "8i: no PL/SQL blocks yet (#134)"},
+    {9, "DML RETURNING with only return binds (VARCHAR)", "8i: no PL/SQL blocks yet (#134)"},
+    {9, "failing DML RETURNING, then the connection still works",
+     "8i: no PL/SQL blocks yet (#134)"},
+    {9, "truncated DML RETURNING value reports 01004", "8i: no PL/SQL blocks yet (#134)"},
+    {9, "IN OUT parameter keeps its input value", "8i: no PL/SQL blocks yet (#134)"},
+    {9, "PL/SQL CLOB / BLOB parameter over 32 KB", "8i: no PL/SQL blocks yet (#134)"},
+    {9, "statement cache after a block that recreates a table", "8i: no PL/SQL blocks yet (#134)"},
+    {9, "CLOB / BLOB columns across fetch batches", "8i: no LOB columns yet (#135)"},
+    {9, "UROWID of a physical rowid renders as ROWID", "8i: no UROWID columns yet (#136)"},
 };
 
 /* The reason `name` is a known gap of the connected server, or NULL. */
@@ -340,7 +341,7 @@ static void check_aggregate_null_warning(SQLHDBC dbc)
                              "SELECT 1, 12345678901234567890.125 FROM dual UNION ALL "
                              "SELECT 2, 12345678901234567890.127 FROM dual UNION ALL "
                              "SELECT 2, 12345678901234567890.131 FROM dual UNION ALL "
-                             "SELECT 3, NULL FROM dual",
+                             "SELECT 3, TO_NUMBER(NULL) FROM dual",
                              err, sizeof err))) {
     fail(name, err[0] ? err : "setup failed");
     exec_do(dbc, "DROP TABLE seer_aggwarn", err, sizeof err);
@@ -2306,8 +2307,8 @@ static void check_large_bind(SQLHDBC dbc)
   free(big);
   SQLFreeHandle(SQL_HANDLE_STMT, st);
   if (SQL_SUCCEEDED(rc) &&
-      SQL_SUCCEEDED(
-          exec_scalar(dbc, "SELECT LENGTH(c) FROM seer_lb", out, sizeof out, err, sizeof err)) &&
+      SQL_SUCCEEDED(exec_scalar(dbc, "SELECT DBMS_LOB.GETLENGTH(c) FROM seer_lb", out, sizeof out,
+                                err, sizeof err)) &&
       strcmp(out, "20000") == 0)
     pass(name);
   else {

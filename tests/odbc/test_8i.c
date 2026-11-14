@@ -6,6 +6,7 @@
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -383,6 +384,149 @@ static void check_bind_refused(void)
   }
 }
 
+/* Run a statement that returns no rows; its status, and its row count into
+ * *rows when given. */
+static SeerStatus run(const char *sql, long *rows)
+{
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, sql, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (rows != NULL)
+    *rows = seer_stmt_row_count(s);
+  seer_stmt_close(s);
+  return st;
+}
+
+/* DDL, DML with binds and an array INSERT (8i has no array DML: a row at a
+ * time), batch errors, row counts and the error of a refused statement
+ * (seerdb PROTOCOL.md §19.12, #133). */
+static void check_dml(void)
+{
+  const char *name = "DDL, DML with binds, array INSERT, batch errors";
+  char m[512] = "", n[16];
+  run("DROP TABLE seer_t8", NULL);
+  SeerStatus c1 = run("CREATE TABLE seer_t8 (id NUMBER PRIMARY KEY, txt VARCHAR2(20))", NULL);
+  SeerStmt *s = NULL;
+  long one = -1, three = -1, two = -1, upd = -1;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_t8 VALUES (:1, :2)", &s) == SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 1);
+    seer_stmt_bind_text(s, 2, "one", -1);
+    if (seer_stmt_execute(s) == SEER_OK)
+      one = seer_stmt_row_count(s);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_t8 VALUES (:1, 'array')", &s) == SEER_OK) {
+    seer_stmt_set_array_size(s, 3);
+    for (int r = 0; r < 3; r++) {
+      seer_stmt_bind_row(s, r);
+      seer_stmt_bind_int64(s, 1, 2 + r);
+    }
+    if (seer_stmt_execute(s) == SEER_OK)
+      three = seer_stmt_row_count(s);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  /* 5, then 1 again (a duplicate), then 6: with batch errors the two good rows
+   * go in and row 1 is reported with ORA-00001. */
+  unsigned erow = 99, ecode = 0;
+  size_t nerr = 0;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_t8 VALUES (:1, 'batch')", &s) == SEER_OK) {
+    seer_stmt_set_array_size(s, 3);
+    seer_stmt_set_batch_errors(s, 1);
+    const int ids[3] = {5, 1, 6};
+    for (int r = 0; r < 3; r++) {
+      seer_stmt_bind_row(s, r);
+      seer_stmt_bind_int64(s, 1, ids[r]);
+    }
+    if (seer_stmt_execute(s) == SEER_OK) {
+      two = seer_stmt_row_count(s);
+      nerr = seer_stmt_batch_error_count(s);
+      if (nerr > 0)
+        seer_stmt_batch_error(s, 0, &erow, &ecode, NULL);
+    }
+  }
+  seer_stmt_close(s);
+  SeerStatus u = run("UPDATE seer_t8 SET txt = 'u' WHERE id > 2", &upd);
+  SeerStatus dup = run("INSERT INTO seer_t8 VALUES (1, 'dup')", NULL);
+  bool dup_ok = dup == SEER_EDB && seer_last_error(C) != NULL &&
+                strncmp(seer_last_error(C), "ORA-00001", 9) == 0;
+  SeerStatus miss = run("INSERT INTO seer_nope VALUES (1)", NULL);
+  long off = seer_last_error_offset(C);
+  query("SELECT COUNT(*) FROM seer_t8", 0, 0, n, sizeof n);
+  run("DROP TABLE seer_t8", NULL);
+  if (c1 == SEER_OK && one == 1 && three == 3 && two == 2 && nerr == 1 && erow == 1 && ecode == 1 &&
+      u == SEER_OK && upd == 4 && dup_ok && miss == SEER_EDB && off == 12 && strcmp(n, "6") == 0)
+    pass(name);
+  else {
+    snprintf(m, sizeof m,
+             "create=%d one=%ld three=%ld two=%ld errs=%zu row=%u code=%u update=%d/%ld dup=%d "
+             "missing=%d@%ld count=%s",
+             (int)c1, one, three, two, nerr, erow, ecode, (int)u, upd, (int)dup, (int)miss, off, n);
+    fail(name, m);
+  }
+}
+
+/* COMMIT and ROLLBACK go as statements (8i has no TTI_COMMIT), and autocommit
+ * commits after each DML. */
+static void check_transactions(void)
+{
+  const char *name = "ROLLBACK, COMMIT and autocommit";
+  char a[16], b[16], c[16];
+  run("DROP TABLE seer_x8", NULL);
+  run("CREATE TABLE seer_x8 (id NUMBER)", NULL);
+  run("INSERT INTO seer_x8 VALUES (1)", NULL); /* autocommit: kept */
+  seer_set_autocommit(C, 0);
+  run("INSERT INTO seer_x8 VALUES (2)", NULL);
+  query("SELECT COUNT(*) FROM seer_x8", 0, 0, a, sizeof a); /* 2, in the transaction */
+  SeerStatus rb = seer_rollback(C);
+  query("SELECT COUNT(*) FROM seer_x8", 0, 0, b, sizeof b); /* 1 */
+  run("INSERT INTO seer_x8 VALUES (3)", NULL);
+  SeerStatus cm = seer_commit(C);
+  seer_set_autocommit(C, 1);
+  query("SELECT COUNT(*) FROM seer_x8", 0, 0, c, sizeof c); /* 2 */
+  run("DROP TABLE seer_x8", NULL);
+  if (strcmp(a, "2") == 0 && rb == SEER_OK && strcmp(b, "1") == 0 && cm == SEER_OK &&
+      strcmp(c, "2") == 0)
+    pass(name);
+  else {
+    char m[128];
+    snprintf(m, sizeof m, "in-txn=%s rollback=%d after=%s commit=%d end=%s", a, (int)rb, b, (int)cm,
+             c);
+    fail(name, m);
+  }
+}
+
+/* ALTER SESSION's reply carries the session's NLS settings as keyword pairs
+ * ahead of its status; and a CREATE whose object compiles with errors
+ * succeeds with the compile-warning flag. */
+static void check_alter_session_and_compile(void)
+{
+  const char *name = "ALTER SESSION, and a CREATE that compiles with errors";
+  char y[16];
+  SeerStatus as = run("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'", NULL);
+  query("SELECT TO_CHAR(TO_DATE('2003-04-05', 'YYYY-MM-DD')) FROM dual", 0, 0, y, sizeof y);
+  run("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'", NULL);
+  SeerStmt *s = NULL;
+  SeerStatus cr = SEER_EPROTO;
+  int warn = 0;
+  if (seer_stmt_prepare(C, "CREATE OR REPLACE PROCEDURE seer_bad8 AS BEGIN nonsense; END;", &s) ==
+      SEER_OK) {
+    cr = seer_stmt_execute(s);
+    warn = seer_stmt_compile_warning(s);
+  }
+  seer_stmt_close(s);
+  run("DROP PROCEDURE seer_bad8", NULL);
+  if (as == SEER_OK && strcmp(y, "2003") == 0 && cr == SEER_OK && warn)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "alter=%d '%s' create=%d warning=%d", (int)as, y, (int)cr, warn);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -410,6 +554,9 @@ int main(void)
   check_cursor_hygiene();
   check_binds();
   check_bind_refused();
+  check_dml();
+  check_transactions();
+  check_alter_session_and_compile();
   check_wrong_password(&p);
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);

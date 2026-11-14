@@ -122,6 +122,10 @@ void seer_test_fv2_decode_dml(const uint8_t *buf, size_t len, int64_t *rowcount,
  * the 10g+ login's AUTH_SID. */
 void seer_client_os_user(char *out, size_t n);
 
+/* Oracle 8i COMMIT / ROLLBACK, sent as ordinary statements on its OALL8 (8i
+ * has no TTI_COMMIT / TTI_ROLLBACK; seerdb PROTOCOL.md §19.12). */
+SeerStatus seer_o8i_tran(SeerConn *c, bool commit);
+
 SeerStatus seer_o8i_build_login(SeerConn *conn, SeerWriter *w, uint8_t op, const char *user,
                                 uint32_t mode, const char *password_field, const char *host,
                                 const char *pid);
