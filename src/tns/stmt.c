@@ -5241,6 +5241,12 @@ static void fv2_resolve_lobs(SeerStmt *stmt)
 
 /* Statement types (OCI_STMT_*), carried in al8i4[7]; 0 is transaction control. */
 #define O8I_STMT_SELECT 1
+#define O8I_STMT_UPDATE 2
+#define O8I_STMT_DELETE 3
+#define O8I_STMT_INSERT 4
+#define O8I_STMT_CREATE 5
+#define O8I_STMT_DROP 6
+#define O8I_STMT_ALTER 7
 #define O8I_STMT_TXN 0
 
 /* A strict reader over a reply that may still be incomplete: `cut` says a
@@ -5470,7 +5476,23 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
     uint32_t cnt = o8r_le16(r);
     for (uint32_t i = 0; i < cnt && !r->cut; i++)
       (void)o8r_le32(r);
-    o8r_skip(r, 4);
+    /* Two ub2 counts, zero after a DML, where seerdb's _O8I_RPA has four
+     * zero bytes: a transaction id's length (0 in every reply seen), and the
+     * session's changed settings as keyword pairs - an ALTER SESSION returns
+     * its 16 NLS values (8.1.7, 2026-11-14). A pair is a ub4 key length and
+     * the key, a ub4 value length and the value (each a ub1 length and the
+     * bytes, none when the length is 0), and the ub2 keyword: 16 AMERICAN, 9
+     * AMERICA, ..., 7 the date format. Read as four bytes, the status behind
+     * an ALTER SESSION was not found. */
+    o8r_skip(r, o8r_le16(r));
+    uint32_t pairs = o8r_le16(r);
+    for (uint32_t i = 0; i < pairs && !r->cut && !r->bad; i++) {
+      if (o8r_le32(r) > 0)
+        o8r_value(r, NULL);
+      if (o8r_le32(r) > 0)
+        o8r_value(r, NULL);
+      (void)o8r_le16(r);
+    }
   }
   if (!o8r_has(r, 1))
     return;
@@ -5934,10 +5956,10 @@ static SeerStatus o8i_unchunk(const uint8_t *v, size_t n, SeerWriter *out)
  * *size. Text goes in WE8ISO8859P1, the session's charset, as the SQL does; a
  * NULL is the empty value 00; NUMBER, DATE and RAW are the bytes the bind
  * stored. */
-static SeerStatus o8i_bind_value(const SeerBind *b, SeerWriter *val, uint32_t *size)
+static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, uint32_t *size)
 {
-  const uint8_t *v = b->rxd != NULL ? b->rxd[0] : NULL;
-  size_t vn = b->rxd != NULL ? b->rxd_len[0] : 0;
+  const uint8_t *v = b->rxd != NULL ? b->rxd[row] : NULL;
+  size_t vn = b->rxd != NULL ? b->rxd_len[row] : 0;
   if (v == NULL || vn == 0 || (vn == 1 && v[0] == 0)) {
     seer_writer_u8(val, 0);
     *size = b->oac_size ? b->oac_size : 1;
@@ -6007,10 +6029,10 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
 
 /* The statement's binds, refused before anything is sent when 8i can't take
  * one: SEER_ENOTIMPL, the reason logged. */
-static SeerStatus o8i_check_binds(SeerStmt *stmt)
+static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query)
 {
-  if (stmt->npbinds > 0 && stmt->n_iters > 1) {
-    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: an array execute is not supported");
+  if (query && stmt->npbinds > 0 && stmt->n_iters > 1) {
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: an array execute of a query is not supported");
     return SEER_ENOTIMPL;
   }
   for (int i = 0; i < stmt->npbinds; i++) {
@@ -6028,7 +6050,7 @@ static SeerStatus o8i_check_binds(SeerStmt *stmt)
  * descriptor, one 0x07, then every value. A value declared past 4000 bytes is
  * LONG-class, and 8i, as 10g+ (§5.4), reads it after the others: written in
  * place, it swapped with the next bind. */
-static SeerStatus o8i_binds(SeerStmt *stmt, SeerWriter *w)
+static SeerStatus o8i_binds(SeerStmt *stmt, int row, SeerWriter *w)
 {
   int nb = stmt->npbinds;
   SeerWriter *vals = calloc((size_t)nb, sizeof *vals);
@@ -6040,7 +6062,7 @@ static SeerStatus o8i_binds(SeerStmt *stmt, SeerWriter *w)
       st = SEER_ENOMEM;
       break;
     }
-    st = o8i_bind_value(&stmt->pbinds[made], &vals[made], &sizes[made]);
+    st = o8i_bind_value(&stmt->pbinds[made], row, &vals[made], &sizes[made]);
     if (st == SEER_OK && !seer_writer_ok(&vals[made]))
       st = SEER_ENOMEM;
   }
@@ -6063,6 +6085,159 @@ static SeerStatus o8i_binds(SeerStmt *stmt, SeerWriter *w)
   free(vals);
   free(sizes);
   return st;
+}
+
+/* ------------------------------------------------- 8i DML, DDL, COMMIT */
+
+/* The statement type 8i's OALL8 carries at al8i4[7] (seerdb o8i_stmt_type),
+ * from the first keyword: what isn't one of these - COMMIT, ROLLBACK,
+ * SAVEPOINT, SET TRANSACTION, GRANT, ... - is 0, a statement with no cursor
+ * of its own in the option word. */
+static uint32_t o8i_stmt_type(const char *sql)
+{
+  static const struct {
+    const char *kw;
+    uint32_t type;
+  } map[] = {
+      {"SELECT", O8I_STMT_SELECT}, {"UPDATE", O8I_STMT_UPDATE},   {"DELETE", O8I_STMT_DELETE},
+      {"INSERT", O8I_STMT_INSERT}, {"CREATE", O8I_STMT_CREATE},   {"DROP", O8I_STMT_DROP},
+      {"ALTER", O8I_STMT_ALTER},   {"TRUNCATE", O8I_STMT_CREATE},
+  };
+  const char *p = sql_first_keyword(sql);
+  for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+    if (starts_with_word(p, map[i].kw))
+      return map[i].type;
+  return O8I_STMT_TXN;
+}
+
+/* One 8i statement that isn't a query (seerdb PROTOCOL.md §19.12): the same
+ * OALL8, its option word PARSE | EXECUTE (0x21), + BIND (0x08) with binds,
+ * and 0x80 in the next byte for a cursor statement, none for transaction
+ * control; al8i4 says execute (1) and the type. `stmt` gives the binds, row
+ * `row`, or is NULL. The reply is an RPA and the status, or the status alone;
+ * the status is in *s, its cursor closed with the next call. */
+static SeerStatus o8i_call(SeerConn *c, SeerStmt *stmt, const char *sql, int row, O8iStatus *s)
+{
+  memset(s, 0, sizeof *s);
+  size_t sqllen = 0;
+  uint8_t *text = o8i_latin1(sql, &sqllen);
+  if (text == NULL)
+    return SEER_ENOMEM;
+  int nb = stmt != NULL ? stmt->npbinds : 0;
+  uint32_t type = o8i_stmt_type(sql);
+  uint32_t options = 0x21 | (nb > 0 ? 0x08 : 0) | (type != O8I_STMT_TXN ? 0x8000 : 0);
+  SeerWriter w;
+  if (!seer_writer_init(&w, 160 + sqllen + (size_t)nb * 32)) {
+    free(text);
+    return SEER_ENOMEM;
+  }
+  o8i_closing(c, &w);
+  o8i_all8(c, &w, options, 0, text, sqllen, true, 1, 0, (uint32_t)nb, 1, 1, type);
+  free(text);
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, row, &w) : SEER_OK;
+  if (st == SEER_OK)
+    st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  seer_writer_free(&w);
+  if (st != SEER_OK)
+    return st;
+
+  SeerWriter buf;
+  if (!seer_writer_init(&buf, 256))
+    return SEER_ENOMEM;
+  /* 8i marks no packet as a reply's last: read on until the status is whole,
+   * its message too. */
+  for (;;) {
+    st = o8i_recv_more(c, &buf);
+    if (st != SEER_OK)
+      break;
+    O8iRd r = {buf.buf, buf.len, 0, false, false};
+    o8i_read_status(&r, s);
+    if (r.bad) {
+      o8i_status_free(s);
+      st = SEER_EPROTO;
+      break;
+    }
+    if (!r.cut)
+      break;
+    o8i_status_free(s);
+  }
+  seer_writer_free(&buf);
+  if (st == SEER_OK && s->cursor != 0)
+    queue_cursor_close(c, s->cursor);
+  return st;
+}
+
+/* COMMIT or ROLLBACK: 8i has no TTI_COMMIT / TTI_ROLLBACK; they go as
+ * ordinary statements of type 0 (§19.12). */
+SeerStatus seer_o8i_tran(SeerConn *c, bool commit)
+{
+  O8iStatus s;
+  SeerStatus st = o8i_call(c, NULL, commit ? "COMMIT" : "ROLLBACK", 0, &s);
+  if (st == SEER_OK && s.code != 0)
+    st = o8i_fail(c, &s);
+  o8i_status_free(&s);
+  return st;
+}
+
+/* Record row `row`'s failure of a batch-errors array execute. */
+static void o8i_batch_error(SeerStmt *stmt, int row, O8iStatus *s)
+{
+  SeerBatchError *nb = realloc(stmt->berrs, (stmt->nberrs + 1) * sizeof *nb);
+  if (nb == NULL)
+    return;
+  stmt->berrs = nb;
+  nb[stmt->nberrs].row = (uint32_t)row;
+  nb[stmt->nberrs].code = s->code;
+  nb[stmt->nberrs].message = s->message;
+  s->message = NULL;
+  stmt->nberrs++;
+}
+
+/* INSERT / UPDATE / DELETE, DDL and the rest that isn't a query or a block.
+ * 8i has no array DML (its status has no batch-error arrays, §19.12), so an
+ * array execute goes a row at a time: it stops at the first failing row, as
+ * an array DML does, or with batch errors armed records the row and goes on.
+ * Autocommit commits after it, as on 9i. */
+static SeerStatus o8i_execute_dml(SeerStmt *stmt)
+{
+  SeerConn *c = stmt->conn;
+  free_rows(stmt);
+  free_columns(stmt->cols, stmt->ncols);
+  stmt->cols = NULL;
+  stmt->ncols = 0;
+  free_batch_errors(stmt);
+  stmt->compile_warning = false;
+  int rows = (stmt->npbinds > 0 && stmt->n_iters > 1) ? stmt->n_iters : 1;
+  bool keep_going = stmt->batch_errors && rows > 1;
+  long affected = 0;
+  for (int row = 0; row < rows; row++) {
+    O8iStatus s;
+    SeerStatus st = o8i_call(c, stmt, stmt->sql, row, &s);
+    if (st != SEER_OK)
+      return st;
+    if (s.code != 0 && s.code != 1403) {
+      if (keep_going) {
+        o8i_batch_error(stmt, row, &s);
+        o8i_status_free(&s);
+        continue;
+      }
+      stmt->affected = affected;
+      st = o8i_fail(c, &s);
+      o8i_status_free(&s);
+      return st;
+    }
+    affected += (long)s.rows;
+    /* A CREATE whose object compiled with errors succeeds; the warning flags
+     * say so (seerdb #2262). */
+    if (s.warnings & 0x20)
+      stmt->compile_warning = true;
+    o8i_status_free(&s);
+  }
+  stmt->affected = affected;
+  stmt->executed = true;
+  if (c->autocommit && o8i_stmt_type(stmt->sql) != O8I_STMT_TXN)
+    return seer_o8i_tran(c, true);
+  return SEER_OK;
 }
 
 static SeerStatus o8i_execute_select(SeerStmt *stmt)
@@ -6090,7 +6265,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   o8i_all8(c, &w, nb > 0 ? 0x8069 : 0x8061, 0, sql, sqllen, true, 1, 0, (uint32_t)nb, 1, 0,
            O8I_STMT_SELECT);
   free(sql);
-  SeerStatus st = nb > 0 ? o8i_binds(stmt, &w) : SEER_OK;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, &w) : SEER_OK;
   if (st != SEER_OK) {
     seer_writer_free(&w);
     return st;
@@ -6885,17 +7060,19 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
   stmt->conn->last_error = NULL;
   stmt->conn->last_error_offset = 0;
   if (stmt->conn->is_8i) {
-    /* Oracle 8i: its own 9.2-era OALL8 dialect (seerdb §19.9-19.10). Queries
-     * are spoken; DML, DDL and PL/SQL are not - refuse rather than send 9i's
-     * ALL7, which 8i never answers. */
-    if (classify_sql(stmt->sql) != STMT_SELECT) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: only queries are supported");
+    /* Oracle 8i: its own 9.2-era OALL8 dialect (seerdb §19.9-19.12):
+     * queries, DML, DDL and transaction control. PL/SQL blocks are not
+     * spoken yet (#134) - refuse rather than send 9i's ALL7, which 8i never
+     * answers. */
+    StmtKind kind = classify_sql(stmt->sql);
+    if (kind == STMT_BLOCK) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: PL/SQL blocks are not supported");
       return SEER_ENOTIMPL;
     }
-    SeerStatus bst = o8i_check_binds(stmt);
+    SeerStatus bst = o8i_check_binds(stmt, kind == STMT_SELECT);
     if (bst != SEER_OK)
       return bst;
-    return o8i_execute_select(stmt);
+    return kind == STMT_SELECT ? o8i_execute_select(stmt) : o8i_execute_dml(stmt);
   }
 
   /* Oracle 9i (fv2) speaks the TTI_ALL7 dialect, not TTI_ALL8: SELECT is a
