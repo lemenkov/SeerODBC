@@ -47,6 +47,8 @@ static void skip(const char *n, const char *w)
 
 /* The checks each release skips (gates.h). Ordered by check. */
 static const Gate GATES[] = {
+    {"a cached statement re-run with binds of other types", 8, 9, GATE_TODO,
+     "it binds doubles, which 8i refuses and 9i stores wrong (#151)"},
     {"BINARY_DOUBLE bind: refused on 8i, the value from 10g", 9, 9, GATE_TODO,
      "a double bind stores garbage on 9i (#151)"},
     {"a BFILE in a missing directory is the server's error", 9, 99, GATE_TODO,
@@ -2134,6 +2136,47 @@ static void check_table_nulls(void)
   }
 }
 
+/* The same SQL re-prepared with binds of other types: the statement cache
+ * reuses a parsed cursor only for binds of the types it was parsed with,
+ * else parses afresh. Reused regardless, SELECT :1 parsed for a double came
+ * back with a protocol error for an int or a text, and the next double wrong
+ * (#162). */
+static void check_cache_bind_types(void)
+{
+  const char *name = "a cached statement re-run with binds of other types";
+  GATE(name);
+  static const struct {
+    int kind;
+    const char *want;
+  } runs[] = {{0, "1.5"}, {0, "1.5"}, {2, "7"}, {3, "txt"}, {0, "1.5"}, {2, "7"}};
+  char m[160] = "";
+  for (size_t i = 0; i < sizeof runs / sizeof runs[0] && m[0] == '\0'; i++) {
+    SeerStmt *s = NULL;
+    const char *v = NULL;
+    int isn = 0;
+    SeerStatus st = seer_stmt_prepare(C, "SELECT :1 FROM dual", &s);
+    if (st == SEER_OK)
+      st = runs[i].kind == 0   ? seer_stmt_bind_double(s, 1, 1.5)
+           : runs[i].kind == 2 ? seer_stmt_bind_int64(s, 1, 7)
+                               : seer_stmt_bind_text(s, 1, "txt", -1);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+      seer_stmt_get_string(s, 0, &v, &isn);
+    /* A double reads back as the server prints it; compare it as a number. */
+    bool ok =
+        v != NULL && (runs[i].kind == 0 ? strtod(v, NULL) == 1.5 : strcmp(v, runs[i].want) == 0);
+    if (st != SEER_OK || !ok)
+      snprintf(m, sizeof m, "run %zu: status %d, '%s' (want %s)", i + 1, (int)st, v ? v : "",
+               runs[i].want);
+    seer_stmt_close(s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 int main(void)
 {
   if (gate_release_init() <= 0) {
@@ -2209,6 +2252,7 @@ int main(void)
   check_urowid();
   check_bfile_missing();
   check_table_nulls();
+  check_cache_bind_types();
   check_wrong_password(&p);
 
   seer_disconnect(C);
