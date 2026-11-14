@@ -5665,7 +5665,16 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell)
   if (!seer_writer_init(&v, 32))
     return SEER_ENOMEM;
   bool null = false;
-  if (t == ORA_TYPE_UROWID) {
+  bool lob = t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE;
+  if (lob) {
+    /* A ub4 length - the locator's, 86 for a CLOB or BLOB, not the content's -
+     * then the locator as a value; NULL is a zero length and the trailer
+     * alone, no locator (§19.10, §19.15, seerdb #387). */
+    if (o8r_le32(r) > 0)
+      o8r_value(r, &v);
+    else
+      null = true;
+  } else if (t == ORA_TYPE_UROWID) {
     if (o8r_le16(r) > 0)
       o8r_value(r, &v);
     else
@@ -5686,6 +5695,13 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell)
   SeerStatus st = SEER_OK;
   if (!r->cut && !r->bad && !null && seer_writer_ok(&v)) {
     switch (t) {
+    case ORA_TYPE_CLOB:
+    case ORA_TYPE_BLOB:
+    case ORA_TYPE_BFILE:
+      /* The locator, read for its content once the rows are in
+       * (o8i_resolve_lobs). */
+      st = cell_set_bytes(cell, v.buf, v.len, true);
+      break;
     case ORA_TYPE_VARCHAR:
     case ORA_TYPE_CHAR:
     case ORA_TYPE_LONG:
@@ -6293,6 +6309,214 @@ static SeerStatus o8i_execute_dml(SeerStmt *stmt)
   return SEER_OK;
 }
 
+/* ------------------------------------------------------- 8i LOB reads */
+
+/* One 8i TTI_LOBOPS request (seerdb _O7_LOBOPS at 8i's widths, §19.15,
+ * §19.17): the source locator's pointer and ub4 length, no destination, the
+ * ub4 source and destination offsets, no charset, the amount's and the null
+ * flag's pointers, the ub4 operation, no SCN, then the locator - as the row
+ * cell carried it - and the ub4 amount when asked for. */
+static SeerStatus o8i_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen, uint32_t op,
+                                 uint32_t offset, bool has_amount, uint32_t amount)
+{
+  SeerWriter w;
+  if (!seer_writer_init(&w, 64 + loclen))
+    return SEER_ENOMEM;
+  o8i_closing(c, &w);
+  seer_ttc_fun_header(c, &w, TTI_LOBOPS);
+  seer_writer_u8(&w, 1); /* source */
+  o8w_le32(&w, (uint32_t)loclen);
+  seer_writer_u8(&w, 0); /* destination */
+  o8w_le32(&w, 0);
+  o8w_le32(&w, offset);
+  o8w_le32(&w, 0);       /* destination offset */
+  seer_writer_u8(&w, 0); /* charset */
+  seer_writer_u8(&w, has_amount ? 1 : 0);
+  seer_writer_u8(&w, 0); /* null LOB */
+  o8w_le32(&w, op);
+  seer_writer_u8(&w, 0); /* SCN */
+  o8w_le32(&w, 0);
+  seer_writer_bytes(&w, loc, loclen);
+  if (has_amount)
+    o8w_le32(&w, amount);
+  SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  seer_writer_free(&w);
+  return st;
+}
+
+/* One LOBOPS call's reply, read whole (8i marks no packet a reply's last):
+ * for a READ the TTI_LOB content (0e, fe, ub1-length chunks, a zero; none
+ * for an empty LOB, seerdb #387) into `content`; then the RPA (seerdb
+ * _O7_LOBOPS_REPLY at 8i's widths: the locator as the server now has it, a
+ * big-endian ub2 length and the bytes, and the ub4 amount when the request
+ * asked for one - the length a GETLEN or READ gives, FILE_OPEN's mode) and
+ * the status. A call that fails sends the status alone. The locator into
+ * *loc when asked for (FILE_OPEN's, its open flag set), the amount into
+ * *amount. Measured on 8.1.7: `08 00 54 <84 bytes> 0a 00 00 00 04 ...` after
+ * a 10-character CLOB. */
+static SeerStatus o8i_lobop_reply(SeerConn *c, bool has_amount, SeerWriter *content, uint8_t **loc,
+                                  size_t *loclen, uint32_t *amount)
+{
+  SeerWriter buf;
+  if (!seer_writer_init(&buf, 512))
+    return SEER_ENOMEM;
+  SeerStatus st;
+  O8iStatus s = {0};
+  for (;;) {
+    st = o8i_recv_more(c, &buf);
+    if (st != SEER_OK)
+      break;
+    O8iRd r = {buf.buf, buf.len, 0, false, false};
+    if (o8r_has(&r, 1) && r.b[0] == TTI_LOB) {
+      r.pos = o8r_has(&r, 2) && r.b[1] == 0xFE ? 2 : 1;
+      for (;;) {
+        uint8_t cl = o8r_u8(&r);
+        if (r.cut || cl == 0)
+          break;
+        o8r_skip(&r, cl);
+        if (r.cut)
+          break;
+      }
+      if (r.cut)
+        continue;
+    }
+    if (o8r_has(&r, 1) && r.b[r.pos] == TTI_RPA) {
+      r.pos++;
+      uint32_t n = 0;
+      if (o8r_has(&r, 2)) {
+        n = (uint32_t)r.b[r.pos] << 8 | r.b[r.pos + 1];
+        r.pos += 2;
+      }
+      o8r_skip(&r, n);
+      if (has_amount)
+        (void)o8r_le32(&r);
+      if (r.cut)
+        continue;
+    }
+    o8i_status_free(&s);
+    o8i_read_status(&r, &s);
+    if (r.bad) {
+      st = SEER_EPROTO;
+      break;
+    }
+    if (!r.cut)
+      break;
+  }
+  if (st == SEER_OK && s.code != 0) {
+    st = o8i_fail(c, &s);
+  } else if (st == SEER_OK) {
+    /* Whole now: take the parts out. */
+    size_t pos = 0;
+    if (buf.buf[0] == TTI_LOB) {
+      uint8_t *data = NULL;
+      size_t dlen = 0;
+      bool complete = false;
+      fv2_parse_lob_chunks(buf.buf, buf.len, &data, &dlen, &complete);
+      if (content != NULL)
+        seer_writer_bytes(content, data, dlen);
+      free(data);
+      pos = buf.buf[1] == 0xFE ? 2 : 1;
+      while (pos < buf.len && buf.buf[pos] != 0)
+        pos += 1 + (size_t)buf.buf[pos];
+      pos++;
+    }
+    if (pos < buf.len && buf.buf[pos] == TTI_RPA && pos + 3 <= buf.len) {
+      size_t n = (size_t)buf.buf[pos + 1] << 8 | buf.buf[pos + 2];
+      if (loc != NULL && pos + 3 + n <= buf.len) {
+        *loc = malloc(2 + n);
+        if (*loc != NULL) {
+          memcpy(*loc, buf.buf + pos + 1, 2 + n); /* its length and the bytes */
+          *loclen = 2 + n;
+        }
+      }
+      if (amount != NULL && has_amount && pos + 3 + n + 4 <= buf.len) {
+        const uint8_t *a = buf.buf + pos + 3 + n;
+        *amount =
+            (uint32_t)a[0] | (uint32_t)a[1] << 8 | (uint32_t)a[2] << 16 | (uint32_t)a[3] << 24;
+      }
+    }
+    if (content != NULL && !seer_writer_ok(content))
+      st = SEER_ENOMEM;
+  }
+  o8i_status_free(&s);
+  seer_writer_free(&buf);
+  return st;
+}
+
+/* A CLOB's or BLOB's content (§19.15): one READ from offset 1 reads the whole
+ * value - 8i needs no GETLEN first, unlike 9i. */
+static SeerStatus o8i_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, SeerWriter *content)
+{
+  SeerStatus st = o8i_lobop_send(c, loc, loclen, LOB_OP_READ, 1, true, 0x40000000u);
+  return st == SEER_OK ? o8i_lobop_reply(c, true, content, NULL, NULL, NULL) : st;
+}
+
+/* A BFILE's content (§19.17): FILE_OPEN (mode 0x0b, read-only), whose reply
+ * carries the locator with its open flag set, which the rest use; GETLEN;
+ * READ that many bytes; FILE_CLOSE, whatever happened. */
+static SeerStatus o8i_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
+                                 SeerWriter *content)
+{
+  SeerStatus st = o8i_lobop_send(c, loc, loclen, LOB_OP_FILE_OPEN, 0, true, 0x0B);
+  uint8_t *opened = NULL;
+  size_t olen = 0;
+  if (st == SEER_OK)
+    st = o8i_lobop_reply(c, true, NULL, &opened, &olen, NULL);
+  if (st != SEER_OK)
+    return st;
+  if (opened == NULL)
+    return SEER_EPROTO;
+  uint32_t length = 0;
+  st = o8i_lobop_send(c, opened, olen, LOB_OP_GET_LENGTH, 0, true, 0);
+  if (st == SEER_OK)
+    st = o8i_lobop_reply(c, true, NULL, NULL, NULL, &length);
+  if (st == SEER_OK && length > 0) {
+    st = o8i_lobop_send(c, opened, olen, LOB_OP_READ, 1, true, length);
+    if (st == SEER_OK)
+      st = o8i_lobop_reply(c, true, content, NULL, NULL, NULL);
+  }
+  SeerStatus cst = o8i_lobop_send(c, opened, olen, LOB_OP_FILE_CLOSE, 0, false, 0);
+  if (cst == SEER_OK)
+    cst = o8i_lobop_reply(c, false, NULL, NULL, NULL, NULL);
+  free(opened);
+  return st != SEER_OK ? st : cst;
+}
+
+/* Read each LOB cell's content in place of its locator, while the cursor is
+ * open: a CLOB's text (in WE8ISO8859P1, the session's charset), a BLOB's or
+ * BFILE's bytes. */
+static SeerStatus o8i_resolve_lobs(SeerStmt *stmt)
+{
+  for (int col = 0; col < stmt->ncols; col++) {
+    uint8_t t = stmt->cols[col].ora_type;
+    if (t != ORA_TYPE_CLOB && t != ORA_TYPE_BLOB && t != ORA_TYPE_BFILE)
+      continue;
+    for (size_t row = 0; row < stmt->nrows; row++) {
+      SeerCell *cell = &stmt->rows[row][col];
+      if (cell->data == NULL)
+        continue; /* NULL */
+      SeerWriter content;
+      if (!seer_writer_init(&content, 256))
+        return SEER_ENOMEM;
+      const uint8_t *loc = (const uint8_t *)cell->data;
+      SeerStatus st = t == ORA_TYPE_BFILE ? o8i_bfile_read(stmt->conn, loc, cell->len, &content)
+                                          : o8i_lob_read(stmt->conn, loc, cell->len, &content);
+      if (st == SEER_OK) {
+        free(cell->data);
+        *cell = (SeerCell){0};
+        st = t == ORA_TYPE_CLOB
+                 ? o8i_text_cell(cell, content.buf, content.len)
+                 : cell_set_bytes(cell, content.len ? content.buf : (const uint8_t *)"",
+                                  content.len, true);
+      }
+      seer_writer_free(&content);
+      if (st != SEER_OK)
+        return st;
+    }
+  }
+  return SEER_OK;
+}
+
 /* ---------------------------------------------------- 8i PL/SQL blocks */
 
 static int fv2_placeholder_order(const char *sql, int *order, int max);
@@ -6564,13 +6788,6 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
     pos = r.pos;
     break;
   }
-  for (int i = 0; st == SEER_OK && i < stmt->ncols; i++) {
-    uint8_t t = stmt->cols[i].ora_type;
-    if (t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE) {
-      seer_log(SEER_LOG_WARNING, "o8i: LOB columns are not supported");
-      st = SEER_ENOTIMPL;
-    }
-  }
   if (st == SEER_OK)
     st = o8i_rows_reply(stmt, &buf, pos, &s);
   seer_writer_free(&buf);
@@ -6612,6 +6829,14 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
              stmt->nrows - before, (unsigned)s.code);
     if (stmt->nrows == before)
       break;
+  }
+  if (s.code == 0 || s.code == 1403) {
+    st = o8i_resolve_lobs(stmt);
+    if (st != SEER_OK) {
+      o8i_status_free(&s);
+      queue_cursor_close(c, cursor);
+      return st;
+    }
   }
   queue_cursor_close(c, cursor);
   if (s.code != 0 && s.code != 1403) {

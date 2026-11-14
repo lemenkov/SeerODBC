@@ -24,6 +24,11 @@ static void fail(const char *n, const char *w)
   printf("  FAIL %s: %s\n", n, w);
   fail_n++;
 }
+static void skip(const char *n, const char *w)
+{
+  printf("  SKIP %s: %s\n", n, w);
+  skip_n++;
+}
 
 static SeerConn *C;
 
@@ -669,6 +674,114 @@ static void check_returning(void)
   }
 }
 
+/* CLOB and BLOB columns (seerdb PROTOCOL.md §19.15, #135): each read in one
+ * TTI_LOBOPS READ after the rows are in; a CLOB's text comes in Latin-1. A
+ * short value, an empty one, a NULL, and 5000 bytes. */
+static void check_lobs(void)
+{
+  const char *name = "CLOB / BLOB columns: short, empty, NULL, 5000 bytes";
+  char m[512] = "";
+  run("DROP TABLE seer_lob8", NULL);
+  run("CREATE TABLE seer_lob8 (id NUMBER, c CLOB, b BLOB)", NULL);
+  run("INSERT INTO seer_lob8 VALUES (1, 'short caf\xc3\xa9', HEXTORAW('0102FF'))", NULL);
+  run("INSERT INTO seer_lob8 VALUES (2, EMPTY_CLOB(), EMPTY_BLOB())", NULL);
+  run("INSERT INTO seer_lob8 VALUES (3, NULL, NULL)", NULL);
+  static char big[5001];
+  memset(big, 'q', 5000);
+  big[5000] = '\0';
+  SeerStmt *s = NULL;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_lob8 VALUES (4, :1, NULL)", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, big, -1);
+    seer_stmt_execute(s);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  int ok = 0, rows = 0;
+  if (seer_stmt_prepare(C, "SELECT c, b FROM seer_lob8 ORDER BY id", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK) {
+    ok = 1;
+    while (seer_stmt_fetch(s) == SEER_OK) {
+      const void *cd = NULL, *bd = NULL;
+      size_t cl = 0, bl = 0;
+      int cn = 0, bn = 0, x = 0;
+      seer_stmt_get_data(s, 0, &cd, &cl, &cn, &x);
+      seer_stmt_get_data(s, 1, &bd, &bl, &bn, &x);
+      rows++;
+      bool row_ok = false;
+      if (rows == 1)
+        row_ok = !cn && cl == 11 && memcmp(cd, "short caf\xc3\xa9", 11) == 0 && !bn && bl == 3 &&
+                 memcmp(bd, "\x01\x02\xff", 3) == 0;
+      else if (rows == 2)
+        row_ok = !cn && cl == 0 && !bn && bl == 0;
+      else if (rows == 3)
+        row_ok = cn && bn;
+      else if (rows == 4)
+        row_ok = !cn && cl == 5000 && ((const char *)cd)[4999] == 'q' && bn;
+      if (!row_ok && ok) {
+        snprintf(m, sizeof m, "row %d: clob null=%d len=%zu, blob null=%d len=%zu", rows, cn, cl,
+                 bn, bl);
+        ok = 0;
+      }
+    }
+  } else
+    snprintf(m, sizeof m, "%s", seer_last_error(C) ? seer_last_error(C) : "query failed");
+  seer_stmt_close(s);
+  run("DROP TABLE seer_lob8", NULL);
+  if (ok && rows == 4)
+    pass(name);
+  else {
+    if (m[0] == '\0')
+      snprintf(m, sizeof m, "%d rows", rows);
+    fail(name, m);
+  }
+}
+
+/* A BFILE (§19.17): FILE_OPEN, GETLEN, READ and FILE_CLOSE. The bed's
+ * alert-log directory (ZZ_SEERDB_BD, the 8i VM's bdump) holds a file that
+ * is always there; its content is checked against the server's own length
+ * and first bytes. A missing directory is the server's error. */
+static void check_bfile(void)
+{
+  const char *name = "BFILE read, and a missing directory's error";
+  char n[32] = "";
+  query("SELECT DBMS_LOB.GETLENGTH(BFILENAME('ZZ_SEERDB_BD', 'ORCLALRT.LOG')) FROM dual", 0, 0, n,
+        sizeof n);
+  if (n[0] == '\0') {
+    skip(name, "directory ZZ_SEERDB_BD not readable by this account");
+    return;
+  }
+  SeerStmt *s = NULL;
+  size_t len = 0;
+  bool head = false;
+  if (seer_stmt_prepare(C, "SELECT BFILENAME('ZZ_SEERDB_BD', 'ORCLALRT.LOG') FROM dual", &s) ==
+          SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+    const void *d = NULL;
+    int isn = 0, isb = 0;
+    seer_stmt_get_data(s, 0, &d, &len, &isn, &isb);
+    head = d != NULL && len >= 9 && memcmp(d, "Dump file", 9) == 0;
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  SeerStatus miss = SEER_OK;
+  if (seer_stmt_prepare(C, "SELECT BFILENAME('NO_SUCH_DIR', 'x') FROM dual", &s) == SEER_OK)
+    miss = seer_stmt_execute(s);
+  bool miss_ok = miss == SEER_EDB && seer_last_error(C) != NULL &&
+                 strncmp(seer_last_error(C), "ORA-22285", 9) == 0;
+  seer_stmt_close(s);
+  char after[8];
+  query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
+  /* The alert log only grows: at least the length the server gave first. */
+  if (len > 0 && len >= (size_t)atol(n) && head && miss_ok && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "len=%zu (server %s) head=%d missing=%d then '%s'", len, n, (int)head,
+             (int)miss, after);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -701,6 +814,8 @@ int main(void)
   check_alter_session_and_compile();
   check_blocks();
   check_returning();
+  check_lobs();
+  check_bfile();
   check_wrong_password(&p);
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
