@@ -5343,9 +5343,9 @@ static void o8w_chr(SeerWriter *w, const uint8_t *p, size_t n)
 
 /* UTF-8 text in 8i's session charset, WE8ISO8859P1: a character it cannot hold
  * becomes the inverted question mark, as the server puts one (seerdb #2276). */
-static uint8_t *o8i_latin1(const char *u8, size_t *outlen)
+static uint8_t *o8i_latin1_n(const char *u8, size_t n, size_t *outlen)
 {
-  size_t n = strlen(u8), k = 0;
+  size_t k = 0;
   uint8_t *out = malloc(n + 1);
   if (out == NULL)
     return NULL;
@@ -5369,6 +5369,11 @@ static uint8_t *o8i_latin1(const char *u8, size_t *outlen)
   }
   *outlen = k;
   return out;
+}
+
+static uint8_t *o8i_latin1(const char *u8, size_t *outlen)
+{
+  return o8i_latin1_n(u8, strlen(u8), outlen);
 }
 
 /* Latin-1 bytes as a UTF-8 cell. */
@@ -5850,6 +5855,216 @@ static SeerStatus o8i_rows_reply(SeerStmt *stmt, SeerWriter *buf, size_t start, 
  * first batch, whose reply is the describe, rows and a status naming the
  * cursor; then fetch OALL8s by that cursor until a batch ends with ORA-01403
  * or brings no rows. The cursor is closed with the next call. */
+/* ------------------------------------------------------------ 8i IN binds */
+
+/* Whether 8i can take this bind (seerdb PROTOCOL.md §19.11): VARCHAR2 / CHAR,
+ * NUMBER, DATE and RAW values, and NULLs. `why` says what it can't take. */
+static bool o8i_bind_ok(const SeerBind *b, const char **why)
+{
+  if (b->is_out) {
+    *why = "OUT and IN OUT parameters";
+    return false;
+  }
+  if (b->is_array || b->oac_override != NULL || b->obj_type != NULL || b->temp_lob) {
+    *why = "array, object and LOB parameters";
+    return false;
+  }
+  if (b->oac_charset == 2000) {
+    *why = "national-character (NCHAR) parameters";
+    return false;
+  }
+  switch (b->oac_type) {
+  case 0: /* unbound: a NULL */
+  case ORA_TYPE_VARCHAR:
+  case ORA_TYPE_CHAR:
+  case ORA_TYPE_LONG:
+  case ORA_TYPE_NUMBER:
+  case ORA_TYPE_DATE:
+  case ORA_TYPE_RAW:
+  case ORA_TYPE_LONGRAW:
+    return true;
+  case ORA_TYPE_TIMESTAMP:
+  case ORA_TYPE_TIMESTAMPTZ:
+  case ORA_TYPE_TIMESTAMPLTZ:
+  case ORA_TYPE_INTERVAL_YM:
+  case ORA_TYPE_INTERVAL_DS:
+    *why = "TIMESTAMP and INTERVAL parameters (8.1.7 has neither type)";
+    return false;
+  case ORA_TYPE_BFLOAT:
+  case ORA_TYPE_BDOUBLE:
+    *why = "BINARY_FLOAT / BINARY_DOUBLE parameters (a 10g type)";
+    return false;
+  default:
+    *why = "parameters of this type";
+    return false;
+  }
+}
+
+static bool o8i_char_bind(const SeerBind *b)
+{
+  return b->oac_type == 0 || b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
+         b->oac_type == ORA_TYPE_LONG;
+}
+
+/* A value the pre-12.2 encode_chr wrote (a ub1 length, or 0xFE, ub1-length
+ * chunks and a zero), back to its bytes. */
+static SeerStatus o8i_unchunk(const uint8_t *v, size_t n, SeerWriter *out)
+{
+  if (n == 0)
+    return SEER_EPROTO;
+  if (v[0] != 0xFE) {
+    if ((size_t)v[0] + 1 > n)
+      return SEER_EPROTO;
+    seer_writer_bytes(out, v + 1, v[0]);
+    return SEER_OK;
+  }
+  for (size_t pos = 1; pos < n;) {
+    uint8_t cl = v[pos++];
+    if (cl == 0)
+      return SEER_OK;
+    if (pos + cl > n)
+      return SEER_EPROTO;
+    seer_writer_bytes(out, v + pos, cl);
+    pos += cl;
+  }
+  return SEER_EPROTO;
+}
+
+/* One bind's value as 8i reads it (§19.11), into `val`; its declared size into
+ * *size. Text goes in WE8ISO8859P1, the session's charset, as the SQL does; a
+ * NULL is the empty value 00; NUMBER, DATE and RAW are the bytes the bind
+ * stored. */
+static SeerStatus o8i_bind_value(const SeerBind *b, SeerWriter *val, uint32_t *size)
+{
+  const uint8_t *v = b->rxd != NULL ? b->rxd[0] : NULL;
+  size_t vn = b->rxd != NULL ? b->rxd_len[0] : 0;
+  if (v == NULL || vn == 0 || (vn == 1 && v[0] == 0)) {
+    seer_writer_u8(val, 0);
+    *size = b->oac_size ? b->oac_size : 1;
+    return SEER_OK;
+  }
+  if (!o8i_char_bind(b)) {
+    seer_writer_bytes(val, v, vn);
+    *size = b->oac_size ? b->oac_size : 1;
+    return SEER_OK;
+  }
+  SeerWriter u8;
+  if (!seer_writer_init(&u8, vn))
+    return SEER_ENOMEM;
+  SeerStatus st = o8i_unchunk(v, vn, &u8);
+  size_t ln = 0;
+  uint8_t *l1 =
+      st == SEER_OK && seer_writer_ok(&u8) ? o8i_latin1_n((const char *)u8.buf, u8.len, &ln) : NULL;
+  seer_writer_free(&u8);
+  if (st != SEER_OK)
+    return st;
+  if (l1 == NULL)
+    return SEER_ENOMEM;
+  o8w_chr(val, l1, ln);
+  free(l1);
+  *size = ln ? (uint32_t)ln : 1;
+  return SEER_OK;
+}
+
+/* One bind's descriptor (§19.11), 25 bytes, the describe column's OAC at 8i's
+ * widths: the type, 0x03, two zero bytes, max_size as a little-endian ub2,
+ * thirteen zero bytes, the charset (big-endian ub4: 31, WE8ISO8859P1, for
+ * text), a zero and the form. Text goes as VARCHAR2 whatever its length: past
+ * 4000 bytes the server reads it as LONG, after the others (o8i_binds). */
+static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
+{
+  uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1;
+  uint32_t charset = 31;
+  switch (b->oac_type) {
+  case ORA_TYPE_NUMBER:
+    type = ORA_TYPE_NUMBER, size = 22, charset = 0, csfrm = 0;
+    break;
+  case ORA_TYPE_DATE:
+    type = ORA_TYPE_DATE, size = 7, charset = 0, csfrm = 0;
+    break;
+  case ORA_TYPE_RAW:
+  case ORA_TYPE_LONGRAW:
+    type = ORA_TYPE_RAW, charset = 0, csfrm = 0;
+    break;
+  default:
+    break;
+  }
+  if (size > 0xFFFF)
+    size = 0xFFFF;
+  seer_writer_u8(w, type);
+  seer_writer_u8(w, 0x03);
+  seer_writer_u8(w, 0);
+  seer_writer_u8(w, 0);
+  seer_writer_u8(w, (uint8_t)(size & 0xFF));
+  seer_writer_u8(w, (uint8_t)(size >> 8));
+  for (int i = 0; i < 13; i++)
+    seer_writer_u8(w, 0);
+  for (int i = 3; i >= 0; i--)
+    seer_writer_u8(w, (uint8_t)(charset >> (8 * i)));
+  seer_writer_u8(w, 0);
+  seer_writer_u8(w, csfrm);
+}
+
+/* The statement's binds, refused before anything is sent when 8i can't take
+ * one: SEER_ENOTIMPL, the reason logged. */
+static SeerStatus o8i_check_binds(SeerStmt *stmt)
+{
+  if (stmt->npbinds > 0 && stmt->n_iters > 1) {
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: an array execute is not supported");
+    return SEER_ENOTIMPL;
+  }
+  for (int i = 0; i < stmt->npbinds; i++) {
+    const char *why = NULL;
+    if (!o8i_bind_ok(&stmt->pbinds[i], &why)) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: %s are not supported (parameter %d)", why,
+               i + 1);
+      return SEER_ENOTIMPL;
+    }
+  }
+  return SEER_OK;
+}
+
+/* The bind section an OALL8 with binds ends in (§19.11): every bind's
+ * descriptor, one 0x07, then every value. A value declared past 4000 bytes is
+ * LONG-class, and 8i, as 10g+ (§5.4), reads it after the others: written in
+ * place, it swapped with the next bind. */
+static SeerStatus o8i_binds(SeerStmt *stmt, SeerWriter *w)
+{
+  int nb = stmt->npbinds;
+  SeerWriter *vals = calloc((size_t)nb, sizeof *vals);
+  uint32_t *sizes = calloc((size_t)nb, sizeof *sizes);
+  SeerStatus st = (vals == NULL || sizes == NULL) ? SEER_ENOMEM : SEER_OK;
+  int made = 0;
+  for (; st == SEER_OK && made < nb; made++) {
+    if (!seer_writer_init(&vals[made], 32)) {
+      st = SEER_ENOMEM;
+      break;
+    }
+    st = o8i_bind_value(&stmt->pbinds[made], &vals[made], &sizes[made]);
+    if (st == SEER_OK && !seer_writer_ok(&vals[made]))
+      st = SEER_ENOMEM;
+  }
+  if (st == SEER_OK) {
+    for (int i = 0; i < nb; i++)
+      o8i_bind_oac(w, &stmt->pbinds[i], sizes[i]);
+    seer_writer_u8(w, TTI_RXD);
+    for (int pass = 0; pass < 2; pass++)
+      for (int i = 0; i < nb; i++) {
+        const SeerBind *b = &stmt->pbinds[i];
+        bool varlen =
+            o8i_char_bind(b) || b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW;
+        bool is_long = varlen && sizes[i] > 4000;
+        if (is_long == (pass == 1))
+          seer_writer_bytes(w, vals[i].buf, vals[i].len);
+      }
+  }
+  for (int i = 0; i < made && vals != NULL; i++)
+    seer_writer_free(&vals[i]);
+  free(vals);
+  free(sizes);
+  return st;
+}
+
 static SeerStatus o8i_execute_select(SeerStmt *stmt)
 {
   SeerConn *c = stmt->conn;
@@ -5863,16 +6078,24 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   if (sql == NULL)
     return SEER_ENOMEM;
   SeerWriter w;
-  if (!seer_writer_init(&w, 160 + sqllen)) {
+  if (!seer_writer_init(&w, 160 + sqllen + (size_t)stmt->npbinds * 32)) {
     free(sql);
     return SEER_ENOMEM;
   }
   o8i_closing(c, &w);
-  /* PARSE | EXECUTE | FETCH (0x61), then 0x80: a cursor statement. A query's
-   * execute waits for its fetch: al8i4[1] (the execute flag) is 0. */
-  o8i_all8(c, &w, 0x8061, 0, sql, sqllen, true, 1, 0, 0, 1, 0, O8I_STMT_SELECT);
+  /* PARSE | EXECUTE | FETCH (0x61), + BIND (0x08) with binds, then 0x80: a
+   * cursor statement. A query's execute waits for its fetch: al8i4[1] (the
+   * execute flag) is 0. */
+  int nb = stmt->npbinds;
+  o8i_all8(c, &w, nb > 0 ? 0x8069 : 0x8061, 0, sql, sqllen, true, 1, 0, (uint32_t)nb, 1, 0,
+           O8I_STMT_SELECT);
   free(sql);
-  SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, &w) : SEER_OK;
+  if (st != SEER_OK) {
+    seer_writer_free(&w);
+    return st;
+  }
+  st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   if (st != SEER_OK)
     return st;
@@ -6669,12 +6892,9 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
       seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: only queries are supported");
       return SEER_ENOTIMPL;
     }
-    /* Its queries go without binds: sent anyway, the server answered
-     * ORA-01008 (not all variables bound), as if the caller had not bound. */
-    if (stmt->npbinds > 0) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: queries with bind parameters are not supported");
-      return SEER_ENOTIMPL;
-    }
+    SeerStatus bst = o8i_check_binds(stmt);
+    if (bst != SEER_OK)
+      return bst;
     return o8i_execute_select(stmt);
   }
 

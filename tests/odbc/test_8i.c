@@ -287,6 +287,102 @@ static void check_wrong_password(const SeerConnParams *good)
   }
 }
 
+/* Row 0 of a bound query, its columns joined with '|' into `out` (NULL for a
+ * NULL); the execute's status. */
+static SeerStatus bound_row(SeerStmt *s, char *out, size_t osz)
+{
+  out[0] = '\0';
+  SeerStatus st = seer_stmt_execute(s);
+  if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+    for (int i = 0; i < seer_stmt_num_cols(s); i++) {
+      const char *v = NULL;
+      int isn = 0;
+      seer_stmt_get_string(s, i, &v, &isn);
+      size_t k = strlen(out);
+      snprintf(out + k, osz - k, "%s%s", i ? "|" : "", isn || v == NULL ? "NULL" : v);
+    }
+  return st;
+}
+
+/* IN binds (seerdb PROTOCOL.md §19.11, #132): NUMBER, text (in Latin-1, inline
+ * and past 64 bytes in chunks), NULL, DATE and RAW, and a bound WHERE. */
+static void check_binds(void)
+{
+  const char *name = "IN binds: NUMBER, text, NULL, DATE, RAW";
+  char a[128] = "", b[128] = "", c[128] = "", d[64] = "";
+  SeerStmt *s = NULL;
+  char wide[301];
+  memset(wide, 'x', 300);
+  wide[300] = '\0';
+  if (seer_stmt_prepare(C, "SELECT :1 + :2, :3 || '-' || :4, LENGTH(:5) FROM dual", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 40);
+    seer_stmt_bind_int64(s, 2, 2);
+    seer_stmt_bind_text(s, 3, "abc", -1);
+    seer_stmt_bind_text(s, 4,
+                        "d\xc3\xa9"
+                        "f",
+                        -1);
+    seer_stmt_bind_text(s, 5, wide, -1);
+    bound_row(s, a, sizeof a);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT NVL(:1, 'none'), NVL(:2, 7) + 0 FROM dual", &s) == SEER_OK) {
+    seer_stmt_bind_null(s, 1);
+    seer_stmt_bind_null_typed(s, 2, 2);
+    bound_row(s, b, sizeof b);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS'), RAWTOHEX(:2) FROM dual",
+                        &s) == SEER_OK) {
+    seer_stmt_bind_date(s, 1, 2001, 2, 3, 4, 5, 6);
+    seer_stmt_bind_raw(s, 2, "\x01\xab\xff", 3);
+    bound_row(s, c, sizeof c);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT COUNT(*) FROM all_users WHERE username = :1", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, "SYSTEM", -1);
+    bound_row(s, d, sizeof d);
+  }
+  seer_stmt_close(s);
+  if (strcmp(a, "42|abc-d\xc3\xa9"
+                "f|300") == 0 &&
+      strcmp(b, "none|7") == 0 && strcmp(c, "2001-02-03 04:05:06|01ABFF") == 0 &&
+      strcmp(d, "1") == 0)
+    pass(name);
+  else {
+    char m[512];
+    snprintf(m, sizeof m, "'%s' / '%s' / '%s' / '%s'", a, b, c, d);
+    fail(name, m);
+  }
+}
+
+/* A bind 8i can't take (BINARY_DOUBLE, a 10g type) is refused before anything
+ * is sent, and the session goes on. */
+static void check_bind_refused(void)
+{
+  const char *name = "a BINARY_DOUBLE bind is refused, the session goes on";
+  SeerStmt *s = NULL;
+  SeerStatus st = SEER_OK;
+  if (seer_stmt_prepare(C, "SELECT :1 FROM dual", &s) == SEER_OK) {
+    seer_stmt_bind_double(s, 1, 1.5);
+    st = seer_stmt_execute(s);
+  }
+  seer_stmt_close(s);
+  char after[16];
+  query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
+  if (st == SEER_ENOTIMPL && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "status %d, then '%s'", (int)st, after);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -312,6 +408,8 @@ int main(void)
   check_long_sql();
   check_rowid();
   check_cursor_hygiene();
+  check_binds();
+  check_bind_refused();
   check_wrong_password(&p);
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);

@@ -34,11 +34,10 @@
 static int n_pass, n_fail, n_skip;
 
 /* Known gaps of the legacy tiers. Oracle 8i and 9i speak their own dialects,
- * and SeerODBC supports them as far as a user needs them: 9i for queries,
- * DML and PL/SQL, 8i for queries only (AGENTS.md: stop a legacy dialect once
- * it is usable). A check listed here, on a server older than `below`
- * (9 = 8i only, 10 = 8i and 9i), is reported as SKIP with the reason rather
- * than as a failure. Anything not listed still fails, so a regression in what
+ * and some checks need what those releases lack, or what SeerODBC doesn't
+ * speak to them yet (8i: DML, DDL and PL/SQL, #133-#134). A check listed
+ * here, on a server older than `below` (9 = 8i only, 10 = 8i and 9i), is
+ * reported as SKIP with the reason rather than as a failure. Anything not listed still fails, so a regression in what
  * these tiers do support shows. g_major is the connected server's release. */
 static int g_major;
 typedef struct {
@@ -67,29 +66,28 @@ static const KnownGap known_gaps[] = {
     {10, "REF fetch", "object types are not read before 10g"},
     {10, "XMLType fetch", "XMLType is not read before 10g"},
     {10, "XMLType fetch (LOB-backed)", "XMLType is not read before 10g"},
-    /* 8i: queries only, without binds */
-    {9, "zero-fraction TIMESTAMP bind matches trunc(LTZ)", "8i: queries only, without binds"},
-    {9, "aggregate over an all-NULL group (OER warning flags)", "8i: queries only, without binds"},
-    {9, "252/253/254-byte bind value and SQL text", "8i: queries only, without binds"},
-    {9, "typed NULL parameter (COALESCE with NUMBER / DATE)", "8i: queries only, without binds"},
-    {9, "leading comments / labels / CALL keep the statement kind",
-     "8i: queries only, without binds"},
-    {9, "describe after SQLPrepare, before SQLExecute", "8i: queries only, without binds"},
-    {9, "LONG column over 252 bytes", "8i: queries only (no DDL to set it up)"},
-    {9, "CLOB / BLOB columns across fetch batches", "8i: queries only (no DDL to set it up)"},
-    {9, "compilation errors reported as SUCCESS_WITH_INFO (ORA-24344)", "8i: queries only"},
-    {9, "ALTER SESSION SET CURRENT_SCHEMA / EDITION", "8i: queries only"},
-    {9, "bind param (?+?)", "8i: queries only, without binds"},
-    {9, "DDL create", "8i: queries only"},
-    {9, "DML RETURNING INTO", "8i: queries only"},
-    {9, "large CLOB bind (fragmented)", "8i: queries only, without binds"},
-    {9, "medium string bind (chunked)", "8i: queries only, without binds"},
-    {9, "TIMESTAMP bind (fractional)", "8i: queries only, without binds"},
-    {9, "INTERVAL bind", "8i: queries only, without binds"},
-    {9, "array DML row counts", "8i: queries only"},
+    /* 8i: what 8.1.7 itself lacks */
+    {9, "zero-fraction TIMESTAMP bind matches trunc(LTZ)", "8.1.7 has no TIMESTAMP type"},
+    {9, "TIMESTAMP bind (fractional)", "8.1.7 has no TIMESTAMP type"},
+    {9, "INTERVAL bind", "8.1.7 has no INTERVAL types"},
+    {9, "typed NULL parameter (COALESCE with NUMBER / DATE)", "8.1.7 has no COALESCE"},
     {9, "multi-batch fetch with a repeated column", "8i has no CONNECT BY level row generator"},
     {9, "CLOB fetch", "8i has no TO_CLOB"},
     {9, "BLOB fetch (hex)", "8i has no TO_BLOB"},
+    {9, "describe after SQLPrepare, before SQLExecute", "8i describes a query as it executes"},
+    /* 8i: not spoken yet - DML / DDL (#133), PL/SQL blocks (#134) */
+    {9, "aggregate over an all-NULL group (OER warning flags)", "8i: no DDL yet (#133)"},
+    {9, "medium string bind (chunked)", "8i: no DDL yet (#133)"},
+    {9, "LONG column over 252 bytes", "8i: no DDL yet (#133)"},
+    {9, "CLOB / BLOB columns across fetch batches", "8i: no DDL yet (#133)"},
+    {9, "ALTER SESSION SET CURRENT_SCHEMA / EDITION", "8i: no ALTER SESSION yet (#133)"},
+    {9, "DDL create", "8i: no DDL yet (#133)"},
+    {9, "large CLOB bind (fragmented)", "8i: no DML yet (#133)"},
+    {9, "array DML row counts", "8i: no DML yet (#133)"},
+    {9, "compilation errors reported as SUCCESS_WITH_INFO (ORA-24344)", "8i: no DDL yet (#133)"},
+    {9, "leading comments / labels / CALL keep the statement kind",
+     "8i: no PL/SQL blocks yet (#134)"},
+    {9, "DML RETURNING INTO", "8i: no PL/SQL blocks yet (#134)"},
 };
 
 /* The reason `name` is a known gap of the connected server, or NULL. */
