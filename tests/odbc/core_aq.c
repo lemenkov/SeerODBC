@@ -1,13 +1,9 @@
-/* Live test for Advanced Queuing (AQ) RAW enqueue against the core protocol API.
+/* test_core: Advanced Queuing (AQ) through the core API.
  *
- * Self-gating: exits 77 (skip) unless SEER_TEST_HOST/SERVICE/USER are set, so it
- * is harmless in an offline `meson test`. Sets up a RAW queue via DBMS_AQADM,
- * enqueues a message, and confirms it landed (count + payload). AQ enqueue is
- * 12c+; on an older server it returns "not implemented" and the test skips, as
- * it does where DBMS_AQADM isn't available to the test user.
- *
- *   SEER_TEST_HOST, SEER_TEST_PORT (default 1521), SEER_TEST_SERVICE,
- *   SEER_TEST_USER, SEER_TEST_PASS
+ * Sets up queues with DBMS_AQADM and round-trips messages through them: RAW
+ * enqueue and dequeue, correlation and browse, array (bulk) enqueue and
+ * dequeue, multi-consumer, object and JSON payloads. Where DBMS_AQADM isn't
+ * available to the test account, the checks are skipped with that reason.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -16,38 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "seer/seertns.h"
-
-static int pass_n, fail_n, skip_n;
-static void pass(const char *n)
-{
-  printf("  PASS %s\n", n);
-  pass_n++;
-}
-static void fail(const char *n, const char *w)
-{
-  printf("  FAIL %s: %s\n", n, w);
-  fail_n++;
-}
-static void skip(const char *n, const char *w)
-{
-  printf("  SKIP %s: %s\n", n, w);
-  skip_n++;
-}
-
-static SeerConn *connect_one(void)
-{
-  const char *port = getenv("SEER_TEST_PORT");
-  SeerConnParams p = {
-      .host = getenv("SEER_TEST_HOST"),
-      .port = (uint16_t)(port ? atoi(port) : 1521),
-      .service_name = getenv("SEER_TEST_SERVICE"),
-      .username = getenv("SEER_TEST_USER"),
-      .password = getenv("SEER_TEST_PASS"),
-  };
-  SeerConn *c = NULL;
-  return seer_connect(&p, &c) == SEER_OK ? c : NULL;
-}
+#include "core.h"
 
 static void exec_sql(SeerConn *c, const char *sql)
 {
@@ -74,16 +39,24 @@ static long qt_count(SeerConn *c)
   return n;
 }
 
-int main(void)
+/* The checks, in the order they run. */
+static const char *const AQ_CHECKS[] = {
+    "AQ RAW enqueue",      "AQ RAW dequeue",    "AQ options (correlation + browse)",
+    "AQ array round-trip", "AQ multi-consumer", "AQ object payload",
+    "AQ JSON payload",
+};
+
+void core_aq(void)
 {
-  if (!getenv("SEER_TEST_HOST") || !getenv("SEER_TEST_SERVICE") || !getenv("SEER_TEST_USER")) {
-    fprintf(stderr, "aq_test: set SEER_TEST_HOST/SERVICE/USER[/PORT/PASS] - skipping\n");
-    return 77;
-  }
-  SeerConn *c = connect_one();
-  if (!c) {
-    fprintf(stderr, "aq_test: connect failed\n");
-    return 1;
+  int gated = 0;
+  for (size_t i = 0; i < sizeof AQ_CHECKS / sizeof AQ_CHECKS[0]; i++)
+    gated |= gated_as("AQ", AQ_CHECKS[i]);
+  if (gated)
+    return;
+  SeerConn *c = core_connect();
+  if (c == NULL) {
+    fail("AQ RAW enqueue", "connect failed");
+    return;
   }
 
   const char *name = "AQ RAW enqueue";
@@ -100,29 +73,14 @@ int main(void)
   seer_commit(c);
 
   if (qt_count(c) < 0) {
-    skip(name, "DBMS_AQADM / queue not available to this user");
-    skip("AQ RAW dequeue", "DBMS_AQADM / queue not available to this user");
-    skip("AQ options (correlation + browse)", "DBMS_AQADM / queue not available");
-    skip("AQ object payload", "DBMS_AQADM / queue not available");
-    skip("AQ array round-trip", "DBMS_AQADM / queue not available");
-    skip("AQ multi-consumer", "DBMS_AQADM / queue not available");
-    skip("AQ JSON payload", "DBMS_AQADM / queue not available");
+    for (size_t i = 0; i < sizeof AQ_CHECKS / sizeof AQ_CHECKS[0]; i++)
+      skip(AQ_CHECKS[i], "DBMS_AQADM isn't available to the test account");
     goto done;
   }
 
   const char *msg = "hello-aq";
   uint8_t msgid[16] = {0};
   SeerStatus st = seer_aq_enq_raw(c, "SEER_Q", (const uint8_t *)msg, strlen(msg), msgid);
-  if (st == SEER_ENOTIMPL) {
-    skip(name, "AQ enqueue requires a 12c+ server");
-    skip("AQ RAW dequeue", "AQ requires a 12c+ server");
-    skip("AQ options (correlation + browse)", "AQ requires a 12c+ server");
-    skip("AQ object payload", "AQ requires a 12c+ server");
-    skip("AQ array round-trip", "AQ requires a 12c+ server");
-    skip("AQ multi-consumer", "AQ requires a 12c+ server");
-    skip("AQ JSON payload", "AQ requires a 12c+ server");
-    goto done;
-  }
   seer_commit(c);
 
   int nz = 0;
@@ -310,60 +268,57 @@ int main(void)
   exec_sql(c, "DROP TYPE seer_aqo FORCE");
 
   /* JSON payload (native binary JSON): enqueue a document, dequeue it back. The
-   * queue table needs an ASSM tablespace for the JSON type; skip where JSON
-   * queues aren't available (older server / no such tablespace). */
-  const char *jname = "AQ JSON payload";
-  exec_sql(c, "BEGIN DBMS_AQADM.STOP_QUEUE('SEER_JQ'); EXCEPTION WHEN OTHERS THEN NULL; END;");
-  exec_sql(c, "BEGIN DBMS_AQADM.DROP_QUEUE('SEER_JQ'); EXCEPTION WHEN OTHERS THEN NULL; END;");
-  exec_sql(c,
-           "BEGIN DBMS_AQADM.DROP_QUEUE_TABLE('SEER_JQT'); EXCEPTION WHEN OTHERS THEN NULL; END;");
-  exec_sql(c, "BEGIN DBMS_AQADM.CREATE_QUEUE_TABLE(queue_table=>'SEER_JQT', "
-              "queue_payload_type=>'JSON', storage_clause=>'TABLESPACE USERS'); END;");
-  exec_sql(c,
-           "BEGIN DBMS_AQADM.CREATE_QUEUE(queue_name=>'SEER_JQ', queue_table=>'SEER_JQT'); END;");
-  exec_sql(c, "BEGIN DBMS_AQADM.START_QUEUE('SEER_JQ'); END;");
-  seer_commit(c);
+   * queue table needs an ASSM tablespace (USERS) for the JSON type. */
+  if (!gated_as("AQ JSON payload", "AQ JSON payload")) {
+    const char *jname = "AQ JSON payload";
+    exec_sql(c, "BEGIN DBMS_AQADM.STOP_QUEUE('SEER_JQ'); EXCEPTION WHEN OTHERS THEN NULL; END;");
+    exec_sql(c, "BEGIN DBMS_AQADM.DROP_QUEUE('SEER_JQ'); EXCEPTION WHEN OTHERS THEN NULL; END;");
+    exec_sql(
+        c, "BEGIN DBMS_AQADM.DROP_QUEUE_TABLE('SEER_JQT'); EXCEPTION WHEN OTHERS THEN NULL; END;");
+    exec_sql(c, "BEGIN DBMS_AQADM.CREATE_QUEUE_TABLE(queue_table=>'SEER_JQT', "
+                "queue_payload_type=>'JSON', storage_clause=>'TABLESPACE USERS'); END;");
+    exec_sql(c,
+             "BEGIN DBMS_AQADM.CREATE_QUEUE(queue_name=>'SEER_JQ', queue_table=>'SEER_JQT'); END;");
+    exec_sql(c, "BEGIN DBMS_AQADM.START_QUEUE('SEER_JQ'); END;");
+    seer_commit(c);
 
-  long jc = -1;
-  SeerStmt *js = NULL;
-  if (seer_stmt_prepare(c, "SELECT COUNT(*) FROM SEER_JQT", &js) == SEER_OK &&
-      seer_stmt_execute(js) == SEER_OK && seer_stmt_fetch(js) == SEER_OK) {
-    const char *v = NULL;
-    int isnull = 0;
-    seer_stmt_get_string(js, 0, &v, &isnull);
-    jc = v ? atol(v) : -1;
-  }
-  seer_stmt_close(js);
-
-  if (jc < 0) {
-    skip(jname, "JSON queue not available (needs 21c+ and an ASSM tablespace)");
-  } else {
-    const char *doc = "{\"id\":42,\"nm\":\"hi\"}";
-    uint8_t jm[16] = {0};
-    SeerStatus je = seer_aq_enq_json(c, "SEER_JQ", doc, jm);
-    if (je == SEER_ENOTIMPL) {
-      skip(jname, "JSON queues need a 20.1+ server");
-    } else {
-      seer_commit(c);
-      char *jt = NULL;
-      SeerStatus jd = seer_aq_deq_json(c, "SEER_JQ", 0, &jt, NULL);
-      int ok = (je == SEER_OK && jd == SEER_OK && jt && strstr(jt, "\"id\":42") &&
-                strstr(jt, "\"nm\":\"hi\""));
-      free(jt);
-      seer_commit(c);
-      if (ok)
-        pass(jname);
-      else
-        fail(jname, seer_last_error(c) ? seer_last_error(c) : "json enqueue/dequeue");
+    long jc = -1;
+    SeerStmt *js = NULL;
+    if (seer_stmt_prepare(c, "SELECT COUNT(*) FROM SEER_JQT", &js) == SEER_OK &&
+        seer_stmt_execute(js) == SEER_OK && seer_stmt_fetch(js) == SEER_OK) {
+      const char *v = NULL;
+      int isnull = 0;
+      seer_stmt_get_string(js, 0, &v, &isnull);
+      jc = v ? atol(v) : -1;
     }
+    seer_stmt_close(js);
+
+    if (jc < 0) {
+      skip(jname, "no ASSM tablespace USERS for the JSON queue table");
+    } else {
+      const char *doc = "{\"id\":42,\"nm\":\"hi\"}";
+      uint8_t jm[16] = {0};
+      SeerStatus je = seer_aq_enq_json(c, "SEER_JQ", doc, jm);
+      {
+        seer_commit(c);
+        char *jt = NULL;
+        SeerStatus jd = seer_aq_deq_json(c, "SEER_JQ", 0, &jt, NULL);
+        int ok = (je == SEER_OK && jd == SEER_OK && jt && strstr(jt, "\"id\":42") &&
+                  strstr(jt, "\"nm\":\"hi\""));
+        free(jt);
+        seer_commit(c);
+        if (ok)
+          pass(jname);
+        else
+          fail(jname, seer_last_error(c) ? seer_last_error(c) : "json enqueue/dequeue");
+      }
+    }
+    exec_sql(c, "BEGIN DBMS_AQADM.STOP_QUEUE('SEER_JQ'); DBMS_AQADM.DROP_QUEUE('SEER_JQ'); "
+                "DBMS_AQADM.DROP_QUEUE_TABLE('SEER_JQT'); EXCEPTION WHEN OTHERS THEN NULL; END;");
   }
-  exec_sql(c, "BEGIN DBMS_AQADM.STOP_QUEUE('SEER_JQ'); DBMS_AQADM.DROP_QUEUE('SEER_JQ'); "
-              "DBMS_AQADM.DROP_QUEUE_TABLE('SEER_JQT'); EXCEPTION WHEN OTHERS THEN NULL; END;");
 
 done:
   exec_sql(c, "BEGIN DBMS_AQADM.STOP_QUEUE('SEER_Q'); DBMS_AQADM.DROP_QUEUE('SEER_Q'); "
               "DBMS_AQADM.DROP_QUEUE_TABLE('SEER_QT'); EXCEPTION WHEN OTHERS THEN NULL; END;");
   seer_disconnect(c);
-  printf("\nAQ: %d passed, %d failed, %d skipped\n", pass_n, fail_n, skip_n);
-  return fail_n ? 1 : 0;
 }

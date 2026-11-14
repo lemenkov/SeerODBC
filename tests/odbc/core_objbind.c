@@ -1,55 +1,17 @@
-/* Live test for SQL OBJECT (ADT) and collection (VARRAY/nested table) parameter
- * binding against the core API.
- *
- * Self-gating: exits 77 (skip) unless SEER_TEST_HOST/SERVICE/USER are set. Binds
- * an object and a VARRAY, inserts each, and reads them back through the decode
- * path. Object/collection binds are 12c+; older servers skip.
+/* test_core: SQL OBJECT (ADT), collection (VARRAY / nested table) and
+ * PL/SQL-type parameter binds through the core API, with the native JSON,
+ * VECTOR and XMLType binds. Each binds a value, runs it, and reads it back
+ * through the decode path.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
-#include "seer/seertns.h"
-
-static int pass_n, fail_n, skip_n;
-static void pass(const char *n)
-{
-  printf("  PASS %s\n", n);
-  pass_n++;
-}
-/* Failures are also kept to repeat on stderr at the end: a CI runner showing
- * only a failed test's last lines of stderr then still names them. */
-static char fail_log[4096];
-static void fail(const char *n, const char *w)
-{
-  printf("  FAIL %s: %s\n", n, w);
-  size_t used = strlen(fail_log);
-  snprintf(fail_log + used, sizeof fail_log - used, "FAIL %s: %s\n", n, w);
-  fail_n++;
-}
-static void skip(const char *n, const char *w)
-{
-  printf("  SKIP %s: %s\n", n, w);
-  skip_n++;
-}
-
-static SeerConn *connect_one(void)
-{
-  const char *port = getenv("SEER_TEST_PORT");
-  SeerConnParams p = {
-      .host = getenv("SEER_TEST_HOST"),
-      .port = (uint16_t)(port ? atoi(port) : 1521),
-      .service_name = getenv("SEER_TEST_SERVICE"),
-      .username = getenv("SEER_TEST_USER"),
-      .password = getenv("SEER_TEST_PASS"),
-  };
-  SeerConn *c = NULL;
-  return seer_connect(&p, &c) == SEER_OK ? c : NULL;
-}
+#include "core.h"
 
 static void run(SeerConn *c, const char *sql)
 {
@@ -104,16 +66,12 @@ static SeerStatus call_with_type(SeerConn *c, const char *sql, const char *schem
   return st;
 }
 
-int main(void)
+void core_objbind(void)
 {
-  if (!getenv("SEER_TEST_HOST") || !getenv("SEER_TEST_SERVICE") || !getenv("SEER_TEST_USER")) {
-    fprintf(stderr, "objbind_test: set SEER_TEST_HOST/SERVICE/USER[/PORT/PASS] - skipping\n");
-    return 77;
-  }
-  SeerConn *c = connect_one();
-  if (!c) {
-    fprintf(stderr, "objbind_test: connect failed\n");
-    return 1;
+  SeerConn *c = core_connect();
+  if (c == NULL) {
+    fail("SQL OBJECT bind", "connect failed");
+    return;
   }
 
   char schema[64];
@@ -124,7 +82,7 @@ int main(void)
   /* --- object bind with a LOB attribute: refused, not sent as text --- */
   run(c, "DROP TYPE seerlb_o");
   run(c, "CREATE TYPE seerlb_o AS OBJECT (n NUMBER, c CLOB)");
-  {
+  if (!gated_as("object binds", "object bind with a LOB attribute is refused")) {
     /* A LOB attribute needs a locator in the image (a temporary LOB written
      * first), which the object bind can't build yet: it must say so rather
      * than put the text where the server expects a locator (ORA-22275). */
@@ -146,14 +104,14 @@ int main(void)
   run(c, "DROP TYPE seerob_o");
   run(c, "CREATE TYPE seerob_o AS OBJECT (n NUMBER, s VARCHAR2(20))");
   run(c, "CREATE TABLE seerob_t (o seerob_o)");
-  {
+  if (!gated_as("object binds", "SQL OBJECT bind")) {
     const char *name = "SQL OBJECT bind";
     const char *attrs[2] = {"42", "hello"};
     SeerStmt *ins = NULL;
     seer_stmt_prepare(c, "INSERT INTO seerob_t VALUES (:1)", &ins);
     SeerStatus st = seer_stmt_bind_object(ins, 1, schema, "SEEROB_O", attrs, 2);
     if (st == SEER_ENOTIMPL) {
-      skip(name, "object bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (st != SEER_OK || seer_stmt_execute(ins) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
     } else {
@@ -175,14 +133,14 @@ int main(void)
   run(c, "DROP TYPE seerva_o");
   run(c, "CREATE TYPE seerva_o AS VARRAY(5) OF NUMBER");
   run(c, "CREATE TABLE seerva_t (v seerva_o)");
-  {
+  if (!gated_as("object binds", "VARRAY bind")) {
     const char *name = "VARRAY bind";
     const char *elems[3] = {"10", "20", "30"};
     SeerStmt *ins = NULL;
     seer_stmt_prepare(c, "INSERT INTO seerva_t VALUES (:1)", &ins);
     SeerStatus st = seer_stmt_bind_collection(ins, 1, schema, "SEERVA_O", elems, 3);
     if (st == SEER_ENOTIMPL) {
-      skip(name, "collection bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (st != SEER_OK || seer_stmt_execute(ins) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
     } else {
@@ -208,7 +166,7 @@ int main(void)
   run(c, "CREATE TYPE seertz_o AS OBJECT (ts TIMESTAMP, tz TIMESTAMP WITH TIME ZONE, "
          "ltz TIMESTAMP WITH LOCAL TIME ZONE, d DATE)");
   run(c, "CREATE TABLE seertz_t (o seertz_o)");
-  {
+  if (!gated_as("object binds", "TIMESTAMP / WITH TIME ZONE / LTZ / DATE attribute bind")) {
     const char *name = "TIMESTAMP / WITH TIME ZONE / LTZ / DATE attribute bind";
     const char *attrs[4] = {"2020-02-29 00:00:00", "2020-02-29 10:00:00.25 +02:00",
                             "2020-02-29 10:00:00.5", "2020-02-29 12:34:56"};
@@ -216,7 +174,7 @@ int main(void)
     seer_stmt_prepare(c, "INSERT INTO seertz_t VALUES (:1)", &ins);
     SeerStatus st = seer_stmt_bind_object(ins, 1, schema, "SEERTZ_O", attrs, 4);
     if (st == SEER_ENOTIMPL) {
-      skip(name, "object bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (st != SEER_OK || seer_stmt_execute(ins) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
     } else {
@@ -257,7 +215,7 @@ int main(void)
   run(c, "CREATE TYPE seernc_o AS OBJECT (a NVARCHAR2(20), b VARCHAR2(20))");
   run(c, "CREATE TYPE seernc_v AS VARRAY(5) OF NVARCHAR2(20)");
   run(c, "CREATE TABLE seernc_t (o seernc_o, l seernc_v)");
-  {
+  if (!gated_as("object binds", "NVARCHAR2 object attribute + element bind")) {
     const char *name = "NVARCHAR2 object attribute + element bind";
     /* "žába 猫" and "猫" */
     const char *attrs[2] = {"\xc5\xbe\xc3\xa1"
@@ -270,7 +228,7 @@ int main(void)
     if (st == SEER_OK)
       st = seer_stmt_bind_collection(ins, 2, schema, "SEERNC_V", elems, 2);
     if (st == SEER_ENOTIMPL) {
-      skip(name, "object bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (st != SEER_OK || seer_stmt_execute(ins) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
     } else {
@@ -304,14 +262,14 @@ int main(void)
   run(c, "CREATE TYPE seerad_o AS OBJECT (street VARCHAR2(20), zip NUMBER)");
   run(c, "CREATE TYPE seerpe_o AS OBJECT (nm VARCHAR2(20), age NUMBER, home seerad_o)");
   run(c, "CREATE TABLE seerpe_t (p seerpe_o)");
-  {
+  if (!gated_as("object binds", "nested object bind")) {
     const char *name = "nested object bind";
     const char *vals[4] = {"Bob", "30", "Main St", "12345"}; /* flattened leaves */
     SeerStmt *ins = NULL;
     seer_stmt_prepare(c, "INSERT INTO seerpe_t VALUES (:1)", &ins);
     SeerStatus st = seer_stmt_bind_object(ins, 1, schema, "SEERPE_O", vals, 4);
     if (st == SEER_ENOTIMPL) {
-      skip(name, "object bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (st != SEER_OK || seer_stmt_execute(ins) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
     } else {
@@ -334,14 +292,14 @@ int main(void)
   run(c, "DROP TYPE seerty_o");
   run(c, "CREATE TYPE seerty_o AS OBJECT (amt NUMBER, born DATE)");
   run(c, "CREATE TABLE seerty_t (o seerty_o)");
-  {
+  if (!gated_as("object binds", "object bind (decimal+DATE)")) {
     const char *name = "object bind (decimal+DATE)";
     const char *vals[2] = {"-1234.567", "1999-12-31 23:59:58"};
     SeerStmt *ins = NULL;
     seer_stmt_prepare(c, "INSERT INTO seerty_t VALUES (:1)", &ins);
     SeerStatus st = seer_stmt_bind_object(ins, 1, schema, "SEERTY_O", vals, 2);
     if (st == SEER_ENOTIMPL) {
-      skip(name, "object bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (st != SEER_OK || seer_stmt_execute(ins) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/insert");
     } else {
@@ -373,14 +331,14 @@ int main(void)
          "    result := NULL; FOR i IN 1..a.COUNT LOOP result := result || a(i); END LOOP; END;\n"
          "  PROCEDURE out_nums(a OUT num_tab) IS BEGIN a(1):=10; a(2):=20; a(3):=30; END;\n"
          "END;");
-  {
+  if (!gated_as("object binds", "assoc-array bind (NUMBER)")) {
     const char *name = "assoc-array bind (NUMBER)";
     SeerStmt *s = NULL;
     int64_t nums[3] = {10, 20, 30};
     seer_stmt_prepare(c, "BEGIN seeraa.sum_arr(:1, :2); END;", &s);
     SeerStatus b = seer_stmt_bind_int64_array(s, 1, nums, 3);
     if (b == SEER_ENOTIMPL) {
-      skip(name, "assoc-array bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (b != SEER_OK || seer_stmt_bind_out(s, 2, 2, 22) != SEER_OK ||
                seer_stmt_execute(s) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
@@ -399,14 +357,14 @@ int main(void)
     }
     seer_stmt_close(s);
   }
-  {
+  if (!gated_as("object binds", "assoc-array bind (VARCHAR)")) {
     const char *name = "assoc-array bind (VARCHAR)";
     SeerStmt *s = NULL;
     const char *strs[2] = {"foo", "bar"};
     seer_stmt_prepare(c, "BEGIN seeraa.cat_arr(:1, :2); END;", &s);
     SeerStatus b = seer_stmt_bind_text_array(s, 1, strs, 2, 40);
     if (b == SEER_ENOTIMPL) {
-      skip(name, "assoc-array bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (b != SEER_OK || seer_stmt_bind_out(s, 2, 1, 100) != SEER_OK ||
                seer_stmt_execute(s) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
@@ -425,13 +383,13 @@ int main(void)
     }
     seer_stmt_close(s);
   }
-  {
+  if (!gated_as("object binds", "OUT assoc-array (NUMBER)")) {
     const char *name = "OUT assoc-array (NUMBER)";
     SeerStmt *s = NULL;
     seer_stmt_prepare(c, "BEGIN seeraa.out_nums(:1); END;", &s);
     SeerStatus b = seer_stmt_bind_out_array(s, 1, 2 /*NUMBER*/, 0, 10);
     if (b == SEER_ENOTIMPL) {
-      skip(name, "assoc-array bind requires a 12c+ server");
+      fail(name, "not implemented");
     } else if (b != SEER_OK || seer_stmt_execute(s) != SEER_OK) {
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
     } else {
@@ -454,7 +412,7 @@ int main(void)
   }
   run(c, "DROP PACKAGE seeraa");
 
-  {
+  if (!gated_as("native JSON bind", "native JSON bind")) {
     const char *name = "native JSON bind";
     run(c, "DROP TABLE seerjb");
     run(c, "CREATE TABLE seerjb (doc JSON) TABLESPACE USERS");
@@ -466,7 +424,7 @@ int main(void)
     seer_commit(c);
     const char *er = seer_last_error(c);
     if (b == SEER_ENOTIMPL) {
-      skip(name, "native JSON bind requires a 21c+ server");
+      fail(name, "not implemented");
     } else if (e != SEER_OK) {
       /* JSON column type / ASSM tablespace may be unavailable -> skip */
       if (er && (strstr(er, "ORA-00902") || strstr(er, "ORA-43853") || strstr(er, "ORA-00942")))
@@ -489,7 +447,7 @@ int main(void)
     run(c, "DROP TABLE seerjb");
   }
 
-  {
+  if (!gated_as("native VECTOR bind", "native VECTOR bind (f32/f64/i8)")) {
     const char *name = "native VECTOR bind (f32/f64/i8)";
     run(c, "DROP TABLE seervb");
     run(c, "CREATE TABLE seervb (a VECTOR(3,FLOAT32), b VECTOR(3,FLOAT64), "
@@ -507,7 +465,7 @@ int main(void)
     seer_commit(c);
     const char *er = seer_last_error(c);
     if (b1 == SEER_ENOTIMPL) {
-      skip(name, "native VECTOR bind requires a 23ai server");
+      fail(name, "not implemented");
     } else if (e != SEER_OK) {
       if (er && (strstr(er, "ORA-00907") || strstr(er, "ORA-00902") || strstr(er, "ORA-00942") ||
                  strstr(er, "ORA-43853")))
@@ -524,7 +482,7 @@ int main(void)
     run(c, "DROP TABLE seervb");
   }
 
-  {
+  if (!gated_as("native VECTOR bind", "native VECTOR bind, large, ahead of another bind")) {
     /* A large VECTOR ahead of another bind: its image rides in place (it is
      * not a LONG-class value, whatever its size), and past 64 KiB its length
      * needs the 3-byte field. 5000 FLOAT64 dimensions = ~40 KB, 30000 = ~240 KB. */
@@ -558,7 +516,7 @@ int main(void)
         why = sizes[k] == 5000 ? "5000 dims: readback mismatch" : "30000 dims: readback mismatch";
     }
     if (b == SEER_ENOTIMPL)
-      skip(name, "native VECTOR bind requires a 23ai server");
+      fail(name, "not implemented");
     else if (why != NULL)
       fail(name, why);
     else
@@ -566,7 +524,7 @@ int main(void)
     run(c, "DROP TABLE seervl");
   }
 
-  {
+  if (!gated_as("native VECTOR bind", "native VECTOR bind (binary/sparse)")) {
     const char *name = "native VECTOR bind (binary/sparse)";
     run(c, "DROP TABLE seervbin");
     run(c, "DROP TABLE seervsp");
@@ -604,7 +562,7 @@ int main(void)
     seer_commit(c);
     const char *er = seer_last_error(c);
     if (bb == SEER_ENOTIMPL) {
-      skip(name, "native VECTOR bind requires a 23ai server");
+      fail(name, "not implemented");
     } else if (eb != SEER_OK || es != SEER_OK || esd != SEER_OK || esi != SEER_OK) {
       if (er && (strstr(er, "ORA-00907") || strstr(er, "ORA-00902") || strstr(er, "ORA-00942") ||
                  strstr(er, "ORA-43853")))
@@ -625,7 +583,7 @@ int main(void)
     run(c, "DROP TABLE seervspi");
   }
 
-  {
+  if (!gated_as("XMLType bind", "XMLType bind")) {
     const char *name = "XMLType bind";
     run(c, "DROP TABLE seer_xb");
     run(c, "CREATE TABLE seer_xb (x XMLTYPE)");
@@ -708,11 +666,13 @@ int main(void)
          "3:0:zero,two"},
     };
     for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+      if (gated_as("object binds", cases[k].name))
+        continue;
       char out[256];
       SeerStatus st = call_with_type(c, cases[k].sql, schema, cases[k].type, cases[k].collection,
                                      cases[k].vals, cases[k].n, out, sizeof out);
       if (st == SEER_ENOTIMPL) {
-        skip(cases[k].name, "object binds require a 12c+ server");
+        fail(cases[k].name, "not implemented");
       } else if (st != SEER_OK) {
         fail(cases[k].name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
       } else if (strcmp(out, cases[k].want) != 0) {
@@ -730,16 +690,14 @@ int main(void)
    * In the image the attribute is 4 bytes with the truth in the first. --- */
   run(c, "DROP TABLE seer_bo_t");
   run(c, "DROP TYPE seer_bo");
-  {
+  if (!gated_as("SQL OBJECT with a BOOLEAN attribute", "SQL OBJECT with a BOOLEAN attribute")) {
     const char *name = "SQL OBJECT with a BOOLEAN attribute";
-    /* Before 23ai a CREATE TYPE with a BOOLEAN attribute succeeds "with
-     * compilation errors", so ask for a SQL BOOLEAN directly. */
     SeerStmt *s = NULL;
     int has_bool = seer_stmt_prepare(c, "SELECT TRUE FROM dual", &s) == SEER_OK &&
                    seer_stmt_execute(s) == SEER_OK;
     seer_stmt_close(s);
     if (!has_bool) {
-      skip(name, "no SQL BOOLEAN before 23ai");
+      fail(name, "SELECT TRUE failed");
     } else {
       run(c, "CREATE TYPE seer_bo AS OBJECT (n NUMBER, b BOOLEAN)");
       run(c, "CREATE TABLE seer_bo_t (id NUMBER, o seer_bo)");
@@ -803,6 +761,8 @@ int main(void)
          "SEER_PKO.STRIX", "[-5: neg, 10: ten]", 0},
     };
     for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+      if (gated_as("object binds", cases[k].name))
+        continue;
       SeerStmt *s = NULL;
       SeerStatus st = seer_stmt_prepare(c, cases[k].sql, &s);
       if (st == SEER_OK)
@@ -818,7 +778,7 @@ int main(void)
       snprintf(got, sizeof got, "%.*s", (int)l, d ? (const char *)d : "");
       seer_stmt_close(s);
       if (st == SEER_ENOTIMPL) {
-        skip(cases[k].name, "object binds require a 12c+ server");
+        fail(cases[k].name, "not implemented");
       } else if (st != SEER_OK) {
         fail(cases[k].name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
       } else if (isnull != cases[k].want_null || strcmp(got, cases[k].want) != 0) {
@@ -830,7 +790,7 @@ int main(void)
       }
     }
   }
-  {
+  if (!gated_as("object binds", "large object OUT bind")) {
     /* An object image well past the 2000 bytes the OUT bind announces. */
     const char *name = "large object OUT bind";
     SeerStmt *s = NULL;
@@ -849,13 +809,13 @@ int main(void)
              ((const char *)d)[l - 1] == 'b';
     seer_stmt_close(s);
     if (st == SEER_ENOTIMPL)
-      skip(name, "object binds require a 12c+ server");
+      fail(name, "not implemented");
     else if (!ok)
       fail(name, st != SEER_OK && seer_last_error(c) ? seer_last_error(c) : "value mismatch");
     else
       pass(name);
   }
-  {
+  if (!gated_as("object binds", "object IN OUT bind")) {
     const char *name = "object IN OUT bind";
     const char *v[2] = {"1", "x"};
     SeerStmt *s = NULL;
@@ -875,7 +835,7 @@ int main(void)
     snprintf(got, sizeof got, "%.*s", (int)l, d ? (const char *)d : "");
     seer_stmt_close(s);
     if (st == SEER_ENOTIMPL)
-      skip(name, "object binds require a 12c+ server");
+      fail(name, "not implemented");
     else if (st != SEER_OK)
       fail(name, seer_last_error(c) ? seer_last_error(c) : "bind/exec");
     else if (strcmp(got, "101, xyz") != 0)
@@ -891,9 +851,4 @@ int main(void)
   run(c, "DROP TYPE seer_obig");
 
   seer_disconnect(c);
-  printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
-  fflush(stdout);
-  if (fail_n > 0)
-    fprintf(stderr, "%s", fail_log);
-  return fail_n > 0 ? 1 : 0;
 }

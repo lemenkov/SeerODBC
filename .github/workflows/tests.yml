@@ -316,9 +316,9 @@ jobs:
           meson compile -C build
       # The driver .so path is baked into test_integration (-DSEER_DRIVER_PATH),
       # so the Driver Manager loads it by absolute path from the DRIVER= connect
-      # string — no odbcinst.ini registration needed. The four live tests activate
-      # once SEER_TEST_* is set; DBA-only features (proxy auth, DRCP) self-skip
-      # because the pyo app user isn't privileged.
+      # string — no odbcinst.ini registration needed. The two live suites (ODBC and
+      # core API) activate once SEER_TEST_* is set; DBA-only features (proxy auth,
+      # DRCP) self-skip because the pyo app user isn't privileged.
       - name: Run integration suite against ${{ matrix.db.name }}
         env:
           # 127.0.0.1, not "localhost" — the DM/driver connects over IPv4 and a
@@ -333,9 +333,4 @@ jobs:
         run: |
           meson test -C build --print-errorlogs \
             'odbc integration' \
-            'two-phase commit (live)' \
-            'object bind (live)' \
-            'advanced queuing (live)' \
-            'request boundaries (live)' \
-            'sessionless transactions (live)' \
-            'request pipelining (live)'
+            'core API (live)'

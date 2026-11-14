@@ -64,12 +64,6 @@ ONLY="${ONLY//,/ }"
 SKIP="${SKIP//,/ }"
 
 BIN="$BUILD/tests/test_integration"
-TPC_BIN="$BUILD/tests/test_tpc"
-OBJBIND_BIN="$BUILD/tests/test_objbind"
-AQ_BIN="$BUILD/tests/test_aq"
-REQBOUND_BIN="$BUILD/tests/reqbound_test"
-SESSIONLESS_BIN="$BUILD/tests/sessionless_test"
-PIPELINE_BIN="$BUILD/tests/pipeline_test"
 CORE_BIN="$BUILD/tests/test_core"
 if [[ ! -x "$BIN" ]]; then
     echo "integration test not built: $BIN (run: meson compile -C $BUILD)" >&2
@@ -92,7 +86,7 @@ DEF_PASS="${SEER_MATRIX_PASS:-pyo123}"
 #   release       -> the server's release, passed to the suites as
 #                    SEER_TEST_RELEASE: they skip what it lacks by it (gates.h)
 # Every tier runs the same suites: the ODBC integration test and the core-API
-# test (test_core); 10g+ also the core-API extras and the TLS leg.
+# test (test_core); 10g+ also the TLS leg.
 TIERS=(
     "11g|public|$CONTAINER_HOST|1521|XE|service|11"
     "18c|public|$CONTAINER_HOST|1527|XEPDB1|service|18"
@@ -202,26 +196,16 @@ for row in "${TIERS[@]}"; do
         "$BIN" >"$log" 2>/dev/null
     [[ -n "$TLS_PID" ]] && kill "$TLS_PID" 2>/dev/null && TLS_PID=""
     grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
-    # The core-API suite, on every tier, then (10g+) the core-API extras CI
-    # runs too: two-phase commit, object bind, AQ, request boundaries,
-    # sessionless transactions, pipelining.
+    # The core-API suite, on every tier.
     if [[ "$address" == "sid" ]]; then
         SEER_TEST_SID="$target" "$CORE_BIN" 2>/dev/null
     else
         SEER_TEST_SERVICE="$target" "$CORE_BIN" 2>/dev/null
     fi | grep -v '^SUMMARY' | tee -a "$xlog" | sed 's/^/  /'
-    if (( release >= 10 )); then
-        for extra in "$TPC_BIN" "$OBJBIND_BIN" "$AQ_BIN" "$REQBOUND_BIN" "$SESSIONLESS_BIN" \
-                     "$PIPELINE_BIN"; do
-            [[ -x "$extra" ]] || continue
-            SEER_TEST_SERVICE="$target" "$extra" 2>/dev/null | grep -v '^SUMMARY' \
-                | tee -a "$xlog" | sed 's/^/  /'
-        done
-    fi
     unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS SEER_TEST_RELEASE
 
     # The tier's main suite must have finished (its SUMMARY line); the totals
-    # count every PASS / FAIL / SKIP line, the main suite's and the extras'.
+    # count every PASS / FAIL / SKIP line, the ODBC suite's and the core API's.
     summary=$(grep '^SUMMARY' "$log")
     if [[ -z "$summary" ]]; then
         result="no summary (connect failed)"
