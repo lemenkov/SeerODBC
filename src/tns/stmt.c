@@ -6747,7 +6747,10 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
     if (r.cut) {
       /* A statement failing as it executes can stop the describe partway:
        * 8i sends what fitted, then the error as a status of its own, and
-       * nothing more (seerdb #1226). That error is the answer. */
+       * nothing more (seerdb #1226). That error is the answer - when it
+       * carries the server's ORA- text. A wide describe's next packet can
+       * open with the byte 0x04 too, as describe data: taken for a status,
+       * a select of 200 columns failed with an empty error (#152). */
       uint8_t *more = NULL;
       size_t mlen = 0;
       st = seer_ttc_recv(c, &more, &mlen);
@@ -6756,7 +6759,8 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
       if (mlen > 0 && more[0] == TTI_OER) {
         O8iRd e = {more, mlen, 0, false, false};
         o8i_read_status(&e, &s);
-        if (!e.cut && !e.bad && s.code != 0) {
+        if (!e.cut && !e.bad && s.code != 0 && s.message != NULL &&
+            strncmp(s.message, "ORA-", 4) == 0) {
           free(more);
           queue_cursor_close(c, s.cursor);
           st = o8i_fail(c, &s);
