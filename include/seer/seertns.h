@@ -259,7 +259,16 @@ SeerStatus seer_stmt_prepare(SeerConn *conn, const char *sql, SeerStmt **out);
 
 /* Bind an input parameter by 1-based position, before execute. A NUMBER bind
  * carries an integer; a text bind carries UTF-8 (len < 0 => strlen); a null
- * bind carries SQL NULL. Re-binding the same position replaces it. */
+ * bind carries SQL NULL. Re-binding the same position replaces it.
+ *
+ * Position N is the N-th distinct placeholder in the statement, in order of
+ * appearance; a placeholder's label means nothing. In
+ * "SELECT :2 || :1 FROM dual" position 1 is :2 and position 2 is :1, and in
+ * "WHERE city = :b AND street = :a" position 1 is :b. A placeholder used again
+ * (":x || :x") is the same position. That is how the server reads the binds,
+ * and how OCI, JDBC and python-oracledb bind by position; it holds on every
+ * release, for SQL and PL/SQL alike. ODBC's ? markers are numbered in order,
+ * so they bind as written. */
 SeerStatus seer_stmt_bind_int64(SeerStmt *stmt, int param, int64_t value);
 SeerStatus seer_stmt_bind_text(SeerStmt *stmt, int param, const char *str, int len);
 SeerStatus seer_stmt_bind_raw(SeerStmt *stmt, int param, const void *data, int len);

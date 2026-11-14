@@ -216,18 +216,19 @@ static void check_plsql(void)
     seer_stmt_close(s);
   }
 
-  /* Block with IN + OUT VARCHAR (:2 := :1 || '_x'). */
+  /* Block with IN + OUT VARCHAR, labels out of order: binds go by order of
+   * appearance (#146), so position 1 is :2, the target, and position 2 is :1. */
   {
     const char *name = "PL/SQL block IN+OUT (varchar)";
     SeerStmt *s = NULL;
     seer_stmt_prepare(C, "BEGIN :2 := :1 || '_x'; END;", &s);
-    seer_stmt_bind_text(s, 1, "hi", -1);
-    SeerStatus b = seer_stmt_bind_out(s, 2, T_VARCHAR, 100);
+    SeerStatus b = seer_stmt_bind_out(s, 1, T_VARCHAR, 100);
+    seer_stmt_bind_text(s, 2, "hi", -1);
     SeerStatus e = (b == SEER_OK) ? seer_stmt_execute(s) : b;
     const void *d = NULL;
     size_t l = 0;
     int isn = 0, isb = 0;
-    seer_stmt_out_data(s, 2, &d, &l, &isn, &isb);
+    seer_stmt_out_data(s, 1, &d, &l, &isn, &isb);
     if (e == SEER_OK && d && strcmp((const char *)d, "hi_x") == 0)
       pass(name);
     else

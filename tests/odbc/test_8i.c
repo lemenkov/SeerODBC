@@ -548,8 +548,8 @@ static const char *out_text(SeerStmt *s, int param, char *out, size_t osz)
 }
 
 /* PL/SQL blocks (seerdb PROTOCOL.md §19.13-19.14, #134): IN values inline,
- * OUT and IN OUT values back in one round trip, in the order the text names
- * the placeholders; a NULL and a never-assigned OUT; a 4000-character OUT,
+ * OUT and IN OUT values back in one round trip, bound by order of appearance
+ * (#146); a NULL and a never-assigned OUT; a 4000-character OUT,
  * whose reply spans packets; DECLARE; CALL ... INTO; a failing block. */
 static void check_blocks(void)
 {
@@ -577,11 +577,12 @@ static void check_blocks(void)
   }
   seer_stmt_close(s);
   s = NULL;
+  /* Labels out of order: position 1 is :2, the target (#146). */
   if (seer_stmt_prepare(C, "BEGIN :2 := :1 || '-x'; END;", &s) == SEER_OK) {
-    seer_stmt_bind_text(s, 1, "in", -1);
-    seer_stmt_bind_out(s, 2, 1, 20);
+    seer_stmt_bind_out(s, 1, 1, 20);
+    seer_stmt_bind_text(s, 2, "in", -1);
     if (seer_stmt_execute(s) == SEER_OK)
-      out_text(s, 2, d, sizeof d);
+      out_text(s, 1, d, sizeof d);
   }
   seer_stmt_close(s);
   s = NULL;

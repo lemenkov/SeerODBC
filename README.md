@@ -105,6 +105,18 @@ The core is also exercised directly — without a Driver Manager — by the
 `seersql` CLI (`tools/seersql/`), a `tsql`-style client for proving the
 protocol against a real server.
 
+### Bind parameters bind by order of appearance
+
+The core API binds by position, and position N is the N-th distinct
+placeholder in the statement as it reads, whatever its label: in
+`SELECT :2 || :1 FROM dual`, position 1 is `:2`, and in
+`WHERE city = :b AND street = :a`, position 1 is `:b`. A placeholder used
+again (`:x || :x`) is the same position. That is how the server pairs the
+values with the placeholders, and how OCI, JDBC and python-oracledb bind by
+position; it holds on every supported release, for SQL and PL/SQL alike.
+There is no bind-by-name call. ODBC's `?` markers are numbered in the order
+they appear, so an ODBC application binds as written.
+
 ## Building
 
 Requirements: a C17 compiler, Meson + Ninja, OpenSSL >= 3.0, and (for the
