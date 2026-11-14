@@ -70,8 +70,7 @@ AQ_BIN="$BUILD/tests/test_aq"
 REQBOUND_BIN="$BUILD/tests/reqbound_test"
 SESSIONLESS_BIN="$BUILD/tests/sessionless_test"
 PIPELINE_BIN="$BUILD/tests/pipeline_test"
-NINE_BIN="$BUILD/tests/test_9i"
-EIGHT_BIN="$BUILD/tests/test_8i"
+CORE_BIN="$BUILD/tests/test_core"
 if [[ ! -x "$BIN" ]]; then
     echo "integration test not built: $BIN (run: meson compile -C $BUILD)" >&2
     exit 1
@@ -84,24 +83,25 @@ DEF_USER="${SEER_MATRIX_USER:-pyo}"
 DEF_PASS="${SEER_MATRIX_PASS:-pyo123}"
 
 # ---- tiers ---------------------------------------------------------------------
-# Row: name|group|host|port|target|kind
-#   group=public -> freely redistributable image, eligible for public GitHub CI
-#   group=local  -> ours to test only (10g's image can't be redistributed, the
-#                   26ai native-encryption bed is lab-specific, 9i is a VM)
-#   kind=odbc    -> ODBC integration test (+ core-API extras); target = SERVICE_NAME
-#   kind=fv2     -> ODBC integration test + Oracle 9i core-API test (test_9i);
-#                   target = SID
-#   kind=o8i     -> ODBC integration test + Oracle 8i core-API test (test_8i);
-#                   target = SERVICE_NAME
+# Row: name|group|host|port|target|address|release
+#   group=public  -> freely redistributable image, eligible for public GitHub CI
+#   group=local   -> ours to test only (10g's image can't be redistributed, the
+#                    26ai native-encryption bed is lab-specific, 9i and 8i are VMs)
+#   address       -> how `target` names the database: service (SERVICE_NAME) or
+#                    sid (9i predates service-name routing)
+#   release       -> the server's release, passed to the suites as
+#                    SEER_TEST_RELEASE: they skip what it lacks by it (gates.h)
+# Every tier runs the same suites: the ODBC integration test and the core-API
+# test (test_core); 10g+ also the core-API extras and the TLS leg.
 TIERS=(
-    "11g|public|$CONTAINER_HOST|1521|XE|odbc"
-    "18c|public|$CONTAINER_HOST|1527|XEPDB1|odbc"
-    "21c|public|$CONTAINER_HOST|1522|XEPDB1|odbc"
-    "23ai|public|$CONTAINER_HOST|1523|FREEPDB1|odbc"
-    "26ai|local|$CONTAINER_HOST|1526|freepdb1|odbc"
-    "10g|local|$CONTAINER_HOST|1525|orcl|odbc"
-    "9i|local|$NINE_HOST|1521|orcl|fv2"
-    "8i|local|$EIGHT_HOST|1521|ORCL|o8i"
+    "11g|public|$CONTAINER_HOST|1521|XE|service|11"
+    "18c|public|$CONTAINER_HOST|1527|XEPDB1|service|18"
+    "21c|public|$CONTAINER_HOST|1522|XEPDB1|service|21"
+    "23ai|public|$CONTAINER_HOST|1523|FREEPDB1|service|23"
+    "26ai|local|$CONTAINER_HOST|1526|freepdb1|service|26"
+    "10g|local|$CONTAINER_HOST|1525|orcl|service|10"
+    "9i|local|$NINE_HOST|1521|orcl|sid|9"
+    "8i|local|$EIGHT_HOST|1521|ORCL|service|8"
 )
 
 in_list() {   # $1 word  $2 space-separated list
@@ -167,7 +167,7 @@ xlog=$(mktemp)
 trap 'rm -f "$log" "$xlog"' EXIT
 
 for row in "${TIERS[@]}"; do
-    IFS='|' read -r name group host port target kind <<<"$row"
+    IFS='|' read -r name group host port target address release <<<"$row"
     if [[ -n "$ONLY" ]] && ! in_list "$name" "$ONLY"; then continue; fi
     if in_list "$name" "$SKIP"; then set_result "$name" "skipped (--skip)"; continue; fi
 
@@ -193,27 +193,24 @@ for row in "${TIERS[@]}"; do
     : >"$xlog"
 
     export SEER_TEST_HOST="$host" SEER_TEST_PORT="$port" \
-           SEER_TEST_USER="$user" SEER_TEST_PASS="$pass"
-    if [[ "$kind" == "fv2" || "$kind" == "o8i" ]]; then
-        # Oracle 9i / 8i: the ODBC integration test, whose checks outside what
-        # these tiers support skip with the reason (its known_gaps table), then
-        # the tier's own core-API test (9i addressed by SID).
-        SEER_TEST_SERVICE="$target" "$BIN" >"$log" 2>/dev/null
-        grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
-        if [[ "$kind" == "fv2" ]]; then
-            SEER_TEST_SID="$target" "$NINE_BIN" 2>/dev/null
-        else
-            SEER_TEST_SERVICE="$target" "$EIGHT_BIN" 2>/dev/null
-        fi | grep -v '^SUMMARY' | tee -a "$xlog" | sed 's/^/  /'
+           SEER_TEST_USER="$user" SEER_TEST_PASS="$pass" SEER_TEST_RELEASE="$release"
+    # The ODBC integration test, service-name addressed (9i's listener takes the
+    # SID as a service name too), with an optional TLS-proxy leg from 10g.
+    TLS_PORT=""; TLS_CA=""; TLS_PID=""
+    (( release >= 10 )) && start_tls_proxy "$host" "$port"
+    SEER_TEST_SERVICE="$target" SEER_TLS_PROXY_PORT="$TLS_PORT" SEER_TLS_CA="$TLS_CA" \
+        "$BIN" >"$log" 2>/dev/null
+    [[ -n "$TLS_PID" ]] && kill "$TLS_PID" 2>/dev/null && TLS_PID=""
+    grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
+    # The core-API suite, on every tier, then (10g+) the core-API extras CI
+    # runs too: two-phase commit, object bind, AQ, request boundaries,
+    # sessionless transactions, pipelining.
+    if [[ "$address" == "sid" ]]; then
+        SEER_TEST_SID="$target" "$CORE_BIN" 2>/dev/null
     else
-        # ODBC integration test (+ the core-API suites CI runs too: two-phase
-        # commit, object bind, AQ, request boundaries, sessionless transactions,
-        # pipelining), service-name addressed, with an optional TLS-proxy leg.
-        start_tls_proxy "$host" "$port"
-        SEER_TEST_SERVICE="$target" SEER_TLS_PROXY_PORT="$TLS_PORT" SEER_TLS_CA="$TLS_CA" \
-            "$BIN" >"$log" 2>/dev/null
-        [[ -n "$TLS_PID" ]] && kill "$TLS_PID" 2>/dev/null
-        grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
+        SEER_TEST_SERVICE="$target" "$CORE_BIN" 2>/dev/null
+    fi | grep -v '^SUMMARY' | tee -a "$xlog" | sed 's/^/  /'
+    if (( release >= 10 )); then
         for extra in "$TPC_BIN" "$OBJBIND_BIN" "$AQ_BIN" "$REQBOUND_BIN" "$SESSIONLESS_BIN" \
                      "$PIPELINE_BIN"; do
             [[ -x "$extra" ]] || continue
@@ -221,7 +218,7 @@ for row in "${TIERS[@]}"; do
                 | tee -a "$xlog" | sed 's/^/  /'
         done
     fi
-    unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS
+    unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS SEER_TEST_RELEASE
 
     # The tier's main suite must have finished (its SUMMARY line); the totals
     # count every PASS / FAIL / SKIP line, the main suite's and the extras'.
