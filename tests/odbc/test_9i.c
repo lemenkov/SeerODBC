@@ -1158,6 +1158,38 @@ static void check_long_error_text(void)
     fail(name, m);
 }
 
+/* Columns the server describes with size 0 but that are defined at a fixed
+ * size - TO_NUMBER(NULL), 1 + NULL, TO_DATE(NULL) - come with a cell in the
+ * row; taken as carrying none, the reader fell a cell behind and the fetch
+ * failed with ORA-01002 (#156). Beside them a bare NULL, which carries none. */
+static void check_zero_size_numbers(void)
+{
+  const char *name = "zero-size NUMBER / DATE columns (TO_NUMBER(NULL), 1 + NULL)";
+  SeerStmt *s = NULL;
+  int isn[5] = {-1, -1, -1, -1, -1};
+  char x[8] = "";
+  SeerStatus st = SEER_EPROTO;
+  if (seer_stmt_prepare(C, "SELECT NULL, 'x', TO_NUMBER(NULL), 1 + NULL, TO_DATE(NULL) FROM dual",
+                        &s) == SEER_OK &&
+      (st = seer_stmt_execute(s)) == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+    for (int i = 0; i < 5; i++) {
+      const char *v = NULL;
+      seer_stmt_get_string(s, i, &v, &isn[i]);
+      if (i == 1 && v != NULL)
+        snprintf(x, sizeof x, "%s", v);
+    }
+  seer_stmt_close(s);
+  if (st == SEER_OK && isn[0] == 1 && isn[1] == 0 && strcmp(x, "x") == 0 && isn[2] == 1 &&
+      isn[3] == 1 && isn[4] == 1)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "status %d, null flags %d%d%d%d%d, '%s'", (int)st, isn[0], isn[1], isn[2],
+             isn[3], isn[4], x);
+    fail(name, m);
+  }
+}
+
 /* A statement with a non-ASCII character in its text: 9i reads the SQL's
  * length in characters, and sent the byte count it waited for the rest and
  * the call hung (#140). A query, then a block, then the session goes on. */
@@ -1258,6 +1290,7 @@ int main(void)
 
   check_select_scalar();
   check_zero_length_columns();
+  check_zero_size_numbers();
   check_select_table();
   check_wide_select();
   check_nullability();
