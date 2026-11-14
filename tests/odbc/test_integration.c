@@ -2172,6 +2172,68 @@ static void check_null_out(SQLHDBC dbc)
   }
 }
 
+/* SQL_C_DOUBLE / SQL_C_FLOAT parameters keep their value in a NUMBER column,
+ * on every release: 10g+ bind them as BINARY_DOUBLE / BINARY_FLOAT, 8i and 9i -
+ * which have neither - as the NUMBER with the fewest digits that reads back to
+ * the same value (#151). 9i stored the IEEE bytes as text before. */
+static void check_double_params(SQLHDBC dbc)
+{
+  const char *name = "SQL_C_DOUBLE / SQL_C_FLOAT parameters keep their value";
+  char err[256] = "";
+  exec_do(dbc, "DROP TABLE seer_dbl", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_dbl (k NUMBER, d NUMBER)", err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  static const double vals[] = {0.1, 1.5, -2.5e-7, 123456789.125, 1e20};
+  const float fv = 2.25f;
+  char m[256] = "";
+  for (int i = 0; i <= 5 && m[0] == '\0'; i++) {
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLINTEGER k = i;
+    SQLLEN kl = 0, dl = 0;
+    double d = i < 5 ? vals[i] : 0;
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &k, 0, &kl);
+    if (i < 5)
+      SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 0, 0, &d, 0, &dl);
+    else
+      SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_FLOAT, SQL_REAL, 0, 0, (SQLPOINTER)&fv, 0,
+                       &dl);
+    SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"INSERT INTO seer_dbl VALUES (?, ?)", SQL_NTS);
+    if (!SQL_SUCCEEDED(rc)) {
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+      snprintf(m, sizeof m, "insert %d: rc=%d %s", i, rc, err);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+  }
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  int rows = 0;
+  if (m[0] == '\0' &&
+      SQL_SUCCEEDED(SQLExecDirect(st, (SQLCHAR *)"SELECT k, d FROM seer_dbl ORDER BY k", SQL_NTS)))
+    while (m[0] == '\0' && SQL_SUCCEEDED(SQLFetch(st))) {
+      SQLINTEGER k = -1;
+      double d = 0;
+      SQLLEN kl = 0, dl = 0;
+      SQLGetData(st, 1, SQL_C_SLONG, &k, 0, &kl);
+      SQLGetData(st, 2, SQL_C_DOUBLE, &d, 0, &dl);
+      double want = k < 5 ? vals[k] : (double)fv;
+      if (d != want)
+        snprintf(m, sizeof m, "row %d: read back %.17g, stored %.17g", (int)k, d, want);
+      rows++;
+    }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_dbl", err, sizeof err);
+  if (m[0] == '\0' && rows == 6)
+    pass(name);
+  else {
+    if (m[0] == '\0')
+      snprintf(m, sizeof m, "%d rows", rows);
+    fail(name, m);
+  }
+}
+
 static void check_urowid(SQLHDBC dbc)
 {
   const char *name = "UROWID fetch";
@@ -3488,6 +3550,7 @@ int main(void)
   check_urowid_long(dbc);
   check_bind_order(dbc);
   check_null_out(dbc);
+  check_double_params(dbc);
   check_intervals(dbc);
   check_boolean(dbc);
   check_vector(dbc);
