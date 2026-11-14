@@ -817,6 +817,42 @@ static void check_urowid(void)
   }
 }
 
+/* A 300-column select: its describe spans several packets, and one can open
+ * with the byte 0x04 as describe data; taken for the status of an error, the
+ * query failed with an empty error and the session after it (#152). */
+static void check_wide_select(void)
+{
+  const char *name = "300-column SELECT (describe across packets)";
+  static char sql[4096];
+  strcpy(sql, "SELECT ");
+  for (int i = 1; i <= 300; i++) {
+    char item[24];
+    snprintf(item, sizeof item, "%s%d c%d", i > 1 ? "," : "", i, i);
+    strcat(sql, item);
+  }
+  strcat(sql, " FROM dual");
+  char last[16] = "", after[8] = "";
+  SeerStmt *s = NULL;
+  int ncols = 0;
+  if (seer_stmt_prepare(C, sql, &s) == SEER_OK && seer_stmt_execute(s) == SEER_OK &&
+      seer_stmt_fetch(s) == SEER_OK) {
+    ncols = seer_stmt_num_cols(s);
+    const char *v = NULL;
+    int isn = 0;
+    if (seer_stmt_get_string(s, 299, &v, &isn) == SEER_OK && v != NULL)
+      snprintf(last, sizeof last, "%s", v);
+  }
+  seer_stmt_close(s);
+  query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
+  if (ncols == 300 && strcmp(last, "300") == 0 && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "ncols=%d last='%s' then '%s'", ncols, last, after);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -837,6 +873,7 @@ int main(void)
   check_nulls_and_empty();
   check_multibatch();
   check_wide_describe();
+  check_wide_select();
   check_errors();
   check_latin1();
   check_long_sql();
