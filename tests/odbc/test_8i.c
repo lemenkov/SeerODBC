@@ -853,6 +853,44 @@ static void check_wide_select(void)
   }
 }
 
+/* NULLs read from a table: a VARCHAR2's comes as an empty value and the
+ * trailer with the indicator -1, a NUMBER's or DATE's as the trailer alone;
+ * read by its first byte, the VARCHAR2 came back an empty string (#153). */
+static void check_table_nulls(void)
+{
+  const char *name = "NULL VARCHAR2 / NUMBER / DATE read from a table";
+  run("DROP TABLE seer_n8", NULL);
+  run("CREATE TABLE seer_n8 (id NUMBER, v VARCHAR2(10), n NUMBER, d DATE)", NULL);
+  run("INSERT INTO seer_n8 VALUES (1, NULL, NULL, NULL)", NULL);
+  run("INSERT INTO seer_n8 VALUES (2, 'x', 5, SYSDATE)", NULL);
+  SeerStmt *s = NULL;
+  int nulls[2][3] = {{-1, -1, -1}, {-1, -1, -1}}, rows = 0;
+  if (seer_stmt_prepare(C, "SELECT v, n, d FROM seer_n8 ORDER BY id", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK)
+    while (rows < 2 && seer_stmt_fetch(s) == SEER_OK) {
+      for (int i = 0; i < 3; i++) {
+        const char *v = NULL;
+        int isn = 0;
+        seer_stmt_get_string(s, i, &v, &isn);
+        nulls[rows][i] = isn;
+      }
+      rows++;
+    }
+  seer_stmt_close(s);
+  run("DROP TABLE seer_n8", NULL);
+  bool ok = rows == 2;
+  for (int i = 0; i < 3; i++)
+    ok = ok && nulls[0][i] == 1 && nulls[1][i] == 0;
+  if (ok)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "rows=%d null flags %d%d%d / %d%d%d", rows, nulls[0][0], nulls[0][1],
+             nulls[0][2], nulls[1][0], nulls[1][1], nulls[1][2]);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -871,6 +909,7 @@ int main(void)
   }
   check_scalar_types();
   check_nulls_and_empty();
+  check_table_nulls();
   check_multibatch();
   check_wide_describe();
   check_wide_select();

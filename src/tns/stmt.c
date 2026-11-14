@@ -5711,7 +5711,13 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell)
   } else {
     o8r_value(r, &v);
   }
-  o8r_skip(r, 4); /* indicator, return code */
+  /* The trailer: the sb2 indicator, -1 for NULL, and the ub2 return code. A
+   * NULL VARCHAR2 from a table comes as an empty value and the trailer with
+   * the indicator -1, not as the trailer alone: read only by its first
+   * byte, it came back an empty string (#153). */
+  if (o8r_le16(r) == 0xFFFF)
+    null = true;
+  o8r_skip(r, 2);
   SeerStatus st = SEER_OK;
   if (!r->cut && !r->bad && !null && seer_writer_ok(&v)) {
     switch (t) {
