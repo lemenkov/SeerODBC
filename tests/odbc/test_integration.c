@@ -2058,6 +2058,51 @@ static void check_rowid(SQLHDBC dbc)
 /* UROWID (type 208): an index-organized table's ROWID renders as "*"+base64.
  * Select ROWID alongside a scalar column and confirm the scalar still decodes -
  * i.e. the UROWID decode consumed exactly its bytes and didn't desync the row. */
+/* A long logical UROWID: an index-organized table whose key is 900
+ * characters has a rowid of over a thousand. Past 252 bytes it comes chunked,
+ * as a LOB locator does; read as one length byte, the reply desynced and the
+ * query failed with ORA-01403 (#144). It binds back to find its row. */
+static void check_urowid_long(SQLHDBC dbc)
+{
+  const char *name = "long logical UROWID (900-character key)";
+  char err[256];
+  exec_do(dbc, "DROP TABLE seer_iotl", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             "CREATE TABLE seer_iotl (k VARCHAR2(1000) PRIMARY KEY, v NUMBER) "
+                             "ORGANIZATION INDEX",
+                             err, sizeof err)) ||
+      !SQL_SUCCEEDED(
+          exec_do(dbc, "INSERT INTO seer_iotl VALUES (RPAD('k', 900, 'x'), 7)", err, sizeof err))) {
+    skip(name, err[0] ? err : "no IOT support");
+    exec_do(dbc, "DROP TABLE seer_iotl", err, sizeof err);
+    return;
+  }
+  static char rid[4096];
+  char v[16] = "";
+  rid[0] = '\0';
+  SQLRETURN rc = exec_scalar(dbc, "SELECT ROWID FROM seer_iotl", rid, sizeof rid, err, sizeof err);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLLEN ind = SQL_NTS, vind = 0;
+  if (SQL_SUCCEEDED(rc)) {
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, sizeof rid, 0, rid, 0, &ind);
+    if (SQL_SUCCEEDED(
+            SQLExecDirect(st, (SQLCHAR *)"SELECT v FROM seer_iotl WHERE ROWID = ?", SQL_NTS)) &&
+        SQL_SUCCEEDED(SQLFetch(st)))
+      SQLGetData(st, 1, SQL_C_CHAR, v, sizeof v, &vind);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_iotl", err, sizeof err);
+  if (SQL_SUCCEEDED(rc) && rid[0] == '*' && strlen(rid) > 1000 && strcmp(v, "7") == 0)
+    pass(name);
+  else {
+    char m[300];
+    snprintf(m, sizeof m, "rc=%d rowid len=%zu bound back='%s' %s", rc, strlen(rid), v,
+             SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
 static void check_urowid(SQLHDBC dbc)
 {
   const char *name = "UROWID fetch";
@@ -3371,6 +3416,7 @@ int main(void)
                "DEADBEEF");
   check_rowid(dbc);
   check_urowid(dbc);
+  check_urowid_long(dbc);
   check_intervals(dbc);
   check_boolean(dbc);
   check_vector(dbc);
