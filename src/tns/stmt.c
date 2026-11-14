@@ -4633,7 +4633,15 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   col->ora_type = data_type;
   col->charset = (uint16_t)charset;
   col->max_size = (uint32_t)(max_len < 0 ? 0 : max_len);
-  col->zero_len = max_len == 0 && !has_own_row_encoding(data_type);
+  /* Described with size 0, a column carries no bytes in the row - when it is
+   * defined at its described size. fv2_define_entry defines a NUMBER, DATE,
+   * TIMESTAMP or rowid at a fixed size instead, and the server sends a cell
+   * for it: taken as carrying none, a TO_NUMBER(NULL) column put the reader a
+   * cell behind and the fetch out of sequence, ORA-01002 (#156). */
+  bool fixed_define = data_type == ORA_TYPE_NUMBER || data_type == ORA_TYPE_DATE ||
+                      data_type == ORA_TYPE_TIMESTAMP || data_type == ORA_TYPE_TIMESTAMPTZ ||
+                      data_type == ORA_TYPE_RID || data_type == ORA_TYPE_ROWID;
+  col->zero_len = max_len == 0 && !has_own_row_encoding(data_type) && !fixed_define;
   col->null_ok = null_ok;
   col->n_obj_attrs = 0;
   return SEER_OK;
