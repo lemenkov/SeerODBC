@@ -19,9 +19,13 @@ with seerdb's `docs/PROTOCOL.md` or weighing a new finding:
 - take what changes what a user sees — a connection that fails or hangs, wrong
   data, a wrong or missing error, a feature that can't be used;
 - leave out byte-level divergences no server rejects, and alternative wire forms
-  for something that already works (seerdb's opt-in OCI "native" forms, say);
-- stop a legacy dialect once it is usable for its realistic purpose (8i: login
-  and queries);
+  for a feature that is already reachable: no thick (OCI "native") protocol, no
+  second dialect for a database SeerODBC already talks to, and no following
+  PROTOCOL.md byte for byte where the form already sent works;
+- a feature a server has but SeerODBC can't reach yet is a gap to fill, on every
+  release in the supported range, in the dialect already spoken to it. An old
+  release is not finished because it logs in and answers a query (8i still
+  lacks binds, DML and PL/SQL);
 - when unsure whether a gap matters to a user, ask the maintainer rather than
   implement it.
 
