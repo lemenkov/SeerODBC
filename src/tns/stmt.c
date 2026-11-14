@@ -4905,6 +4905,19 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
  * bind's OAC follows, then one RXD a row (an array DML sends them all in this
  * one call, the tail counting the rows; seerdb #2245). The RXD value bytes are
  * exactly what the TTI_ALL8 path stored in b->rxd. */
+/* The SQL's length as 9i reads it in a TTI_ALL7 call: in characters, not the
+ * UTF-8 bytes that carry it. Sent the byte count, 9.2.0.4 waited for the
+ * characters it was still owed, and a statement with a non-ASCII character
+ * in its text hung (#140; seerdb _o7_sql_length, #2275). */
+static uint32_t fv2_sql_chars(const char *sql)
+{
+  uint32_t n = 0;
+  for (const unsigned char *p = (const unsigned char *)sql; *p != '\0'; p++)
+    if ((*p & 0xC0) != 0x80) /* not a continuation byte */
+      n++;
+  return n;
+}
+
 static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
 {
   size_t qlen = strlen(stmt->sql);
@@ -4928,7 +4941,7 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
   seer_enc_sb4(w, opt);
   seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
   seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, (uint32_t)qlen);
+  seer_enc_sb4(w, fv2_sql_chars(stmt->sql));
   {
     static const uint8_t mid[] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0};
     seer_writer_bytes(w, mid, sizeof mid);
@@ -4989,7 +5002,7 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
   }
   seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
   seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, (uint32_t)qlen);
+  seer_enc_sb4(w, fv2_sql_chars(stmt->sql));
   {
     static const uint8_t mid[] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0};
     seer_writer_bytes(w, mid, sizeof mid);

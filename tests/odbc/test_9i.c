@@ -1157,6 +1157,39 @@ static void check_long_error_text(void)
     fail(name, m);
 }
 
+/* A statement with a non-ASCII character in its text: 9i reads the SQL's
+ * length in characters, and sent the byte count it waited for the rest and
+ * the call hung (#140). A query, then a block, then the session goes on. */
+static void check_non_ascii_sql(void)
+{
+  const char *name = "SQL text with a non-ASCII character (query and block)";
+  char a[32], b[16], c[16];
+  scalar("SELECT 'caf\xc3\xa9' || LENGTH('caf\xc3\xa9') FROM dual", a, sizeof a);
+  SeerStmt *s = NULL;
+  SeerStatus st = SEER_EPROTO;
+  if (seer_stmt_prepare(C, "BEGIN :1 := LENGTH('d\xc3\xa9j\xc3\xa0'); END;", &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 2 /* NUMBER */, 22);
+    st = seer_stmt_execute(s);
+    const void *d = NULL;
+    size_t len = 0;
+    int isn = 0, isb = 0;
+    b[0] = '\0';
+    if (st == SEER_OK && seer_stmt_out_data(s, 1, &d, &len, &isn, &isb) == SEER_OK && d != NULL)
+      snprintf(b, sizeof b, "%.*s", (int)len, (const char *)d);
+  }
+  seer_stmt_close(s);
+  scalar("SELECT 1 FROM dual", c, sizeof c);
+  if (strcmp(a, "caf\xc3\xa9"
+                "4") == 0 &&
+      st == SEER_OK && strcmp(b, "4") == 0 && strcmp(c, "1") == 0)
+    pass(name);
+  else {
+    char m[128];
+    snprintf(m, sizeof m, "'%s' / block %d '%s' / then '%s'", a, (int)st, b, c);
+    fail(name, m);
+  }
+}
+
 /* The session names this client: program "seerodbc" and this machine, the
  * login's AUTH_PROGRAM_NM and AUTH_MACHINE (#123). JDBC thin's positional
  * login, sent until then, named every 9i session "JDBC Thin Client" on "o9i". */
@@ -1252,6 +1285,7 @@ int main(void)
   check_long_raw_bind();
   check_cursor_hygiene();
   check_session_identity();
+  check_non_ascii_sql();
   check_wrong_password(&p);
 
   seer_disconnect(C);
