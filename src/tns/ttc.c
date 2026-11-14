@@ -1260,47 +1260,70 @@ static char *hex_upper(const uint8_t *in, size_t n)
   return s;
 }
 
-/* O3LOGON (Oracle 9i, field version 2): the pre-10g DES thin authenticator, the
- * path the Oracle JDBC thin driver uses against 9i. Phase 1 (TTI_3LOGA) sends the
- * username; the server returns an 8-byte session key as positional ASCII-hex in an
- * RPA. Phase 2 (TTI_3LOGON) sends AUTH_PASSWORD = upper-hex(DES-encrypt the padded
- * password under the recovered session key) + decimal pad count. A clean OER
- * (code 0/1403) means authenticated - there is no separate TTI_AUTH step, and no
- * AUTH_SVR_RESPONSE to validate. The fixed message skeletons and env strings match
- * the JDBC thin driver byte-for-byte (seerdb/seerdb#90). */
-static const uint8_t O3_MID1[] = {
-    /* 31 bytes (seerdb _O3_MID1) */
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x07, 0x01, 0x01, 0x03, 0x01, 0x01, 0x04, 0x02,
-    0x10, 0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x01,
-};
-static const uint8_t O3_MID2[] = {
-    /* 29 bytes (seerdb _O3_MID2) */
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x07, 0x01, 0x01, 0x03, 0x01, 0x01, 0x04, 0x02, 0x10,
-    0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00,
-};
-static const char O3_ENV[] = "unknowno9irootJDBC Thin Client";
+/* O3LOGON (Oracle 9i, field version 2), in the key-value OSESSKEY / OAUTH
+ * envelope 10g+ and 8i take (seerdb PROTOCOL.md §4.4, §19; seerdb #2342).
+ * Phase 1 is the OSESSKEY 11g gets (build_sess: mode 1, the raw user,
+ * program, machine, pid and OS user); the reply is an RPA of pairs whose
+ * AUTH_SESSKEY is the 8-byte DES session key in ASCII hex. Phase 2 is an OAUTH
+ * with mode 0x101: AUTH_PASSWORD = upper-hex(DES-encrypt the padded password
+ * under the session key) + the decimal pad count, the same session pairs, and
+ * AUTH_ACL. A reply of pairs means authenticated (there is no server proof to
+ * check); a refusal at either phase is a status alone.
+ *
+ * The login was once the JDBC thin driver's positional TTI_3LOGA /
+ * TTI_3LOGON, copied with a block nobody understood and its fixed session
+ * strings, so every 9i session reported program "JDBC Thin Client" on host
+ * "o9i" (#123). */
+static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwdfield,
+                                  SeerWriter *w)
+{
+  size_t ulen = strlen(user);
+  char host[256];
+  if (gethostname(host, sizeof host - 1) != 0)
+    strcpy(host, "localhost");
+  host[sizeof host - 1] = '\0';
+  char pid[16];
+  snprintf(pid, sizeof pid, "%ld", (long)getpid());
+  char osuser[128];
+  seer_client_os_user(osuser, sizeof osuser);
+  static const char APP[] = "seerodbc";
+  static const char ACL[] = "8000";
+
+  if (!seer_writer_init(w, 256 + ulen + strlen(pwdfield)))
+    return SEER_ENOMEM;
+  seer_ttc_fun_header(c, w, TTI_AUTH);
+  seer_writer_u8(w, 1);
+  seer_enc_sb4(w, (uint32_t)ulen); /* user length               */
+  seer_enc_sb4(w, 0x101);          /* logon mode, with the proof */
+  seer_writer_u8(w, 1);
+  seer_enc_sb4(w, 6); /* key/value pairs */
+  seer_writer_u8(w, 1);
+  seer_writer_u8(w, 1);
+  seer_writer_bytes(w, user, ulen); /* raw, as below 12.1 */
+  seer_enc_kv(w, "AUTH_PASSWORD", 13, pwdfield, strlen(pwdfield), 0, false);
+  seer_enc_kv(w, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0, false);
+  seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0, false);
+  seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0, false);
+  seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0, false);
+  seer_enc_kv(w, "AUTH_ACL", 8, ACL, sizeof ACL - 1, 0, false);
+  if (!seer_writer_ok(w)) {
+    seer_writer_free(w);
+    return SEER_ENOMEM;
+  }
+  return SEER_OK;
+}
 
 static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
 {
   const char *user = (params->username && params->username[0]) ? params->username : "";
   const char *pass = params->password ? params->password : "";
-  size_t ulen = strlen(user);
 
-  /* --- Phase 1: TTI_3LOGA, fetch the session key --- */
+  /* --- Phase 1: OSESSKEY, fetch the session key --- */
   SeerWriter w;
-  if (!seer_writer_init(&w, 96 + ulen))
-    return SEER_ENOMEM;
-  seer_ttc_fun_header(conn, &w, TTI_3LOGA);
-  seer_writer_u8(&w, 1);
-  seer_enc_sb4(&w, (uint32_t)ulen);
-  seer_writer_bytes(&w, O3_MID1, sizeof O3_MID1);
-  seer_writer_bytes(&w, (const uint8_t *)user, ulen);
-  seer_writer_bytes(&w, (const uint8_t *)O3_ENV, sizeof O3_ENV - 1);
-  if (!seer_writer_ok(&w)) {
-    seer_writer_free(&w);
-    return SEER_ENOMEM;
-  }
-  SeerStatus st = seer_ttc_send(conn, w.buf, w.len);
+  SeerStatus st = build_sess(conn, params, &w);
+  if (st != SEER_OK)
+    return st;
+  st = seer_ttc_send(conn, w.buf, w.len);
   seer_writer_free(&w);
   if (st != SEER_OK)
     return st;
@@ -1310,105 +1333,60 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
   st = seer_ttc_recv(conn, &resp, &rlen);
   if (st != SEER_OK)
     return st;
-  /* RPA: [TTI_RPA][ub1 count][ub1 hexlen][<hexlen ASCII-hex chars>]. A user the
-   * server refuses at once (an unknown one: ORA-01017) gets a status with the
-   * message instead. */
-  if (rlen < 3 || resp[0] != TTI_RPA) {
-    bool refused =
-        rlen > 0 && resp[0] == TTI_OER && seer_conn_error_from_reply(conn, resp, rlen, 1);
-    if (!refused)
-      seer_log(SEER_LOG_ERROR, "o3logon: phase-1 reply not RPA (token %u)", rlen ? resp[0] : 0);
+  SeerAuthChallenge ch;
+  st = parse_challenge(resp, rlen, &ch);
+  if (st != SEER_OK) {
+    /* A user the server refuses at once (ORA-01017) gets a status alone. */
+    seer_conn_error_from_reply(conn, resp, rlen, 1);
     free(resp);
-    return refused ? SEER_EAUTH : SEER_EPROTO;
-  }
-  size_t hexlen = resp[2];
-  if (hexlen == 0 || 3 + hexlen > rlen) {
-    free(resp);
-    return SEER_EPROTO;
-  }
-  uint8_t *sesskey = NULL;
-  size_t skl = 0;
-  st = hex_decode(resp + 3, hexlen, &sesskey, &skl);
-  free(resp);
-  if (st != SEER_OK)
     return st;
+  }
+  free(resp);
 
   /* --- AUTH_PASSWORD = upper-hex(DES(session key, padded password)) + pad --- */
   uint8_t verifier[8];
   seer_des_verifier(user, pass, verifier);
   uint8_t *authpass = NULL;
   size_t apn = 0;
-  st = seer_o3logon(sesskey, skl, verifier, pass, &authpass, &apn);
-  free(sesskey);
+  st = seer_o3logon(ch.sesskey, ch.sesskey_len, verifier, pass, &authpass, &apn);
+  seer_auth_challenge_free(&ch);
   if (st != SEER_OK)
     return st;
   char *hexpw = hex_upper(authpass, apn);
   free(authpass);
   if (hexpw == NULL)
     return SEER_ENOMEM;
-  size_t pl = strlen(pass);
-  unsigned padcount = (unsigned)((8 - (pl % 8)) % 8);
   char pwdfield[300];
-  int pwn = snprintf(pwdfield, sizeof pwdfield, "%s%u", hexpw, padcount);
+  int pwn =
+      snprintf(pwdfield, sizeof pwdfield, "%s%u", hexpw, (unsigned)((8 - (strlen(pass) % 8)) % 8));
   free(hexpw);
   if (pwn < 0 || (size_t)pwn >= sizeof pwdfield)
     return SEER_EPROTO;
-  size_t pwlen = (size_t)pwn;
 
-  /* --- Phase 2: TTI_3LOGON, send AUTH_PASSWORD --- */
-  if (!seer_writer_init(&w, 128 + ulen + pwlen))
-    return SEER_ENOMEM;
-  seer_ttc_fun_header(conn, &w, TTI_3LOGON);
-  seer_writer_u8(&w, 1);
-  seer_enc_sb4(&w, (uint32_t)ulen);
-  seer_writer_u8(&w, 1);
-  seer_enc_sb4(&w, (uint32_t)pwlen);
-  seer_writer_bytes(&w, O3_MID2, sizeof O3_MID2);
-  seer_writer_bytes(&w, (const uint8_t *)user, ulen);
-  seer_writer_bytes(&w, (const uint8_t *)pwdfield, pwlen);
-  seer_writer_bytes(&w, (const uint8_t *)O3_ENV, sizeof O3_ENV - 1);
-  if (!seer_writer_ok(&w)) {
-    seer_writer_free(&w);
-    return SEER_ENOMEM;
-  }
+  /* --- Phase 2: OAUTH, send AUTH_PASSWORD --- */
+  st = o9i_build_oauth(conn, user, pwdfield, &w);
+  if (st != SEER_OK)
+    return st;
   st = seer_ttc_send(conn, w.buf, w.len);
   seer_writer_free(&w);
   if (st != SEER_OK)
     return st;
-
   st = seer_ttc_recv(conn, &resp, &rlen);
   if (st != SEER_OK)
     return st;
-  /* Short pre-10g OER: token, then ub4 call_status, seq, rowcount, then the ub4
-   * ORA code. 0 / 1403 = authenticated. A refusal (a wrong password) is a
-   * longer status that ends with the message, "ORA-01017: invalid
-   * username/password; logon denied", and keeps its code in another field, so
-   * the message is what tells it: measured on 9.2.0.4, where a success has no
-   * text and the code read below stayed 0 for a wrong password - the login
-   * "succeeded" and every call then failed with ORA-01012. */
-  if (rlen > 0 && resp[0] == TTI_OER && seer_conn_error_from_reply(conn, resp, rlen, 1)) {
+  if (rlen < 1 || resp[0] != TTI_RPA) {
+    /* A wrong password: a status alone, "ORA-01017: invalid username/password;
+     * logon denied". */
+    bool status = rlen > 0 && resp[0] == TTI_OER;
+    if (status)
+      seer_conn_error_from_reply(conn, resp, rlen, 1);
+    else
+      seer_log(SEER_LOG_ERROR, "o3logon: phase-2 reply neither pairs nor a status (token %u)",
+               rlen ? resp[0] : 0);
     free(resp);
-    return SEER_EAUTH;
+    return status ? SEER_EAUTH : SEER_EPROTO;
   }
-  if (rlen < 1 || resp[0] != TTI_OER) {
-    seer_log(SEER_LOG_ERROR, "o3logon: phase-2 reply not OER (token %u)", rlen ? resp[0] : 0);
-    free(resp);
-    return SEER_EPROTO;
-  }
-  SeerReader r;
-  seer_reader_init(&r, resp + 1, rlen - 1);
-  (void)seer_dec_sb4(&r); /* call_status */
-  (void)seer_dec_sb4(&r); /* seq         */
-  (void)seer_dec_sb4(&r); /* rowcount    */
-  int64_t code = seer_dec_sb4(&r);
   free(resp);
-  if (!seer_reader_ok(&r))
-    return SEER_EPROTO;
-  if (code != 0 && code != 1403) {
-    seer_log(SEER_LOG_DEBUG, "o3logon: authentication failed (ORA-%05ld)", (long)code);
-    seer_conn_error_code(conn, (long)code);
-    return SEER_EAUTH;
-  }
   conn->authenticated = true;
   seer_log(SEER_LOG_INFO, "TTC: authenticated (O3LOGON / 9i, fv=%u)", conn->field_version);
   return SEER_OK;
@@ -1611,8 +1589,9 @@ static int64_t o8i_status_code(const uint8_t *b, size_t n)
 
 /* Oracle 8i's O3LOGON (seerdb PROTOCOL.md §19.8): 9i's DES crypto, carried in
  * the 10g-style OSESSKEY / OAUTH envelope at 8i's fixed little-endian widths
- * (9i's positional TTI_3LOGA draws an OER on 8i). Phase 1 returns the 8-byte
- * session key as AUTH_SESSKEY (ASCII hex); phase 2 sends AUTH_PASSWORD =
+ * (8i takes JDBC thin's positional login too, seerdb #2641; it isn't used).
+ * Phase 1 returns the 8-byte session key as AUTH_SESSKEY (ASCII hex); phase 2
+ * sends AUTH_PASSWORD =
  * upper-hex(DES blocks) + the decimal pad count, and a reply of pairs - not a
  * status - means authenticated; there is no server proof to check. */
 static SeerStatus o8i_login(SeerConn *conn, const SeerConnParams *params)

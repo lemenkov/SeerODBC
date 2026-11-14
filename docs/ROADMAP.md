@@ -112,7 +112,10 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       SID=orcl). `seer_o3logon` (DES-decrypt AUTH_SESSKEY under the DES verifier,
       DES-encrypt the padded password; reuses the 10g DES machinery; pinned to the
       JDBC-thin→9.2.0.4 vector in `test_auth`) driven by `o3logon_login` in ttc.c:
-      TTI_3LOGA `0x52` → session-key RPA → TTI_3LOGON `0x51` → short pre-10g OER.
+      OSESSKEY (mode 1) → AUTH_SESSKEY pairs → OAUTH (mode 0x101, AUTH_PASSWORD)
+      → pairs, the key-value envelope 8i and 10g+ take (seerdb #2342). The
+      first version sent JDBC thin's positional TTI_3LOGA / TTI_3LOGON, which
+      named every session "JDBC Thin Client" on "o9i" (#123).
       Needed three enablers: `sid` connect param (9i predates service names), a
       lower CONNECT floor (300, since 9i's max is 312), and the minimal pre-10g
       caps (no O5LOGON). No regression on 10g/11g/21c/23ai.
