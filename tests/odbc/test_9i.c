@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include "netcompat.h" /* gethostname(): <unistd.h> on POSIX, Winsock on Windows */
 
 #include "seer/seertns.h"
 
