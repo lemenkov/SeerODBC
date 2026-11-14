@@ -35,7 +35,7 @@ static int n_pass, n_fail, n_skip;
 
 /* Known gaps of the legacy tiers. Oracle 8i and 9i speak their own dialects,
  * and some checks need what those releases lack, or what SeerODBC doesn't
- * speak to them yet (8i: LOB and UROWID columns, #135-#136). A
+ * speak to them yet (8i: UROWID columns, #136). A
  * check listed here, on a server older than `below` (9 = 8i only, 10 = 8i and
  * 9i), is reported as SKIP with the reason rather than as a failure. Anything
  * not listed still fails, so a regression in what these tiers do support
@@ -79,8 +79,7 @@ static const KnownGap known_gaps[] = {
     {9, "fetch all rows inside an open transaction", "8i has no CONNECT BY level row generator"},
     {9, "PL/SQL CLOB / BLOB parameter over 32 KB",
      "8.1.7 has no temporary LOB to carry it (PLS-00306)"},
-    /* 8i: not spoken yet - LOB columns (#135), UROWID (#136) */
-    {9, "CLOB / BLOB columns across fetch batches", "8i: no LOB columns yet (#135)"},
+    /* 8i: not spoken yet - UROWID (#136) */
     {9, "UROWID of a physical rowid renders as ROWID", "8i: no UROWID columns yet (#136)"},
 };
 
@@ -1512,12 +1511,13 @@ static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
           "DECLARE cc CLOB; bb BLOB; nc PLS_INTEGER; nb PLS_INTEGER; k PLS_INTEGER; "
           "r RAW(2000); BEGIN FOR i IN 1 .. 120 LOOP "
           "IF MOD(i, 50) = 0 THEN INSERT INTO seer_ld VALUES (i, NULL, NULL); ELSE "
-          "nc := CASE WHEN MOD(i, 50) = 1 THEN 0 WHEN i > 115 THEN 30000 ELSE i * 7 END; "
-          "nb := CASE WHEN i > 115 THEN 20000 ELSE i * 5 END; "
+          "IF MOD(i, 50) = 1 THEN nc := 0; ELSIF i > 115 THEN nc := 30000; "
+          "ELSE nc := i * 7; END IF; "
+          "IF i > 115 THEN nb := 20000; ELSE nb := i * 5; END IF; "
           "r := UTL_RAW.COPIES(HEXTORAW(LPAD(TRIM(TO_CHAR(MOD(i, 256), 'XX')), 2, '0')), 2000); "
           "DBMS_LOB.CREATETEMPORARY(cc, TRUE); DBMS_LOB.CREATETEMPORARY(bb, TRUE); "
           "k := nc; WHILE k > 0 LOOP DBMS_LOB.WRITEAPPEND(cc, LEAST(k, 1000), "
-          "RPAD(UNISTR('\\00E9'), LEAST(k, 1000), UNISTR('\\00E9'))); k := k - 1000; END LOOP; "
+          "RPAD('\xc3\xa9', LEAST(k, 1000), '\xc3\xa9')); k := k - 1000; END LOOP; "
           "k := nb; WHILE k > 0 LOOP DBMS_LOB.WRITEAPPEND(bb, LEAST(k, 2000), "
           "UTL_RAW.SUBSTR(r, 1, LEAST(k, 2000))); k := k - 2000; END LOOP; "
           "INSERT INTO seer_ld VALUES (i, cc, bb); "

@@ -108,6 +108,7 @@
 #define TNS_AL8I4_IMPLICIT_RESULTSET 0x8000
 
 /* TTI_LOBOPS opcodes (§14.2) */
+#define LOB_OP_GET_LENGTH 0x0001 /* the LOB's length (9i, 8i BFILE)    */
 #define LOB_OP_READ 0x0002
 #define LOB_OP_WRITE 0x0040       /* write at an offset (§14.2)           */
 #define LOB_OP_FILE_OPEN 0x0100   /* open a BFILE before reading (§19.8) */
