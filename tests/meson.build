@@ -244,7 +244,7 @@ if build_driver
   # server. Self-gating - exits 77 (skip) unless SEER_TEST_HOST/SERVICE/USER are
   # set, so it is harmless in an offline `meson test`. The driver .so to load is
   # baked in (overridable via SEER_DRIVER); point at a server with, e.g.:
-  #   SEER_TEST_HOST=127.0.0.1 SEER_TEST_SERVICE=XE \
+  #   SEER_TEST_HOST=127.0.0.1 SEER_TEST_SERVICE=XE SEER_TEST_RELEASE=11 \
   #   SEER_TEST_USER=pyo SEER_TEST_PASS=pyo123 meson test 'odbc integration'
   odbc_dm_dep = cc.find_library('odbc', required : false)
   if odbc_dm_dep.found()

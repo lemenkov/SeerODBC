@@ -275,12 +275,15 @@ jobs:
           - name: "XE 11g"
             image: "gvenzl/oracle-xe:11-slim"
             service: "XE"
+            release: "11"
           - name: "XE 21c"
             image: "gvenzl/oracle-xe:21-slim"
             service: "XEPDB1"
+            release: "21"
           - name: "23ai Free"
             image: "gvenzl/oracle-free:23-slim"
             service: "FREEPDB1"
+            release: "23"
     services:
       oracle:
         image: ${{ matrix.db.image }}
@@ -325,6 +328,8 @@ jobs:
           SEER_TEST_SERVICE: ${{ matrix.db.service }}
           SEER_TEST_USER: pyo
           SEER_TEST_PASS: pyo123
+          # The server's release: the suite skips what it lacks by it (gates.h).
+          SEER_TEST_RELEASE: ${{ matrix.db.release }}
         run: |
           meson test -C build --print-errorlogs \
             'odbc integration' \
