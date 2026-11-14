@@ -223,6 +223,12 @@ SeerStatus seer_bfile_read(SeerConn *conn, const uint8_t *locator, size_t loclen
    * failed - nothing was opened, so no FILE_CLOSE is owed. */
   SeerReader r;
   seer_reader_init(&r, resp, rlen);
+  /* A file that won't open is answered with the server's error - ORA-22285
+   * for a missing directory - which the caller reports for the cell (#158). */
+  if (rlen > 0 && resp[0] == TTI_OER && seer_conn_error_from_reply(conn, resp, rlen, 0)) {
+    free(resp);
+    return SEER_EDB;
+  }
   if (seer_reader_u8(&r) != TTI_RPA) {
     seer_log(SEER_LOG_ERROR, "bfile: FILE_OPEN not acknowledged");
     free(resp);

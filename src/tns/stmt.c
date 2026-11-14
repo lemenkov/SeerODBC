@@ -186,6 +186,14 @@ struct SeerStmt {
   SeerPendingLob *plobs; /* LOB cells awaiting content */
   size_t nplobs;
   size_t plobs_cap;
+  /* Cells whose content the server refused to give - a BFILE whose file
+   * can't be opened - and its error, which reading the cell returns (#158). */
+  struct {
+    size_t row;
+    int col;
+    char *message;
+  } *cell_errs;
+  size_t ncell_errs;
   SeerPendingObj *pobjs; /* ADT cells awaiting layout + decode */
   size_t npobjs;
   size_t pobjs_cap;
@@ -3520,6 +3528,11 @@ SeerStatus seer_stmt_prepare(SeerConn *conn, const char *sql, SeerStmt **out)
 /* Free the buffered result rows and reset the cursor position. */
 static void free_rows(SeerStmt *stmt)
 {
+  for (size_t i = 0; i < stmt->ncell_errs; i++)
+    free(stmt->cell_errs[i].message);
+  free(stmt->cell_errs);
+  stmt->cell_errs = NULL;
+  stmt->ncell_errs = 0;
   for (size_t r = 0; r < stmt->nrows; r++) {
     for (int c = 0; c < stmt->ncols; c++)
       free(stmt->rows[r][c].data);
@@ -4249,6 +4262,8 @@ static SeerStatus fetch_all_rows(SeerStmt *stmt)
   return SEER_OK;
 }
 
+static void record_cell_error(SeerStmt *stmt, size_t row, int col);
+
 /* Resolve every captured LOB cell into its content (CLOB -> UTF-8 text, BLOB ->
  * raw bytes). A per-cell read failure is logged and skipped, not fatal. */
 static void resolve_pending_lobs(SeerStmt *stmt)
@@ -4262,6 +4277,10 @@ static void resolve_pending_lobs(SeerStmt *stmt)
     SeerStatus lst = (p->ora_type == ORA_TYPE_BFILE)
                          ? seer_bfile_read(stmt->conn, p->locator, p->loclen, &raw, &rawlen)
                          : seer_lob_read(stmt->conn, p->locator, p->loclen, &raw, &rawlen);
+    if (lst == SEER_EDB && p->ora_type == ORA_TYPE_BFILE) {
+      record_cell_error(stmt, p->row, p->col);
+      continue;
+    }
     if (lst != SEER_OK) {
       seer_log(SEER_LOG_WARNING, "stmt: LOB read failed for row %zu col %d", p->row, p->col);
       continue;
@@ -5337,7 +5356,14 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
   if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_FOPEN_MID, sizeof FV2_LOBOP_FOPEN_MID, fopen_trl,
                      sizeof fopen_trl, &resp, &rlen) != SEER_OK)
     return SEER_EPROTO;
-  /* Opened locator: RPA 00 <ub1 len><body>  ->  00 <ub1 len><body>. */
+  /* Opened locator: RPA 00 <ub1 len><body>  ->  00 <ub1 len><body>. A file
+   * that won't open is answered with a status: its error (ORA-22285 for a
+   * missing directory) is the cell's (#158). */
+  if (rlen > 0 && resp[0] == TTI_OER) {
+    fv2_set_error(c, resp, rlen);
+    free(resp);
+    return SEER_EDB;
+  }
   if (rlen < 3 || resp[0] != TTI_RPA) {
     free(resp);
     return SEER_EPROTO;
@@ -5383,7 +5409,10 @@ static void fv2_resolve_lobs(SeerStmt *stmt)
     uint8_t *content = NULL;
     size_t clen = 0;
     if (p->ora_type == ORA_TYPE_BFILE) {
-      fv2_bfile_read(c, p->locator, p->loclen, &content, &clen);
+      if (fv2_bfile_read(c, p->locator, p->loclen, &content, &clen) == SEER_EDB) {
+        record_cell_error(stmt, p->row, p->col);
+        continue;
+      }
     } else {
       int64_t amount = fv2_lob_getlen(c, p->locator, p->loclen);
       if (amount > 0)
@@ -6643,6 +6672,14 @@ static SeerStatus o8i_resolve_lobs(SeerStmt *stmt)
       const uint8_t *loc = (const uint8_t *)cell->data;
       SeerStatus st = t == ORA_TYPE_BFILE ? o8i_bfile_read(stmt->conn, loc, cell->len, &content)
                                           : o8i_lob_read(stmt->conn, loc, cell->len, &content);
+      if (st == SEER_EDB && t == ORA_TYPE_BFILE) {
+        /* The server's error is the cell's, read when the cell is (#158). */
+        free(cell->data);
+        *cell = (SeerCell){0};
+        record_cell_error(stmt, row, col);
+        seer_writer_free(&content);
+        continue;
+      }
       if (st == SEER_OK) {
         free(cell->data);
         *cell = (SeerCell){0};
@@ -7995,6 +8032,9 @@ void seer_stmt_close(SeerStmt *stmt)
     free(stmt->rows[r]);
   }
   free(stmt->rows);
+  for (size_t i = 0; i < stmt->ncell_errs; i++) /* the cells' errors (#158) */
+    free(stmt->cell_errs[i].message);
+  free(stmt->cell_errs);
   /* Keep this statement's parsed server cursor open in the statement cache,
    * keyed by its SQL, so re-preparing the same SQL re-executes it without a
    * re-parse. The describe columns move with it. (A full cache evicts + closes
@@ -8084,6 +8124,26 @@ long seer_stmt_row_count(SeerStmt *stmt)
   return stmt->ncols > 0 ? (long)stmt->nrows : stmt->affected;
 }
 
+/* Keep the error the server gave for this cell's content - the connection's
+ * last error - so reading the cell returns it, as Oracle's clients report a
+ * BFILE that can't be opened when they read it, not when the row is fetched
+ * (#158). The cell stays NULL; the query and the other cells go on. */
+static void record_cell_error(SeerStmt *stmt, size_t row, int col)
+{
+  SeerConn *c = stmt->conn;
+  void *n = realloc(stmt->cell_errs, (stmt->ncell_errs + 1) * sizeof *stmt->cell_errs);
+  if (n == NULL)
+    return;
+  stmt->cell_errs = n;
+  stmt->cell_errs[stmt->ncell_errs].row = row;
+  stmt->cell_errs[stmt->ncell_errs].col = col;
+  stmt->cell_errs[stmt->ncell_errs].message =
+      strdup(c->last_error != NULL ? c->last_error : "the server refused the value");
+  stmt->ncell_errs++;
+  free(c->last_error);
+  c->last_error = NULL; /* the query itself succeeded */
+}
+
 SeerStatus seer_stmt_get_data(SeerStmt *stmt, int col, const void **data, size_t *len, int *is_null,
                               int *is_binary)
 {
@@ -8098,6 +8158,14 @@ SeerStatus seer_stmt_get_data(SeerStmt *stmt, int col, const void **data, size_t
     return SEER_EPARAM;
   if (stmt->cur < 0 || (size_t)stmt->cur >= stmt->nrows)
     return SEER_EPROTO;
+
+  for (size_t i = 0; i < stmt->ncell_errs; i++)
+    if (stmt->cell_errs[i].row == (size_t)stmt->cur && stmt->cell_errs[i].col == col) {
+      free(stmt->conn->last_error);
+      stmt->conn->last_error =
+          stmt->cell_errs[i].message ? strdup(stmt->cell_errs[i].message) : NULL;
+      return SEER_EDB;
+    }
 
   SeerCell *cell = &stmt->rows[stmt->cur][col];
   if (cell->data != NULL) {

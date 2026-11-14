@@ -48,8 +48,6 @@ static void skip(const char *n, const char *w)
 
 /* The checks each release skips (gates.h). Ordered by check. */
 static const Gate GATES[] = {
-    {"a BFILE in a missing directory is the server's error", 9, 99, GATE_TODO,
-     "a BFILE that can't be opened reads as empty (#158)"},
     {"describe before execute, with a placeholder", 8, 8, GATE_SERVER,
      "8i returns a query's describe only with its execute"},
     {"national charset: NVARCHAR2 bind + fetch, UNISTR", 8, 8, GATE_SERVER,
@@ -2086,27 +2084,43 @@ static void check_bfile(void)
   }
 }
 
-/* A BFILE in a directory that doesn't exist is the server's ORA-22285, and the
- * session goes on. */
+/* A BFILE whose file can't be opened, as Oracle reports it: fetching the row
+ * succeeds - it carries only the locator - and reading the cell is the
+ * server's error, ORA-22285 for a missing directory (#158). A column beside
+ * it reads as usual, and the session goes on. */
 static void check_bfile_missing(void)
 {
-  const char *name = "a BFILE in a missing directory is the server's error";
-  GATE(name);
+  const char *name = "a BFILE in a missing directory is the server's error when read";
   SeerStmt *s = NULL;
-  SeerStatus st = SEER_OK;
-  if (seer_stmt_prepare(C, "SELECT BFILENAME('NO_SUCH_DIR', 'x') FROM dual", &s) == SEER_OK)
+  SeerStatus st = SEER_EPROTO, fs = SEER_EPROTO, gs = SEER_EPROTO;
+  char err[128] = "", tail[16] = "";
+  if (seer_stmt_prepare(C, "SELECT BFILENAME('NO_SUCH_DIR', 'x'), 'tail' FROM dual", &s) ==
+      SEER_OK) {
     st = seer_stmt_execute(s);
-  bool err = st == SEER_EDB && seer_last_error(C) != NULL &&
-             strncmp(seer_last_error(C), "ORA-22285", 9) == 0;
+    if (st == SEER_OK)
+      fs = seer_stmt_fetch(s);
+    if (fs == SEER_OK) {
+      const void *d = NULL;
+      size_t len = 0;
+      int isn = 0, isb = 0;
+      gs = seer_stmt_get_data(s, 0, &d, &len, &isn, &isb);
+      if (seer_last_error(C) != NULL)
+        snprintf(err, sizeof err, "%s", seer_last_error(C));
+      const char *t = NULL;
+      if (seer_stmt_get_string(s, 1, &t, &isn) == SEER_OK && t != NULL)
+        snprintf(tail, sizeof tail, "%s", t);
+    }
+  }
   seer_stmt_close(s);
   char after[8];
   query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
-  if (err && strcmp(after, "1") == 0)
+  if (st == SEER_OK && fs == SEER_OK && gs == SEER_EDB && strncmp(err, "ORA-22285", 9) == 0 &&
+      strcmp(tail, "tail") == 0 && strcmp(after, "1") == 0)
     pass(name);
   else {
-    char m[200];
-    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st,
-             seer_last_error(C) ? seer_last_error(C) : "", after);
+    char m[240];
+    snprintf(m, sizeof m, "execute %d fetch %d read %d '%s', tail '%s', then '%s'", (int)st,
+             (int)fs, (int)gs, err, tail, after);
     fail(name, m);
   }
 }

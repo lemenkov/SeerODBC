@@ -2234,6 +2234,43 @@ static void check_double_params(SQLHDBC dbc)
   }
 }
 
+/* A BFILE whose file can't be opened: as Oracle reports it, the fetch
+ * succeeds and SQLGetData of that column is the server's error, ORA-22285
+ * for a missing directory (native 22285); the column beside it reads (#158).
+ * It used to read as an empty value on 9i and 10g+, and fail the whole query
+ * on 8i. */
+static void check_bfile_unopenable(SQLHDBC dbc)
+{
+  const char *name = "an unopenable BFILE is the server's error at SQLGetData";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  char m[300] = "", tail[16] = "";
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"SELECT BFILENAME('NO_SUCH_DIR', 'x'), 'tail' FROM dual", SQL_NTS);
+  SQLRETURN fr = SQL_SUCCEEDED(rc) ? SQLFetch(st) : rc;
+  SQLRETURN gr = SQL_ERROR;
+  SQLINTEGER native = 0;
+  if (SQL_SUCCEEDED(fr)) {
+    unsigned char buf[64];
+    SQLLEN ind = 0;
+    gr = SQLGetData(st, 1, SQL_C_BINARY, buf, sizeof buf, &ind);
+    SQLCHAR state[6] = "";
+    SQLSMALLINT ml = 0;
+    if (gr == SQL_ERROR)
+      SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, NULL, 0, &ml);
+    SQLGetData(st, 2, SQL_C_CHAR, tail, sizeof tail, &ind);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(fr) && gr == SQL_ERROR && native == 22285 &&
+      strcmp(tail, "tail") == 0)
+    pass(name);
+  else {
+    snprintf(m, sizeof m, "execute %d fetch %d getdata %d native %ld tail '%s'", rc, fr, gr,
+             (long)native, tail);
+    fail(name, m);
+  }
+}
+
 static void check_urowid(SQLHDBC dbc)
 {
   const char *name = "UROWID fetch";
@@ -3550,6 +3587,7 @@ int main(void)
   check_urowid_long(dbc);
   check_bind_order(dbc);
   check_null_out(dbc);
+  check_bfile_unopenable(dbc);
   check_double_params(dbc);
   check_intervals(dbc);
   check_boolean(dbc);
