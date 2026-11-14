@@ -34,12 +34,11 @@
 static int n_pass, n_fail, n_skip;
 
 /* Known gaps of the legacy tiers. Oracle 8i and 9i speak their own dialects,
- * and some checks need what those releases lack, or what SeerODBC doesn't
- * speak to them yet (8i: UROWID columns, #136). A
- * check listed here, on a server older than `below` (9 = 8i only, 10 = 8i and
- * 9i), is reported as SKIP with the reason rather than as a failure. Anything
- * not listed still fails, so a regression in what these tiers do support
- * shows. g_major is the connected server's release. */
+ * and some checks need what those releases lack. A check listed here, on a
+ * server older than `below` (9 = 8i only, 10 = 8i and 9i), is reported as
+ * SKIP with the reason rather than as a failure. Anything not listed still
+ * fails, so a regression in what these tiers do support shows. g_major is the
+ * connected server's release. */
 static int g_major;
 typedef struct {
   int below;
@@ -79,8 +78,6 @@ static const KnownGap known_gaps[] = {
     {9, "fetch all rows inside an open transaction", "8i has no CONNECT BY level row generator"},
     {9, "PL/SQL CLOB / BLOB parameter over 32 KB",
      "8.1.7 has no temporary LOB to carry it (PLS-00306)"},
-    /* 8i: not spoken yet - UROWID (#136) */
-    {9, "UROWID of a physical rowid renders as ROWID", "8i: no UROWID columns yet (#136)"},
 };
 
 /* The reason `name` is a known gap of the connected server, or NULL. */
