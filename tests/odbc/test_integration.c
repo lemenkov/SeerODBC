@@ -3,14 +3,15 @@
  * (connect, typed fetch, binds, DML + rowcount, array DML + batch errors,
  * transactions, catalog, LOB, FOR UPDATE concurrency).
  *
- * It is *gated*: with no server configured it exits 77 (the automake/meson
- * "skip" code), so `meson test` stays green offline. Point it at a server with
+ * With no server configured it exits 77 (the automake/meson "skip" code), so
+ * `meson test` stays green offline. Point it at a server with
  *   SEER_TEST_HOST, SEER_TEST_PORT (default 1521), SEER_TEST_SERVICE,
- *   SEER_TEST_USER, SEER_TEST_PASS
+ *   SEER_TEST_USER, SEER_TEST_PASS, SEER_TEST_RELEASE (required: 8, 9, 10, 11,
+ *   18, 21, 23, 26)
  * and the driver to load with SEER_DRIVER (an absolute .so path; defaults to
- * the build-tree path baked in at compile time). Every check is independent
- * and self-contained, so the same binary measures any server version - the
- * 9i..23ai support matrix is just this run against each one.
+ * the build-tree path baked in at compile time). Every tier, 8i to 26ai, runs
+ * the same checks; one that can't apply to the release is a SKIP with its
+ * reason (GATES below, tests/odbc/gates.h, #148).
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -27,67 +28,83 @@
 #include <sql.h>
 #include <sqlext.h>
 
+#include "gates.h"
+
 #ifndef SEER_DRIVER_PATH
 #define SEER_DRIVER_PATH ""
 #endif
 
 static int n_pass, n_fail, n_skip;
 
-/* Known gaps of the legacy tiers. Oracle 8i and 9i speak their own dialects,
- * and some checks need what those releases lack. A check listed here, on a
- * server older than `below` (9 = 8i only, 10 = 8i and 9i), is reported as
- * SKIP with the reason rather than as a failure. Anything not listed still
- * fails, so a regression in what these tiers do support shows. g_major is the
- * connected server's release. */
-static int g_major;
-typedef struct {
-  int below;
-  const char *check;
-  const char *why;
-} KnownGap;
-static const KnownGap known_gaps[] = {
-    /* 8i and 9i */
-    {10, "nested CURSOR() column", "CURSOR() columns are not read before 10g"},
-    {10, "REF CURSOR rows holding a CURSOR() column",
-     "REF CURSOR binds are not supported before 10g"},
-    {10, "large CLOB OUT parameter; CLOB + BLOB via RETURNING",
-     "LOB OUT parameters and RETURNING are not supported before 10g"},
-    {10, "large text bind ahead of another bind (5000 / 40000 bytes)",
-     "9i takes text binds up to 32512 bytes (in a block): 40000 is refused"},
-    {10, "BINARY_FLOAT bind", "BINARY_FLOAT is a 10g type"},
-    {10, "SQL OBJECT (ADT) fetch", "object types are not read before 10g"},
-    {10, "SQL OBJECT with an XMLType attribute", "object types are not read before 10g"},
-    {10, "SQL OBJECT / VARRAY with NVARCHAR2 attributes", "object types are not read before 10g"},
-    {10, "SQL OBJECT with CLOB / BLOB attributes", "object types are not read before 10g"},
-    {10, "nested SQL OBJECT fetch", "object types are not read before 10g"},
-    {10, "collection-of-objects fetch", "object types are not read before 10g"},
-    {10, "object-with-collection-attr fetch", "object types are not read before 10g"},
-    {10, "VARRAY / collection fetch", "object types are not read before 10g"},
-    {10, "REF fetch", "object types are not read before 10g"},
-    {10, "XMLType fetch", "XMLType is not read before 10g"},
-    {10, "XMLType fetch (LOB-backed)", "XMLType is not read before 10g"},
-    /* 8i: what 8.1.7 itself lacks */
-    {9, "zero-fraction TIMESTAMP bind matches trunc(LTZ)", "8.1.7 has no TIMESTAMP type"},
-    {9, "TIMESTAMP bind (fractional)", "8.1.7 has no TIMESTAMP type"},
-    {9, "INTERVAL bind", "8.1.7 has no INTERVAL types"},
-    {9, "typed NULL parameter (COALESCE with NUMBER / DATE)", "8.1.7 has no COALESCE"},
-    {9, "multi-batch fetch with a repeated column", "8i has no CONNECT BY level row generator"},
-    {9, "CLOB fetch", "8i has no TO_CLOB"},
-    {9, "BLOB fetch (hex)", "8i has no TO_BLOB"},
-    {9, "describe after SQLPrepare, before SQLExecute", "8i describes a query as it executes"},
-    {9, "fetch all rows inside an open transaction", "8i has no CONNECT BY level row generator"},
-    {9, "PL/SQL CLOB / BLOB parameter over 32 KB",
-     "8.1.7 has no temporary LOB to carry it (PLS-00306)"},
+/* The checks each release skips (gates.h): what the release lacks
+ * ("server: ...") or what SeerODBC doesn't reach on it yet ("todo: ..." and
+ * the issue). A gated check opens with GATE(name) and doesn't run; anything
+ * not gated runs and fails if it fails. Ordered as the checks run. */
+static const Gate GATES[] = {
+    {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 8, 8, GATE_SERVER,
+     "8.1.7 has no TIMESTAMP type"},
+    {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 9, 9, GATE_SERVER,
+     "9i's TRUNC takes no TIMESTAMP WITH LOCAL TIME ZONE (ORA-00932)"},
+    {"multi-batch fetch with a repeated column", 8, 8, GATE_SERVER,
+     "8i has no CONNECT BY level row generator"},
+    {"nested CURSOR() column", 8, 9, GATE_TODO, "CURSOR() columns before 10g (#166)"},
+    {"large text bind ahead of another bind (5000 / 40000 bytes)", 9, 9, GATE_TODO,
+     "9i text binds over 32512 bytes (#169)"},
+    {"typed NULL parameter (COALESCE with NUMBER / DATE)", 8, 8, GATE_SERVER,
+     "8.1.7 has no COALESCE"},
+    {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 9, GATE_TODO,
+     "object types before 10g (#168)"},
+    {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
+    {"SQL OBJECT with an XMLType attribute", 9, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"SQL OBJECT with CLOB / BLOB attributes", 8, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"describe after SQLPrepare, before SQLExecute", 8, 8, GATE_SERVER,
+     "8i describes a query as it executes"},
+    {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 11, GATE_SERVER,
+     "no temporary LOB carries a PL/SQL bind over 32 KB before 12c"},
+    {"temporary LOBs of large PL/SQL binds are freed", 8, 11, GATE_SERVER,
+     "a large PL/SQL bind isn't promoted to a temporary LOB before 12c"},
+    {"VECTOR column dimensions / format (SQLColAttribute)", 8, 21, GATE_SERVER,
+     "no VECTOR type before 23ai"},
+    {"large CLOB OUT parameter; CLOB + BLOB via RETURNING", 8, 9, GATE_TODO,
+     "LOB OUT parameters and LOBs via RETURNING before 10g (#167)"},
+    {"column annotations", 8, 21, GATE_SERVER, "no ANNOTATIONS before 23ai"},
+    {"REF CURSOR rows holding a CURSOR() column", 8, 9, GATE_TODO,
+     "CURSOR() columns and REF CURSOR parameters before 10g (#166)"},
+    {"implicit result rows holding a CURSOR() column", 8, 11, GATE_SERVER,
+     "no DBMS_SQL.RETURN_RESULT before 12c"},
+    {"implicit results", 8, 11, GATE_SERVER, "no DBMS_SQL.RETURN_RESULT before 12c"},
+    {"array DML row counts", 8, 11, GATE_SERVER, "no array-DML row counts before 12c"},
+    {"fetch all rows inside an open transaction", 8, 8, GATE_SERVER,
+     "8i has no CONNECT BY level row generator"},
+    {"BOOLEAN (23ai)", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
+    {"VECTOR (23ai)", 8, 21, GATE_SERVER, "no VECTOR type before 23ai"},
+    {"JSON (OSON)", 8, 18, GATE_SERVER, "no JSON type before 21c"},
+    {"JSON: long field names and compressed columns", 8, 21, GATE_SERVER,
+     "no JSON field names over 255 bytes before 23ai"},
+    {"INTERVAL bind", 8, 8, GATE_SERVER, "8.1.7 has no INTERVAL types"},
+    {"TIMESTAMP bind (fractional)", 8, 8, GATE_SERVER, "8.1.7 has no TIMESTAMP type"},
+    {"CLOB / BLOB columns across fetch batches (LOBINLINE)", 8, 11, GATE_SERVER,
+     "no inline LOB fetch before 12c"},
+    {"DRCP (pooled session)", 8, 10, GATE_SERVER, "no DRCP before 11g"},
+    {"DRCP (pooled session)", 11, 11, GATE_SERVER, "11g's pool takes only OCI clients (ORA-56606)"},
+    {"nested SQL OBJECT fetch", 8, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"XMLType fetch (LOB-backed)", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
+    {"XMLType fetch (LOB-backed)", 9, 9, GATE_TODO, "XMLType on 9i (#168)"},
+    {"XMLType fetch", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
+    {"XMLType fetch", 9, 9, GATE_TODO, "XMLType on 9i (#168)"},
+    {"XMLType fetch", 11, 11, GATE_SERVER,
+     "11g keeps XMLType as binary XML, which the server doesn't render to text: "
+     "XMLSERIALIZE reads it"},
+    {"object-with-collection-attr fetch", 8, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"collection-of-objects fetch", 8, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"SQL OBJECT (ADT) fetch", 8, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"VARRAY / collection fetch", 8, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"REF fetch", 9, 9, GATE_TODO, "object types before 10g (#168)"},
+    {"BINARY_FLOAT bind", 8, 9, GATE_SERVER, "no BINARY_FLOAT before 10g"},
+    {"BOOLEAN bind (23ai)", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
+    {"CLOB fetch", 8, 8, GATE_SERVER, "8i has no TO_CLOB"},
+    {"BLOB fetch (hex)", 8, 8, GATE_SERVER, "8i has no TO_BLOB"},
 };
-
-/* The reason `name` is a known gap of the connected server, or NULL. */
-static const char *known_gap(const char *name)
-{
-  for (size_t i = 0; i < sizeof known_gaps / sizeof known_gaps[0]; i++)
-    if (g_major > 0 && g_major < known_gaps[i].below && strcmp(known_gaps[i].check, name) == 0)
-      return known_gaps[i].why;
-  return NULL;
-}
 
 static void pass(const char *name)
 {
@@ -97,14 +114,8 @@ static void pass(const char *name)
 /* Failures are also kept to repeat on stderr at the end: a CI runner showing
  * only a failed test's last lines of stderr then still names them. */
 static char fail_log[4096];
-static void skip(const char *name, const char *why);
 static void fail(const char *name, const char *why)
 {
-  const char *gap = known_gap(name);
-  if (gap != NULL) {
-    skip(name, gap);
-    return;
-  }
   printf("  \033[31mFAIL\033[0m %s: %s\n", name, why);
   size_t used = strlen(fail_log);
   snprintf(fail_log + used, sizeof fail_log - used, "FAIL %s: %s\n", name, why);
@@ -115,6 +126,26 @@ static void skip(const char *name, const char *why)
   printf("  \033[33mSKIP\033[0m %s: %s\n", name, why);
   n_skip++;
 }
+
+/* Whether `name` is gated on the connected release; if so it is reported as
+ * SKIP with the gate's reason. */
+static int gated(const char *name)
+{
+  const Gate *g = gate_find(GATES, sizeof GATES / sizeof GATES[0], name);
+  if (g == NULL)
+    return 0;
+  char why[256];
+  gate_reason(g, why, sizeof why);
+  skip(name, why);
+  return 1;
+}
+
+/* Skip the check `nm` and return when its release is gated. */
+#define GATE(nm)                                                                                   \
+  do {                                                                                             \
+    if (gated(nm))                                                                                 \
+      return;                                                                                      \
+  } while (0)
 
 /* First diagnostic record's message text, for failure reporting. */
 static void diag_text(SQLSMALLINT type, SQLHANDLE h, char *out, int n)
@@ -175,6 +206,7 @@ static SQLRETURN exec_do(SQLHDBC dbc, const char *sql, char *err, int errn)
 /* A scalar check: run `sql`, expect column 1 to contain `want`. */
 static void check_scalar(SQLHDBC dbc, const char *name, const char *sql, const char *want)
 {
+  GATE(name);
   char out[256], err[256];
   SQLRETURN rc = exec_scalar(dbc, sql, out, sizeof out, err, sizeof err);
   if (!SQL_SUCCEEDED(rc)) {
@@ -282,6 +314,7 @@ static void check_transaction(SQLHDBC dbc)
 static void check_fetch_in_txn(SQLHDBC dbc)
 {
   const char *name = "fetch all rows inside an open transaction";
+  GATE(name);
   char err[256];
   SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
   exec_do(dbc, "INSERT INTO " TBL " VALUES (98, 'txnopen')", err, sizeof err);
@@ -372,6 +405,7 @@ static void check_aggregate_null_warning(SQLHDBC dbc)
 static void check_batch_resume_repeated_column(SQLHDBC dbc)
 {
   const char *name = "multi-batch fetch with a repeated column";
+  GATE(name);
   SQLHSTMT st;
   char err[256] = "";
   /* An inline view, as in check_fetch_in_txn: 9i ends a bare CONNECT BY on
@@ -410,6 +444,7 @@ static void check_batch_resume_repeated_column(SQLHDBC dbc)
 static void check_timestamp_zero_fraction_bind(SQLHDBC dbc)
 {
   const char *name = "zero-fraction TIMESTAMP bind matches trunc(LTZ)";
+  GATE(name);
   char err[256] = "";
   exec_do(dbc, "DROP TABLE seer_tsz", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc,
@@ -420,13 +455,11 @@ static void check_timestamp_zero_fraction_bind(SQLHDBC dbc)
   }
   exec_do(dbc, "INSERT INTO seer_tsz VALUES (1, TIMESTAMP '2026-09-25 13:45:06.123456')", err,
           sizeof err);
-  /* 9i's TRUNC takes no TIMESTAMP WITH LOCAL TIME ZONE (ORA-00932 even for a
-   * literal), so there is nothing for the bind to match. */
   char lit[16];
   if (!SQL_SUCCEEDED(exec_scalar(
           dbc, "SELECT COUNT(*) FROM seer_tsz WHERE TRUNC(l) = TIMESTAMP '2026-09-25 00:00:00'",
           lit, sizeof lit, err, sizeof err))) {
-    skip(name, "the server can't TRUNC a TIMESTAMP WITH LOCAL TIME ZONE");
+    fail(name, err);
     exec_do(dbc, "DROP TABLE seer_tsz", err, sizeof err);
     return;
   }
@@ -489,6 +522,7 @@ static void check_zero_length_columns(SQLHDBC dbc)
 static void check_nested_cursor_column(SQLHDBC dbc)
 {
   const char *name = "nested CURSOR() column";
+  GATE(name);
   SQLHSTMT st;
   char err[256] = "", tail[32] = "";
   SQLLEN ic = 0, it = 0;
@@ -593,6 +627,7 @@ static void check_length_boundaries(SQLHDBC dbc)
 static void check_long_bind_order(SQLHDBC dbc)
 {
   const char *name = "large text bind ahead of another bind (5000 / 40000 bytes)";
+  GATE(name);
   static const int sizes[] = {5000, 40000};
   static char big[40001];
   char err[256] = "", m[400] = "";
@@ -683,6 +718,7 @@ static void check_array_null_last_row(SQLHDBC dbc)
 static void check_typed_null(SQLHDBC dbc)
 {
   const char *name = "typed NULL parameter (COALESCE with NUMBER / DATE)";
+  GATE(name);
   char err[256] = "", a[32] = "", b[32] = "";
   SQLLEN nul = SQL_NULL_DATA, ia = 0, ib = 0;
   SQLINTEGER iv = 0;
@@ -1019,13 +1055,14 @@ static void check_failed_statements_close_cursors(SQLHDBC dbc)
 static void check_json_server_forms(SQLHDBC dbc)
 {
   const char *name = "JSON: long field names and compressed columns";
+  GATE(name);
   char out[600] = "", err[256] = "", m[800] = "";
   SQLRETURN rc = exec_scalar(dbc,
                              "SELECT JSON_OBJECT(RPAD('A', 256, 'A') VALUE 6700 RETURNING JSON) "
                              "FROM dual",
                              out, sizeof out, err, sizeof err);
   if (!SQL_SUCCEEDED(rc)) {
-    skip(name, err[0] ? err : "no native JSON");
+    fail(name, err[0] ? err : "execute failed");
     return;
   }
   if (out[0] && strspn(out, "0123456789ABCDEF") == strlen(out)) {
@@ -1070,13 +1107,14 @@ static void check_json_server_forms(SQLHDBC dbc)
 static void check_object_national_attrs(SQLHDBC dbc)
 {
   const char *name = "SQL OBJECT / VARRAY with NVARCHAR2 attributes";
+  GATE(name);
   char err[256] = "", obj[256] = "", coll[256] = "";
   exec_do(dbc, "DROP TABLE seer_nat", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_no", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_nv", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TYPE seer_no AS OBJECT (a NVARCHAR2(20), b VARCHAR2(20))",
                              err, sizeof err))) {
-    skip(name, err[0] ? err : "create type failed");
+    fail(name, err[0] ? err : "create type failed");
     return;
   }
   exec_do(dbc, "CREATE TYPE seer_nv AS VARRAY(5) OF NVARCHAR2(20)", err, sizeof err);
@@ -1107,13 +1145,14 @@ static void check_object_national_attrs(SQLHDBC dbc)
 static void check_object_xmltype_attr(SQLHDBC dbc)
 {
   const char *name = "SQL OBJECT with an XMLType attribute";
+  GATE(name);
   char err[256] = "", out[256] = "";
   exec_do(dbc, "DROP TABLE seer_xot", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_xo", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc,
                              "CREATE TYPE seer_xo AS OBJECT (a NUMBER, x SYS.XMLTYPE, z NUMBER)",
                              err, sizeof err))) {
-    skip(name, err[0] ? err : "create type failed");
+    fail(name, err[0] ? err : "create type failed");
     return;
   }
   exec_do(dbc, "CREATE TABLE seer_xot (o seer_xo)", err, sizeof err);
@@ -1139,13 +1178,14 @@ static void check_object_xmltype_attr(SQLHDBC dbc)
 static void check_object_lob_attrs(SQLHDBC dbc)
 {
   const char *name = "SQL OBJECT with CLOB / BLOB attributes";
+  GATE(name);
   char err[256] = "", out[256] = "";
   exec_do(dbc, "DROP TABLE seer_lot", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_lo", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc,
                              "CREATE TYPE seer_lo AS OBJECT (a NUMBER, c CLOB, b BLOB, z NUMBER)",
                              err, sizeof err))) {
-    skip(name, err[0] ? err : "create type failed");
+    fail(name, err[0] ? err : "create type failed");
     return;
   }
   exec_do(dbc, "CREATE TABLE seer_lot (o seer_lo)", err, sizeof err);
@@ -1171,6 +1211,7 @@ static void check_object_lob_attrs(SQLHDBC dbc)
 static void check_describe_before_execute(SQLHDBC dbc)
 {
   const char *name = "describe after SQLPrepare, before SQLExecute";
+  GATE(name);
   char err[256] = "", m[400] = "";
   SQLHSTMT st;
   SQLSMALLINT ncols = -1, nlen = 0, dtype = 0;
@@ -1291,11 +1332,12 @@ static void check_error_native_and_offset(SQLHDBC dbc)
 static void check_vector_metadata(SQLHDBC dbc)
 {
   const char *name = "VECTOR column dimensions / format (SQLColAttribute)";
+  GATE(name);
   char err[256] = "";
   exec_do(dbc, "DROP TABLE seer_vmeta", err, sizeof err);
   if (!SQL_SUCCEEDED(
           exec_do(dbc, "CREATE TABLE seer_vmeta (v VECTOR(3, FLOAT32))", err, sizeof err))) {
-    skip(name, "no VECTOR type (23ai+)");
+    fail(name, err);
     return;
   }
   SQLHSTMT st;
@@ -1386,23 +1428,6 @@ static void check_max_identifier_len(SQLHDBC dbc)
   pass(name);
 }
 
-/* The server's major release (10, 11, 18, ...), asked of the server itself; 0
- * if the query fails. */
-static int server_major(SQLHDBC dbc)
-{
-  char ver[64] = "", err[256];
-  exec_scalar(dbc,
-              "SELECT MAX(version) FROM product_component_version WHERE product LIKE 'Oracle%'",
-              ver, sizeof ver, err, sizeof err);
-  return atoi(ver);
-}
-
-/* Whether the server is 12c or later. */
-static int server_is_12c(SQLHDBC dbc)
-{
-  return server_major(dbc) >= 12;
-}
-
 /* A value over 32767 bytes bound to a PL/SQL CLOB / BLOB parameter: a LONG
  * (the form a large text bind takes) can't reach a PL/SQL LOB parameter that
  * big (ORA-01460); it has to go as a temporary LOB. 11g has no CREATE_TEMP,
@@ -1410,6 +1435,7 @@ static int server_is_12c(SQLHDBC dbc)
 static void check_plsql_large_lob_param(SQLHDBC dbc)
 {
   const char *name = "PL/SQL CLOB / BLOB parameter over 32 KB";
+  GATE(name);
   char err[256] = "", out[64] = "";
   if (!SQL_SUCCEEDED(exec_do(dbc,
                              "CREATE OR REPLACE PROCEDURE seer_lobp (c IN CLOB, b IN BLOB, "
@@ -1439,8 +1465,6 @@ static void check_plsql_large_lob_param(SQLHDBC dbc)
   exec_do(dbc, "DROP PROCEDURE seer_lobp", e2, sizeof e2);
   if (SQL_SUCCEEDED(rc) && strcmp(out, "50000:40000") == 0)
     pass(name);
-  else if (!SQL_SUCCEEDED(rc) && strstr(err, "ORA-01460") != NULL && !server_is_12c(dbc))
-    skip(name, "pre-12c: no temporary LOB to carry it");
   else {
     char m[400];
     snprintf(m, sizeof m, "rc=%d got '%s' %s", rc, out, SQL_SUCCEEDED(rc) ? "" : err);
@@ -1573,15 +1597,12 @@ static void check_lob_columns_batched(SQLHDBC dbc, int lob_inline)
 static void check_temp_lobs_freed(SQLHDBC dbc)
 {
   const char *name = "temporary LOBs of large PL/SQL binds are freed";
+  GATE(name);
   const char *count_sql = "SELECT cache_lobs + nocache_lobs FROM v$temporary_lobs "
                           "WHERE sid = SYS_CONTEXT('USERENV', 'SID')";
   char before[32], err[256];
   if (!SQL_SUCCEEDED(exec_scalar(dbc, count_sql, before, sizeof before, err, sizeof err))) {
     skip(name, "V$TEMPORARY_LOBS not readable");
-    return;
-  }
-  if (!server_is_12c(dbc)) {
-    skip(name, "pre-12c: no temporary LOB promotion");
     return;
   }
   static char text[40001];
@@ -1625,6 +1646,7 @@ static void check_temp_lobs_freed(SQLHDBC dbc)
 static void check_lob_out(SQLHDBC dbc)
 {
   const char *name = "large CLOB OUT parameter; CLOB + BLOB via RETURNING";
+  GATE(name);
   static char buf[20001];
   char err[256] = "", m[400] = "";
   SQLLEN ind = 0;
@@ -1833,11 +1855,12 @@ static void check_lock(SQLHDBC dbc)
 static void check_annotations(SQLHDBC dbc)
 {
   const char *name = "column annotations";
+  GATE(name);
   char err[256];
   exec_do(dbc, "DROP TABLE seer_ann", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_ann (id NUMBER ANNOTATIONS (Foo 'bar'))", err,
                              sizeof err))) {
-    skip(name, "server has no ANNOTATIONS support");
+    fail(name, err);
     return;
   }
   SQLHSTMT st;
@@ -1910,7 +1933,7 @@ static void check_refcursor_nested_cursor(SQLHDBC dbc)
   const char *query = "'SELECT level a, CURSOR(SELECT 1 FROM dual) c, ''tail'' t "
                       "FROM dual CONNECT BY level <= 30'";
   char why[300] = "", blk[512];
-  {
+  if (!gated("REF CURSOR rows holding a CURSOR() column")) {
     const char *name = "REF CURSOR rows holding a CURSOR() column";
     SQLHSTMT st;
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
@@ -1927,9 +1950,7 @@ static void check_refcursor_nested_cursor(SQLHDBC dbc)
       fail(name, why);
     SQLFreeHandle(SQL_HANDLE_STMT, st);
   }
-  if (!server_is_12c(dbc))
-    return; /* no DBMS_SQL.RETURN_RESULT */
-  {
+  if (!gated("implicit result rows holding a CURSOR() column")) {
     const char *name = "implicit result rows holding a CURSOR() column";
     SQLHSTMT st;
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
@@ -1953,6 +1974,7 @@ static void check_refcursor_nested_cursor(SQLHDBC dbc)
 static void check_implicit_results(SQLHDBC dbc)
 {
   const char *name = "implicit results";
+  GATE(name);
   char err[256];
   const char *blk = "DECLARE c SYS_REFCURSOR; BEGIN "
                     "OPEN c FOR SELECT 42 AS n FROM DUAL; DBMS_SQL.RETURN_RESULT(c); END;";
@@ -1961,13 +1983,13 @@ static void check_implicit_results(SQLHDBC dbc)
   SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)blk, SQL_NTS);
   if (!SQL_SUCCEEDED(rc)) {
     diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
-    skip(name, err[0] ? err : "no implicit-results support");
+    fail(name, err[0] ? err : "execute failed");
     SQLFreeHandle(SQL_HANDLE_STMT, st);
     return;
   }
   rc = SQLMoreResults(st);
   if (rc == SQL_NO_DATA) {
-    skip(name, "server returned no implicit result");
+    fail(name, "server returned no implicit result");
     SQLFreeHandle(SQL_HANDLE_STMT, st);
     return;
   }
@@ -1999,6 +2021,7 @@ static void check_implicit_results(SQLHDBC dbc)
 static void check_array_dml_rowcounts(SQLHDBC dbc)
 {
   const char *name = "array DML row counts";
+  GATE(name);
   char err[256];
   exec_do(dbc, "DROP TABLE seer_admlc", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_admlc (id NUMBER)", err, sizeof err))) {
@@ -2021,7 +2044,7 @@ static void check_array_dml_rowcounts(SQLHDBC dbc)
     diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
     fail(name, err[0] ? err : "array UPDATE failed");
   } else if (counts[0] == 0 && counts[1] == 0 && counts[2] == 0) {
-    skip(name, "server has no 12c+ array-DML row counts");
+    fail(name, "every row count is 0");
   } else if (counts[0] == 1 && counts[1] == 3 && counts[2] == 5) {
     pass(name);
   } else {
@@ -2335,10 +2358,11 @@ static void check_intervals(SQLHDBC dbc)
 static void check_boolean(SQLHDBC dbc)
 {
   const char *name = "BOOLEAN (23ai)";
+  GATE(name);
   char out[256], err[256];
   exec_do(dbc, "DROP TABLE seer_bool", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_bool (b BOOLEAN)", err, sizeof err))) {
-    skip(name, "no native BOOLEAN type");
+    fail(name, err);
     return;
   }
   exec_do(dbc, "INSERT INTO seer_bool VALUES (TRUE)", err, sizeof err);
@@ -2362,11 +2386,12 @@ static void check_boolean(SQLHDBC dbc)
 static void check_vector(SQLHDBC dbc)
 {
   const char *name = "VECTOR (23ai)";
+  GATE(name);
   char out[256], err[256];
   SQLRETURN rc = exec_scalar(dbc, "SELECT TO_VECTOR('[1.5, 2.5, 3.5]', 3, FLOAT32) FROM DUAL", out,
                              sizeof out, err, sizeof err);
   if (!SQL_SUCCEEDED(rc)) {
-    skip(name, err[0] ? err : "no native VECTOR type");
+    fail(name, err[0] ? err : "execute failed");
     return;
   }
   if (strstr(out, "1.5, 2.5, 3.5") != NULL)
@@ -2387,15 +2412,12 @@ static void check_vector(SQLHDBC dbc)
 static void check_json(SQLHDBC dbc)
 {
   const char *name = "JSON (OSON)";
+  GATE(name);
   char out[512], err[256];
   SQLRETURN rc = exec_scalar(dbc, "SELECT JSON('{\"n\":42,\"s\":\"hi\",\"b\":true}') FROM DUAL",
                              out, sizeof out, err, sizeof err);
   if (!SQL_SUCCEEDED(rc)) {
-    skip(name, err[0] ? err : "no native JSON type");
-    return;
-  }
-  if (!out[0]) { /* 18c has no JSON type: its JSON() yields NULL (DUMP says so) */
-    skip(name, "server's JSON() returns NULL (no native JSON type)");
+    fail(name, err[0] ? err : "execute failed");
     return;
   }
   if (strstr(out, "\"n\":42") && strstr(out, "\"s\":\"hi\"") && strstr(out, "\"b\":true"))
@@ -2526,6 +2548,7 @@ static void check_large_bind(SQLHDBC dbc)
 static void check_interval_bind(SQLHDBC dbc)
 {
   const char *name = "INTERVAL bind";
+  GATE(name);
   char err[256], ymv[48] = "", dsv[64] = "";
   exec_do(dbc, "DROP TABLE seer_iv", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc,
@@ -2577,6 +2600,7 @@ static void check_interval_bind(SQLHDBC dbc)
 static void check_timestamp_bind(SQLHDBC dbc)
 {
   const char *name = "TIMESTAMP bind (fractional)";
+  GATE(name);
   char err[256], out[64];
   exec_do(dbc, "DROP TABLE seer_ts", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_ts (ts TIMESTAMP(9))", err, sizeof err))) {
@@ -2656,6 +2680,7 @@ static void check_tls(const char *drv, const char *svc, const char *user, const 
 static void check_lob_inline(const char *drv, const char *host, const char *port, const char *svc,
                              const char *user, const char *pwd)
 {
+  GATE("CLOB / BLOB columns across fetch batches (LOBINLINE)");
   SQLHENV e;
   SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
   SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
@@ -2672,10 +2697,7 @@ static void check_lob_inline(const char *drv, const char *host, const char *port
     diag_text(SQL_HANDLE_DBC, d, m, sizeof m);
     fail("CLOB / BLOB columns across fetch batches (LOBINLINE)", m[0] ? m : "connect failed");
   } else {
-    if (!server_is_12c(d)) /* before 12.1 the option has no effect */
-      skip("CLOB / BLOB columns across fetch batches (LOBINLINE)", "inline LOB fetch is 12.1+");
-    else
-      check_lob_columns_batched(d, 1);
+    check_lob_columns_batched(d, 1);
     SQLDisconnect(d);
   }
   SQLFreeHandle(SQL_HANDLE_DBC, d);
@@ -2847,14 +2869,8 @@ static void check_drcp(SQLHDBC dbc, const char *drv, const char *host, const cha
                        const char *svc, const char *user, const char *pwd)
 {
   const char *name = "DRCP (pooled session)";
+  GATE(name);
   char err[256];
-  /* 10g has no pool: its listener ignores SERVER=POOLED and hands out a
-   * dedicated session, which would pass the check below without testing it. */
-  int major = server_major(dbc);
-  if (major > 0 && major < 11) {
-    skip(name, "no DRCP before 11g");
-    return;
-  }
   /* Best-effort: start the pool (needs DBA; harmless if already up / denied). */
   exec_do(dbc, "BEGIN DBMS_CONNECTION_POOL.START_POOL; END;", err, sizeof err);
 
@@ -2928,6 +2944,7 @@ static void check_desc_write(SQLHDBC dbc)
 static void check_nested_object(SQLHDBC dbc)
 {
   const char *name = "nested SQL OBJECT fetch";
+  GATE(name);
   char err[256], out[256];
   exec_do(dbc, "DROP TABLE seer_nt", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_person", err, sizeof err);
@@ -3029,18 +3046,19 @@ static void check_stmt_cache(SQLHDBC dbc)
 static void check_xmltype_lob(SQLHDBC dbc)
 {
   const char *name = "XMLType fetch (LOB-backed)";
+  GATE(name);
   char err[256], out[512];
   exec_do(dbc, "DROP TABLE seer_xmll", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc,
                              "CREATE TABLE seer_xmll (doc XMLTYPE) "
                              "XMLTYPE COLUMN doc STORE AS CLOB",
                              err, sizeof err))) {
-    skip(name, "CLOB-stored XMLType not available on this server");
+    fail(name, err);
     return;
   }
   if (!SQL_SUCCEEDED(exec_do(dbc, "INSERT INTO seer_xmll VALUES (XMLTYPE('<a><b>hi</b></a>'))", err,
                              sizeof err))) {
-    skip(name, "XMLType insert not supported here");
+    fail(name, err);
     exec_do(dbc, "DROP TABLE seer_xmll", err, sizeof err);
     return;
   }
@@ -3048,8 +3066,6 @@ static void check_xmltype_lob(SQLHDBC dbc)
   SQLRETURN rc = exec_scalar(dbc, "SELECT doc FROM seer_xmll", out, sizeof out, err, sizeof err);
   if (SQL_SUCCEEDED(rc) && strstr(out, "<a>") != NULL && strstr(out, "hi") != NULL)
     pass(name); /* the LOB locator was read + decoded */
-  else if (SQL_SUCCEEDED(rc) && out[0] == '\0')
-    skip(name, "legacy CLOB-stored XMLType (not decoded inline)"); /* 10g/11g */
   else {
     char m[600];
     snprintf(m, sizeof m, "got '%s'", out);
@@ -3061,15 +3077,16 @@ static void check_xmltype_lob(SQLHDBC dbc)
 static void check_xmltype(SQLHDBC dbc)
 {
   const char *name = "XMLType fetch";
+  GATE(name);
   char err[256], out[512];
   exec_do(dbc, "DROP TABLE seer_xml", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_xml (doc XMLTYPE)", err, sizeof err))) {
-    skip(name, "XMLType not available on this server");
+    fail(name, err);
     return;
   }
   if (!SQL_SUCCEEDED(exec_do(dbc, "INSERT INTO seer_xml VALUES (XMLTYPE('<a><b>hi</b></a>'))", err,
                              sizeof err))) {
-    skip(name, "XMLType insert not supported here");
+    fail(name, err);
     exec_do(dbc, "DROP TABLE seer_xml", err, sizeof err);
     return;
   }
@@ -3077,10 +3094,6 @@ static void check_xmltype(SQLHDBC dbc)
   SQLRETURN rc = exec_scalar(dbc, "SELECT doc FROM seer_xml", out, sizeof out, err, sizeof err);
   if (SQL_SUCCEEDED(rc) && strstr(out, "<a>") != NULL && strstr(out, "hi") != NULL)
     pass(name);
-  else if (SQL_SUCCEEDED(rc) && out[0] == '\0')
-    /* Legacy CLOB-stored XMLType (e.g. 11g): not decoded inline - cast via
-     * XMLSERIALIZE / XMLTYPE.getclobval in SQL. python-oracledb is the same. */
-    skip(name, "legacy CLOB-stored XMLType (cast via XMLSERIALIZE)");
   else {
     char m[600];
     snprintf(m, sizeof m, "got '%s'", out);
@@ -3095,13 +3108,14 @@ static void check_xmltype(SQLHDBC dbc)
 static void check_object_with_collection(SQLHDBC dbc)
 {
   const char *name = "object-with-collection-attr fetch";
+  GATE(name);
   char err[256], out[256];
   exec_do(dbc, "DROP TABLE seer_owc", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_prsn", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_phon", err, sizeof err);
   if (!SQL_SUCCEEDED(
           exec_do(dbc, "CREATE TYPE seer_phon AS VARRAY(5) OF VARCHAR2(20)", err, sizeof err))) {
-    skip(name, "object types not available (pre-12c)");
+    fail(name, err);
     return;
   }
   exec_do(dbc, "CREATE TYPE seer_prsn AS OBJECT (nm VARCHAR2(20), age NUMBER, ph seer_phon)", err,
@@ -3130,13 +3144,14 @@ static void check_object_with_collection(SQLHDBC dbc)
 static void check_collection_of_objects(SQLHDBC dbc)
 {
   const char *name = "collection-of-objects fetch";
+  GATE(name);
   char err[256], out[256];
   exec_do(dbc, "DROP TABLE seer_cot", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_ptv", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_pt", err, sizeof err);
   if (!SQL_SUCCEEDED(
           exec_do(dbc, "CREATE TYPE seer_pt AS OBJECT (x NUMBER, y NUMBER)", err, sizeof err))) {
-    skip(name, "object types not available (pre-12c)");
+    fail(name, err);
     return;
   }
   exec_do(dbc, "CREATE TYPE seer_ptv AS VARRAY(5) OF seer_pt", err, sizeof err);
@@ -3161,6 +3176,7 @@ static void check_collection_of_objects(SQLHDBC dbc)
 static void check_object(SQLHDBC dbc)
 {
   const char *name = "SQL OBJECT (ADT) fetch";
+  GATE(name);
   char err[256], out[256];
   exec_do(dbc, "DROP TABLE seer_ot", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_objt", err, sizeof err);
@@ -3188,6 +3204,7 @@ static void check_object(SQLHDBC dbc)
 static void check_collection(SQLHDBC dbc)
 {
   const char *name = "VARRAY / collection fetch";
+  GATE(name);
   char err[256], out[256];
   exec_do(dbc, "DROP TABLE seer_ct", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_va", err, sizeof err);
@@ -3213,6 +3230,7 @@ static void check_collection(SQLHDBC dbc)
 static void check_ref(SQLHDBC dbc)
 {
   const char *name = "REF fetch";
+  GATE(name);
   char err[256], out[256];
   exec_do(dbc, "DROP TABLE seer_oref", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_robj", err, sizeof err);
@@ -3239,6 +3257,7 @@ static void check_ref(SQLHDBC dbc)
 static void check_float_bind(SQLHDBC dbc)
 {
   const char *name = "BINARY_FLOAT bind";
+  GATE(name);
   char err[256], out[64];
   exec_do(dbc, "DROP TABLE seer_bf", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_bf (f BINARY_FLOAT)", err, sizeof err))) {
@@ -3269,10 +3288,11 @@ static void check_float_bind(SQLHDBC dbc)
 static void check_bool_bind(SQLHDBC dbc)
 {
   const char *name = "BOOLEAN bind (23ai)";
+  GATE(name);
   char err[256], out[64];
   exec_do(dbc, "DROP TABLE seer_bb", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_bb (b BOOLEAN)", err, sizeof err))) {
-    skip(name, "no native BOOLEAN type");
+    fail(name, err);
     return;
   }
   SQLHSTMT st;
@@ -3489,6 +3509,11 @@ int main(void)
                     "(set SEER_TEST_HOST/SERVICE/USER[/PORT/PASS] and SEER_DRIVER) - skipping\n");
     return 77; /* meson/automake "skipped" */
   }
+  if (gate_release_init() <= 0) {
+    fprintf(stderr, "integration: set SEER_TEST_RELEASE to the server's release (8, 9, 10, 11, "
+                    "18, 21, 23, 26)\n");
+    return 2;
+  }
   if (port == NULL)
     port = "1521";
   if (pwd == NULL)
@@ -3524,7 +3549,6 @@ int main(void)
   SQLGetInfo(dbc, SQL_DBMS_VER, ver, sizeof ver, NULL);
   (void)junk;
   printf("  connected, DBMS version %s\n", ver[0] ? ver : "(unknown)");
-  g_major = atoi(ver); /* "09.02.0004" -> 9 */
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_dbms_ver(dbc);

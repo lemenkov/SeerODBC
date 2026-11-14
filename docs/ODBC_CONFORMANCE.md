@@ -115,18 +115,20 @@ for any function where only one width is exported.
   the driver through the unixODBC Driver Manager against a live server (15
   checks across the surface, incl. data-at-execution). Self-gating - skipped
   (exit 77) unless
-  `SEER_TEST_HOST/SERVICE/USER` are set, so offline `meson test` stays green:
+  `SEER_TEST_HOST/SERVICE/USER` are set, so offline `meson test` stays green.
+  `SEER_TEST_RELEASE` names the server's release, which the skips key on:
   ```
-  SEER_TEST_HOST=127.0.0.1 SEER_TEST_SERVICE=XE \
+  SEER_TEST_HOST=127.0.0.1 SEER_TEST_SERVICE=XE SEER_TEST_RELEASE=11 \
   SEER_TEST_USER=pyo SEER_TEST_PASS=pyo123 meson test -C build 'odbc integration'
   ```
   `tests/odbc/run-matrix.sh` runs it across every reachable server version and
   prints a support matrix — **10g, 11g, 21c and 23ai all pass** (10g at fv4, 23ai
   natively at fv24; the earlier 10g-login and 23ai-framing gaps are closed). The
-  script also runs the core-API suite (`tests/odbc/test_core.c`) on every tier,
-  8i to 26ai: one set of checks, each skipped with its reason where the release
-  lacks what it needs or SeerODBC doesn't reach it yet (`tests/odbc/gates.h`,
-  keyed on the `SEER_TEST_RELEASE` the script passes per tier).
+  script also runs the core-API suite (`tests/odbc/test_core.c`) on every tier.
+  Both suites run one set of checks on every tier, 8i to 26ai, each skipped with
+  its reason where the release lacks what it needs or SeerODBC doesn't reach it
+  yet (`tests/odbc/gates.h`, keyed on the `SEER_TEST_RELEASE` the script passes
+  per tier).
   Where the servers live is set by environment variables (`SEER_CONTAINER_HOST`
   for the container tiers, `SEER_9I_HOST` for the 9i VM, per-tier
   `SEER_<TIER>_{HOST,PORT,TARGET,USER,PASS}` overrides) or a gitignored
