@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "seer/seertns.h"
 
@@ -1156,6 +1157,30 @@ static void check_long_error_text(void)
     fail(name, m);
 }
 
+/* The session names this client: program "seerodbc" and this machine, the
+ * login's AUTH_PROGRAM_NM and AUTH_MACHINE (#123). JDBC thin's positional
+ * login, sent until then, named every 9i session "JDBC Thin Client" on "o9i". */
+static void check_session_identity(void)
+{
+  const char *name = "the session reports program seerodbc on this machine";
+  char host[256];
+  if (gethostname(host, sizeof host - 1) != 0) {
+    skip(name, "gethostname failed");
+    return;
+  }
+  host[sizeof host - 1] = '\0';
+  char prog[128], mach[256];
+  scalar("SELECT program FROM v$session WHERE audsid = USERENV('SESSIONID')", prog, sizeof prog);
+  scalar("SELECT machine FROM v$session WHERE audsid = USERENV('SESSIONID')", mach, sizeof mach);
+  if (strcmp(prog, "seerodbc") == 0 && strcmp(mach, host) == 0) {
+    pass(name);
+  } else {
+    char m[512];
+    snprintf(m, sizeof m, "program '%s', machine '%s', want 'seerodbc' on '%s'", prog, mach, host);
+    fail(name, m);
+  }
+}
+
 /* A wrong password is refused, and says so as the server did: ORA-01017,
  * not a connection that seems to work and then fails every call. */
 static void check_wrong_password(const SeerConnParams *good)
@@ -1226,6 +1251,7 @@ int main(void)
   check_long_text_bind();
   check_long_raw_bind();
   check_cursor_hygiene();
+  check_session_identity();
   check_wrong_password(&p);
 
   seer_disconnect(C);
