@@ -37,8 +37,9 @@ static int n_pass, n_fail, n_skip;
  * and some checks need what those releases lack, or what SeerODBC doesn't
  * speak to them yet (8i: DML, DDL and PL/SQL, #133-#134). A check listed
  * here, on a server older than `below` (9 = 8i only, 10 = 8i and 9i), is
- * reported as SKIP with the reason rather than as a failure. Anything not listed still fails, so a regression in what
- * these tiers do support shows. g_major is the connected server's release. */
+ * reported as SKIP with the reason rather than as a failure. Anything not
+ * listed still fails, so a regression in what these tiers do support shows.
+ * g_major is the connected server's release. */
 static int g_major;
 typedef struct {
   int below;
