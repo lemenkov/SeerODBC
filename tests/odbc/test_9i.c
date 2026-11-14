@@ -1190,6 +1190,31 @@ static void check_zero_size_numbers(void)
   }
 }
 
+/* A query that fails as its rows are made: the fetch's reply carries the
+ * error, and its text reaches the caller - taken after the reply was freed,
+ * it had none (#159) - and the session goes on. */
+static void check_fetch_error_text(void)
+{
+  const char *name = "a query failing at fetch (ORA-01476) reports its error";
+  SeerStmt *s = NULL;
+  SeerStatus st = SEER_OK;
+  char err[128] = "", after[8] = "";
+  if (seer_stmt_prepare(C, "SELECT 1 / (ROWNUM - 3) FROM all_objects WHERE ROWNUM <= 5", &s) ==
+      SEER_OK)
+    st = seer_stmt_execute(s);
+  if (seer_last_error(C) != NULL)
+    snprintf(err, sizeof err, "%s", seer_last_error(C));
+  seer_stmt_close(s);
+  scalar("SELECT 1 FROM dual", after, sizeof after);
+  if (st == SEER_EDB && strncmp(err, "ORA-01476", 9) == 0 && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st, err, after);
+    fail(name, m);
+  }
+}
+
 /* A statement with a non-ASCII character in its text: 9i reads the SQL's
  * length in characters, and sent the byte count it waited for the rest and
  * the call hung (#140). A query, then a block, then the session goes on. */
@@ -1320,6 +1345,7 @@ int main(void)
   check_cursor_hygiene();
   check_session_identity();
   check_non_ascii_sql();
+  check_fetch_error_text();
   check_wrong_password(&p);
 
   seer_disconnect(C);
