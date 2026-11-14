@@ -6995,6 +6995,16 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
       return st;
     size_t nadded = 0;
     st = fv2_decode_rows(stmt, resp, rlen, &errcode, &nadded);
+    /* A query can fail as its rows are made - 1 / 0 is ORA-01476 - and the
+     * fetch's reply carries the error: keep its text while the reply is in
+     * hand. Taken only after it was freed, the error had no text (#159). */
+    if (st == SEER_OK && errcode != 0 && errcode != 1403) {
+      free(c->last_error);
+      c->last_error = NULL;
+      fv2_set_error(c, resp, rlen);
+      if (c->last_error == NULL)
+        seer_conn_error_code(c, (long)errcode);
+    }
     free(resp);
     resp = NULL;
     if (st != SEER_OK)
