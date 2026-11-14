@@ -2140,6 +2140,38 @@ static void check_bind_order(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* OUT parameters that come back NULL: one the block sets to NULL, one it never
+ * assigns, then one with a value, which shows the reply stayed in step. Each
+ * NULL's return code is a ub4 the 10g+ reader once took as a single byte, and
+ * the call failed with a protocol error (#149). */
+static void check_null_out(SQLHDBC dbc)
+{
+  const char *name = "NULL and never-assigned OUT parameters";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  char a[16] = "x";
+  SQLINTEGER b = -1, c = -1;
+  SQLLEN ia = 0, ib = 0, ic = 0;
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 15, 0, a, sizeof a, &ia);
+  SQLBindParameter(st, 2, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &b, 0, &ib);
+  SQLBindParameter(st, 3, SQL_PARAM_OUTPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &c, 0, &ic);
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"BEGIN ? := NULL; IF 1 = 0 THEN ? := 5; END IF; ? := 7; END;", SQL_NTS);
+  char err[256] = "";
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (SQL_SUCCEEDED(rc) && ia == SQL_NULL_DATA && ib == SQL_NULL_DATA && ic != SQL_NULL_DATA &&
+      c == 7)
+    pass(name);
+  else {
+    char m[320];
+    snprintf(m, sizeof m, "rc=%d ind %ld/%ld/%ld third=%ld %s", rc, (long)ia, (long)ib, (long)ic,
+             (long)c, err);
+    fail(name, m);
+  }
+}
+
 static void check_urowid(SQLHDBC dbc)
 {
   const char *name = "UROWID fetch";
@@ -3455,6 +3487,7 @@ int main(void)
   check_urowid(dbc);
   check_urowid_long(dbc);
   check_bind_order(dbc);
+  check_null_out(dbc);
   check_intervals(dbc);
   check_boolean(dbc);
   check_vector(dbc);

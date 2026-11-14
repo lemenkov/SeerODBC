@@ -1598,7 +1598,12 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
         free(dirs);
         return SEER_EPROTO;
       }
-      (void)seer_reader_u8(r); /* present/NULL indicator */
+      /* Then the value's ub4 return code, as an object's or an array
+       * element's: 0 - one byte, `00` - for a value, and non-zero for a NULL
+       * (1405, "fetched column value is NULL"), which takes more bytes. Read
+       * as one byte, a NULL or never-assigned OUT desynced the reply and the
+       * block failed with "unexpected response token" (#149). */
+      (void)seer_dec_sb4(r);
       if (b != NULL) {
         free(b->out.data);
         b->out = (SeerCell){0};
