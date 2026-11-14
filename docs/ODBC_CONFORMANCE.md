@@ -123,9 +123,10 @@ for any function where only one width is exported.
   `tests/odbc/run-matrix.sh` runs it across every reachable server version and
   prints a support matrix — **10g, 11g, 21c and 23ai all pass** (10g at fv4, 23ai
   natively at fv24; the earlier 10g-login and 23ai-framing gaps are closed). The
-  script also runs a local-only **9i** row via a dedicated core-API test
-  (`tests/odbc/test_9i.c`): 9i speaks the legacy fv2 / `TTI_ALL7` dialect and is
-  exercised through the `seer_*` core API rather than the Driver Manager.
+  script also runs the core-API suite (`tests/odbc/test_core.c`) on every tier,
+  8i to 26ai: one set of checks, each skipped with its reason where the release
+  lacks what it needs or SeerODBC doesn't reach it yet (`tests/odbc/gates.h`,
+  keyed on the `SEER_TEST_RELEASE` the script passes per tier).
   Where the servers live is set by environment variables (`SEER_CONTAINER_HOST`
   for the container tiers, `SEER_9I_HOST` for the 9i VM, per-tier
   `SEER_<TIER>_{HOST,PORT,TARGET,USER,PASS}` overrides) or a gitignored

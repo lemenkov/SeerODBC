@@ -33,8 +33,8 @@ protocol variant with no feature behind it is not a gap.
       TTI_ALL8 we send 10g+), DML/DDL, binds, PL/SQL blocks (IN/OUT), CLOB/BLOB/BFILE
       read, and national-charset binds — all fv-gated so 10g+ is untouched. See the
       per-feature `[x]` entries below and seerdb's [`docs/PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) §19. Wired
-      into `run-matrix.sh` as a **local-only** 9i row (its own core-API test
-      `tests/odbc/test_9i.c`, SID-addressed, self-gating); it is deliberately *not*
+      into `run-matrix.sh` as a **local-only** 9i row (SID-addressed; the shared
+      core-API suite `tests/odbc/test_core.c` runs on it as on every tier, #148); it is deliberately *not*
       a meson `test()` so `meson test` / GitHub CI never reference 9i (9i and 10g
       stay local; 11g/21c/23ai are the intended public-CI tier). Override the
       endpoint with `SEER_9I_*`.

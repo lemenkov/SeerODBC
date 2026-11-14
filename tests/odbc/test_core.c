@@ -1,27 +1,29 @@
-/* Oracle 9i (field-version-2) core-API integration test.
+/* The core-API live suite: one set of checks for every tier, 8i to 26ai
+ * (#148). Driven through the seer_* API, not the ODBC Driver Manager.
  *
- * 9i speaks the legacy fv2 dialect (O3LOGON auth + the TTI_ALL7 query/DML/PLSQL
- * path + the two-call TTI_LOBOPS LOB read), which the containerized 10g-23ai
- * matrix never exercises. It is validated ONLY here, against a local 9i VM (9i
- * can't be containerized - it needs an old kernel/glibc - so this is deliberately
- * local-only; it is not part of any GitHub CI).
+ * Every tier runs every check; one that can't apply to the connected release
+ * is a SKIP with its reason (GATES below, tests/odbc/gates.h): what the
+ * release lacks ("server: ...") or what SeerODBC doesn't reach yet ("todo:
+ * ..." and the issue). Where only the expected outcome differs by release,
+ * the check branches on g_release.
  *
- * Driven through the core seer_* API (not the ODBC DM): 9i is addressed by SID
- * (it predates service-name routing), so set SEER_TEST_SID. Self-gating: if the
- * 9i VM is unreachable, every check skips and the process exits 0.
- *
- * Env: SEER_TEST_HOST, SEER_TEST_PORT, SEER_TEST_SID, SEER_TEST_USER,
- *      SEER_TEST_PASS.
+ * Env: SEER_TEST_RELEASE (required: 8, 9, 10, 11, 18, 21, 23, 26 - the
+ * matrix knows each tier), SEER_TEST_HOST, SEER_TEST_PORT, SEER_TEST_SID or
+ * SEER_TEST_SERVICE, SEER_TEST_USER, SEER_TEST_PASS. Run by
+ * tests/odbc/run-matrix.sh; an unreachable server is one SKIP and exit 0.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "netcompat.h" /* gethostname(): <unistd.h> on POSIX, Winsock on Windows */
 
 #include "seer/seertns.h"
+
+#include "gates.h"
 
 #define T_VARCHAR 1
 #define T_NUMBER 2
@@ -43,7 +45,34 @@ static void skip(const char *n, const char *w)
   skip_n++;
 }
 
+/* The checks each release skips (gates.h). Ordered by check. */
+static const Gate GATES[] = {
+    {"BINARY_DOUBLE bind: refused on 8i, the value from 10g", 9, 9, GATE_TODO,
+     "a double bind stores garbage on 9i (#151)"},
+    {"a BFILE in a missing directory is the server's error", 9, 99, GATE_TODO,
+     "a BFILE that can't be opened reads as empty (#158)"},
+    {"describe before execute, with a placeholder", 8, 8, GATE_SERVER,
+     "8i returns a query's describe only with its execute"},
+    {"national charset: NVARCHAR2 bind + fetch, UNISTR", 8, 8, GATE_SERVER,
+     "8.1.7's national charset is WE8ISO8859P1, and it has no UNISTR"},
+};
+
+/* Skip the check `nm` and return when its release is gated. */
+#define GATE(nm)                                                                                   \
+  do {                                                                                             \
+    const Gate *g_ = gate_find(GATES, sizeof GATES / sizeof GATES[0], (nm));                       \
+    if (g_ != NULL) {                                                                              \
+      char w_[256];                                                                                \
+      gate_reason(g_, w_, sizeof w_);                                                              \
+      skip((nm), w_);                                                                              \
+      return;                                                                                      \
+    }                                                                                              \
+  } while (0)
+
 static SeerConn *C;
+
+/* Whether this account can read V$SESSION: a grant some beds lack. */
+static bool can_read_v_session(void);
 
 /* Best-effort DDL/DML (setup); ignore "table does not exist" on pre-drops. */
 static void run(const char *sql)
@@ -108,6 +137,63 @@ static void check_zero_length_columns(void)
     fail(name, m);
   }
   seer_stmt_close(s);
+}
+
+/* Columns the server describes with size 0 but that are defined at a fixed
+ * size - TO_NUMBER(NULL), 1 + NULL, TO_DATE(NULL) - come with a cell in the
+ * row; taken as carrying none, the reader fell a cell behind and the fetch
+ * failed with ORA-01002 (#156). Beside them a bare NULL, which carries none. */
+static void check_zero_size_numbers(void)
+{
+  const char *name = "zero-size NUMBER / DATE columns (TO_NUMBER(NULL), 1 + NULL)";
+  SeerStmt *s = NULL;
+  int isn[5] = {-1, -1, -1, -1, -1};
+  char x[8] = "";
+  SeerStatus st = SEER_EPROTO;
+  if (seer_stmt_prepare(C, "SELECT NULL, 'x', TO_NUMBER(NULL), 1 + NULL, TO_DATE(NULL) FROM dual",
+                        &s) == SEER_OK &&
+      (st = seer_stmt_execute(s)) == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+    for (int i = 0; i < 5; i++) {
+      const char *v = NULL;
+      seer_stmt_get_string(s, i, &v, &isn[i]);
+      if (i == 1 && v != NULL)
+        snprintf(x, sizeof x, "%s", v);
+    }
+  seer_stmt_close(s);
+  if (st == SEER_OK && isn[0] == 1 && isn[1] == 0 && strcmp(x, "x") == 0 && isn[2] == 1 &&
+      isn[3] == 1 && isn[4] == 1)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "status %d, null flags %d%d%d%d%d, '%s'", (int)st, isn[0], isn[1], isn[2],
+             isn[3], isn[4], x);
+    fail(name, m);
+  }
+}
+
+/* A query that fails as its rows are made: the fetch's reply carries the
+ * error, and its text reaches the caller - taken after the reply was freed,
+ * it had none (#159) - and the session goes on. */
+static void check_fetch_error_text(void)
+{
+  const char *name = "a query failing at fetch (ORA-01476) reports its error";
+  SeerStmt *s = NULL;
+  SeerStatus st = SEER_OK;
+  char err[128] = "", after[8] = "";
+  if (seer_stmt_prepare(C, "SELECT 1 / (ROWNUM - 3) FROM all_objects WHERE ROWNUM <= 5", &s) ==
+      SEER_OK)
+    st = seer_stmt_execute(s);
+  if (seer_last_error(C) != NULL)
+    snprintf(err, sizeof err, "%s", seer_last_error(C));
+  seer_stmt_close(s);
+  scalar("SELECT 1 FROM dual", after, sizeof after);
+  if (st == SEER_EDB && strncmp(err, "ORA-01476", 9) == 0 && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st, err, after);
+    fail(name, m);
+  }
 }
 
 static void check_select_table(void)
@@ -288,7 +374,19 @@ static void check_lob(void)
 {
   run("DROP TABLE seer9l");
   run("CREATE TABLE seer9l (c CLOB, b BLOB)");
-  run("INSERT INTO seer9l VALUES (RPAD(TO_CLOB('c'), 5000, 'c'), HEXTORAW('cafe1234babe'))");
+  /* The 5000 characters go as a bind: 8.1.7 has no TO_CLOB. */
+  {
+    static char cs[5001];
+    memset(cs, 'c', 5000);
+    cs[5000] = '\0';
+    SeerStmt *ins = NULL;
+    if (seer_stmt_prepare(C, "INSERT INTO seer9l VALUES (:1, HEXTORAW('cafe1234babe'))", &ins) ==
+        SEER_OK) {
+      seer_stmt_bind_text(ins, 1, cs, -1);
+      seer_stmt_execute(ins);
+    }
+    seer_stmt_close(ins);
+  }
   seer_commit(C);
   char out[64];
   scalar("SELECT c FROM seer9l", out, sizeof out);
@@ -296,7 +394,7 @@ static void check_lob(void)
   {
     SeerStmt *s = NULL;
     long len = -1;
-    if (seer_stmt_prepare(C, "SELECT LENGTH(c) FROM seer9l", &s) == SEER_OK &&
+    if (seer_stmt_prepare(C, "SELECT DBMS_LOB.GETLENGTH(c) FROM seer9l", &s) == SEER_OK &&
         seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
       const char *v = NULL;
       int n = 0;
@@ -336,39 +434,13 @@ static void check_lob(void)
   run("DROP TABLE seer9l");
 }
 
-static void check_bfile(void)
-{
-  /* Needs the local fixture DIRECTORY BFDIR -> a dir holding hello.bin
-   * ("BFILE-9i-content" + ca fe ba be, 20 bytes). Skips if not present. */
-  const char *name = "BFILE read (BFDIR/hello.bin)";
-  SeerStmt *s = NULL;
-  if (seer_stmt_prepare(C, "SELECT BFILENAME('BFDIR','hello.bin') FROM dual", &s) == SEER_OK &&
-      seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
-    const void *d = NULL;
-    size_t len = 0;
-    int isn = 0, isb = 0;
-    seer_stmt_get_data(s, 0, &d, &len, &isn, &isb);
-    if (len == 20 && d && memcmp(d, "BFILE-9i-content", 16) == 0)
-      pass(name);
-    else if (len == 0)
-      skip(name, "BFDIR/hello.bin fixture not present");
-    else {
-      char m[64];
-      snprintf(m, sizeof m, "len=%zu", len);
-      fail(name, m);
-    }
-  } else {
-    skip(name, "BFDIR directory not available");
-  }
-  seer_stmt_close(s);
-}
-
 static void check_national(void)
 {
   /* U+00C4 and U+4E2D: the first has a Latin-1 form, the second has none, so
    * any detour through the WE8ISO8859P1 database charset shows. */
   static const char text[] = "\xC3\x84\xE4\xB8\xAD-9i";
   const char *name = "national charset: NVARCHAR2 bind + fetch, UNISTR";
+  GATE(name);
   char out[64], lit[64];
   run("DROP TABLE seer9n");
   run("CREATE TABLE seer9n (n NVARCHAR2(20))");
@@ -490,7 +562,8 @@ static void check_multibatch_fetch(void)
   const char *name = "multi-batch fetch (200 rows)";
   run("DROP TABLE seer9b");
   run("CREATE TABLE seer9b (id NUMBER)");
-  run("INSERT INTO seer9b SELECT level FROM dual CONNECT BY level <= 200");
+  /* ROWNUM over a big view, not CONNECT BY level: 8.1.7 hasn't that. */
+  run("INSERT INTO seer9b SELECT ROWNUM FROM all_objects WHERE ROWNUM <= 200");
   seer_commit(C);
   SeerStmt *s = NULL;
   long rows = 0, sum = 0;
@@ -744,6 +817,7 @@ static void check_batch_errors(void)
 static void check_describe_before_execute(void)
 {
   const char *name = "describe before execute, with a placeholder";
+  GATE(name);
   SeerStmt *s = NULL;
   SeerStatus st =
       seer_stmt_prepare(C, "SELECT 42 AS answer, 'x' AS letter FROM dual WHERE 1 = :1", &s);
@@ -837,7 +911,7 @@ static void check_returning(void)
  * and past the 32512 bytes measured to work the bind is refused. */
 static void check_long_text_bind(void)
 {
-  const char *name = "text bind over 4000 bytes into a CLOB (5000; 32513 refused)";
+  const char *name = "text bind over 4000 bytes into a CLOB (5000; 32513 refused on 9i)";
   run("DROP TABLE seer9t");
   run("CREATE TABLE seer9t (c CLOB, id NUMBER)");
   static char big[32514];
@@ -867,13 +941,17 @@ static void check_long_text_bind(void)
   scalar("SELECT COUNT(*) || ':' || MAX(id) || ':' || MAX(DBMS_LOB.GETLENGTH(c)) FROM seer9t", out,
          sizeof out);
   run("DROP TABLE seer9t");
-  if (st == SEER_OK && rows == 1 && strcmp(out, "1:42:5000") == 0 && too_long == SEER_ENOTIMPL)
+  /* 9i takes text in a block up to 32512 bytes (seerdb PROTOCOL.md §19.3.1),
+   * and 32513 is refused before it is sent; 8i and 10g+ take it. */
+  bool nine = g_release == 9;
+  const char *want = nine ? "1:42:5000" : "2:43:32513";
+  if (st == SEER_OK && rows == 1 && strcmp(out, want) == 0 &&
+      (nine ? too_long == SEER_ENOTIMPL : too_long == SEER_OK))
     pass(name);
   else {
     char m[200];
-    snprintf(m, sizeof m,
-             "5000: status %d, %ld row(s); 32513: status %d; table '%s' (want 1:42:5000)", (int)st,
-             rows, (int)too_long, out);
+    snprintf(m, sizeof m, "5000: status %d, %ld row(s); 32513: status %d; table '%s' (want %s)",
+             (int)st, rows, (int)too_long, out, want);
     fail(name, m);
   }
 }
@@ -882,7 +960,7 @@ static void check_long_text_bind(void)
  * declared RAW 32767, values up to 32512 bytes (seerdb PROTOCOL.md §19.3.1). */
 static void check_long_raw_bind(void)
 {
-  const char *name = "RAW bind over 2000 bytes into a BLOB (5000; 32513 refused)";
+  const char *name = "RAW bind over 2000 bytes into a BLOB (5000; 32513 refused on 9i)";
   run("DROP TABLE seer9w");
   run("CREATE TABLE seer9w (b BLOB, id NUMBER)");
   static unsigned char big[32513];
@@ -908,12 +986,15 @@ static void check_long_raw_bind(void)
          "MAX(RAWTOHEX(DBMS_LOB.SUBSTR(b, 1, 5000))) FROM seer9w",
          out, sizeof out);
   run("DROP TABLE seer9w");
-  if (sts[0] == SEER_OK && sts[1] == SEER_ENOTIMPL && strcmp(out, "1:42:5000:B1") == 0)
+  bool nine = g_release == 9;
+  const char *want = nine ? "1:42:5000:B1" : "2:43:32513:B1";
+  if (sts[0] == SEER_OK && (nine ? sts[1] == SEER_ENOTIMPL : sts[1] == SEER_OK) &&
+      strcmp(out, want) == 0)
     pass(name);
   else {
     char m[200];
-    snprintf(m, sizeof m, "5000: status %d; 32513: status %d; table '%s' (want 1:42:5000:B1)",
-             (int)sts[0], (int)sts[1], out);
+    snprintf(m, sizeof m, "5000: status %d; 32513: status %d; table '%s' (want %s)", (int)sts[0],
+             (int)sts[1], out, want);
     fail(name, m);
   }
 }
@@ -1068,7 +1149,7 @@ static void check_rowid(void)
   if (strlen(rid) == 18 && strcmp(tail, "tail") == 0 && ulen == 1212 && strcmp(back, "7") == 0)
     pass(name);
   else {
-    char m[128];
+    char m[192];
     snprintf(m, sizeof m, "rowid='%s' tail='%s' urowid len=%zu bound back='%s'", rid, tail, ulen,
              back);
     fail(name, m);
@@ -1158,63 +1239,6 @@ static void check_long_error_text(void)
     fail(name, m);
 }
 
-/* Columns the server describes with size 0 but that are defined at a fixed
- * size - TO_NUMBER(NULL), 1 + NULL, TO_DATE(NULL) - come with a cell in the
- * row; taken as carrying none, the reader fell a cell behind and the fetch
- * failed with ORA-01002 (#156). Beside them a bare NULL, which carries none. */
-static void check_zero_size_numbers(void)
-{
-  const char *name = "zero-size NUMBER / DATE columns (TO_NUMBER(NULL), 1 + NULL)";
-  SeerStmt *s = NULL;
-  int isn[5] = {-1, -1, -1, -1, -1};
-  char x[8] = "";
-  SeerStatus st = SEER_EPROTO;
-  if (seer_stmt_prepare(C, "SELECT NULL, 'x', TO_NUMBER(NULL), 1 + NULL, TO_DATE(NULL) FROM dual",
-                        &s) == SEER_OK &&
-      (st = seer_stmt_execute(s)) == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
-    for (int i = 0; i < 5; i++) {
-      const char *v = NULL;
-      seer_stmt_get_string(s, i, &v, &isn[i]);
-      if (i == 1 && v != NULL)
-        snprintf(x, sizeof x, "%s", v);
-    }
-  seer_stmt_close(s);
-  if (st == SEER_OK && isn[0] == 1 && isn[1] == 0 && strcmp(x, "x") == 0 && isn[2] == 1 &&
-      isn[3] == 1 && isn[4] == 1)
-    pass(name);
-  else {
-    char m[96];
-    snprintf(m, sizeof m, "status %d, null flags %d%d%d%d%d, '%s'", (int)st, isn[0], isn[1], isn[2],
-             isn[3], isn[4], x);
-    fail(name, m);
-  }
-}
-
-/* A query that fails as its rows are made: the fetch's reply carries the
- * error, and its text reaches the caller - taken after the reply was freed,
- * it had none (#159) - and the session goes on. */
-static void check_fetch_error_text(void)
-{
-  const char *name = "a query failing at fetch (ORA-01476) reports its error";
-  SeerStmt *s = NULL;
-  SeerStatus st = SEER_OK;
-  char err[128] = "", after[8] = "";
-  if (seer_stmt_prepare(C, "SELECT 1 / (ROWNUM - 3) FROM all_objects WHERE ROWNUM <= 5", &s) ==
-      SEER_OK)
-    st = seer_stmt_execute(s);
-  if (seer_last_error(C) != NULL)
-    snprintf(err, sizeof err, "%s", seer_last_error(C));
-  seer_stmt_close(s);
-  scalar("SELECT 1 FROM dual", after, sizeof after);
-  if (st == SEER_EDB && strncmp(err, "ORA-01476", 9) == 0 && strcmp(after, "1") == 0)
-    pass(name);
-  else {
-    char m[200];
-    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st, err, after);
-    fail(name, m);
-  }
-}
-
 /* A statement with a non-ASCII character in its text: 9i reads the SQL's
  * length in characters, and sent the byte count it waited for the rest and
  * the call hung (#140). A query, then a block, then the session goes on. */
@@ -1254,6 +1278,10 @@ static void check_non_ascii_sql(void)
 static void check_session_identity(void)
 {
   const char *name = "the session reports program seerodbc on this machine";
+  if (!can_read_v_session()) {
+    skip(name, "fixture: this account can't read V$SESSION");
+    return;
+  }
   char host[256];
   if (gethostname(host, sizeof host - 1) != 0) {
     skip(name, "gethostname failed");
@@ -1266,7 +1294,7 @@ static void check_session_identity(void)
   if (strcmp(prog, "seerodbc") == 0 && strcmp(mach, host) == 0) {
     pass(name);
   } else {
-    char m[512];
+    char m[768];
     snprintf(m, sizeof m, "program '%s', machine '%s', want 'seerodbc' on '%s'", prog, mach, host);
     fail(name, m);
   }
@@ -1293,21 +1321,838 @@ static void check_wrong_password(const SeerConnParams *good)
   }
 }
 
+/* ---- checks first written for 8i ---- */
+
+/* Run a query; return its row count (-1 on failure) and copy row `r`, column
+ * `col` into `out` (empty when NULL or absent). */
+static long query(const char *sql, long r, int col, char *out, size_t osz)
+{
+  if (out != NULL)
+    out[0] = '\0';
+  SeerStmt *s = NULL;
+  long rows = -1;
+  if (seer_stmt_prepare(C, sql, &s) == SEER_OK && seer_stmt_execute(s) == SEER_OK) {
+    rows = 0;
+    while (seer_stmt_fetch(s) == SEER_OK) {
+      if (rows == r && out != NULL) {
+        const char *v = NULL;
+        int isn = 0;
+        if (seer_stmt_get_string(s, col, &v, &isn) == SEER_OK && v != NULL)
+          snprintf(out, osz, "%s", v);
+      }
+      rows++;
+    }
+  }
+  seer_stmt_close(s);
+  return rows;
+}
+
+/* Row 0 of a bound query, its columns joined with '|' into `out` (NULL for a
+ * NULL); the execute's status. */
+static SeerStatus bound_row(SeerStmt *s, char *out, size_t osz)
+{
+  out[0] = '\0';
+  SeerStatus st = seer_stmt_execute(s);
+  if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+    for (int i = 0; i < seer_stmt_num_cols(s); i++) {
+      const char *v = NULL;
+      int isn = 0;
+      seer_stmt_get_string(s, i, &v, &isn);
+      size_t k = strlen(out);
+      snprintf(out + k, osz - k, "%s%s", i ? "|" : "", isn || v == NULL ? "NULL" : v);
+    }
+  return st;
+}
+
+/* Run a statement that returns no rows; its status, and its row count into
+ * *rows when given. */
+static SeerStatus run_rows(const char *sql, long *rows)
+{
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, sql, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (rows != NULL)
+    *rows = seer_stmt_row_count(s);
+  seer_stmt_close(s);
+  return st;
+}
+
+/* An OUT parameter's value as text into `out` ("NULL" for a NULL). */
+static const char *out_text(SeerStmt *s, int param, char *out, size_t osz)
+{
+  const void *d = NULL;
+  size_t len = 0;
+  int isn = 0, isb = 0;
+  if (seer_stmt_out_data(s, param, &d, &len, &isn, &isb) != SEER_OK)
+    snprintf(out, osz, "(error)");
+  else if (isn || d == NULL)
+    snprintf(out, osz, "NULL");
+  else
+    snprintf(out, osz, "%.*s", (int)len, (const char *)d);
+  return out;
+}
+
+static void check_scalar_types(void)
+{
+  const char *name = "SELECT NUMBER / VARCHAR2 / CHAR / DATE / decimal";
+  char a[64], b[64], c[64], d[64], e[64];
+  long n = query("SELECT 42, 'hello', CAST('ab' AS CHAR(4)), "
+                 "TO_DATE('2026-02-28 13:45:06', 'YYYY-MM-DD HH24:MI:SS'), -3.25 FROM dual",
+                 0, 0, a, sizeof a);
+  query("SELECT 42, 'hello' FROM dual", 0, 1, b, sizeof b);
+  query("SELECT CAST('ab' AS CHAR(4)) FROM dual", 0, 0, c, sizeof c);
+  query("SELECT TO_DATE('2026-02-28 13:45:06', 'YYYY-MM-DD HH24:MI:SS') FROM dual", 0, 0, d,
+        sizeof d);
+  query("SELECT -3.25 FROM dual", 0, 0, e, sizeof e);
+  if (n == 1 && strcmp(a, "42") == 0 && strcmp(b, "hello") == 0 && strcmp(c, "ab  ") == 0 &&
+      strcmp(d, "2026-02-28 13:45:06") == 0 && strcmp(e, "-3.25") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "rows=%ld '%s' '%s' '%s' '%s' '%s'", n, a, b, c, d, e);
+    fail(name, m);
+  }
+}
+
+static void check_nulls_and_empty(void)
+{
+  const char *name = "NULL cells and an empty result";
+  char a[16] = "x", b[16];
+  SeerStmt *s = NULL;
+  int isn0 = 0, isn2 = 0;
+  if (seer_stmt_prepare(C, "SELECT NULL, 'x', TO_NUMBER(NULL) FROM dual", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+    const char *v = NULL;
+    seer_stmt_get_string(s, 0, &v, &isn0);
+    seer_stmt_get_string(s, 1, &v, &isn2);
+    snprintf(a, sizeof a, "%s", v ? v : "");
+    seer_stmt_get_string(s, 2, &v, &isn2);
+  }
+  seer_stmt_close(s);
+  long empty = query("SELECT 1 FROM dual WHERE 1 = 0", 0, 0, b, sizeof b);
+  if (isn0 && isn2 && strcmp(a, "x") == 0 && empty == 0)
+    pass(name);
+  else {
+    char m[128];
+    snprintf(m, sizeof m, "null0=%d null2=%d mid='%s' empty=%ld", isn0, isn2, a, empty);
+    fail(name, m);
+  }
+}
+
+/* 250 rows over three fetches; the constant column repeats, so 8i omits it
+ * from rows (the row header's bit vector), across batch boundaries too. */
+static void check_multibatch(void)
+{
+  const char *name = "250 rows across fetch batches, repeated columns";
+  SeerStmt *s = NULL;
+  long rows = 0, bad = 0;
+  if (seer_stmt_prepare(C,
+                        "SELECT ROWNUM, 'tail', MOD(ROWNUM, 3) FROM all_objects "
+                        "WHERE ROWNUM <= 250",
+                        &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK) {
+    while (seer_stmt_fetch(s) == SEER_OK) {
+      const char *a = NULL, *t = NULL, *m = NULL;
+      int isn = 0;
+      seer_stmt_get_string(s, 0, &a, &isn);
+      seer_stmt_get_string(s, 1, &t, &isn);
+      seer_stmt_get_string(s, 2, &m, &isn);
+      rows++;
+      if (a == NULL || atol(a) != rows || t == NULL || strcmp(t, "tail") != 0 || m == NULL ||
+          atol(m) != rows % 3)
+        bad++;
+    }
+  }
+  seer_stmt_close(s);
+  if (rows == 250 && bad == 0)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "rows=%ld bad=%ld", rows, bad);
+    fail(name, m);
+  }
+}
+
+/* V$SESSION's 45 columns describe past one 2 KB packet, unmarked. */
+static void check_wide_describe(void)
+{
+  const char *name = "describe across packets (V$SESSION)";
+  if (!can_read_v_session()) {
+    skip(name, "fixture: this account can't read V$SESSION");
+    return;
+  }
+  SeerStmt *s = NULL;
+  int ncols = 0;
+  long rows = 0;
+  if (seer_stmt_prepare(C, "SELECT * FROM v$session WHERE ROWNUM <= 3", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK) {
+    ncols = seer_stmt_num_cols(s);
+    while (seer_stmt_fetch(s) == SEER_OK)
+      rows++;
+  }
+  seer_stmt_close(s);
+  if (ncols >= 40 && rows == 3)
+    pass(name);
+  else {
+    char m[64];
+    snprintf(m, sizeof m, "ncols=%d rows=%ld", ncols, rows);
+    fail(name, m);
+  }
+}
+
+static void check_errors(void)
+{
+  const char *name = "errors: refused query, describe cut short, then recovery";
+  SeerStmt *s = NULL;
+  char e1[128] = "", e2[128] = "", e3[128] = "", ok[16];
+  if (seer_stmt_prepare(C, "SELECT * FROM no_such_table_8i", &s) == SEER_OK &&
+      seer_stmt_execute(s) != SEER_OK && seer_last_error(C))
+    snprintf(e1, sizeof e1, "%s", seer_last_error(C));
+  seer_stmt_close(s);
+  s = NULL;
+  /* 8i has no USERENV SID: the describe stops partway and the error follows.
+   * From 9i the query is good, so only the session going on is checked. */
+  if (g_release == 8) {
+    if (seer_stmt_prepare(C, "SELECT * FROM v$session WHERE sid = sys_context('userenv','sid')",
+                          &s) == SEER_OK &&
+        seer_stmt_execute(s) != SEER_OK && seer_last_error(C))
+      snprintf(e2, sizeof e2, "%s", seer_last_error(C));
+    seer_stmt_close(s);
+  } else
+    snprintf(e2, sizeof e2, "ORA-02003 (8i only)");
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT 1 / 0 FROM dual", &s) == SEER_OK &&
+      seer_stmt_execute(s) != SEER_OK && seer_last_error(C))
+    snprintf(e3, sizeof e3, "%s", seer_last_error(C));
+  seer_stmt_close(s);
+  query("SELECT 'alive' FROM dual", 0, 0, ok, sizeof ok);
+  if (strncmp(e1, "ORA-00942", 9) == 0 && strncmp(e2, "ORA-02003", 9) == 0 &&
+      strncmp(e3, "ORA-01476", 9) == 0 && strcmp(ok, "alive") == 0)
+    pass(name);
+  else {
+    char m[480];
+    snprintf(m, sizeof m, "'%s' / '%s' / '%s' / '%s'", e1, e2, e3, ok);
+    fail(name, m);
+  }
+}
+
+/* 8i's session charset is WE8ISO8859P1: Latin-1 text reads back as UTF-8, and
+ * the SQL text goes out in Latin-1. */
+static void check_latin1(void)
+{
+  /* Non-ASCII text out and back, whatever the database charset: 8i's and
+   * 9i's are WE8ISO8859P1, the containers' AL32UTF8. */
+  const char *name = "non-ASCII text both ways";
+  char a[32], b[32];
+  query("SELECT '\xc3\xbc' || 'ber' FROM dual", 0, 0, a, sizeof a);
+  query("SELECT LENGTH('\xc3\xa9t\xc3\xa9') FROM dual", 0, 0, b, sizeof b);
+  if (strcmp(a, "\xc3\xbc"
+                "ber") == 0 &&
+      strcmp(b, "3") == 0)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "'%s' / '%s'", a, b);
+    fail(name, m);
+  }
+}
+
+/* SQL text past 64 bytes goes in 64-byte chunks, and its length past 255 as
+ * the fixed ub4 (a variable-width one draws ORA-01009). */
+static void check_long_sql(void)
+{
+  const char *name = "300-byte SQL text";
+  char sql[512] = "SELECT ";
+  for (int i = 1; i <= 100; i++) {
+    char item[8];
+    snprintf(item, sizeof item, "%s%d", i > 1 ? "+" : "", i);
+    strncat(sql, item, sizeof sql - strlen(sql) - 1);
+  }
+  strncat(sql, " FROM dual", sizeof sql - strlen(sql) - 1);
+  char v[16];
+  query(sql, 0, 0, v, sizeof v);
+  if (strlen(sql) > 255 && strcmp(v, "5050") == 0)
+    pass(name);
+  else {
+    char m[64];
+    snprintf(m, sizeof m, "len=%zu got '%s'", strlen(sql), v);
+    fail(name, m);
+  }
+}
+
+static void check_rowid_column(void)
+{
+  const char *name = "ROWID column";
+  char r[32], back[16];
+  query("SELECT ROWID FROM dual", 0, 0, r, sizeof r);
+  char sql[96];
+  snprintf(sql, sizeof sql, "SELECT 'found' FROM dual WHERE ROWID = '%s'", r);
+  query(sql, 0, 0, back, sizeof back);
+  if (strlen(r) == 18 && strcmp(back, "found") == 0)
+    pass(name);
+  else {
+    char m[80];
+    snprintf(m, sizeof m, "rowid='%s' back='%s'", r, back);
+    fail(name, m);
+  }
+}
+
+/* IN binds (seerdb PROTOCOL.md §19.11, #132): NUMBER, text (in Latin-1, inline
+ * and past 64 bytes in chunks), NULL, DATE and RAW, and a bound WHERE. */
+static void check_binds(void)
+{
+  const char *name = "IN binds: NUMBER, text, NULL, DATE, RAW";
+  char a[128] = "", b[128] = "", c[128] = "", d[64] = "";
+  SeerStmt *s = NULL;
+  char wide[301];
+  memset(wide, 'x', 300);
+  wide[300] = '\0';
+  if (seer_stmt_prepare(C, "SELECT :1 + :2, :3 || '-' || :4, LENGTH(:5) FROM dual", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 40);
+    seer_stmt_bind_int64(s, 2, 2);
+    seer_stmt_bind_text(s, 3, "abc", -1);
+    seer_stmt_bind_text(s, 4,
+                        "d\xc3\xa9"
+                        "f",
+                        -1);
+    seer_stmt_bind_text(s, 5, wide, -1);
+    bound_row(s, a, sizeof a);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT NVL(:1, 'none'), NVL(:2, 7) + 0 FROM dual", &s) == SEER_OK) {
+    seer_stmt_bind_null(s, 1);
+    seer_stmt_bind_null_typed(s, 2, 2);
+    bound_row(s, b, sizeof b);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS'), RAWTOHEX(:2) FROM dual",
+                        &s) == SEER_OK) {
+    seer_stmt_bind_date(s, 1, 2001, 2, 3, 4, 5, 6);
+    seer_stmt_bind_raw(s, 2, "\x01\xab\xff", 3);
+    bound_row(s, c, sizeof c);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "SELECT COUNT(*) FROM all_users WHERE username = :1", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, "SYSTEM", -1);
+    bound_row(s, d, sizeof d);
+  }
+  seer_stmt_close(s);
+  if (strcmp(a, "42|abc-d\xc3\xa9"
+                "f|300") == 0 &&
+      strcmp(b, "none|7") == 0 && strcmp(c, "2001-02-03 04:05:06|01ABFF") == 0 &&
+      strcmp(d, "1") == 0)
+    pass(name);
+  else {
+    char m[512];
+    snprintf(m, sizeof m, "'%s' / '%s' / '%s' / '%s'", a, b, c, d);
+    fail(name, m);
+  }
+}
+
+/* A bind 8i can't take (BINARY_DOUBLE, a 10g type) is refused before anything
+ * is sent, and the session goes on. */
+static void check_bind_refused(void)
+{
+  /* 8.1.7 has no BINARY_DOUBLE: the bind is refused before anything is sent
+   * and the session goes on. 10g+ bind it natively. */
+  const char *name = "BINARY_DOUBLE bind: refused on 8i, the value from 10g";
+  GATE(name);
+  SeerStmt *s = NULL;
+  SeerStatus st = SEER_EPROTO;
+  char v[32] = "";
+  /* Compared by the server, not as text: a BINARY_DOUBLE prints 3.0E+000. */
+  if (seer_stmt_prepare(C, "SELECT CASE WHEN :1 * 2 = 3 THEN 'yes' ELSE 'no' END FROM dual", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_double(s, 1, 1.5);
+    st = seer_stmt_execute(s);
+    const char *x = NULL;
+    int isn = 0;
+    if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK &&
+        seer_stmt_get_string(s, 0, &x, &isn) == SEER_OK && x != NULL)
+      snprintf(v, sizeof v, "%s", x);
+  }
+  seer_stmt_close(s);
+  char after[16];
+  query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
+  bool ok = g_release == 8 ? st == SEER_ENOTIMPL : st == SEER_OK && strcmp(v, "yes") == 0;
+  if (ok && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st, v, after);
+    fail(name, m);
+  }
+}
+
+/* DDL, DML with binds and an array INSERT (8i has no array DML: a row at a
+ * time), batch errors, row counts and the error of a refused statement
+ * (seerdb PROTOCOL.md §19.12, #133). */
+static void check_dml(void)
+{
+  const char *name = "DDL, DML with binds, array INSERT, batch errors";
+  char m[512] = "", n[16];
+  run_rows("DROP TABLE seer_t8", NULL);
+  SeerStatus c1 = run_rows("CREATE TABLE seer_t8 (id NUMBER PRIMARY KEY, txt VARCHAR2(20))", NULL);
+  SeerStmt *s = NULL;
+  long one = -1, three = -1, two = -1, upd = -1;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_t8 VALUES (:1, :2)", &s) == SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 1);
+    seer_stmt_bind_text(s, 2, "one", -1);
+    if (seer_stmt_execute(s) == SEER_OK)
+      one = seer_stmt_row_count(s);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_t8 VALUES (:1, 'array')", &s) == SEER_OK) {
+    seer_stmt_set_array_size(s, 3);
+    for (int r = 0; r < 3; r++) {
+      seer_stmt_bind_row(s, r);
+      seer_stmt_bind_int64(s, 1, 2 + r);
+    }
+    if (seer_stmt_execute(s) == SEER_OK)
+      three = seer_stmt_row_count(s);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  /* 5, then 1 again (a duplicate), then 6: with batch errors the two good rows
+   * go in and row 1 is reported with ORA-00001. */
+  unsigned erow = 99, ecode = 0;
+  size_t nerr = 0;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_t8 VALUES (:1, 'batch')", &s) == SEER_OK) {
+    seer_stmt_set_array_size(s, 3);
+    seer_stmt_set_batch_errors(s, 1);
+    const int ids[3] = {5, 1, 6};
+    for (int r = 0; r < 3; r++) {
+      seer_stmt_bind_row(s, r);
+      seer_stmt_bind_int64(s, 1, ids[r]);
+    }
+    if (seer_stmt_execute(s) == SEER_OK) {
+      two = seer_stmt_row_count(s);
+      nerr = seer_stmt_batch_error_count(s);
+      if (nerr > 0)
+        seer_stmt_batch_error(s, 0, &erow, &ecode, NULL);
+    }
+  }
+  seer_stmt_close(s);
+  SeerStatus u = run_rows("UPDATE seer_t8 SET txt = 'u' WHERE id > 2", &upd);
+  SeerStatus dup = run_rows("INSERT INTO seer_t8 VALUES (1, 'dup')", NULL);
+  bool dup_ok = dup == SEER_EDB && seer_last_error(C) != NULL &&
+                strncmp(seer_last_error(C), "ORA-00001", 9) == 0;
+  SeerStatus miss = run_rows("INSERT INTO seer_nope VALUES (1)", NULL);
+  long off = seer_last_error_offset(C);
+  query("SELECT COUNT(*) FROM seer_t8", 0, 0, n, sizeof n);
+  run_rows("DROP TABLE seer_t8", NULL);
+  if (c1 == SEER_OK && one == 1 && three == 3 && two == 2 && nerr == 1 && erow == 1 && ecode == 1 &&
+      u == SEER_OK && upd == 4 && dup_ok && miss == SEER_EDB && off == 12 && strcmp(n, "6") == 0)
+    pass(name);
+  else {
+    snprintf(m, sizeof m,
+             "create=%d one=%ld three=%ld two=%ld errs=%zu row=%u code=%u update=%d/%ld dup=%d "
+             "missing=%d@%ld count=%s",
+             (int)c1, one, three, two, nerr, erow, ecode, (int)u, upd, (int)dup, (int)miss, off, n);
+    fail(name, m);
+  }
+}
+
+/* COMMIT and ROLLBACK go as statements (8i has no TTI_COMMIT), and autocommit
+ * commits after each DML. */
+static void check_transactions(void)
+{
+  const char *name = "ROLLBACK, COMMIT and autocommit";
+  char a[16], b[16], c[16];
+  run_rows("DROP TABLE seer_x8", NULL);
+  run_rows("CREATE TABLE seer_x8 (id NUMBER)", NULL);
+  run_rows("INSERT INTO seer_x8 VALUES (1)", NULL); /* autocommit: kept */
+  seer_set_autocommit(C, 0);
+  run_rows("INSERT INTO seer_x8 VALUES (2)", NULL);
+  query("SELECT COUNT(*) FROM seer_x8", 0, 0, a, sizeof a); /* 2, in the transaction */
+  SeerStatus rb = seer_rollback(C);
+  query("SELECT COUNT(*) FROM seer_x8", 0, 0, b, sizeof b); /* 1 */
+  run_rows("INSERT INTO seer_x8 VALUES (3)", NULL);
+  SeerStatus cm = seer_commit(C);
+  seer_set_autocommit(C, 1);
+  query("SELECT COUNT(*) FROM seer_x8", 0, 0, c, sizeof c); /* 2 */
+  run_rows("DROP TABLE seer_x8", NULL);
+  if (strcmp(a, "2") == 0 && rb == SEER_OK && strcmp(b, "1") == 0 && cm == SEER_OK &&
+      strcmp(c, "2") == 0)
+    pass(name);
+  else {
+    char m[128];
+    snprintf(m, sizeof m, "in-txn=%s rollback=%d after=%s commit=%d end=%s", a, (int)rb, b, (int)cm,
+             c);
+    fail(name, m);
+  }
+}
+
+/* ALTER SESSION's reply carries the session's NLS settings as keyword pairs
+ * ahead of its status; and a CREATE whose object compiles with errors
+ * succeeds with the compile-warning flag. */
+static void check_alter_session_and_compile(void)
+{
+  const char *name = "ALTER SESSION, and a CREATE that compiles with errors";
+  char y[16];
+  SeerStatus as = run_rows("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'", NULL);
+  query("SELECT TO_CHAR(TO_DATE('2003-04-05', 'YYYY-MM-DD')) FROM dual", 0, 0, y, sizeof y);
+  run_rows("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'", NULL);
+  SeerStmt *s = NULL;
+  SeerStatus cr = SEER_EPROTO;
+  int warn = 0;
+  if (seer_stmt_prepare(C, "CREATE OR REPLACE PROCEDURE seer_bad8 AS BEGIN nonsense; END;", &s) ==
+      SEER_OK) {
+    cr = seer_stmt_execute(s);
+    warn = seer_stmt_compile_warning(s);
+  }
+  seer_stmt_close(s);
+  run_rows("DROP PROCEDURE seer_bad8", NULL);
+  if (as == SEER_OK && strcmp(y, "2003") == 0 && cr == SEER_OK && warn)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "alter=%d '%s' create=%d warning=%d", (int)as, y, (int)cr, warn);
+    fail(name, m);
+  }
+}
+
+/* PL/SQL blocks (seerdb PROTOCOL.md §19.13-19.14, #134): IN values inline,
+ * OUT and IN OUT values back in one round trip, bound by order of appearance
+ * (#146); a NULL and a never-assigned OUT; a 4000-character OUT,
+ * whose reply spans packets; DECLARE; CALL ... INTO; a failing block. */
+static void check_blocks(void)
+{
+  const char *name = "PL/SQL blocks: IN, OUT, IN OUT, CALL, a failing block";
+  char a[32], b[32], c[32], d[32], e[80], f[4100], g[32], h[32];
+  SeerStmt *s = NULL;
+  a[0] = b[0] = c[0] = d[0] = e[0] = f[0] = g[0] = h[0] = '\0';
+  if (seer_stmt_prepare(C, "BEGIN :1 := :2 * 2; :3 := 'got ' || :4; END;", &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 2 /* NUMBER */, 22);
+    seer_stmt_bind_int64(s, 2, 21);
+    seer_stmt_bind_out(s, 3, 1 /* VARCHAR2 */, 100);
+    seer_stmt_bind_text(s, 4, "caf\xc3\xa9", -1);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      out_text(s, 1, a, sizeof a);
+      out_text(s, 3, b, sizeof b);
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "BEGIN :1 := :1 + 1; END;", &s) == SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 41);
+    seer_stmt_bind_set_inout(s, 1, 22);
+    if (seer_stmt_execute(s) == SEER_OK)
+      out_text(s, 1, c, sizeof c);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  /* Labels out of order: position 1 is :2, the target (#146). */
+  if (seer_stmt_prepare(C, "BEGIN :2 := :1 || '-x'; END;", &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 1, 20);
+    seer_stmt_bind_text(s, 2, "in", -1);
+    if (seer_stmt_execute(s) == SEER_OK)
+      out_text(s, 1, d, sizeof d);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "BEGIN :1 := NULL; IF 1 = 0 THEN :2 := 5; END IF; END;", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_out(s, 1, 1, 20);
+    seer_stmt_bind_out(s, 2, 2, 22);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      char x[32], y[32];
+      snprintf(e, sizeof e, "%s/%s", out_text(s, 1, x, sizeof x), out_text(s, 2, y, sizeof y));
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "DECLARE v NUMBER := 3; BEGIN :1 := RPAD('w', 4000, 'w'); :2 := v; END;",
+                        &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 1, 4000);
+    seer_stmt_bind_out(s, 2, 2, 22);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      out_text(s, 1, f, sizeof f);
+      out_text(s, 2, g, sizeof g);
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  run_rows("CREATE OR REPLACE FUNCTION seer_nine8 RETURN NUMBER AS BEGIN RETURN 9; END;", NULL);
+  if (seer_stmt_prepare(C, "CALL seer_nine8() INTO :1", &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 2, 22);
+    if (seer_stmt_execute(s) == SEER_OK)
+      out_text(s, 1, h, sizeof h);
+  }
+  seer_stmt_close(s);
+  run_rows("DROP FUNCTION seer_nine8", NULL);
+  SeerStatus bad = run_rows("BEGIN no_such_proc; END;", NULL);
+  bool bad_ok = bad == SEER_EDB && seer_last_error(C) != NULL &&
+                strncmp(seer_last_error(C), "ORA-06550", 9) == 0;
+  if (strcmp(a, "42") == 0 && strcmp(b, "got caf\xc3\xa9") == 0 && strcmp(c, "42") == 0 &&
+      strcmp(d, "in-x") == 0 && strcmp(e, "NULL/NULL") == 0 && strlen(f) == 4000 &&
+      strcmp(g, "3") == 0 && strcmp(h, "9") == 0 && bad_ok)
+    pass(name);
+  else {
+    char m[512];
+    snprintf(m, sizeof m, "'%s' '%s' '%s' '%s' '%s' len=%zu '%s' '%s' failing=%d", a, b, c, d, e,
+             strlen(f), g, h, (int)bad);
+    fail(name, m);
+  }
+}
+
+/* CLOB and BLOB columns (seerdb PROTOCOL.md §19.15, #135): each read in one
+ * TTI_LOBOPS READ after the rows are in; a CLOB's text comes in Latin-1. A
+ * short value, an empty one, a NULL, and 5000 bytes. */
+static void check_lobs(void)
+{
+  const char *name = "CLOB / BLOB columns: short, empty, NULL, 5000 bytes";
+  char m[512] = "";
+  run_rows("DROP TABLE seer_lob8", NULL);
+  run_rows("CREATE TABLE seer_lob8 (id NUMBER, c CLOB, b BLOB)", NULL);
+  run_rows("INSERT INTO seer_lob8 VALUES (1, 'short caf\xc3\xa9', HEXTORAW('0102FF'))", NULL);
+  run_rows("INSERT INTO seer_lob8 VALUES (2, EMPTY_CLOB(), EMPTY_BLOB())", NULL);
+  run_rows("INSERT INTO seer_lob8 VALUES (3, NULL, NULL)", NULL);
+  static char big[5001];
+  memset(big, 'q', 5000);
+  big[5000] = '\0';
+  SeerStmt *s = NULL;
+  if (seer_stmt_prepare(C, "INSERT INTO seer_lob8 VALUES (4, :1, NULL)", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, big, -1);
+    seer_stmt_execute(s);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  int ok = 0, rows = 0;
+  if (seer_stmt_prepare(C, "SELECT c, b FROM seer_lob8 ORDER BY id", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK) {
+    ok = 1;
+    while (seer_stmt_fetch(s) == SEER_OK) {
+      const void *cd = NULL, *bd = NULL;
+      size_t cl = 0, bl = 0;
+      int cn = 0, bn = 0, x = 0;
+      seer_stmt_get_data(s, 0, &cd, &cl, &cn, &x);
+      seer_stmt_get_data(s, 1, &bd, &bl, &bn, &x);
+      rows++;
+      bool row_ok = false;
+      if (rows == 1)
+        row_ok = !cn && cl == 11 && memcmp(cd, "short caf\xc3\xa9", 11) == 0 && !bn && bl == 3 &&
+                 memcmp(bd, "\x01\x02\xff", 3) == 0;
+      else if (rows == 2)
+        row_ok = !cn && cl == 0 && !bn && bl == 0;
+      else if (rows == 3)
+        row_ok = cn && bn;
+      else if (rows == 4)
+        row_ok = !cn && cl == 5000 && ((const char *)cd)[4999] == 'q' && bn;
+      if (!row_ok && ok) {
+        snprintf(m, sizeof m, "row %d: clob null=%d len=%zu, blob null=%d len=%zu", rows, cn, cl,
+                 bn, bl);
+        ok = 0;
+      }
+    }
+  } else
+    snprintf(m, sizeof m, "%s", seer_last_error(C) ? seer_last_error(C) : "query failed");
+  seer_stmt_close(s);
+  run_rows("DROP TABLE seer_lob8", NULL);
+  if (ok && rows == 4)
+    pass(name);
+  else {
+    if (m[0] == '\0')
+      snprintf(m, sizeof m, "%d rows", rows);
+    fail(name, m);
+  }
+}
+
+/* UROWID (seerdb PROTOCOL.md §19.10, #136): an index-organized table's
+ * logical rowid in the '*'-prefixed form, which binds back as text to find
+ * its row; a physical rowid held in a UROWID renders as the ROWID it is. */
+static void check_urowid(void)
+{
+  const char *name = "UROWID: logical rowid round trip, physical as ROWID";
+  char lr[128] = "", back[16] = "", u[64] = "", r[64] = "";
+  run_rows("DROP TABLE seer_iot8", NULL);
+  run_rows("CREATE TABLE seer_iot8 (id NUMBER PRIMARY KEY, v VARCHAR2(8)) ORGANIZATION INDEX",
+           NULL);
+  run_rows("INSERT INTO seer_iot8 VALUES (7, 'seven')", NULL);
+  query("SELECT ROWID FROM seer_iot8 WHERE id = 7", 0, 0, lr, sizeof lr);
+  SeerStmt *s = NULL;
+  if (seer_stmt_prepare(C, "SELECT v FROM seer_iot8 WHERE ROWID = :1", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, lr, -1);
+    bound_row(s, back, sizeof back);
+  }
+  seer_stmt_close(s);
+  run_rows("DROP TABLE seer_iot8", NULL);
+  run_rows("DROP TABLE seer_hp8", NULL);
+  run_rows("CREATE TABLE seer_hp8 (id NUMBER)", NULL);
+  run_rows("INSERT INTO seer_hp8 VALUES (1)", NULL);
+  query("SELECT CAST(ROWID AS UROWID) FROM seer_hp8", 0, 0, u, sizeof u);
+  query("SELECT ROWIDTOCHAR(ROWID) FROM seer_hp8", 0, 0, r, sizeof r);
+  run_rows("DROP TABLE seer_hp8", NULL);
+  if (lr[0] == '*' && strlen(lr) > 1 && strcmp(back, "seven") == 0 && u[0] != '\0' &&
+      strcmp(u, r) == 0)
+    pass(name);
+  else {
+    char m[320];
+    snprintf(m, sizeof m, "logical '%s' -> '%s'; urowid '%s' rowid '%s'", lr, back, u, r);
+    fail(name, m);
+  }
+}
+
+/* The BFILE fixtures the beds have: a directory and a file whose content
+ * starts with `head`. The 9i bed's BFDIR holds hello.bin (20 bytes); the 8i
+ * bed's ZZ_SEERDB_BD is its bdump directory, whose alert log is always there;
+ * the 11g container's SEERBFILE holds hello.txt. */
+static const struct {
+  const char *dir, *file, *head;
+} BFILES[] = {
+    {"BFDIR", "hello.bin", "BFILE-9i-content"},
+    {"ZZ_SEERDB_BD", "ORCLALRT.LOG", "Dump file"},
+    {"SEERBFILE", "hello.txt", "Hello, BFILE world!"},
+};
+
+/* The first fixture this account can read, its length into *len; -1 if none. */
+static int bfile_fixture(long *len)
+{
+  for (size_t i = 0; i < sizeof BFILES / sizeof BFILES[0]; i++) {
+    char sql[160], n[32] = "";
+    snprintf(sql, sizeof sql, "SELECT DBMS_LOB.GETLENGTH(BFILENAME('%s', '%s')) FROM dual",
+             BFILES[i].dir, BFILES[i].file);
+    query(sql, 0, 0, n, sizeof n);
+    if (n[0] != '\0' && atol(n) > 0) {
+      *len = atol(n);
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+/* A BFILE column's content: on 8i FILE_OPEN, GETLEN, READ, FILE_CLOSE; on 9i
+ * and 10g+ their own LOB calls. Checked against the server's own length (the
+ * alert log only grows) and the file's first bytes. */
+static void check_bfile(void)
+{
+  const char *name = "BFILE read";
+  long want = 0;
+  int f = bfile_fixture(&want);
+  if (f < 0) {
+    skip(name, "fixture: no BFILE directory this account can read on this bed");
+    return;
+  }
+  char sql[128];
+  snprintf(sql, sizeof sql, "SELECT BFILENAME('%s', '%s') FROM dual", BFILES[f].dir,
+           BFILES[f].file);
+  SeerStmt *s = NULL;
+  size_t len = 0;
+  bool head = false;
+  if (seer_stmt_prepare(C, sql, &s) == SEER_OK && seer_stmt_execute(s) == SEER_OK &&
+      seer_stmt_fetch(s) == SEER_OK) {
+    const void *d = NULL;
+    int isn = 0, isb = 0;
+    seer_stmt_get_data(s, 0, &d, &len, &isn, &isb);
+    size_t hl = strlen(BFILES[f].head);
+    head = d != NULL && len >= hl && memcmp(d, BFILES[f].head, hl) == 0;
+  }
+  seer_stmt_close(s);
+  if (len >= (size_t)want && head)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "%s/%s: len=%zu (server %ld) head=%d", BFILES[f].dir, BFILES[f].file, len,
+             want, (int)head);
+    fail(name, m);
+  }
+}
+
+/* A BFILE in a directory that doesn't exist is the server's ORA-22285, and the
+ * session goes on. */
+static void check_bfile_missing(void)
+{
+  const char *name = "a BFILE in a missing directory is the server's error";
+  GATE(name);
+  SeerStmt *s = NULL;
+  SeerStatus st = SEER_OK;
+  if (seer_stmt_prepare(C, "SELECT BFILENAME('NO_SUCH_DIR', 'x') FROM dual", &s) == SEER_OK)
+    st = seer_stmt_execute(s);
+  bool err = st == SEER_EDB && seer_last_error(C) != NULL &&
+             strncmp(seer_last_error(C), "ORA-22285", 9) == 0;
+  seer_stmt_close(s);
+  char after[8];
+  query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
+  if (err && strcmp(after, "1") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st,
+             seer_last_error(C) ? seer_last_error(C) : "", after);
+    fail(name, m);
+  }
+}
+
+static bool can_read_v_session(void)
+{
+  char n[16] = "";
+  query("SELECT COUNT(*) FROM v$session WHERE ROWNUM = 1", 0, 0, n, sizeof n);
+  return strcmp(n, "1") == 0;
+}
+
+/* NULLs read from a table: a VARCHAR2's comes as an empty value and the
+ * trailer with the indicator -1, a NUMBER's or DATE's as the trailer alone;
+ * read by its first byte, the VARCHAR2 came back an empty string (#153). */
+static void check_table_nulls(void)
+{
+  const char *name = "NULL VARCHAR2 / NUMBER / DATE read from a table";
+  run_rows("DROP TABLE seer_n8", NULL);
+  run_rows("CREATE TABLE seer_n8 (id NUMBER, v VARCHAR2(10), n NUMBER, d DATE)", NULL);
+  run_rows("INSERT INTO seer_n8 VALUES (1, NULL, NULL, NULL)", NULL);
+  run_rows("INSERT INTO seer_n8 VALUES (2, 'x', 5, SYSDATE)", NULL);
+  SeerStmt *s = NULL;
+  int nulls[2][3] = {{-1, -1, -1}, {-1, -1, -1}}, rows = 0;
+  if (seer_stmt_prepare(C, "SELECT v, n, d FROM seer_n8 ORDER BY id", &s) == SEER_OK &&
+      seer_stmt_execute(s) == SEER_OK)
+    while (rows < 2 && seer_stmt_fetch(s) == SEER_OK) {
+      for (int i = 0; i < 3; i++) {
+        const char *v = NULL;
+        int isn = 0;
+        seer_stmt_get_string(s, i, &v, &isn);
+        nulls[rows][i] = isn;
+      }
+      rows++;
+    }
+  seer_stmt_close(s);
+  run_rows("DROP TABLE seer_n8", NULL);
+  bool ok = rows == 2;
+  for (int i = 0; i < 3; i++)
+    ok = ok && nulls[0][i] == 1 && nulls[1][i] == 0;
+  if (ok)
+    pass(name);
+  else {
+    char m[96];
+    snprintf(m, sizeof m, "rows=%d null flags %d%d%d / %d%d%d", rows, nulls[0][0], nulls[0][1],
+             nulls[0][2], nulls[1][0], nulls[1][1], nulls[1][2]);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
+  if (gate_release_init() <= 0) {
+    fprintf(stderr, "test_core: set SEER_TEST_RELEASE to the server's release (8, 9, 10, 11, 18, "
+                    "21, 23, 26)\n");
+    return 2;
+  }
   const char *port = getenv("SEER_TEST_PORT");
   const char *sid = getenv("SEER_TEST_SID");
   SeerConnParams p = {
       .host = getenv("SEER_TEST_HOST"),
-      .port = (uint16_t)(port ? atoi(port) : 1526),
+      .port = (uint16_t)(port ? atoi(port) : 1521),
       .sid = (sid && sid[0]) ? sid : NULL,
       .service_name = getenv("SEER_TEST_SERVICE"),
       .username = getenv("SEER_TEST_USER"),
       .password = getenv("SEER_TEST_PASS"),
   };
-  if (seer_connect(&p, &C) != SEER_OK) {
-    /* Local-only: the 9i VM isn't reachable -> report nothing ran, exit clean. */
-    printf("  SKIP 9i: VM not reachable (%s)\n",
+  if (p.host == NULL || seer_connect(&p, &C) != SEER_OK) {
+    printf("  SKIP core: server not reachable (%s)\n",
            seer_last_error(NULL) ? seer_last_error(NULL) : "connect failed");
     printf("SUMMARY pass=0 fail=0 skip=1\n");
     return 0;
@@ -1346,6 +2191,24 @@ int main(void)
   check_session_identity();
   check_non_ascii_sql();
   check_fetch_error_text();
+  check_scalar_types();
+  check_nulls_and_empty();
+  check_multibatch();
+  check_wide_describe();
+  check_errors();
+  check_latin1();
+  check_long_sql();
+  check_rowid_column();
+  check_binds();
+  check_bind_refused();
+  check_dml();
+  check_transactions();
+  check_alter_session_and_compile();
+  check_blocks();
+  check_lobs();
+  check_urowid();
+  check_bfile_missing();
+  check_table_nulls();
   check_wrong_password(&p);
 
   seer_disconnect(C);
