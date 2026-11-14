@@ -192,6 +192,7 @@ struct SeerStmt {
   long affected; /* DML affected-row count (from the OER) */
   int cursor_id;
   int reuse_cursor;     /* cached server cursor to re-execute without a re-parse */
+  char *reuse_binds;    /* the bind types reuse_cursor was parsed with (bind_signature) */
   bool describe_only;   /* build_exec: a parse + describe, no execute (seer_stmt_describe) */
   bool described_only;  /* cols came from seer_stmt_describe; the execute re-describes */
   bool compile_warning; /* the last execute created an object that compiled with errors */
@@ -3300,16 +3301,42 @@ static void queue_cursor_close(SeerConn *c, int64_t cursor_id)
 
 /* ------------------------------------------------------------- public API */
 
+/* What a cursor's parse depends on in its binds: each one's type, charset
+ * form and direction. In SELECT :1 a BINARY_DOUBLE bind makes column 1 a
+ * BINARY_DOUBLE; re-executed with an int or text bind, the cached cursor and
+ * its describe no longer fit the reply - a protocol error, or a value decoded
+ * as the wrong type (#162). Malloc'd; "" for a statement without binds. */
+static char *bind_signature(const SeerStmt *stmt)
+{
+  size_t cap = 1 + (size_t)stmt->npbinds * 24;
+  char *sig = malloc(cap);
+  if (sig == NULL)
+    return NULL;
+  size_t n = 0;
+  sig[0] = '\0';
+  for (int i = 0; i < stmt->npbinds; i++) {
+    const SeerBind *b = &stmt->pbinds[i];
+    int w = snprintf(sig + n, cap - n, "%u.%u.%d.%d;", b->oac_type, b->oac_charset,
+                     b->is_out ? 1 : 0, b->is_array ? 1 : 0);
+    if (w < 0 || (size_t)w >= cap - n)
+      break;
+    n += (size_t)w;
+  }
+  return sig;
+}
+
 /* Statement cache. take() returns a cached parsed cursor for `sql`, moving its
  * SELECT column describe out into cols/ncols, and removes the entry (the caller
  * now owns the cursor + columns). Returns 0 (and leaves *cols NULL) if not cached. */
-static int stmt_cache_take(SeerConn *c, const char *sql, SeerColumn **cols, int *ncols)
+static int stmt_cache_take(SeerConn *c, const char *sql, SeerColumn **cols, int *ncols,
+                           char **binds)
 {
   for (int i = 0; i < c->stmt_cache_n; i++) {
     if (strcmp(c->stmt_cache[i].sql, sql) == 0) {
       int cid = c->stmt_cache[i].cursor_id;
       *cols = (SeerColumn *)c->stmt_cache[i].cols;
       *ncols = c->stmt_cache[i].ncols;
+      *binds = c->stmt_cache[i].binds;
       free(c->stmt_cache[i].sql);
       c->stmt_cache[i] = c->stmt_cache[c->stmt_cache_n - 1];
       c->stmt_cache_n--;
@@ -3321,7 +3348,8 @@ static int stmt_cache_take(SeerConn *c, const char *sql, SeerColumn **cols, int 
 
 /* put() caches (sql, cursor_id) and takes ownership of the describe cols; when
  * full, evicts the oldest entry (queues its cursor to close, frees its cols). */
-static void stmt_cache_put(SeerConn *c, const char *sql, int cursor_id, SeerColumn *cols, int ncols)
+static void stmt_cache_put(SeerConn *c, const char *sql, int cursor_id, SeerColumn *cols, int ncols,
+                           char *binds)
 {
   int cap = (int)(sizeof c->stmt_cache / sizeof c->stmt_cache[0]);
   int nclose = (int)(sizeof c->close_cursors / sizeof c->close_cursors[0]);
@@ -3329,6 +3357,7 @@ static void stmt_cache_put(SeerConn *c, const char *sql, int cursor_id, SeerColu
     if (c->n_close < nclose)
       c->close_cursors[c->n_close++] = c->stmt_cache[0].cursor_id;
     free(c->stmt_cache[0].sql);
+    free(c->stmt_cache[0].binds);
     free_columns((SeerColumn *)c->stmt_cache[0].cols, c->stmt_cache[0].ncols);
     memmove(&c->stmt_cache[0], &c->stmt_cache[1],
             (size_t)(c->stmt_cache_n - 1) * sizeof c->stmt_cache[0]);
@@ -3339,9 +3368,11 @@ static void stmt_cache_put(SeerConn *c, const char *sql, int cursor_id, SeerColu
     if (c->n_close < nclose)
       c->close_cursors[c->n_close++] = cursor_id;
     free_columns(cols, ncols);
+    free(binds);
     return;
   }
   c->stmt_cache[c->stmt_cache_n].sql = dup;
+  c->stmt_cache[c->stmt_cache_n].binds = binds;
   c->stmt_cache[c->stmt_cache_n].cursor_id = cursor_id;
   c->stmt_cache[c->stmt_cache_n].cols = cols;
   c->stmt_cache[c->stmt_cache_n].ncols = ncols;
@@ -3359,6 +3390,7 @@ static void stmt_cache_flush(SeerConn *c)
     if (c->n_close < nclose)
       c->close_cursors[c->n_close++] = c->stmt_cache[i].cursor_id;
     free(c->stmt_cache[i].sql);
+    free(c->stmt_cache[i].binds);
     free_columns((SeerColumn *)c->stmt_cache[i].cols, c->stmt_cache[i].ncols);
   }
   c->stmt_cache_n = 0;
@@ -3370,6 +3402,7 @@ void seer_stmt_cache_clear(SeerConn *conn)
     return;
   for (int i = 0; i < conn->stmt_cache_n; i++) {
     free(conn->stmt_cache[i].sql);
+    free(conn->stmt_cache[i].binds);
     free_columns((SeerColumn *)conn->stmt_cache[i].cols, conn->stmt_cache[i].ncols);
   }
   conn->stmt_cache_n = 0;
@@ -3389,7 +3422,7 @@ SeerStatus seer_stmt_prepare(SeerConn *conn, const char *sql, SeerStmt **out)
   s->cur = -1;
   s->n_iters = 1;
   /* Reuse a cached parsed cursor (and its describe) for this exact SQL, if any. */
-  s->reuse_cursor = stmt_cache_take(conn, sql, &s->cols, &s->ncols);
+  s->reuse_cursor = stmt_cache_take(conn, sql, &s->cols, &s->ncols, &s->reuse_binds);
   if (s->sql == NULL) {
     free(s);
     return SEER_ENOMEM;
@@ -7520,6 +7553,21 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
   stmt->dml_rowcounts = NULL;
   stmt->n_dml_rowcounts = 0;
 
+  /* A cached cursor is reused only for binds of the types it was parsed
+   * with; for others it is closed and the statement parsed afresh (#162). */
+  if (stmt->reuse_cursor > 0) {
+    char *sig = bind_signature(stmt);
+    if (sig == NULL || stmt->reuse_binds == NULL || strcmp(sig, stmt->reuse_binds) != 0) {
+      queue_cursor_close(stmt->conn, stmt->reuse_cursor);
+      stmt->reuse_cursor = 0;
+      free_columns(stmt->cols, stmt->ncols);
+      stmt->cols = NULL;
+      stmt->ncols = 0;
+      free(stmt->reuse_binds);
+      stmt->reuse_binds = NULL;
+    }
+    free(sig);
+  }
   bool was_reuse = stmt->reuse_cursor > 0;
   SeerWriter w;
   uint8_t *resp = NULL;
@@ -7872,7 +7920,12 @@ void seer_stmt_close(SeerStmt *stmt)
   int keep_cursor = stmt->cursor_id > 0 ? stmt->cursor_id : stmt->reuse_cursor;
   if (c != NULL && c->authenticated && keep_cursor > 0 && stmt->sql != NULL) {
     if (sql_is_cacheable(stmt->sql)) {
-      stmt_cache_put(c, stmt->sql, keep_cursor, stmt->cols, stmt->ncols);
+      /* The bind types the cursor was last parsed or run with: this
+       * execute's, or - closed unexecuted - those it came from the cache with. */
+      char *binds = stmt->cursor_id > 0 ? bind_signature(stmt) : stmt->reuse_binds;
+      if (binds == stmt->reuse_binds)
+        stmt->reuse_binds = NULL;
+      stmt_cache_put(c, stmt->sql, keep_cursor, stmt->cols, stmt->ncols, binds);
       stmt->cols = NULL; /* moved to the cache; don't free */
       stmt->ncols = 0;
     } else if (c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0])) {
@@ -7893,6 +7946,7 @@ void seer_stmt_close(SeerStmt *stmt)
   free_implicit(stmt);
   free(stmt->dml_rowcounts);
   free(stmt->sql);
+  free(stmt->reuse_binds);
   free(stmt);
 }
 

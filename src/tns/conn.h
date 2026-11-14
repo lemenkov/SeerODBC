@@ -80,6 +80,7 @@ struct SeerConn {
     int cursor_id;
     void *cols;
     int ncols;
+    char *binds; /* the bind types the cursor was parsed with (#162) */
   } stmt_cache[24];
   int stmt_cache_n;
   /* Opaque transaction context returned by tpc_begin, replayed on the
