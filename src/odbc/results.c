@@ -730,7 +730,11 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
     const void *val = NULL;
     size_t vlen = 0;
     int is_null = 0, is_binary = 0;
-    seer_stmt_get_data(s->core, i, &val, &vlen, &is_null, &is_binary);
+    if (seer_stmt_get_data(s->core, i, &val, &vlen, &is_null, &is_binary) == SEER_EDB) {
+      /* A value the server refused (#158): its error, the column left as is. */
+      ret = seer_odbc_exec_error(s, SEER_EDB);
+      continue;
+    }
 
     void *buf = b->buf;
     SQLLEN *ind = b->indicator;
@@ -947,8 +951,8 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   size_t vlen = 0;
   int is_null = 0, is_binary = 0;
   SeerStatus gst = seer_stmt_get_data(s->core, col, &val, &vlen, &is_null, &is_binary);
-  if (gst != SEER_OK)
-    return seer_odbc_diag(s, seer_odbc_sqlstate(gst), 0, seer_strerror(gst), SQL_ERROR);
+  if (gst != SEER_OK) /* a value the server refused carries its ORA text (#158) */
+    return seer_odbc_exec_error(s, gst);
 
   /* A repeat call after the value was fully returned signals end-of-column. */
   if (!is_null && s->getdata_off > 0 && (size_t)s->getdata_off >= vlen)
