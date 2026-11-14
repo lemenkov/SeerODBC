@@ -162,56 +162,25 @@ if host_machine.system() != 'windows'
   test('exact-size final packet', test_fragment_wait, timeout : 60)
 endif
 
-# Live two-phase-commit (XA/TPC) test against the core API. Self-gating: exits 77
-# (skip) unless SEER_TEST_HOST/SERVICE/USER are set, so it is a no-op offline.
-test_tpc = executable('test_tpc',
-  'odbc/tpc_test.c',
-  dependencies : [test_dep, seertns_dep],
-)
-test('two-phase commit (live)', test_tpc, is_parallel : false, timeout : 60)
-
-# Live request-boundary test (§35, core API). Self-gating: exits 77 offline.
-test_reqbound_live = executable('reqbound_test',
-  'odbc/reqbound_test.c',
-  dependencies : [test_dep, seertns_dep],
-)
-test('request boundaries (live)', test_reqbound_live, is_parallel : false, timeout : 60)
-
-# Live sessionless-transaction test (§31, core API). Self-gating: exits 77 offline.
-test_sessionless_live = executable('sessionless_test',
-  'odbc/sessionless_test.c',
-  dependencies : [test_dep, seertns_dep],
-)
-test('sessionless transactions (live)', test_sessionless_live, is_parallel : false, timeout : 60)
-
-# Live request-pipelining test (§32, core API). Self-gating: exits 77 offline.
-test_pipeline_live = executable('pipeline_test',
-  'odbc/pipeline_test.c',
-  dependencies : [test_dep, seertns_dep],
-)
-test('request pipelining (live)', test_pipeline_live, is_parallel : false, timeout : 60)
-
-# Live SQL OBJECT bind test (core API). Self-gating: exits 77 (skip) offline.
-test_objbind = executable('test_objbind',
-  'odbc/objbind_test.c',
-  dependencies : [test_dep, seertns_dep],
-)
-test('object bind (live)', test_objbind, is_parallel : false, timeout : 60)
-
-# Live Advanced Queuing (AQ) enqueue test (core API). Self-gating: exits 77 offline.
-test_aq = executable('test_aq',
-  'odbc/aq_test.c',
-  dependencies : [test_dep, seertns_dep],
-)
-test('advanced queuing (live)', test_aq, is_parallel : false, timeout : 60)
-
 # The core-API live suite: one set of checks for every tier, 8i to 26ai, with
-# skips gated by release (#148). LOCAL ONLY, run by tests/odbc/run-matrix.sh,
-# which knows each tier and passes its release; not a meson test().
+# skips gated by release (#148): test_core.c and its feature modules (two-phase
+# commit, request boundaries, sessionless transactions, pipelining, object
+# binds, AQ). Self-gating: exits 77 (skip) unless SEER_TEST_HOST is set, so it
+# is a no-op offline; SEER_TEST_RELEASE names the server's release, e.g.
+#   SEER_TEST_HOST=127.0.0.1 SEER_TEST_SERVICE=XE SEER_TEST_RELEASE=11 \
+#   SEER_TEST_USER=pyo SEER_TEST_PASS=pyo123 meson test 'core API (live)'
+# tests/odbc/run-matrix.sh runs it on every tier.
 test_core = executable('test_core',
   'odbc/test_core.c',
+  'odbc/core_tpc.c',
+  'odbc/core_reqbound.c',
+  'odbc/core_sessionless.c',
+  'odbc/core_pipeline.c',
+  'odbc/core_objbind.c',
+  'odbc/core_aq.c',
   dependencies : [test_dep, seertns_dep],
 )
+test('core API (live)', test_core, is_parallel : false, timeout : 600)
 
 # ODBC-shim pure logic (only when the driver is built). These link the
 # sqlprep + convert static library directly - no Driver Manager, no server.

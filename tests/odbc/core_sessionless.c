@@ -1,17 +1,10 @@
-/* Live test for sessionless transactions (§31) against the core protocol API.
- *
- * Self-gating: exits 77 (skip) unless SEER_TEST_HOST/SERVICE/USER are set, so it
- * is harmless in an offline `meson test`. Sessionless transactions are 23ai+; on
- * an older server begin returns SEER_ENOTIMPL and the test skips.
+/* test_core: sessionless transactions (§31) through the core API.
  *
  * Drives the whole lifecycle across two connections: begin + insert on A,
- * suspend on A, resume on B, commit on B — then verifies the row is invisible
- * while suspended (isolation) and durable after the cross-session commit. The
- * insert after begin also exercises the server SYNC piggyback (opcode 5) the
- * response carries while a sessionless txn is active.
- *
- *   SEER_TEST_HOST, SEER_TEST_PORT (default 1521), SEER_TEST_SERVICE,
- *   SEER_TEST_USER, SEER_TEST_PASS
+ * suspend on A, resume on B, commit on B. It then verifies the row is
+ * invisible while suspended (isolation) and durable after the cross-session
+ * commit. The insert after begin also exercises the server SYNC piggyback
+ * (opcode 5) the response carries while a sessionless txn is active.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -20,38 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "seer/seertns.h"
-
-static int pass_n, fail_n, skip_n;
-static void pass(const char *n)
-{
-  printf("  PASS %s\n", n);
-  pass_n++;
-}
-static void fail(const char *n, const char *w)
-{
-  printf("  FAIL %s: %s\n", n, w);
-  fail_n++;
-}
-static void skip(const char *n, const char *w)
-{
-  printf("  SKIP %s: %s\n", n, w);
-  skip_n++;
-}
-
-static SeerConn *connect_one(void)
-{
-  const char *port = getenv("SEER_TEST_PORT");
-  SeerConnParams p = {
-      .host = getenv("SEER_TEST_HOST"),
-      .port = (uint16_t)(port ? atoi(port) : 1521),
-      .service_name = getenv("SEER_TEST_SERVICE"),
-      .username = getenv("SEER_TEST_USER"),
-      .password = getenv("SEER_TEST_PASS"),
-  };
-  SeerConn *c = NULL;
-  return seer_connect(&p, &c) == SEER_OK ? c : NULL;
-}
+#include "core.h"
 
 static void exec_sql(SeerConn *c, const char *sql)
 {
@@ -78,17 +40,18 @@ static long count_123(SeerConn *c)
   return n;
 }
 
-int main(void)
+void core_sessionless(void)
 {
-  if (!getenv("SEER_TEST_HOST") || !getenv("SEER_TEST_SERVICE") || !getenv("SEER_TEST_USER")) {
-    fprintf(stderr, "sessionless_test: set SEER_TEST_HOST/SERVICE/USER[/PORT/PASS] - skipping\n");
-    return 77;
-  }
-  SeerConn *a = connect_one();
-  SeerConn *b = connect_one();
+  GATE("sessionless transactions");
+  SeerConn *a = core_connect();
+  SeerConn *b = core_connect();
   if (!a || !b) {
-    fprintf(stderr, "sessionless_test: connect failed\n");
-    return 1;
+    fail("sessionless transactions", "connect failed");
+    if (a)
+      seer_disconnect(a);
+    if (b)
+      seer_disconnect(b);
+    return;
   }
 
   exec_sql(a, "DROP TABLE seersless");
@@ -99,14 +62,7 @@ int main(void)
   const uint8_t txn[] = "seer-sless-1";
   size_t txn_len = sizeof txn - 1;
 
-  /* Begin on A. Pre-23ai returns ENOTIMPL -> skip the whole feature. */
-  SeerStatus rc = seer_txn_begin_sessionless(a, txn, txn_len, 60);
-  if (rc == SEER_ENOTIMPL) {
-    skip("sessionless transactions", "server is pre-23ai");
-    exec_sql(a, "DROP TABLE seersless");
-    goto done;
-  }
-  if (rc != SEER_OK) {
+  if (seer_txn_begin_sessionless(a, txn, txn_len, 60) != SEER_OK) {
     fail("begin", "begin_sessionless failed on a 23ai server");
     goto cleanup;
   }
@@ -151,9 +107,6 @@ int main(void)
 cleanup:
   seer_set_autocommit(a, 1);
   exec_sql(a, "DROP TABLE seersless");
-done:
   seer_disconnect(a);
   seer_disconnect(b);
-  printf("SUMMARY sessionless pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
-  return fail_n ? 1 : 0;
 }

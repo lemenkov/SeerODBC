@@ -1,12 +1,8 @@
-/* Live test for request pipelining (§32, #132) — the serial execution path.
+/* test_core: request pipelining (§32) through the core API.
  *
- * Self-gating: exits 77 (skip) unless SEER_TEST_HOST/SERVICE/USER are set, so it
- * is harmless in an offline `meson test`. Runs on every server (the single-round-
- * trip wire burst is a later optimisation with identical results). Covers the
+ * Runs on every server: the single-round-trip wire burst (23ai+, EOR
+ * negotiated) gives the same results as the serial path elsewhere. Covers the
  * op/result model, reading a query op's rows, and continue-on-error.
- *
- *   SEER_TEST_HOST, SEER_TEST_PORT (default 1521), SEER_TEST_SERVICE,
- *   SEER_TEST_USER, SEER_TEST_PASS
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -14,19 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "seer/seertns.h"
-
-static int pass_n, fail_n;
-static void pass(const char *n)
-{
-  printf("  PASS %s\n", n);
-  pass_n++;
-}
-static void fail(const char *n, const char *w)
-{
-  printf("  FAIL %s: %s\n", n, w);
-  fail_n++;
-}
+#include "core.h"
 
 static void exec_sql(SeerConn *c, const char *sql)
 {
@@ -37,24 +21,12 @@ static void exec_sql(SeerConn *c, const char *sql)
   seer_stmt_close(s);
 }
 
-int main(void)
+void core_pipeline(void)
 {
-  if (!getenv("SEER_TEST_HOST") || !getenv("SEER_TEST_SERVICE") || !getenv("SEER_TEST_USER")) {
-    fprintf(stderr, "pipeline_test: set SEER_TEST_HOST/SERVICE/USER[/PORT/PASS] - skipping\n");
-    return 77;
-  }
-  const char *port = getenv("SEER_TEST_PORT");
-  SeerConnParams p = {
-      .host = getenv("SEER_TEST_HOST"),
-      .port = (uint16_t)(port ? atoi(port) : 1521),
-      .service_name = getenv("SEER_TEST_SERVICE"),
-      .username = getenv("SEER_TEST_USER"),
-      .password = getenv("SEER_TEST_PASS"),
-  };
-  SeerConn *c = NULL;
-  if (seer_connect(&p, &c) != SEER_OK) {
-    fprintf(stderr, "connect failed\n");
-    return 1;
+  SeerConn *c = core_connect();
+  if (c == NULL) {
+    fail("run", "connect failed");
+    return;
   }
 
   exec_sql(c, "DROP TABLE seerpipe");
@@ -149,6 +121,4 @@ int main(void)
 
   exec_sql(c, "DROP TABLE seerpipe");
   seer_disconnect(c);
-  printf("SUMMARY pipeline pass=%d fail=%d\n", pass_n, fail_n);
-  return fail_n ? 1 : 0;
 }

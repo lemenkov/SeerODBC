@@ -7,10 +7,16 @@
  * ..." and the issue). Where only the expected outcome differs by release,
  * the check branches on g_release.
  *
+ * The feature modules core_*.c (two-phase commit, request boundaries,
+ * sessionless transactions, pipelining, object binds, AQ) are part of the
+ * suite: they share its verdicts and GATES through core.h.
+ *
  * Env: SEER_TEST_RELEASE (required: 8, 9, 10, 11, 18, 21, 23, 26 - the
  * matrix knows each tier), SEER_TEST_HOST, SEER_TEST_PORT, SEER_TEST_SID or
  * SEER_TEST_SERVICE, SEER_TEST_USER, SEER_TEST_PASS. Run by
- * tests/odbc/run-matrix.sh; an unreachable server is one SKIP and exit 0.
+ * tests/odbc/run-matrix.sh and, in CI, as the meson test 'core API (live)'.
+ * Without SEER_TEST_HOST it exits 77 (skipped); an unreachable server is one
+ * SKIP and exit 0.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -24,49 +30,75 @@
 
 #include "seer/seertns.h"
 
+#include "core.h"
 #include "gates.h"
 
 #define T_VARCHAR 1
 #define T_NUMBER 2
 
 static int pass_n, fail_n, skip_n;
-static void pass(const char *n)
+void pass(const char *n)
 {
   printf("  PASS %s\n", n);
   pass_n++;
 }
-static void fail(const char *n, const char *w)
+void fail(const char *n, const char *w)
 {
   printf("  FAIL %s: %s\n", n, w);
   fail_n++;
 }
-static void skip(const char *n, const char *w)
+void skip(const char *n, const char *w)
 {
   printf("  SKIP %s: %s\n", n, w);
   skip_n++;
 }
 
-/* The checks each release skips (gates.h). Ordered by check. */
+/* The checks each release skips (gates.h), and the features several checks
+ * share. Ordered as the checks run. */
 static const Gate GATES[] = {
     {"describe before execute, with a placeholder", 8, 8, GATE_SERVER,
      "8i returns a query's describe only with its execute"},
     {"national charset: NVARCHAR2 bind + fetch, UNISTR", 8, 8, GATE_SERVER,
      "8.1.7's national charset is WE8ISO8859P1, and it has no UNISTR"},
+    /* core_tpc.c */
+    {"two-phase commit", 8, 11, GATE_TODO, "two-phase commit before 12c (#171)"},
+    {"two-phase rollback", 8, 11, GATE_TODO, "two-phase commit before 12c (#171)"},
+    /* core_reqbound.c */
+    {"request boundaries", 8, 18, GATE_SERVER, "no request boundaries before 21c"},
+    /* core_sessionless.c */
+    {"sessionless transactions", 8, 21, GATE_SERVER, "no sessionless transactions before 23ai"},
+    /* core_objbind.c */
+    {"object binds", 8, 11, GATE_TODO,
+     "object, collection and PL/SQL-type binds before 12c (#172)"},
+    {"native JSON bind", 8, 18, GATE_SERVER, "no JSON type before 21c"},
+    {"native VECTOR bind", 8, 21, GATE_SERVER, "no VECTOR type before 23ai"},
+    {"XMLType bind", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
+    {"XMLType bind", 9, 9, GATE_TODO, "XMLType on 9i (#168)"},
+    {"SQL OBJECT with a BOOLEAN attribute", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
+    /* core_aq.c */
+    {"AQ", 8, 11, GATE_TODO, "Advanced Queuing before 12c (#173)"},
+    {"AQ JSON payload", 12, 18, GATE_SERVER, "no JSON queues before 21c"},
 };
 
-/* Skip the check `nm` and return when its release is gated. */
-#define GATE(nm)                                                                                   \
-  do {                                                                                             \
-    const Gate *g_ = gate_find(GATES, sizeof GATES / sizeof GATES[0], (nm));                       \
-    if (g_ != NULL) {                                                                              \
-      char w_[256];                                                                                \
-      gate_reason(g_, w_, sizeof w_);                                                              \
-      skip((nm), w_);                                                                              \
-      return;                                                                                      \
-    }                                                                                              \
-  } while (0)
+int gated_as(const char *gate, const char *name)
+{
+  const Gate *g = gate_find(GATES, sizeof GATES / sizeof GATES[0], gate);
+  if (g == NULL)
+    return 0;
+  char why[256];
+  gate_reason(g, why, sizeof why);
+  skip(name, why);
+  return 1;
+}
 
 static SeerConn *C;
+static SeerConnParams P; /* the suite's connection parameters, for core_connect() */
+
+SeerConn *core_connect(void)
+{
+  SeerConn *c = NULL;
+  return seer_connect(&P, &c) == SEER_OK ? c : NULL;
+}
 
 /* Whether this account can read V$SESSION: a grant some beds lack. */
 static bool can_read_v_session(void);
@@ -2213,6 +2245,12 @@ static void check_cache_bind_types(void)
 
 int main(void)
 {
+  if (getenv("SEER_TEST_HOST") == NULL) {
+    fprintf(stderr, "test_core: no target configured (set SEER_TEST_HOST, SEER_TEST_SERVICE or "
+                    "SEER_TEST_SID, SEER_TEST_USER, SEER_TEST_PASS, SEER_TEST_RELEASE) - "
+                    "skipping\n");
+    return 77; /* meson/automake "skipped" */
+  }
   if (gate_release_init() <= 0) {
     fprintf(stderr, "test_core: set SEER_TEST_RELEASE to the server's release (8, 9, 10, 11, 18, "
                     "21, 23, 26)\n");
@@ -2220,7 +2258,7 @@ int main(void)
   }
   const char *port = getenv("SEER_TEST_PORT");
   const char *sid = getenv("SEER_TEST_SID");
-  SeerConnParams p = {
+  P = (SeerConnParams){
       .host = getenv("SEER_TEST_HOST"),
       .port = (uint16_t)(port ? atoi(port) : 1521),
       .sid = (sid && sid[0]) ? sid : NULL,
@@ -2228,7 +2266,7 @@ int main(void)
       .username = getenv("SEER_TEST_USER"),
       .password = getenv("SEER_TEST_PASS"),
   };
-  if (p.host == NULL || seer_connect(&p, &C) != SEER_OK) {
+  if (seer_connect(&P, &C) != SEER_OK) {
     printf("  SKIP core: server not reachable (%s)\n",
            seer_last_error(NULL) ? seer_last_error(NULL) : "connect failed");
     printf("SUMMARY pass=0 fail=0 skip=1\n");
@@ -2287,7 +2325,13 @@ int main(void)
   check_bfile_missing();
   check_table_nulls();
   check_cache_bind_types();
-  check_wrong_password(&p);
+  check_wrong_password(&P);
+  core_tpc();
+  core_reqbound();
+  core_sessionless();
+  core_pipeline();
+  core_objbind();
+  core_aq();
 
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
