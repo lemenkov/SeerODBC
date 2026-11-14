@@ -6123,7 +6123,7 @@ static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query, bool block)
  * descriptor, one 0x07, then every value. A value declared past 4000 bytes is
  * LONG-class, and 8i, as 10g+ (§5.4), reads it after the others: written in
  * place, it swapped with the next bind. */
-static SeerStatus o8i_binds(SeerStmt *stmt, int row, const int *order, bool block, SeerWriter *w)
+static SeerStatus o8i_binds(SeerStmt *stmt, int row, bool block, SeerWriter *w)
 {
   int nb = stmt->npbinds;
   SeerWriter *vals = calloc((size_t)nb, sizeof *vals);
@@ -6135,18 +6135,17 @@ static SeerStatus o8i_binds(SeerStmt *stmt, int row, const int *order, bool bloc
       st = SEER_ENOMEM;
       break;
     }
-    int bi = order != NULL ? order[made] : made;
-    st = o8i_bind_value(&stmt->pbinds[bi], row, &vals[made], &sizes[made]);
+    st = o8i_bind_value(&stmt->pbinds[made], row, &vals[made], &sizes[made]);
     if (st == SEER_OK && !seer_writer_ok(&vals[made]))
       st = SEER_ENOMEM;
   }
   if (st == SEER_OK) {
     for (int i = 0; i < nb; i++)
-      o8i_bind_oac(w, &stmt->pbinds[order != NULL ? order[i] : i], sizes[i]);
+      o8i_bind_oac(w, &stmt->pbinds[i], sizes[i]);
     seer_writer_u8(w, TTI_RXD);
     for (int pass = 0; pass < (block ? 1 : 2); pass++)
       for (int i = 0; i < nb; i++) {
-        const SeerBind *b = &stmt->pbinds[order != NULL ? order[i] : i];
+        const SeerBind *b = &stmt->pbinds[i];
         bool varlen =
             o8i_char_bind(b) || b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW;
         bool is_long = !block && varlen && sizes[i] > 4000;
@@ -6208,7 +6207,7 @@ static SeerStatus o8i_call(SeerConn *c, SeerStmt *stmt, const char *sql, int row
   o8i_closing(c, &w);
   o8i_all8(c, &w, options, 0, text, sqllen, true, 1, 0, (uint32_t)nb, 1, 1, type);
   free(text);
-  SeerStatus st = nb > 0 ? o8i_binds(stmt, row, NULL, false, &w) : SEER_OK;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, row, false, &w) : SEER_OK;
   if (st == SEER_OK)
     st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
@@ -6524,8 +6523,6 @@ static SeerStatus o8i_resolve_lobs(SeerStmt *stmt)
 
 /* ---------------------------------------------------- 8i PL/SQL blocks */
 
-static int fv2_placeholder_order(const char *sql, int *order, int max);
-
 #define O8I_DIR_OUT 0x10 /* the prompt's mask for a value the block returns */
 
 /* One OUT value of an 8i block reply into `b->out` (§19.14, _O8I_OUT_CELL):
@@ -6562,8 +6559,9 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
  * binds - 9i's I/O vector at 8i's widths (0b, the flags, a ub2 of requests, a
  * ub2 of iterations, a ub4, eight bytes, then a mask a bind) - then one RXD
  * with the OUT values in the masks' order, then the RPA and the status. A
- * block that failed sends the status alone. `order` maps the masks to binds. */
-static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, const int *order, O8iStatus *s)
+ * block that failed sends the status alone. Mask k is bind k: the server
+ * pairs the binds with the placeholders in order of appearance (#146). */
+static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, O8iStatus *s)
 {
   if (o8r_has(r, 1) && r->b[r->pos] == TTI_IOV) {
     r->pos++;
@@ -6590,7 +6588,7 @@ static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, const int *order, O8iStatu
       for (uint32_t k = 0; k < count && !r->cut && !r->bad; k++) {
         if (!(masks[k] & O8I_DIR_OUT))
           continue;
-        int bi = order != NULL && k < (uint32_t)stmt->npbinds ? order[k] : (int)k;
+        int bi = (int)k;
         if (bi < 0 || bi >= stmt->npbinds) {
           r->bad = true;
           return;
@@ -6607,57 +6605,37 @@ static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, const int *order, O8iStatu
  * statement type 8 / 9 (§19.13): the option word 0x21, + BIND with binds,
  * then 0x04 with binds and 0x04, the block's mark. Unlike 9i, 8i takes the IN
  * values inline - a pure OUT bind sends fd 01 - so a block is one round trip.
- * The binds go in the order the text names them, as the server reads them by
- * position, and the reply's values follow the same order. */
+ * Bind N is the N-th distinct placeholder in order of appearance, as on every
+ * tier (#146); the reply's values follow the same order. */
 static SeerStatus o8i_execute_block(SeerStmt *stmt)
 {
   SeerConn *c = stmt->conn;
   int nb = stmt->npbinds;
-  int *order = NULL;
-  if (nb > 0) {
-    order = calloc((size_t)nb, sizeof *order);
-    if (order == NULL)
-      return SEER_ENOMEM;
-    bool ok = fv2_placeholder_order(stmt->sql, order, nb) == nb;
-    for (int k = 0; ok && k < nb; k++)
-      ok = order[k] >= 0 && order[k] < nb;
-    if (!ok) { /* the text doesn't account for every bind: bind order */
-      for (int k = 0; k < nb; k++)
-        order[k] = k;
-    }
-  }
   size_t sqllen = 0;
   uint8_t *text = o8i_latin1(stmt->sql, &sqllen);
-  if (text == NULL) {
-    free(order);
+  if (text == NULL)
     return SEER_ENOMEM;
-  }
   const char *kw = sql_first_keyword(stmt->sql);
   uint32_t type = starts_with_word(kw, "DECLARE") ? O8I_STMT_DECLARE : O8I_STMT_BEGIN;
   uint32_t options = 0x21 | (nb > 0 ? 0x0408 : 0) | 0x040000;
   SeerWriter w;
   if (!seer_writer_init(&w, 160 + sqllen + (size_t)nb * 32)) {
     free(text);
-    free(order);
     return SEER_ENOMEM;
   }
   o8i_closing(c, &w);
   o8i_all8(c, &w, options, 0, text, sqllen, true, 1, 0, (uint32_t)nb, 1, 1, type);
   free(text);
-  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, order, true, &w) : SEER_OK;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, true, &w) : SEER_OK;
   if (st == SEER_OK)
     st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
-  if (st != SEER_OK) {
-    free(order);
+  if (st != SEER_OK)
     return st;
-  }
 
   SeerWriter buf;
-  if (!seer_writer_init(&buf, 512)) {
-    free(order);
+  if (!seer_writer_init(&buf, 512))
     return SEER_ENOMEM;
-  }
   O8iStatus s = {0};
   /* No packet is marked a reply's last, and long OUT values span several:
    * read on until the prompt, every OUT value and the status are whole
@@ -6668,7 +6646,7 @@ static SeerStatus o8i_execute_block(SeerStmt *stmt)
       break;
     O8iRd r = {buf.buf, buf.len, 0, false, false};
     o8i_status_free(&s);
-    o8i_block_reply(&r, stmt, order, &s);
+    o8i_block_reply(&r, stmt, &s);
     if (r.bad) {
       st = SEER_EPROTO;
       break;
@@ -6677,7 +6655,6 @@ static SeerStatus o8i_execute_block(SeerStmt *stmt)
       break;
   }
   seer_writer_free(&buf);
-  free(order);
   if (st != SEER_OK) {
     o8i_status_free(&s);
     return st;
@@ -6722,7 +6699,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   o8i_all8(c, &w, nb > 0 ? 0x8069 : 0x8061, 0, sql, sqllen, true, 1, 0, (uint32_t)nb, 1, 0,
            O8I_STMT_SELECT);
   free(sql);
-  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, NULL, false, &w) : SEER_OK;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, false, &w) : SEER_OK;
   if (st != SEER_OK) {
     seer_writer_free(&w);
     return st;
@@ -7097,62 +7074,13 @@ static bool fv2_bind_directions(const uint8_t *d, size_t n, int nbinds, uint8_t 
   return true;
 }
 
-/* The bind index (0-based) behind each placeholder of `sql`, in order of first
- * appearance - the order the 9i prompt's masks and the block's values follow.
- * `:N` maps to bind N; a named placeholder takes the next position. Skips
- * string literals, quoted identifiers and comments. Returns the number of
- * distinct placeholders written to `order` (at most `max`). */
-static int fv2_placeholder_order(const char *sql, int *order, int max)
-{
-  char seen[64][32];
-  int n = 0;
-  const char *p = sql;
-  while (*p != '\0' && n < max && n < 64) {
-    if (*p == '\'' || *p == '"') { /* literal / quoted identifier */
-      const char *e = strchr(p + 1, *p);
-      if (e == NULL)
-        break;
-      p = e + 1;
-    } else if (p[0] == '-' && p[1] == '-') {
-      const char *e = strchr(p, '\n');
-      if (e == NULL)
-        break;
-      p = e + 1;
-    } else if (p[0] == '/' && p[1] == '*') {
-      const char *e = strstr(p + 2, "*/");
-      if (e == NULL)
-        break;
-      p = e + 2;
-    } else if (*p == ':' && (isalnum((unsigned char)p[1]) || p[1] == '_')) {
-      const char *b = p + 1, *e = b;
-      while (isalnum((unsigned char)*e) || *e == '_' || *e == '$' || *e == '#')
-        e++;
-      size_t len = (size_t)(e - b) < sizeof seen[0] - 1 ? (size_t)(e - b) : sizeof seen[0] - 1;
-      bool dup = false;
-      for (int k = 0; k < n && !dup; k++)
-        dup = strncasecmp(seen[k], b, len) == 0 && seen[k][len] == '\0';
-      if (!dup) {
-        memcpy(seen[n], b, len);
-        seen[n][len] = '\0';
-        order[n] = isdigit((unsigned char)*b) ? atoi(seen[n]) - 1 : n;
-        n++;
-      }
-      p = e;
-    } else {
-      p++;
-    }
-  }
-  return n;
-}
-
 /* Decode a 9i PL/SQL block reply: strip any leading bind prompt, read `n_out`
  * OUT/IN-OUT values (DALC + indicator, in bind order) into the OUT binds' `out`
  * cells - the binds the prompt's masks mark OUT when there was one (`dirs`),
  * else those declared OUT - then read the trailing RPA + short OER for rowcount
  * + status. */
 static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dlen, int n_out,
-                                 const uint8_t *dirs, const int *order, int64_t *rowcount,
-                                 int64_t *code)
+                                 const uint8_t *dirs, int64_t *rowcount, int64_t *code)
 {
   *rowcount = 0;
   *code = 0;
@@ -7170,8 +7098,7 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
   if (n_out > 0 && seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_RXD) {
     r.pos += 1;
     for (int k = 0; k < stmt->npbinds; k++) {
-      int i = order != NULL ? order[k] : k;
-      SeerBind *b = &stmt->pbinds[i];
+      SeerBind *b = &stmt->pbinds[k];
       if (dirs != NULL ? !(dirs[k] & FV2_DIR_OUT) : !b->is_out)
         continue;
       /* An OUT bind the block never assigned - what a RETURNING ... INTO that
@@ -7346,20 +7273,9 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
    * directions stand. */
   uint8_t *dirs = stmt->npbinds > 0 ? calloc((size_t)stmt->npbinds, 1) : NULL;
   bool prompted = dirs != NULL && fv2_bind_directions(resp, rlen, stmt->npbinds, dirs);
-  /* The masks (and the values) follow the placeholders' order of first
-   * appearance - `BEGIN :2 := :1 ...` lists :2 first - so map each to its bind.
-   * Fall back to bind order if the text doesn't account for every bind. */
-  int *order = NULL;
+  /* Mask k is bind k: the server pairs the binds with the placeholders in
+   * order of appearance, as on every tier (#146). */
   if (prompted) {
-    order = calloc((size_t)stmt->npbinds, sizeof *order);
-    bool ok =
-        order != NULL && fv2_placeholder_order(stmt->sql, order, stmt->npbinds) == stmt->npbinds;
-    for (int k = 0; ok && k < stmt->npbinds; k++)
-      ok = order[k] >= 0 && order[k] < stmt->npbinds;
-    if (!ok) {
-      free(order);
-      order = NULL;
-    }
     n_in = n_out = 0;
     for (int k = 0; k < stmt->npbinds; k++) {
       n_in += (dirs[k] & FV2_DIR_IN) != 0;
@@ -7379,20 +7295,17 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
       seer_log(SEER_LOG_DEBUG, "fv2: block compile failed (ORA-%05ld)", (long)pc);
       free(resp);
       free(dirs);
-      free(order);
       return SEER_EDB;
     }
     free(resp);
     resp = NULL;
     if (!seer_writer_init(&w, 32 + (size_t)n_in * 16)) {
       free(dirs);
-      free(order);
       return SEER_ENOMEM;
     }
     seer_writer_u8(&w, TTI_RXD);
     for (int k = 0; k < stmt->npbinds; k++) {
-      int i = order != NULL ? order[k] : k;
-      SeerBind *b = &stmt->pbinds[i];
+      SeerBind *b = &stmt->pbinds[k];
       if (dirs != NULL ? !(dirs[k] & FV2_DIR_IN) : b->is_out)
         continue;
       uint8_t *rxd = (b->rxd != NULL) ? b->rxd[0] : NULL;
@@ -7404,22 +7317,19 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
     if (!seer_writer_ok(&w)) {
       seer_writer_free(&w);
       free(dirs);
-      free(order);
       return SEER_ENOMEM;
     }
     st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
     seer_writer_free(&w);
     if (st != SEER_OK) {
       free(dirs);
-      free(order);
       return st;
     }
   }
 
   int64_t rowcount = 0, code = 0;
-  fv2_decode_block_out(stmt, resp, rlen, n_out, dirs, order, &rowcount, &code);
+  fv2_decode_block_out(stmt, resp, rlen, n_out, dirs, &rowcount, &code);
   free(dirs);
-  free(order);
   bool failed = (code != 0 && code != 1403);
   if (failed) {
     fv2_set_error(c, resp, rlen);

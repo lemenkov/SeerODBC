@@ -2103,6 +2103,43 @@ static void check_urowid_long(SQLHDBC dbc)
   }
 }
 
+/* Binds pair with placeholders in order of appearance, whatever their labels,
+ * on every release (#146): in SELECT :2 || :1 parameter 1 is :2, a repeated
+ * placeholder is one parameter, and a block reads the same way - parameter 1
+ * of BEGIN :2 := :1 || 'x' is the target. */
+static void check_bind_order(SQLHDBC dbc)
+{
+  const char *name = "binds pair with placeholders in order of appearance";
+  char m[256] = "";
+  SQLHSTMT st;
+  char a[8] = "A", b[8] = "B", out[32] = "";
+  SQLLEN ia = SQL_NTS, ib = SQL_NTS, io = 0;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0, a, 0, &ia);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0, b, 0, &ib);
+  if (SQL_SUCCEEDED(
+          SQLExecDirect(st, (SQLCHAR *)"SELECT :2 || '-' || :1 || '-' || :2 FROM dual", SQL_NTS)) &&
+      SQL_SUCCEEDED(SQLFetch(st)))
+    SQLGetData(st, 1, SQL_C_CHAR, out, sizeof out, &io);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (strcmp(out, "A-B-A") != 0)
+    snprintf(m, sizeof m, "SELECT :2||:1||:2 gave '%s', want 'A-B-A'", out);
+  char target[32] = "", in[8] = "in";
+  SQLLEN it = 0, ii = SQL_NTS;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_VARCHAR, 30, 0, target, sizeof target,
+                   &it);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0, in, 0, &ii);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"BEGIN :2 := :1 || '-x'; END;", SQL_NTS);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (m[0] == '\0' && (!SQL_SUCCEEDED(rc) || strcmp(target, "in-x") != 0))
+    snprintf(m, sizeof m, "BEGIN :2 := :1: rc=%d target '%s', want 'in-x'", rc, target);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_urowid(SQLHDBC dbc)
 {
   const char *name = "UROWID fetch";
@@ -3417,6 +3454,7 @@ int main(void)
   check_rowid(dbc);
   check_urowid(dbc);
   check_urowid_long(dbc);
+  check_bind_order(dbc);
   check_intervals(dbc);
   check_boolean(dbc);
   check_vector(dbc);
