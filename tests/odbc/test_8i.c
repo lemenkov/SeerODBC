@@ -527,6 +527,148 @@ static void check_alter_session_and_compile(void)
   }
 }
 
+/* An OUT parameter's value as text into `out` ("NULL" for a NULL). */
+static const char *out_text(SeerStmt *s, int param, char *out, size_t osz)
+{
+  const void *d = NULL;
+  size_t len = 0;
+  int isn = 0, isb = 0;
+  if (seer_stmt_out_data(s, param, &d, &len, &isn, &isb) != SEER_OK)
+    snprintf(out, osz, "(error)");
+  else if (isn || d == NULL)
+    snprintf(out, osz, "NULL");
+  else
+    snprintf(out, osz, "%.*s", (int)len, (const char *)d);
+  return out;
+}
+
+/* PL/SQL blocks (seerdb PROTOCOL.md §19.13-19.14, #134): IN values inline,
+ * OUT and IN OUT values back in one round trip, in the order the text names
+ * the placeholders; a NULL and a never-assigned OUT; a 4000-character OUT,
+ * whose reply spans packets; DECLARE; CALL ... INTO; a failing block. */
+static void check_blocks(void)
+{
+  const char *name = "PL/SQL blocks: IN, OUT, IN OUT, CALL, a failing block";
+  char a[32], b[32], c[32], d[32], e[80], f[4100], g[32], h[32];
+  SeerStmt *s = NULL;
+  a[0] = b[0] = c[0] = d[0] = e[0] = f[0] = g[0] = h[0] = '\0';
+  if (seer_stmt_prepare(C, "BEGIN :1 := :2 * 2; :3 := 'got ' || :4; END;", &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 2 /* NUMBER */, 22);
+    seer_stmt_bind_int64(s, 2, 21);
+    seer_stmt_bind_out(s, 3, 1 /* VARCHAR2 */, 100);
+    seer_stmt_bind_text(s, 4, "caf\xc3\xa9", -1);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      out_text(s, 1, a, sizeof a);
+      out_text(s, 3, b, sizeof b);
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "BEGIN :1 := :1 + 1; END;", &s) == SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 41);
+    seer_stmt_bind_set_inout(s, 1, 22);
+    if (seer_stmt_execute(s) == SEER_OK)
+      out_text(s, 1, c, sizeof c);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "BEGIN :2 := :1 || '-x'; END;", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, "in", -1);
+    seer_stmt_bind_out(s, 2, 1, 20);
+    if (seer_stmt_execute(s) == SEER_OK)
+      out_text(s, 2, d, sizeof d);
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "BEGIN :1 := NULL; IF 1 = 0 THEN :2 := 5; END IF; END;", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_out(s, 1, 1, 20);
+    seer_stmt_bind_out(s, 2, 2, 22);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      char x[32], y[32];
+      snprintf(e, sizeof e, "%s/%s", out_text(s, 1, x, sizeof x), out_text(s, 2, y, sizeof y));
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "DECLARE v NUMBER := 3; BEGIN :1 := RPAD('w', 4000, 'w'); :2 := v; END;",
+                        &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 1, 4000);
+    seer_stmt_bind_out(s, 2, 2, 22);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      out_text(s, 1, f, sizeof f);
+      out_text(s, 2, g, sizeof g);
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  run("CREATE OR REPLACE FUNCTION seer_nine8 RETURN NUMBER AS BEGIN RETURN 9; END;", NULL);
+  if (seer_stmt_prepare(C, "CALL seer_nine8() INTO :1", &s) == SEER_OK) {
+    seer_stmt_bind_out(s, 1, 2, 22);
+    if (seer_stmt_execute(s) == SEER_OK)
+      out_text(s, 1, h, sizeof h);
+  }
+  seer_stmt_close(s);
+  run("DROP FUNCTION seer_nine8", NULL);
+  SeerStatus bad = run("BEGIN no_such_proc; END;", NULL);
+  bool bad_ok = bad == SEER_EDB && seer_last_error(C) != NULL &&
+                strncmp(seer_last_error(C), "ORA-06550", 9) == 0;
+  if (strcmp(a, "42") == 0 && strcmp(b, "got caf\xc3\xa9") == 0 && strcmp(c, "42") == 0 &&
+      strcmp(d, "in-x") == 0 && strcmp(e, "NULL/NULL") == 0 && strlen(f) == 4000 &&
+      strcmp(g, "3") == 0 && strcmp(h, "9") == 0 && bad_ok)
+    pass(name);
+  else {
+    char m[512];
+    snprintf(m, sizeof m, "'%s' '%s' '%s' '%s' '%s' len=%zu '%s' '%s' failing=%d", a, b, c, d, e,
+             strlen(f), g, h, (int)bad);
+    fail(name, m);
+  }
+}
+
+/* DML RETURNING ... INTO runs as a block, as on 9i: the row's values come
+ * back, and the row count; a statement that matched no row returns NULLs. */
+static void check_returning(void)
+{
+  const char *name = "DML RETURNING ... INTO";
+  char a[32] = "", b[32] = "", c[32] = "";
+  long rows = -1, none = -1;
+  run("DROP TABLE seer_r8", NULL);
+  run("CREATE TABLE seer_r8 (id NUMBER, t VARCHAR2(20))", NULL);
+  SeerStmt *s = NULL;
+  if (seer_stmt_prepare(
+          C, "INSERT INTO seer_r8 VALUES (:1, 'seven') RETURNING id + 100, t INTO :2, :3", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_int64(s, 1, 7);
+    seer_stmt_bind_out(s, 2, 2, 22);
+    seer_stmt_bind_out(s, 3, 1, 20);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      rows = seer_stmt_row_count(s);
+      out_text(s, 2, a, sizeof a);
+      out_text(s, 3, b, sizeof b);
+    }
+  }
+  seer_stmt_close(s);
+  s = NULL;
+  if (seer_stmt_prepare(C, "UPDATE seer_r8 SET id = id WHERE id = 999 RETURNING t INTO :1", &s) ==
+      SEER_OK) {
+    seer_stmt_bind_out(s, 1, 1, 20);
+    if (seer_stmt_execute(s) == SEER_OK) {
+      none = seer_stmt_row_count(s);
+      out_text(s, 1, c, sizeof c);
+    }
+  }
+  seer_stmt_close(s);
+  run("DROP TABLE seer_r8", NULL);
+  if (rows == 1 && strcmp(a, "107") == 0 && strcmp(b, "seven") == 0 && none == 0 &&
+      strcmp(c, "NULL") == 0)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "rows=%ld '%s' '%s'; no match rows=%ld '%s'", rows, a, b, none, c);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -557,6 +699,8 @@ int main(void)
   check_dml();
   check_transactions();
   check_alter_session_and_compile();
+  check_blocks();
+  check_returning();
   check_wrong_password(&p);
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
