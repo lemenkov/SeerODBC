@@ -17,13 +17,15 @@ protocol variant with no feature behind it is not a gap.
 
 ## Server versions (negotiated TTC field version)
 
-- [~] 8i (8.1.7) — **queries with IN binds, DML, DDL and transactions,
+- [~] 8i (8.1.7) — **queries with IN binds, DML, DDL, transactions and PL/SQL,
       live-validated against an 8i VM** (its own dialect: the OSESSKEY-envelope
       O3LOGON, a 9.2-era OALL8, fixed-width little-endian describe / rows /
       status, WE8ISO8859P1 text; binds as seerdb PROTOCOL.md §19.11, #132; DML,
       DDL and COMMIT / ROLLBACK as §19.12, #133 - an array execute a row at a
-      time, as 8i has no array DML). Not spoken yet: PL/SQL (#134), LOB columns
-      (#135), UROWID (#136) - refused with SEER_ENOTIMPL.
+      time, as 8i has no array DML; PL/SQL blocks with IN, OUT and IN OUT binds
+      in one round trip as §19.13-19.14, and DML RETURNING through a block,
+      #134). Not spoken yet: LOB columns (#135), UROWID (#136) - refused with
+      SEER_ENOTIMPL.
 - [x] 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the

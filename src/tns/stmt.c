@@ -109,6 +109,7 @@ typedef struct {
   uint8_t oac_flag;     /* 16 for char/raw, 0 otherwise */
   bool is_out;          /* OUT / IN OUT parameter */
   bool type_from_null;  /* the OAC type came from a NULL value (a placeholder) */
+  bool out_only;        /* bound by seer_stmt_bind_out: OUT, no value to send   */
   uint8_t **rxd;        /* per-iteration encoded RXD values, [n_iters] */
   size_t *rxd_len;
   SeerCell out;         /* OUT value captured from the IOV response */
@@ -1945,6 +1946,7 @@ static SeerStatus store_bind_ex(SeerStmt *s, int param, uint8_t oac_type, uint32
     b->type_from_null = is_null;
   }
   b->is_out = is_out;
+  b->out_only = false;
   if (oac_size > b->oac_size)
     b->oac_size = oac_size;
   free(b->rxd[it]);
@@ -2506,7 +2508,11 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
     rxd[0] = 0;
     rxd_len = 1;
   }
-  return store_bind(stmt, param, oac_type, oac_size, oac_charset, oac_flag, true, rxd, rxd_len);
+  SeerStatus st =
+      store_bind(stmt, param, oac_type, oac_size, oac_charset, oac_flag, true, rxd, rxd_len);
+  if (st == SEER_OK)
+    stmt->pbinds[param - 1].out_only = true;
+  return st;
 }
 
 long seer_stmt_out_truncated(SeerStmt *stmt, int param)
@@ -5247,6 +5253,8 @@ static void fv2_resolve_lobs(SeerStmt *stmt)
 #define O8I_STMT_CREATE 5
 #define O8I_STMT_DROP 6
 #define O8I_STMT_ALTER 7
+#define O8I_STMT_BEGIN 8
+#define O8I_STMT_DECLARE 9
 #define O8I_STMT_TXN 0
 
 /* A strict reader over a reply that may still be incomplete: `cut` says a
@@ -5881,10 +5889,14 @@ static SeerStatus o8i_rows_reply(SeerStmt *stmt, SeerWriter *buf, size_t start, 
 
 /* Whether 8i can take this bind (seerdb PROTOCOL.md §19.11): VARCHAR2 / CHAR,
  * NUMBER, DATE and RAW values, and NULLs. `why` says what it can't take. */
-static bool o8i_bind_ok(const SeerBind *b, const char **why)
+static bool o8i_bind_ok(const SeerBind *b, bool block, const char **why)
 {
-  if (b->is_out) {
-    *why = "OUT and IN OUT parameters";
+  if (b->is_out && !block) {
+    *why = "OUT and IN OUT parameters outside a PL/SQL block";
+    return false;
+  }
+  if (b->oac_type == ORA_TYPE_REFCURSOR) {
+    *why = "REF CURSOR parameters";
     return false;
   }
   if (b->is_array || b->oac_override != NULL || b->obj_type != NULL || b->temp_lob) {
@@ -5952,6 +5964,23 @@ static SeerStatus o8i_unchunk(const uint8_t *v, size_t n, SeerWriter *out)
   return SEER_EPROTO;
 }
 
+/* The return buffer an OUT or IN OUT bind declares, at least `size`: text at
+ * 4000 bytes and RAW at 2000, as 9i declares them, whatever the caller asked
+ * for. A value longer than the caller's size is then cut to it, with the full
+ * length kept (seer_stmt_out_truncated, 01004); declared at the caller's size,
+ * PL/SQL raised ORA-06502 instead. */
+static uint32_t o8i_out_buffer(const SeerBind *b, uint32_t size)
+{
+  uint32_t floor = 1;
+  if (o8i_char_bind(b))
+    floor = 4000;
+  else if (b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW)
+    floor = 2000;
+  if (b->oac_size > size)
+    size = b->oac_size;
+  return size > floor ? size : floor;
+}
+
 /* One bind's value as 8i reads it (§19.11), into `val`; its declared size into
  * *size. Text goes in WE8ISO8859P1, the session's charset, as the SQL does; a
  * NULL is the empty value 00; NUMBER, DATE and RAW are the bytes the bind
@@ -5960,6 +5989,14 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
 {
   const uint8_t *v = b->rxd != NULL ? b->rxd[row] : NULL;
   size_t vn = b->rxd != NULL ? b->rxd_len[row] : 0;
+  if (b->is_out && b->out_only) {
+    /* A pure OUT bind sends the fixed placeholder fd 01 in its slot, and
+     * declares its return buffer (§19.14). */
+    seer_writer_u8(val, 0xFD);
+    seer_writer_u8(val, 0x01);
+    *size = o8i_out_buffer(b, b->oac_size);
+    return SEER_OK;
+  }
   if (v == NULL || vn == 0 || (vn == 1 && v[0] == 0)) {
     seer_writer_u8(val, 0);
     *size = b->oac_size ? b->oac_size : 1;
@@ -5985,6 +6022,8 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
   o8w_chr(val, l1, ln);
   free(l1);
   *size = ln ? (uint32_t)ln : 1;
+  if (b->is_out) /* an IN OUT's return buffer */
+    *size = o8i_out_buffer(b, *size);
   return SEER_OK;
 }
 
@@ -6029,7 +6068,7 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
 
 /* The statement's binds, refused before anything is sent when 8i can't take
  * one: SEER_ENOTIMPL, the reason logged. */
-static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query)
+static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query, bool block)
 {
   if (query && stmt->npbinds > 0 && stmt->n_iters > 1) {
     seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: an array execute of a query is not supported");
@@ -6037,7 +6076,7 @@ static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query)
   }
   for (int i = 0; i < stmt->npbinds; i++) {
     const char *why = NULL;
-    if (!o8i_bind_ok(&stmt->pbinds[i], &why)) {
+    if (!o8i_bind_ok(&stmt->pbinds[i], block, &why)) {
       seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: %s are not supported (parameter %d)", why,
                i + 1);
       return SEER_ENOTIMPL;
@@ -6050,7 +6089,7 @@ static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query)
  * descriptor, one 0x07, then every value. A value declared past 4000 bytes is
  * LONG-class, and 8i, as 10g+ (§5.4), reads it after the others: written in
  * place, it swapped with the next bind. */
-static SeerStatus o8i_binds(SeerStmt *stmt, int row, SeerWriter *w)
+static SeerStatus o8i_binds(SeerStmt *stmt, int row, const int *order, bool block, SeerWriter *w)
 {
   int nb = stmt->npbinds;
   SeerWriter *vals = calloc((size_t)nb, sizeof *vals);
@@ -6062,20 +6101,21 @@ static SeerStatus o8i_binds(SeerStmt *stmt, int row, SeerWriter *w)
       st = SEER_ENOMEM;
       break;
     }
-    st = o8i_bind_value(&stmt->pbinds[made], row, &vals[made], &sizes[made]);
+    int bi = order != NULL ? order[made] : made;
+    st = o8i_bind_value(&stmt->pbinds[bi], row, &vals[made], &sizes[made]);
     if (st == SEER_OK && !seer_writer_ok(&vals[made]))
       st = SEER_ENOMEM;
   }
   if (st == SEER_OK) {
     for (int i = 0; i < nb; i++)
-      o8i_bind_oac(w, &stmt->pbinds[i], sizes[i]);
+      o8i_bind_oac(w, &stmt->pbinds[order != NULL ? order[i] : i], sizes[i]);
     seer_writer_u8(w, TTI_RXD);
-    for (int pass = 0; pass < 2; pass++)
+    for (int pass = 0; pass < (block ? 1 : 2); pass++)
       for (int i = 0; i < nb; i++) {
-        const SeerBind *b = &stmt->pbinds[i];
+        const SeerBind *b = &stmt->pbinds[order != NULL ? order[i] : i];
         bool varlen =
             o8i_char_bind(b) || b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW;
-        bool is_long = varlen && sizes[i] > 4000;
+        bool is_long = !block && varlen && sizes[i] > 4000;
         if (is_long == (pass == 1))
           seer_writer_bytes(w, vals[i].buf, vals[i].len);
       }
@@ -6134,7 +6174,7 @@ static SeerStatus o8i_call(SeerConn *c, SeerStmt *stmt, const char *sql, int row
   o8i_closing(c, &w);
   o8i_all8(c, &w, options, 0, text, sqllen, true, 1, 0, (uint32_t)nb, 1, 1, type);
   free(text);
-  SeerStatus st = nb > 0 ? o8i_binds(stmt, row, &w) : SEER_OK;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, row, NULL, false, &w) : SEER_OK;
   if (st == SEER_OK)
     st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
@@ -6240,6 +6280,181 @@ static SeerStatus o8i_execute_dml(SeerStmt *stmt)
   return SEER_OK;
 }
 
+/* ---------------------------------------------------- 8i PL/SQL blocks */
+
+static int fv2_placeholder_order(const char *sql, int *order, int max);
+
+#define O8I_DIR_OUT 0x10 /* the prompt's mask for a value the block returns */
+
+/* One OUT value of an 8i block reply into `b->out` (§19.14, _O8I_OUT_CELL):
+ * a value and an sb2 indicator, -1 for NULL; `ff` and the indicator 3105
+ * for one the block never assigned. Text comes in WE8ISO8859P1. */
+static void o8i_out_cell(O8iRd *r, SeerBind *b)
+{
+  free(b->out.data);
+  b->out = (SeerCell){0};
+  if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
+    r->pos++;
+    (void)o8r_le16(r); /* 3105: never assigned */
+    return;
+  }
+  SeerWriter v;
+  if (!seer_writer_init(&v, 32)) {
+    r->bad = true;
+    return;
+  }
+  o8r_value(r, &v);
+  uint16_t ind = (uint16_t)o8r_le16(r);
+  if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v)) {
+    bool text = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
+                b->oac_type == ORA_TYPE_LONG || b->oac_type == 0;
+    if (text)
+      (void)o8i_text_cell(&b->out, v.buf, v.len);
+    else
+      (void)decode_scalar(b->oac_type, v.buf, v.len, &b->out);
+  }
+  seer_writer_free(&v);
+}
+
+/* An 8i block's reply (§19.13-19.14): the bind prompt when the block has
+ * binds - 9i's I/O vector at 8i's widths (0b, the flags, a ub2 of requests, a
+ * ub2 of iterations, a ub4, eight bytes, then a mask a bind) - then one RXD
+ * with the OUT values in the masks' order, then the RPA and the status. A
+ * block that failed sends the status alone. `order` maps the masks to binds. */
+static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, const int *order, O8iStatus *s)
+{
+  if (o8r_has(r, 1) && r->b[r->pos] == TTI_IOV) {
+    r->pos++;
+    o8r_skip(r, 1); /* flags */
+    uint32_t requests = o8r_le16(r);
+    uint32_t iterations = o8r_le16(r);
+    o8r_skip(r, 4 + 8);
+    uint32_t count = iterations * 256 + requests;
+    if (r->cut || r->bad || !o8r_has(r, count))
+      return;
+    const uint8_t *masks = r->b + r->pos;
+    r->pos += count;
+    bool any_out = false;
+    for (uint32_t k = 0; k < count; k++)
+      any_out |= (masks[k] & O8I_DIR_OUT) != 0;
+    if (any_out) {
+      if (!o8r_has(r, 1))
+        return;
+      if (r->b[r->pos] != TTI_RXD) {
+        r->bad = true;
+        return;
+      }
+      r->pos++;
+      for (uint32_t k = 0; k < count && !r->cut && !r->bad; k++) {
+        if (!(masks[k] & O8I_DIR_OUT))
+          continue;
+        int bi = order != NULL && k < (uint32_t)stmt->npbinds ? order[k] : (int)k;
+        if (bi < 0 || bi >= stmt->npbinds) {
+          r->bad = true;
+          return;
+        }
+        o8i_out_cell(r, &stmt->pbinds[bi]);
+      }
+    }
+  }
+  if (!r->cut && !r->bad)
+    o8i_read_status(r, s);
+}
+
+/* An anonymous PL/SQL block (BEGIN / DECLARE) or a CALL, on the OALL8 as
+ * statement type 8 / 9 (§19.13): the option word 0x21, + BIND with binds,
+ * then 0x04 with binds and 0x04, the block's mark. Unlike 9i, 8i takes the IN
+ * values inline - a pure OUT bind sends fd 01 - so a block is one round trip.
+ * The binds go in the order the text names them, as the server reads them by
+ * position, and the reply's values follow the same order. */
+static SeerStatus o8i_execute_block(SeerStmt *stmt)
+{
+  SeerConn *c = stmt->conn;
+  int nb = stmt->npbinds;
+  int *order = NULL;
+  if (nb > 0) {
+    order = calloc((size_t)nb, sizeof *order);
+    if (order == NULL)
+      return SEER_ENOMEM;
+    bool ok = fv2_placeholder_order(stmt->sql, order, nb) == nb;
+    for (int k = 0; ok && k < nb; k++)
+      ok = order[k] >= 0 && order[k] < nb;
+    if (!ok) { /* the text doesn't account for every bind: bind order */
+      for (int k = 0; k < nb; k++)
+        order[k] = k;
+    }
+  }
+  size_t sqllen = 0;
+  uint8_t *text = o8i_latin1(stmt->sql, &sqllen);
+  if (text == NULL) {
+    free(order);
+    return SEER_ENOMEM;
+  }
+  const char *kw = sql_first_keyword(stmt->sql);
+  uint32_t type = starts_with_word(kw, "DECLARE") ? O8I_STMT_DECLARE : O8I_STMT_BEGIN;
+  uint32_t options = 0x21 | (nb > 0 ? 0x0408 : 0) | 0x040000;
+  SeerWriter w;
+  if (!seer_writer_init(&w, 160 + sqllen + (size_t)nb * 32)) {
+    free(text);
+    free(order);
+    return SEER_ENOMEM;
+  }
+  o8i_closing(c, &w);
+  o8i_all8(c, &w, options, 0, text, sqllen, true, 1, 0, (uint32_t)nb, 1, 1, type);
+  free(text);
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, order, true, &w) : SEER_OK;
+  if (st == SEER_OK)
+    st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  seer_writer_free(&w);
+  if (st != SEER_OK) {
+    free(order);
+    return st;
+  }
+
+  SeerWriter buf;
+  if (!seer_writer_init(&buf, 512)) {
+    free(order);
+    return SEER_ENOMEM;
+  }
+  O8iStatus s = {0};
+  /* No packet is marked a reply's last, and long OUT values span several:
+   * read on until the prompt, every OUT value and the status are whole
+   * (seerdb o8i_block_complete, #2334). */
+  for (;;) {
+    st = o8i_recv_more(c, &buf);
+    if (st != SEER_OK)
+      break;
+    O8iRd r = {buf.buf, buf.len, 0, false, false};
+    o8i_status_free(&s);
+    o8i_block_reply(&r, stmt, order, &s);
+    if (r.bad) {
+      st = SEER_EPROTO;
+      break;
+    }
+    if (!r.cut && r.pos > 0)
+      break;
+  }
+  seer_writer_free(&buf);
+  free(order);
+  if (st != SEER_OK) {
+    o8i_status_free(&s);
+    return st;
+  }
+  if (s.cursor != 0)
+    queue_cursor_close(c, s.cursor);
+  if (s.code != 0 && s.code != 1403) {
+    st = o8i_fail(c, &s);
+    o8i_status_free(&s);
+    return st;
+  }
+  o8i_status_free(&s);
+  stmt->affected = (long)s.rows;
+  stmt->executed = true;
+  if (c->autocommit)
+    return seer_o8i_tran(c, true);
+  return SEER_OK;
+}
+
 static SeerStatus o8i_execute_select(SeerStmt *stmt)
 {
   SeerConn *c = stmt->conn;
@@ -6265,7 +6480,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   o8i_all8(c, &w, nb > 0 ? 0x8069 : 0x8061, 0, sql, sqllen, true, 1, 0, (uint32_t)nb, 1, 0,
            O8I_STMT_SELECT);
   free(sql);
-  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, &w) : SEER_OK;
+  SeerStatus st = nb > 0 ? o8i_binds(stmt, 0, NULL, false, &w) : SEER_OK;
   if (st != SEER_OK) {
     seer_writer_free(&w);
     return st;
@@ -6789,14 +7004,15 @@ static void free_one_bind(SeerStmt *s, SeerBind *b)
 static SeerStatus fv2_execute_block(SeerStmt *stmt);
 static SeerStatus fv2_execute_in_block(SeerStmt *stmt)
 {
+  const char *rel = stmt->conn->is_8i ? "8i" : "9i";
   if (stmt->n_iters > 1) {
     seer_log(SEER_LOG_WARNING,
-             "stmt: Oracle 9i: an array DML with RETURNING or long binds is not supported");
+             "stmt: Oracle %s: an array DML with RETURNING or long binds is not supported", rel);
     return SEER_ENOTIMPL;
   }
   for (int i = 0; i < stmt->npbinds; i++)
     if (stmt->pbinds[i].is_out && stmt->pbinds[i].ret_lob) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: RETURNING into a LOB is not supported");
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle %s: RETURNING into a LOB is not supported", rel);
       return SEER_ENOTIMPL;
     }
 
@@ -6818,7 +7034,7 @@ static SeerStatus fv2_execute_in_block(SeerStmt *stmt)
   }
   char *orig = stmt->sql;
   stmt->sql = wrapped;
-  st = fv2_execute_block(stmt);
+  st = stmt->conn->is_8i ? o8i_execute_block(stmt) : fv2_execute_block(stmt);
   stmt->sql = orig;
   free(wrapped);
 
@@ -7065,13 +7281,18 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
      * spoken yet (#134) - refuse rather than send 9i's ALL7, which 8i never
      * answers. */
     StmtKind kind = classify_sql(stmt->sql);
-    if (kind == STMT_BLOCK) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: PL/SQL blocks are not supported");
-      return SEER_ENOTIMPL;
-    }
-    SeerStatus bst = o8i_check_binds(stmt, kind == STMT_SELECT);
+    bool has_out = false;
+    for (int i = 0; i < stmt->npbinds; i++)
+      has_out |= stmt->pbinds[i].is_out;
+    /* A DML with OUT binds is a RETURNING ... INTO: run in a block, as on 9i. */
+    bool in_block = kind == STMT_BLOCK || (kind == STMT_CHANGE && has_out);
+    SeerStatus bst = o8i_check_binds(stmt, kind == STMT_SELECT, in_block);
     if (bst != SEER_OK)
       return bst;
+    if (kind == STMT_BLOCK)
+      return o8i_execute_block(stmt);
+    if (in_block)
+      return fv2_execute_in_block(stmt);
     return kind == STMT_SELECT ? o8i_execute_select(stmt) : o8i_execute_dml(stmt);
   }
 
