@@ -782,6 +782,40 @@ static void check_bfile(void)
   }
 }
 
+/* UROWID (seerdb PROTOCOL.md §19.10, #136): an index-organized table's
+ * logical rowid in the '*'-prefixed form, which binds back as text to find
+ * its row; a physical rowid held in a UROWID renders as the ROWID it is. */
+static void check_urowid(void)
+{
+  const char *name = "UROWID: logical rowid round trip, physical as ROWID";
+  char lr[128] = "", back[16] = "", u[64] = "", r[64] = "";
+  run("DROP TABLE seer_iot8", NULL);
+  run("CREATE TABLE seer_iot8 (id NUMBER PRIMARY KEY, v VARCHAR2(8)) ORGANIZATION INDEX", NULL);
+  run("INSERT INTO seer_iot8 VALUES (7, 'seven')", NULL);
+  query("SELECT ROWID FROM seer_iot8 WHERE id = 7", 0, 0, lr, sizeof lr);
+  SeerStmt *s = NULL;
+  if (seer_stmt_prepare(C, "SELECT v FROM seer_iot8 WHERE ROWID = :1", &s) == SEER_OK) {
+    seer_stmt_bind_text(s, 1, lr, -1);
+    bound_row(s, back, sizeof back);
+  }
+  seer_stmt_close(s);
+  run("DROP TABLE seer_iot8", NULL);
+  run("DROP TABLE seer_hp8", NULL);
+  run("CREATE TABLE seer_hp8 (id NUMBER)", NULL);
+  run("INSERT INTO seer_hp8 VALUES (1)", NULL);
+  query("SELECT CAST(ROWID AS UROWID) FROM seer_hp8", 0, 0, u, sizeof u);
+  query("SELECT ROWIDTOCHAR(ROWID) FROM seer_hp8", 0, 0, r, sizeof r);
+  run("DROP TABLE seer_hp8", NULL);
+  if (lr[0] == '*' && strlen(lr) > 1 && strcmp(back, "seven") == 0 && u[0] != '\0' &&
+      strcmp(u, r) == 0)
+    pass(name);
+  else {
+    char m[320];
+    snprintf(m, sizeof m, "logical '%s' -> '%s'; urowid '%s' rowid '%s'", lr, back, u, r);
+    fail(name, m);
+  }
+}
+
 int main(void)
 {
   const char *port = getenv("SEER_TEST_PORT");
@@ -816,6 +850,7 @@ int main(void)
   check_returning();
   check_lobs();
   check_bfile();
+  check_urowid();
   check_wrong_password(&p);
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);

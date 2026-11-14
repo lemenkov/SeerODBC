@@ -386,19 +386,15 @@ static void b64_encode(SeerWriter *w, const uint8_t *p, size_t n)
  * same RXD framing as a LOB column - ub4 num_bytes, a 1-byte length echo, then
  * num_bytes rowid bytes (a leading type tag + body). Rendered "*" + base64 of
  * the body (the leading tag byte dropped). */
-static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
+/* A UROWID's bytes (a leading type tag, then the body) as its text. Tag 01: a
+ * physical rowid held in a UROWID - object ub4, file ub2, block ub4, slot
+ * ub2 (big-endian) - rendered as the 18-char ROWID it is, so it matches
+ * ROWIDTOCHAR() and works in WHERE ROWID = ?. Tag 02 (logical, an IOT row)
+ * keeps the '*'-prefixed base64 form. 8i sends the same bytes (#136). */
+static SeerStatus urowid_cell(const uint8_t *p, size_t nbytes, SeerCell *cell)
 {
-  int64_t nbytes = seer_dec_sb4(r);
-  if (nbytes <= 0)
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO; /* NULL */
-  (void)seer_reader_u8(r);                            /* 1-byte length echo */
-  const uint8_t *p = seer_reader_bytes(r, (size_t)nbytes);
-  if (p == NULL)
-    return SEER_EPROTO;
-  /* Tag 01: a physical rowid held in a UROWID - object ub4, file ub2, block
-   * ub4, slot ub2 (big-endian) - rendered as the 18-char ROWID it is, so it
-   * matches ROWIDTOCHAR() and works in WHERE ROWID = ?. Tag 02 (logical, an
-   * IOT row) keeps the '*'-prefixed base64 form. */
+  if (nbytes == 0)
+    return SEER_OK;
   if (p[0] == 0x01 && nbytes == 13) {
     uint32_t obj = (uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | p[4];
     uint32_t file = (uint32_t)p[5] << 8 | p[6];
@@ -412,14 +408,26 @@ static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
     return cell_set_bytes(cell, rid, sizeof rid, false);
   }
   SeerWriter w;
-  if (!seer_writer_init(&w, (size_t)nbytes * 2))
+  if (!seer_writer_init(&w, nbytes * 2))
     return SEER_ENOMEM;
   seer_writer_u8(&w, '*');
   if (nbytes > 1)
-    b64_encode(&w, p + 1, (size_t)nbytes - 1); /* drop the leading tag */
+    b64_encode(&w, p + 1, nbytes - 1); /* drop the leading tag */
   SeerStatus st = seer_writer_ok(&w) ? cell_set_bytes(cell, w.buf, w.len, false) : SEER_ENOMEM;
   seer_writer_free(&w);
   return st;
+}
+
+static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
+{
+  int64_t nbytes = seer_dec_sb4(r);
+  if (nbytes <= 0)
+    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO; /* NULL */
+  (void)seer_reader_u8(r);                            /* 1-byte length echo */
+  const uint8_t *p = seer_reader_bytes(r, (size_t)nbytes);
+  if (p == NULL)
+    return SEER_EPROTO;
+  return urowid_cell(p, (size_t)nbytes, cell);
 }
 
 /* VECTOR binary image format (PROTOCOL.md §18). */
@@ -5707,19 +5715,9 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell)
     case ORA_TYPE_LONG:
       st = o8i_text_cell(cell, v.buf, v.len); /* WE8ISO8859P1 */
       break;
-    case ORA_TYPE_UROWID: {
-      SeerWriter u;
-      if (!seer_writer_init(&u, v.len * 2 + 2)) {
-        st = SEER_ENOMEM;
-        break;
-      }
-      seer_writer_u8(&u, '*');
-      if (v.len > 1)
-        b64_encode(&u, v.buf + 1, v.len - 1);
-      st = seer_writer_ok(&u) ? cell_set_bytes(cell, u.buf, u.len, false) : SEER_ENOMEM;
-      seer_writer_free(&u);
+    case ORA_TYPE_UROWID:
+      st = urowid_cell(v.buf, v.len, cell);
       break;
-    }
     default:
       if (v.len > 0)
         st = decode_scalar(t, v.buf, v.len, cell);

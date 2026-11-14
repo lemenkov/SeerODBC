@@ -34,9 +34,10 @@ dialect) is validated through the core API. 11g/21c/23ai are the public-CI tier;
 12.1 level is exercised by capping a 21c session at fv7). 8i (8.1.7) runs
 queries with IN binds, DML (an array execute a row at a time) with RETURNING,
 DDL, COMMIT / ROLLBACK and PL/SQL blocks with IN, OUT and IN OUT parameters
-and CLOB / BLOB / BFILE columns (validated live through the core API and an
-ODBC Driver Manager connection); a UROWID's physical rowid doesn't render as a
-ROWID yet (#136).
+and CLOB / BLOB / BFILE, ROWID and UROWID columns (validated live through the
+core API and an ODBC Driver Manager connection). What 8i itself lacks -
+TIMESTAMP / INTERVAL, BINARY_FLOAT / DOUBLE, temporary LOBs, object types read
+by thin clients - stays out.
 
 - **Connect & auth** — O5LOGON across the 10g (DES), 11g (AES-192/SHA-1) and
   12c (AES-256/PBKDF2) verifiers, 23ai fv24 fast-auth, and 9i O3LOGON (legacy
