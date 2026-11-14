@@ -423,11 +423,18 @@ static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
   int64_t nbytes = seer_dec_sb4(r);
   if (nbytes <= 0)
     return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO; /* NULL */
-  (void)seer_reader_u8(r);                            /* 1-byte length echo */
-  const uint8_t *p = seer_reader_bytes(r, (size_t)nbytes);
-  if (p == NULL)
-    return SEER_EPROTO;
-  return urowid_cell(p, (size_t)nbytes, cell);
+  /* The rowid as a value, as a LOB's locator is: a ub1 length, or past 252
+   * bytes 0xFE and chunks - an index-organized table's logical rowid grows
+   * with its key. Read as one length byte and num_bytes raw bytes, a rowid
+   * past 252 bytes desynced the reply, and the query failed with a bogus
+   * ORA-01403 (#144). */
+  uint8_t *p = NULL;
+  size_t n = 0;
+  SeerStatus st = seer_dec_dalc(r, &p, &n);
+  if (st == SEER_OK)
+    st = urowid_cell(p, n, cell);
+  free(p);
+  return st;
 }
 
 /* VECTOR binary image format (PROTOCOL.md §18). */
