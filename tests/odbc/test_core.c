@@ -61,8 +61,8 @@ static const Gate GATES[] = {
     {"national charset: NVARCHAR2 bind + fetch, UNISTR", 8, 8, GATE_SERVER,
      "8.1.7's national charset is WE8ISO8859P1, and it has no UNISTR"},
     /* core_tpc.c */
-    {"two-phase commit", 8, 11, GATE_TODO, "two-phase commit before 12c (#171)"},
-    {"two-phase rollback", 8, 11, GATE_TODO, "two-phase commit before 12c (#171)"},
+    {"two-phase commit", 8, 10, GATE_TODO, "two-phase commit before 11g (#171)"},
+    {"two-phase rollback", 8, 10, GATE_TODO, "two-phase commit before 11g (#171)"},
     /* core_reqbound.c */
     {"request boundaries", 8, 18, GATE_SERVER, "no request boundaries before 21c"},
     /* core_sessionless.c */
