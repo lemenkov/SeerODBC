@@ -15,6 +15,7 @@
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,10 +48,6 @@ static void skip(const char *n, const char *w)
 
 /* The checks each release skips (gates.h). Ordered by check. */
 static const Gate GATES[] = {
-    {"a cached statement re-run with binds of other types", 8, 9, GATE_TODO,
-     "it binds doubles, which 8i refuses and 9i stores wrong (#151)"},
-    {"BINARY_DOUBLE bind: refused on 8i, the value from 10g", 9, 9, GATE_TODO,
-     "a double bind stores garbage on 9i (#151)"},
     {"a BFILE in a missing directory is the server's error", 9, 99, GATE_TODO,
      "a BFILE that can't be opened reads as empty (#158)"},
     {"describe before execute, with a placeholder", 8, 8, GATE_SERVER,
@@ -1660,35 +1657,58 @@ static void check_binds(void)
  * is sent, and the session goes on. */
 static void check_bind_refused(void)
 {
-  /* 8.1.7 has no BINARY_DOUBLE: the bind is refused before anything is sent
-   * and the session goes on. 10g+ bind it natively. */
-  const char *name = "BINARY_DOUBLE bind: refused on 8i, the value from 10g";
-  GATE(name);
-  SeerStmt *s = NULL;
-  SeerStatus st = SEER_EPROTO;
-  char v[32] = "";
-  /* Compared by the server, not as text: a BINARY_DOUBLE prints 3.0E+000. */
-  if (seer_stmt_prepare(C, "SELECT CASE WHEN :1 * 2 = 3 THEN 'yes' ELSE 'no' END FROM dual", &s) ==
-      SEER_OK) {
-    seer_stmt_bind_double(s, 1, 1.5);
-    st = seer_stmt_execute(s);
-    const char *x = NULL;
+  /* A double and a float bind keep their value on every release: 10g+ bind
+   * them as BINARY_DOUBLE / BINARY_FLOAT; 8i and 9i, which have neither, as
+   * the NUMBER with the fewest digits that reads back the same (#151). There
+   * NaN has no form and is refused, the session going on. */
+  const char *name = "double and float binds keep their value";
+  static const double vals[] = {0.1, 1.5, -2.5e-7, 123456789.125, 1e20};
+  char m[160] = "";
+  for (size_t i = 0; i < sizeof vals / sizeof vals[0] && m[0] == '\0'; i++) {
+    SeerStmt *s = NULL;
+    const char *v = NULL;
     int isn = 0;
-    if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK &&
-        seer_stmt_get_string(s, 0, &x, &isn) == SEER_OK && x != NULL)
-      snprintf(v, sizeof v, "%s", x);
+    SeerStatus st = seer_stmt_prepare(C, "SELECT :1 FROM dual", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_double(s, 1, vals[i]);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+      seer_stmt_get_string(s, 0, &v, &isn);
+    if (st != SEER_OK || v == NULL || strtod(v, NULL) != vals[i])
+      snprintf(m, sizeof m, "%.17g: status %d, read back '%s'", vals[i], (int)st, v ? v : "");
+    seer_stmt_close(s);
   }
-  seer_stmt_close(s);
-  char after[16];
-  query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
-  bool ok = g_release == 8 ? st == SEER_ENOTIMPL : st == SEER_OK && strcmp(v, "yes") == 0;
-  if (ok && strcmp(after, "1") == 0)
+  if (m[0] == '\0') {
+    SeerStmt *s = NULL;
+    const char *v = NULL;
+    int isn = 0;
+    if (seer_stmt_prepare(C, "SELECT :1 FROM dual", &s) == SEER_OK &&
+        seer_stmt_bind_float(s, 1, 2.25f) == SEER_OK && seer_stmt_execute(s) == SEER_OK &&
+        seer_stmt_fetch(s) == SEER_OK)
+      seer_stmt_get_string(s, 0, &v, &isn);
+    if (v == NULL || strtof(v, NULL) != 2.25f)
+      snprintf(m, sizeof m, "float 2.25: read back '%s'", v ? v : "");
+    seer_stmt_close(s);
+  }
+  if (m[0] == '\0' && g_release < 10) {
+    SeerStmt *s = NULL;
+    SeerStatus st = SEER_OK;
+    if (seer_stmt_prepare(C, "SELECT :1 FROM dual", &s) == SEER_OK) {
+      st = seer_stmt_bind_double(s, 1, NAN);
+      if (st == SEER_OK)
+        st = seer_stmt_execute(s);
+    }
+    seer_stmt_close(s);
+    char after[8];
+    query("SELECT 1 FROM dual", 0, 0, after, sizeof after);
+    if (st != SEER_ENOTIMPL || strcmp(after, "1") != 0)
+      snprintf(m, sizeof m, "NaN: status %d (want refused), then '%s'", (int)st, after);
+  }
+  if (m[0] == '\0')
     pass(name);
-  else {
-    char m[96];
-    snprintf(m, sizeof m, "status %d '%s', then '%s'", (int)st, v, after);
+  else
     fail(name, m);
-  }
 }
 
 /* DDL, DML with binds and an array INSERT (8i has no array DML: a row at a

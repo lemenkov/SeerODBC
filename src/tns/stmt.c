@@ -25,6 +25,7 @@
 #include "writer.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2379,10 +2380,93 @@ SeerStatus seer_stmt_bind_interval_ds(SeerStmt *stmt, int param, int32_t days, i
   return store_bind(stmt, param, ORA_TYPE_INTERVAL_DS, 11, 0, 0, false, rxd, rl);
 }
 
+/* 8i and 9i have no BINARY_DOUBLE / BINARY_FLOAT: a double or float binds
+ * there as a NUMBER instead (#151), written with the fewest significant
+ * digits that read back to the very same value - 17 at most for a double, 9
+ * for a float - so the caller gets back exactly what it stored. NaN and the
+ * infinities have no NUMBER form, and a value past NUMBER's range (about
+ * 1e-130 to 1e126) none either: refused, rather than stored wrong. Before
+ * this, 9i sent the IEEE bytes as text and stored them garbled. */
+static bool binary_float_type_missing(const SeerConn *c)
+{
+  return c->is_8i || c->field_version < TTC_FIELD_VERSION_10_2;
+}
+
+static SeerStatus bind_float_as_number(SeerStmt *stmt, int param, double value, bool single)
+{
+  if (!isfinite(value)) {
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i / 9i: NaN and infinity have no NUMBER form");
+    return SEER_ENOTIMPL;
+  }
+  /* The shortest decimal that reads back to `value`, as d.ddde<exp>. */
+  char e[40] = "0e+00";
+  if (value != 0) {
+    for (int prec = 1; prec <= (single ? 9 : 17); prec++) {
+      snprintf(e, sizeof e, "%.*e", prec - 1, value);
+      double back = strtod(e, NULL);
+      if (single ? (float)back == (float)value : back == value)
+        break;
+    }
+  }
+  /* d.ddd e<exp> -> a plain decimal, the form seer_encode_number_str takes. */
+  char digits[24];
+  int nd = 0, exp10 = 0;
+  bool neg = false;
+  const char *q = e;
+  if (*q == '-') {
+    neg = true;
+    q++;
+  }
+  for (; *q != '\0' && *q != 'e'; q++)
+    if (*q >= '0' && *q <= '9' && nd < (int)sizeof digits)
+      digits[nd++] = *q;
+  if (*q == 'e')
+    exp10 = atoi(q + 1);
+  /* NUMBER spans 1e-130 to 1e126; the encoder takes 127 digits a side. */
+  int point = exp10 + 1; /* digits before the decimal point */
+  if (value != 0 && (point > 126 || point - nd < -126)) {
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i / 9i: %g is past the range of a NUMBER", value);
+    return SEER_ENOTIMPL;
+  }
+  char plain[300];
+  size_t k = 0;
+  if (neg)
+    plain[k++] = '-';
+  if (point <= 0) {
+    plain[k++] = '0';
+    plain[k++] = '.';
+    for (int i = 0; i < -point; i++)
+      plain[k++] = '0';
+    for (int i = 0; i < nd; i++)
+      plain[k++] = digits[i];
+  } else {
+    for (int i = 0; i < point; i++)
+      plain[k++] = i < nd ? digits[i] : '0';
+    if (nd > point) {
+      plain[k++] = '.';
+      for (int i = point; i < nd; i++)
+        plain[k++] = digits[i];
+    }
+  }
+  plain[k] = '\0';
+  uint8_t num[24];
+  size_t nn = value == 0 ? seer_encode_number_int(0, num) : seer_encode_number_str(plain, num);
+  if (nn == 0)
+    return SEER_EPARAM;
+  uint8_t *rxd = NULL;
+  size_t rl = 0;
+  SeerStatus st = rxd_short(num, nn, &rxd, &rl);
+  if (st != SEER_OK)
+    return st;
+  return store_bind(stmt, param, ORA_TYPE_NUMBER, 22, 0, 0, false, rxd, rl);
+}
+
 SeerStatus seer_stmt_bind_double(SeerStmt *stmt, int param, double value)
 {
   if (stmt == NULL)
     return SEER_EPARAM;
+  if (binary_float_type_missing(stmt->conn))
+    return bind_float_as_number(stmt, param, value, false);
   uint8_t enc[8];
   seer_encode_bdouble(value, enc);
   uint8_t *rxd = NULL;
@@ -2397,6 +2481,8 @@ SeerStatus seer_stmt_bind_float(SeerStmt *stmt, int param, float value)
 {
   if (stmt == NULL)
     return SEER_EPARAM;
+  if (binary_float_type_missing(stmt->conn))
+    return bind_float_as_number(stmt, param, value, true);
   uint8_t enc[4];
   seer_encode_bfloat(value, enc);
   uint8_t *rxd = NULL;
