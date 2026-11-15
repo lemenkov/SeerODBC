@@ -45,7 +45,7 @@ void core_tpc(void)
   int gr = gated_as("two-phase rollback", "two-phase rollback");
   if (gc && gr)
     return;
-  SeerConn *c = core_connect();
+  SeerConn *c = core_connect_xa();
   SeerConn *v = core_connect();
   if (!c || !v) {
     fail("two-phase commit", "connect failed");

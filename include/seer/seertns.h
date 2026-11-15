@@ -77,6 +77,12 @@ typedef struct {
    * peer is gone fails instead of hanging; the descriptor carries
    * (EXPIRE_TIME=<minutes>) too, as python-oracledb writes it. 0: off. */
   int expire_time;
+  /* Two-phase commit on 9i: non-zero logs the session on with the names 9.2
+   * requires before seer_tpc_begin (AUTH_INTERNALNAME / AUTH_EXTERNALNAME).
+   * Such a session raises a refused commit's ORA-02091 again on every statement
+   * until a rollback, so it is opt-in (#183). Ignored on other releases, which
+   * take two-phase commit on any session. */
+  int xa;
 } SeerConnParams;
 
 #define SEER_PURITY_NEW 1
@@ -128,8 +134,10 @@ typedef struct {
 #define SEER_TPC_END_SUSPEND 0x00100000 /* suspend (resume-able) end   */
 
 /* Begin (or join/resume) a global transaction branch. `timeout` is the seconds
- * the server holds an idle branch (0 = server default). On 8i the calls run as
- * PL/SQL on SYS.JAVA_XA, which the account must be able to execute. */
+ * the server holds an idle branch (0 = server default). On 9i the connection
+ * must be opened with SeerConnParams.xa set (SEER_ENOTIMPL otherwise). On 8i the
+ * calls run as PL/SQL on SYS.JAVA_XA, which the account must be able to
+ * execute. */
 SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, uint32_t timeout);
 /* End the local work on the branch (detach); flags SEER_TPC_END_*. */
 SeerStatus seer_tpc_end(SeerConn *conn, const SeerXid *xid, uint32_t flags);

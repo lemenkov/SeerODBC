@@ -29,6 +29,8 @@ int gated_as(const char *gate, const char *name);
 
 /* A new connection with the suite's parameters, or NULL. */
 SeerConn *core_connect(void);
+/* The same, opened for two-phase commit (SeerConnParams.xa, which 9i needs). */
+SeerConn *core_connect_xa(void);
 
 /* The feature modules, run by main() in this order. */
 void core_tpc(void);

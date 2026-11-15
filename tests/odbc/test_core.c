@@ -100,6 +100,14 @@ SeerConn *core_connect(void)
   return seer_connect(&P, &c) == SEER_OK ? c : NULL;
 }
 
+SeerConn *core_connect_xa(void)
+{
+  SeerConnParams p = P;
+  p.xa = 1;
+  SeerConn *c = NULL;
+  return seer_connect(&p, &c) == SEER_OK ? c : NULL;
+}
+
 /* Whether this account can read V$SESSION: a grant some beds lack. */
 static bool can_read_v_session(void);
 

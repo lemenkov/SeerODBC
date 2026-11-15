@@ -9517,6 +9517,13 @@ SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, ui
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
+  if (!conn->is_8i && conn->field_version < TTC_FIELD_VERSION_10_2 && !conn->xa) {
+    /* 9i takes it only on a session that logged on for it (#183). */
+    free(conn->last_error);
+    conn->last_error = strdup("two-phase commit on 9i needs a connection opened with "
+                              "SeerConnParams.xa set");
+    return SEER_ENOTIMPL;
+  }
   if (conn->is_8i) {
     int64_t xf = (flags & SEER_TPC_BEGIN_JOIN)     ? XA_TMJOIN
                  : (flags & SEER_TPC_BEGIN_RESUME) ? XA_TMRESUME
