@@ -9962,13 +9962,133 @@ static SeerStatus aq_enq_send(SeerConn *conn, SeerWriter *w, uint8_t msgid[16])
   return st;
 }
 
+/* 9i and 8i: AQ through PL/SQL on DBMS_AQ, the route their era's clients have
+ * (seerdb PROTOCOL.md §29: 9.2 closes a thin session on the native enqueue,
+ * and 8.1.7 has no native form in any reference client). Every option is a
+ * field of DBMS_AQ's PL/SQL records, set in the block (#173). */
+#define PLSQL_AQ_MAX_RAW 32512       /* the largest RAW a 9i block takes in (§19.3.1) */
+#define PLSQL_AQ_MAX_RAW_OUT_9I 2000 /* 9i's RAW OUT bind is inline-only (#189) */
+
+static SeerStatus plsql_aq_stmt(SeerConn *c, const char *sql, SeerStmt **out)
+{
+  *out = NULL;
+  return seer_stmt_prepare(c, sql, out);
+}
+
+static SeerStatus plsql_aq_text(SeerStmt *s, int param, const char *v)
+{
+  if (v == NULL || v[0] == '\0')
+    return seer_stmt_bind_null_typed(s, param, ORA_TYPE_VARCHAR);
+  return seer_stmt_bind_text(s, param, v, (int)strlen(v));
+}
+
+static SeerStatus plsql_aq_enq(SeerConn *c, const char *queue_name, const uint8_t *payload,
+                               size_t payload_len, const SeerAqEnqOptions *opt, uint8_t msgid[16])
+{
+  static const char SQL[] =
+      "DECLARE eo DBMS_AQ.ENQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; m RAW(16); "
+      "BEGIN mp.priority := :1; mp.delay := :2; mp.expiration := :3; mp.correlation := :4; "
+      "DBMS_AQ.ENQUEUE(:5, eo, mp, :6, m); :7 := m; END;";
+  if (payload_len > PLSQL_AQ_MAX_RAW)
+    return SEER_EPARAM;
+  SeerStmt *s = NULL;
+  SeerStatus st = plsql_aq_stmt(c, SQL, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_int64(s, 1, opt ? (int64_t)opt->priority : 0);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_int64(s, 2, opt ? (int64_t)opt->delay : 0);
+  if (st == SEER_OK) /* -1 is DBMS_AQ.NEVER */
+    st = seer_stmt_bind_int64(s, 3, opt ? (int64_t)opt->expiration : -1);
+  if (st == SEER_OK)
+    st = plsql_aq_text(s, 4, opt ? opt->correlation : NULL);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(s, 5, queue_name, (int)strlen(queue_name));
+  if (st == SEER_OK)
+    st = seer_stmt_bind_raw(s, 6, payload, (int)payload_len);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 7, ORA_TYPE_RAW, 16);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (st == SEER_OK && msgid != NULL) {
+    const void *d = NULL;
+    size_t n = 0;
+    int isnull = 0, isbin = 0;
+    if (seer_stmt_out_data(s, 7, &d, &n, &isnull, &isbin) == SEER_OK && !isnull && n == 16)
+      memcpy(msgid, d, 16);
+    else
+      st = SEER_EPROTO;
+  }
+  seer_stmt_close(s);
+  return st;
+}
+
+static SeerStatus plsql_aq_deq(SeerConn *c, const char *queue_name, const SeerAqDeqOptions *opt,
+                               uint8_t **payload, size_t *payload_len, uint8_t msgid[16])
+{
+  static const char SQL[] =
+      "DECLARE do DBMS_AQ.DEQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; m RAW(16); "
+      "p RAW(32767); BEGIN do.wait := :1; do.navigation := DBMS_AQ.FIRST_MESSAGE; "
+      "IF :2 = 1 THEN do.dequeue_mode := DBMS_AQ.BROWSE; END IF; do.correlation := :3; "
+      "do.consumer_name := :4; DBMS_AQ.DEQUEUE(:5, do, mp, p, m); :6 := p; :7 := m; END;";
+  SeerStmt *s = NULL;
+  SeerStatus st = plsql_aq_stmt(c, SQL, &s);
+  if (st == SEER_OK) /* 0 is DBMS_AQ.NO_WAIT */
+    st = seer_stmt_bind_int64(s, 1, opt ? (int64_t)opt->wait_seconds : 0);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_int64(s, 2, (opt && opt->browse) ? 1 : 0);
+  if (st == SEER_OK)
+    st = plsql_aq_text(s, 3, opt ? opt->correlation : NULL);
+  if (st == SEER_OK)
+    st = plsql_aq_text(s, 4, opt ? opt->consumer : NULL);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(s, 5, queue_name, (int)strlen(queue_name));
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 6, ORA_TYPE_RAW,
+                            c->is_8i ? PLSQL_AQ_MAX_RAW : PLSQL_AQ_MAX_RAW_OUT_9I);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 7, ORA_TYPE_RAW, 16);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (st == SEER_EDB) {
+    const char *e = seer_last_error(c);
+    if (e != NULL && (strncmp(e, "ORA-25228", 9) == 0 || strncmp(e, "ORA-25254", 9) == 0))
+      st = SEER_ENODATA; /* empty queue, or the wait ran out */
+  }
+  if (st == SEER_OK) {
+    const void *d = NULL;
+    size_t n = 0;
+    int isnull = 0, isbin = 0;
+    if (seer_stmt_out_data(s, 6, &d, &n, &isnull, &isbin) != SEER_OK) {
+      st = SEER_EPROTO;
+    } else if (payload != NULL) {
+      uint8_t *pl = malloc(n ? n : 1);
+      if (pl == NULL) {
+        st = SEER_ENOMEM;
+      } else {
+        if (n > 0 && !isnull)
+          memcpy(pl, d, n);
+        *payload = pl;
+        if (payload_len != NULL)
+          *payload_len = isnull ? 0 : n;
+      }
+    }
+    if (st == SEER_OK && msgid != NULL &&
+        (seer_stmt_out_data(s, 7, &d, &n, &isnull, &isbin) != SEER_OK || isnull || n != 16))
+      st = SEER_EPROTO;
+    else if (st == SEER_OK && msgid != NULL)
+      memcpy(msgid, d, 16);
+  }
+  seer_stmt_close(s);
+  return st;
+}
+
 SeerStatus seer_aq_enq_raw_opt(SeerConn *conn, const char *queue_name, const uint8_t *payload,
                                size_t payload_len, const SeerAqEnqOptions *opt, uint8_t msgid[16])
 {
   if (conn == NULL || queue_name == NULL)
     return SEER_EPARAM;
   if (conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i and 8i: DBMS_AQ only (#173) */
+    return plsql_aq_enq(conn, queue_name, payload, payload_len, opt, msgid);
 
   unsigned pri = opt ? opt->priority : 0;
   unsigned dly = opt ? opt->delay : 0;
@@ -10279,12 +10399,12 @@ SeerStatus seer_aq_deq_raw_opt(SeerConn *conn, const char *queue_name, const See
 {
   if (conn == NULL || queue_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i and 8i: DBMS_AQ only (#173) */
   if (payload != NULL)
     *payload = NULL;
   if (payload_len != NULL)
     *payload_len = 0;
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return plsql_aq_deq(conn, queue_name, opt, payload, payload_len, msgid);
 
   uint32_t mode = (opt && opt->browse) ? TNS_AQ_DEQ_BROWSE : TNS_AQ_DEQ_REMOVE;
   uint32_t wait = opt ? opt->wait_seconds : 0;

@@ -176,9 +176,11 @@ SeerStatus seer_unsubscribe(SeerConn *conn);
 /* Advanced Queuing: enqueue a RAW message to `queue_name` (current schema unless
  * "SCHEMA.QUEUE"). The queue's payload type must be RAW. On success the 16-byte
  * message id is written to `msgid` (if non-NULL). Enqueue visibility is ON_COMMIT,
- * so commit to make the message available. 10g+ for RAW enqueue / dequeue and
- * their options; the object, JSON and array forms are 12c+ (SEER_ENOTIMPL before,
- * #173). */
+ * so commit to make the message available. RAW enqueue / dequeue and their
+ * options work on every release: 10g and later in the AQ protocol, 9i and 8i as
+ * PL/SQL on DBMS_AQ (the account needs EXECUTE on it), where a payload is at
+ * most 32512 bytes and a 9i dequeue returns at most 2000 (#189). The object and
+ * JSON forms are 12c+ (SEER_ENOTIMPL before, #173). */
 /* Enqueue options (all optional; a NULL options pointer means the defaults that
  * seer_aq_enq_raw uses). */
 typedef struct {
