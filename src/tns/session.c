@@ -324,6 +324,7 @@ SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char 
   conn->seq = 1;           /* TTC sequence numbers start at 1 */
   conn->autocommit = true; /* ODBC default */
   conn->lob_inline = params->lob_inline != 0;
+  conn->xa = params->xa != 0;
 
   char cur_host[256];
   snprintf(cur_host, sizeof cur_host, "%s", params->host);

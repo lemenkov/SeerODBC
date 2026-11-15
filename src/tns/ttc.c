@@ -1296,7 +1296,7 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
   seer_enc_sb4(w, (uint32_t)ulen); /* user length               */
   seer_enc_sb4(w, 0x101);          /* logon mode, with the proof */
   seer_writer_u8(w, 1);
-  seer_enc_sb4(w, 8); /* key/value pairs */
+  seer_enc_sb4(w, c->xa ? 8 : 6); /* key/value pairs */
   seer_writer_u8(w, 1);
   seer_writer_u8(w, 1);
   seer_writer_bytes(w, user, ulen); /* raw, as below 12.1 */
@@ -1307,9 +1307,14 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
   seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0, false);
   /* 9i takes a distributed transaction only on a session that logged on with
    * these names (ORA-02048 otherwise). The keys carry their NUL, as JDBC thin's
-   * XA connection sends them (#171). */
-  seer_enc_kv(w, "AUTH_INTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
-  seer_enc_kv(w, "AUTH_EXTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
+   * XA connection sends them (#171). Such a session keeps a refused commit's
+   * transaction (ORA-02091 again on the next commit), so the names go only to
+   * a connection that asks for two-phase commit, as JDBC gives them only to
+   * its XA connection (#183). */
+  if (c->xa) {
+    seer_enc_kv(w, "AUTH_INTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
+    seer_enc_kv(w, "AUTH_EXTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
+  }
   seer_enc_kv(w, "AUTH_ACL", 8, ACL, sizeof ACL - 1, 0, false);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
@@ -2010,11 +2015,14 @@ static SeerStatus seer_ttc_tran(SeerConn *conn, uint8_t func)
   st = seer_ttc_recv(conn, &resp, &rlen);
   if (st != SEER_OK)
     return st;
+  /* A refused commit (ORA-02091: a deferred constraint, the transaction rolled
+   * back) is an error, not a success (#184). */
+  st = seer_conn_call_status(conn, resp, rlen);
   free(resp);
   /* An ordinary commit/rollback ends any active sessionless transaction (§31);
    * the server rides a SYNC piggyback on this response, harmlessly discarded. */
   conn->sessionless_active = false;
-  return SEER_OK;
+  return st;
 }
 
 SeerStatus seer_request_begin(SeerConn *conn)

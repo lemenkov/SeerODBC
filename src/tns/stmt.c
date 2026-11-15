@@ -9213,6 +9213,42 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
                   oac_len);
 }
 
+/* The status of a reply to a call that returns no rows (a commit, a rollback):
+ * SEER_OK unless it carries an error (TTI_OER with a non-zero code), which is
+ * then put on the connection and returned as SEER_EDB. A refused commit is a
+ * real error - ORA-02091, the transaction rolled back - and once went
+ * unreported on 9i and later (#184). */
+SeerStatus seer_conn_call_status(SeerConn *c, const uint8_t *resp, size_t rlen)
+{
+  if (rlen == 0 || resp[0] != TTI_OER)
+    return SEER_OK;
+  if (c->field_version < TTC_FIELD_VERSION_10_2) { /* 9i's short status */
+    int64_t code = fv2_oer_code(resp, rlen);
+    if (code == 0)
+      return SEER_OK;
+    free(c->last_error);
+    c->last_error = NULL;
+    fv2_set_error(c, resp, rlen);
+    if (c->last_error == NULL && code > 0)
+      seer_conn_error_code(c, (long)code);
+    return SEER_EDB;
+  }
+  SeerReader r;
+  seer_reader_init(&r, resp + 1, rlen - 1);
+  r.sb4_chunks = c->field_version >= TTC_FIELD_VERSION_12_1;
+  SeerStmt tmp = {.conn = c};
+  OerResult oer = {0};
+  free(c->last_error);
+  c->last_error = NULL;
+  parse_oer(&r, &tmp, &oer);
+  free_batch_errors(&tmp);
+  if (oer.err_code == 0)
+    return SEER_OK;
+  if (c->last_error == NULL)
+    seer_conn_error_code(c, (long)oer.err_code);
+  return SEER_EDB;
+}
+
 /* ------------------------------------------------- two-phase commit (XA/TPC) */
 
 /* Reject an out-of-range Xid (XA caps gtrid and bqual at 64 bytes each). */
@@ -9517,6 +9553,13 @@ SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, ui
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
+  if (!conn->is_8i && conn->field_version < TTC_FIELD_VERSION_10_2 && !conn->xa) {
+    /* 9i takes it only on a session that logged on for it (#183). */
+    free(conn->last_error);
+    conn->last_error = strdup("two-phase commit on 9i needs a connection opened with "
+                              "SeerConnParams.xa set");
+    return SEER_ENOTIMPL;
+  }
   if (conn->is_8i) {
     int64_t xf = (flags & SEER_TPC_BEGIN_JOIN)     ? XA_TMJOIN
                  : (flags & SEER_TPC_BEGIN_RESUME) ? XA_TMRESUME

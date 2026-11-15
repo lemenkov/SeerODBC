@@ -308,6 +308,42 @@ static void check_transaction(SQLHDBC dbc)
   }
 }
 
+/* A commit the server refuses (a deferred constraint, ORA-02091: the
+ * transaction rolled back) is an error from SQLEndTran, SQLSTATE 40002 with the
+ * ORA number as the native error. It was once reported as success (#184). */
+static void check_refused_commit(SQLHDBC dbc)
+{
+  const char *name = "SQLEndTran on a refused commit: 40002, ORA-02091";
+  char err[256], out[64];
+  exec_do(dbc, "DROP TABLE seer_odbc_defer", err, sizeof err);
+  exec_do(dbc,
+          "CREATE TABLE seer_odbc_defer (n NUMBER CONSTRAINT seer_odbc_defer_pos CHECK (n > 0) "
+          "DEFERRABLE INITIALLY DEFERRED)",
+          err, sizeof err);
+  SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+  exec_do(dbc, "INSERT INTO seer_odbc_defer VALUES (-1)", err, sizeof err);
+  SQLRETURN rc = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+  SQLCHAR state[6] = "", msg[256] = "";
+  SQLINTEGER native = 0;
+  SQLSMALLINT ml = 0;
+  if (rc == SQL_ERROR)
+    SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, state, &native, msg, sizeof msg, &ml);
+  SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
+  SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+  out[0] = '\0';
+  exec_scalar(dbc, "SELECT COUNT(*) FROM seer_odbc_defer", out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_odbc_defer", err, sizeof err);
+  if (rc == SQL_ERROR && strcmp((char *)state, "40002") == 0 && native == 2091 &&
+      strcmp(out, "0") == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "rc=%d state=%s native=%d kept=%s (%.200s)", (int)rc, (char *)state,
+             (int)native, out, (char *)msg);
+    fail(name, m);
+  }
+}
+
 /* A query run while a transaction is open must still return every row. The
  * server reports call_status 2 (transaction in progress) rather than 1 in the
  * OER then, so the fetch loop must keep going on the cursor, not on that flag. */
@@ -3579,6 +3615,7 @@ int main(void)
   check_bind(dbc);
   if (check_dml(dbc)) {
     check_transaction(dbc);
+    check_refused_commit(dbc);
     check_fetch_in_txn(dbc);
     check_urowid_physical(dbc);
     check_long_bind_order(dbc);

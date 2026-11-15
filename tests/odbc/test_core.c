@@ -100,6 +100,14 @@ SeerConn *core_connect(void)
   return seer_connect(&P, &c) == SEER_OK ? c : NULL;
 }
 
+SeerConn *core_connect_xa(void)
+{
+  SeerConnParams p = P;
+  p.xa = 1;
+  SeerConn *c = NULL;
+  return seer_connect(&p, &c) == SEER_OK ? c : NULL;
+}
+
 /* Whether this account can read V$SESSION: a grant some beds lack. */
 static bool can_read_v_session(void);
 
@@ -1870,6 +1878,44 @@ static void check_alter_session_and_compile(void)
   }
 }
 
+/* A commit refused by a deferred constraint is an error, ORA-02091, and it
+ * ends that transaction: the next statement runs, and a valid row then
+ * commits alone. The refusal once went unreported on 9i and later (#184), and
+ * a 9i session that logged on with the XA names keeps the refused transaction,
+ * failing the next commit too (#183). */
+static void check_refused_commit(void)
+{
+  const char *name = "a commit refused by a deferred constraint is an error, and ends there";
+  run_rows("DROP TABLE seer_defer", NULL);
+  run_rows("CREATE TABLE seer_defer (n NUMBER CONSTRAINT seer_defer_pos CHECK (n > 0) "
+           "DEFERRABLE INITIALLY DEFERRED)",
+           NULL);
+  seer_set_autocommit(C, 0);
+  SeerStatus ins = run_rows("INSERT INTO seer_defer VALUES (-1)", NULL);
+  SeerStatus com = seer_commit(C);
+  const char *e = seer_last_error(C);
+  int refused = com == SEER_EDB && e != NULL && strstr(e, "ORA-02091") != NULL;
+  char one[16] = "";
+  query("SELECT 1 FROM dual", 0, 0, one, sizeof one);
+  SeerStatus ins2 = run_rows("INSERT INTO seer_defer VALUES (5)", NULL);
+  SeerStatus com2 = seer_commit(C);
+  if (com2 != SEER_OK)
+    seer_rollback(C);
+  seer_set_autocommit(C, 1);
+  char kept[16] = "";
+  query("SELECT COUNT(*) FROM seer_defer", 0, 0, kept, sizeof kept);
+  run_rows("DROP TABLE seer_defer", NULL);
+  if (ins == SEER_OK && refused && strcmp(one, "1") == 0 && ins2 == SEER_OK && com2 == SEER_OK &&
+      strcmp(kept, "1") == 0)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "commit=%d refused=%d next='%s' insert=%d commit=%d kept='%s'", (int)com,
+             refused, one, (int)ins2, (int)com2, kept);
+    fail(name, m);
+  }
+}
+
 /* PL/SQL blocks (seerdb PROTOCOL.md §19.13-19.14, #134): IN values inline,
  * OUT and IN OUT values back in one round trip, bound by order of appearance
  * (#146); a NULL and a never-assigned OUT; a 4000-character OUT,
@@ -2319,6 +2365,7 @@ int main(void)
   check_dml();
   check_transactions();
   check_alter_session_and_compile();
+  check_refused_commit();
   check_blocks();
   check_lobs();
   check_urowid();
