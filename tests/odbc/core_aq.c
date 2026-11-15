@@ -48,11 +48,12 @@ static const char *const AQ_CHECKS[] = {
 
 void core_aq(void)
 {
-  int gated = 0;
-  for (size_t i = 0; i < sizeof AQ_CHECKS / sizeof AQ_CHECKS[0]; i++)
-    gated |= gated_as("AQ", AQ_CHECKS[i]);
-  if (gated)
+  /* The whole module waits when AQ itself is gated; single checks gate below. */
+  if (feature_gated("AQ")) {
+    for (size_t i = 0; i < sizeof AQ_CHECKS / sizeof AQ_CHECKS[0]; i++)
+      gated_as("AQ", AQ_CHECKS[i]);
     return;
+  }
   SeerConn *c = core_connect();
   if (c == NULL) {
     fail("AQ RAW enqueue", "connect failed");

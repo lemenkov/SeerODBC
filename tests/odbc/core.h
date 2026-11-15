@@ -15,10 +15,15 @@ void pass(const char *name);
 void fail(const char *name, const char *why);
 void skip(const char *name, const char *why);
 
-/* Whether `gate` is gated on the connected release; if so, `name` is reported
- * as SKIP with the gate's reason. A gate names a check, or a feature several
- * checks share ("object binds"). */
+/* Whether `name` is gated on the connected release, by its own gate or else by
+ * the feature gate `gate` it falls under; if so, `name` is reported as SKIP with
+ * the gate's reason. A gate names a check, or a feature several checks share
+ * ("object binds"), and a check's own gate wins. */
 int gated_as(const char *gate, const char *name);
+
+/* Whether the feature gate `gate` itself applies (no check's own gate, nothing
+ * reported). */
+int feature_gated(const char *gate);
 
 /* Skip the check `nm` and return when its release is gated. */
 #define GATE(nm)                                                                                   \
