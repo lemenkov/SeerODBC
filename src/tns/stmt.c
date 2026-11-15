@@ -9751,6 +9751,18 @@ static void aq_two_lengths(SeerWriter *w, const uint8_t *data, size_t n, uint8_t
   obj_append_chr(w, data, n, fv);
 }
 
+/* The queue name in an AQ request's data section. 11g reads it raw, with no
+ * length in front: the 12c length byte shifted the type id and the payload
+ * behind it (ORA-00600 [kpoaqeq: payload]; seerdb, measured on 11.2.0.2 against
+ * JDBC thin's AQ, 2026-11-15). */
+static void aq_queue_name(SeerWriter *w, const char *qname, size_t qn, uint8_t fv)
+{
+  if (fv < TTC_FIELD_VERSION_12_1)
+    seer_writer_bytes(w, qname, qn);
+  else
+    obj_append_chr(w, (const uint8_t *)qname, qn, fv);
+}
+
 /* The message-property block (oracledb write_msg_props), shared by single and
  * array enqueue: priority/delay/expiration/correlation, the four agent keyword
  * extensions (AGENT_PROTOCOL carries a one-byte 0x00 binary), the trailing
@@ -9862,7 +9874,7 @@ static SeerStatus aq_build_enq(SeerConn *c, SeerWriter *w, const char *qname,
 
   /* data section: queue name, the 16-byte payload TOID (RAW sentinel or the
    * object type's OID), then the payload (raw bytes / the object bind value). */
-  obj_append_chr(w, (const uint8_t *)qname, qn, fv);
+  aq_queue_name(w, qname, qn, fv);
   seer_writer_bytes(w, toid16, 16);
   if (plen > 0)
     seer_writer_bytes(w, payload, plen);
@@ -9909,8 +9921,11 @@ SeerStatus seer_aq_enq_raw_opt(SeerConn *conn, const char *queue_name, const uin
 {
   if (conn == NULL || queue_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (conn->field_version < TTC_FIELD_VERSION_11_2)
+    return SEER_ENOTIMPL; /* 10g and older: not measured (#173) */
+  if (conn->field_version < TTC_FIELD_VERSION_12_1 && opt != NULL && opt->correlation != NULL &&
+      opt->correlation[0] != '\0')
+    return SEER_ENOTIMPL; /* 11g correlation: not measured (#173) */
 
   unsigned pri = opt ? opt->priority : 0;
   unsigned dly = opt ? opt->delay : 0;
@@ -10094,7 +10109,7 @@ static SeerStatus aq_build_deq(SeerConn *c, SeerWriter *w, const char *qname, ui
 
   /* data section: queue name, optional consumer, optional correlation, then the
    * 16-byte RAW payload TOID (order mirrors AqDeqMessage). */
-  obj_append_chr(w, (const uint8_t *)qname, qn, fv);
+  aq_queue_name(w, qname, qn, fv);
   if (consumer != NULL && consumer[0] != '\0')
     obj_append_chr(w, (const uint8_t *)consumer, strlen(consumer), fv);
   if (correlation != NULL && correlation[0] != '\0')
@@ -10221,8 +10236,12 @@ SeerStatus seer_aq_deq_raw_opt(SeerConn *conn, const char *queue_name, const See
 {
   if (conn == NULL || queue_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (conn->field_version < TTC_FIELD_VERSION_11_2)
+    return SEER_ENOTIMPL; /* 10g and older: not measured (#173) */
+  if (conn->field_version < TTC_FIELD_VERSION_12_1 && opt != NULL &&
+      ((opt->correlation != NULL && opt->correlation[0] != '\0') ||
+       (opt->consumer != NULL && opt->consumer[0] != '\0')))
+    return SEER_ENOTIMPL; /* 11g correlation and consumer names: not measured (#173) */
   if (payload != NULL)
     *payload = NULL;
   if (payload_len != NULL)

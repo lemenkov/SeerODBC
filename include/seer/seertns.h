@@ -168,7 +168,9 @@ SeerStatus seer_unsubscribe(SeerConn *conn);
 /* Advanced Queuing: enqueue a RAW message to `queue_name` (current schema unless
  * "SCHEMA.QUEUE"). The queue's payload type must be RAW. On success the 16-byte
  * message id is written to `msgid` (if non-NULL). Enqueue visibility is ON_COMMIT,
- * so commit to make the message available. 12c+ (SEER_ENOTIMPL on older). */
+ * so commit to make the message available. 11g+ for RAW enqueue / dequeue; on
+ * 11g a correlation or consumer name is SEER_ENOTIMPL, as are the object, JSON and
+ * array forms before 12c (#173). */
 /* Enqueue options (all optional; a NULL options pointer means the defaults that
  * seer_aq_enq_raw uses). */
 typedef struct {
