@@ -5841,6 +5841,7 @@ int seer_test_o8i_status(const uint8_t *buf, size_t len, uint32_t *code)
  * the max row size, the column count and - with columns - a byte, then each
  * column (9i's OAC at fixed widths, nullability, the name, the type's schema
  * and name), then the describe time (a ub4 length and the date). */
+static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *ncols);
 static void o8i_read_describe(O8iRd *r, SeerColumn **out, int *ncols)
 {
   *out = NULL;
@@ -5850,8 +5851,24 @@ static void o8i_read_describe(O8iRd *r, SeerColumn **out, int *ncols)
       r->bad = true;
     return;
   }
-  o8r_value(r, NULL); /* preamble */
-  (void)o8r_le32(r);  /* max row size */
+  o8i_read_columns(r, false, out, ncols);
+}
+
+/* The describe's body. A cursor's cell - a REF CURSOR OUT value, a CURSOR()
+ * column - carries it too, with the max row size ahead of the preamble, which
+ * is empty there (seerdb §19.17a, from sqlplus 9.2 against 8.1.7). `out` may
+ * be NULL to read past the columns. */
+static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *ncols)
+{
+  if (out != NULL) {
+    *out = NULL;
+    *ncols = 0;
+  }
+  if (cursor_cell)
+    (void)o8r_le32(r); /* max row size */
+  o8r_value(r, NULL);  /* preamble */
+  if (!cursor_cell)
+    (void)o8r_le32(r); /* max row size */
   uint32_t n = o8r_le32(r);
   if (r->cut)
     return;
@@ -5902,7 +5919,7 @@ static void o8i_read_describe(O8iRd *r, SeerColumn **out, int *ncols)
   }
   if (o8r_le32(r) > 0)
     o8r_value(r, NULL); /* the describe time */
-  if (r->cut || r->bad) {
+  if (r->cut || r->bad || out == NULL) {
     free_columns(cols, (int)n);
     return;
   }
@@ -5910,13 +5927,36 @@ static void o8i_read_describe(O8iRd *r, SeerColumn **out, int *ncols)
   *ncols = (int)n;
 }
 
+/* A cursor's cell (§19.17a): the describe body, the cursor id (ub4) and a
+ * ub2; a CURSOR() column's row cell adds a ub2 return code, as every 8i row
+ * cell has. The cursor id into *cursor, the columns into `cols` when
+ * non-NULL. */
+static void o8i_read_cursor_cell(O8iRd *r, bool row_cell, SeerColumn **cols, int *ncols,
+                                 uint32_t *cursor)
+{
+  o8i_read_columns(r, true, cols, ncols);
+  *cursor = o8r_le32(r);
+  o8r_skip(r, row_cell ? 4 : 2);
+  if ((r->cut || r->bad) && cols != NULL && *cols != NULL) {
+    free_columns(*cols, *ncols);
+    *cols = NULL;
+    *ncols = 0;
+  }
+}
+
 /* One 8i cell (seerdb _O8I_CELL and kin): the value and a 4-byte trailer, an
  * sb2 indicator and a ub2 return code; NULL is the trailer alone (`ff ff ..`);
  * a LONG comes chunked, a NULL one as a bare zero; a ROWID a byte (0x0e, 0 for
  * NULL) and the rowid at fixed widths; a UROWID a ub2 length and a value. */
-static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell)
+static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell, uint32_t *nested)
 {
   uint8_t t = col->ora_type;
+  if (t == ORA_TYPE_REFCURSOR) {
+    /* A CURSOR() column: ODBC has no nested cursor type, so it reads as NULL,
+     * as on 9i; its cursor is named for closing (#166). */
+    o8i_read_cursor_cell(r, true, NULL, NULL, nested);
+    return SEER_OK;
+  }
   if (t == ORA_TYPE_RID) {
     uint8_t size = o8r_u8(r);
     uint32_t obj = 0, file = 0, blk = 0, slot = 0;
@@ -6006,7 +6046,8 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell)
  * vector names the columns its next row sends; a clear bit repeats the
  * previous row's value - across batches too. The rows go into `rows` (not the
  * statement) so a reply cut short can be read again whole. */
-static SeerStatus o8i_read_rows(O8iRd *r, SeerStmt *stmt, SeerCell ***rows, size_t *nrows)
+static SeerStatus o8i_read_rows(O8iRd *r, SeerStmt *stmt, SeerCell ***rows, size_t *nrows,
+                                SeerWriter *nested)
 {
   int ncols = stmt->ncols;
   uint8_t vec[512];
@@ -6046,7 +6087,10 @@ static SeerStatus o8i_read_rows(O8iRd *r, SeerStmt *stmt, SeerCell ***rows, size
           }
           continue;
         }
-        SeerStatus st = o8i_read_cell(r, &stmt->cols[i], &row[i]);
+        uint32_t id = 0;
+        SeerStatus st = o8i_read_cell(r, &stmt->cols[i], &row[i], &id);
+        if (st == SEER_OK && id != 0 && !r->cut && !r->bad)
+          o8w_le32(nested, id);
         if (st != SEER_OK) {
           for (int k = 0; k <= i; k++)
             free(row[k].data);
@@ -6142,18 +6186,32 @@ static SeerStatus o8i_fail(SeerConn *c, O8iStatus *s)
 }
 
 /* Read the rows and the status of one execute / fetch reply, reading on until
- * both are whole, and commit the rows to the statement. */
+ * both are whole, and commit the rows to the statement. The batch's CURSOR()
+ * cells' cursors are closed ahead of the next call, the parent's next fetch
+ * included: left open, 8i ran out at open_cursors (seerdb ID 54, #166). */
 static SeerStatus o8i_rows_reply(SeerStmt *stmt, SeerWriter *buf, size_t start, O8iStatus *s)
 {
   SeerConn *c = stmt->conn;
+  SeerWriter nested;
+  if (!seer_writer_init(&nested, 64))
+    return SEER_ENOMEM;
   for (;;) {
     O8iRd r = {buf->buf, buf->len, start, false, false};
     SeerCell **rows = NULL;
     size_t nrows = 0;
-    SeerStatus st = o8i_read_rows(&r, stmt, &rows, &nrows);
+    nested.len = 0; /* a reply read again names its cursors again */
+    SeerStatus st = o8i_read_rows(&r, stmt, &rows, &nrows, &nested);
     if (st == SEER_OK && !r.cut && !r.bad)
       o8i_read_status(&r, s);
+    if (st == SEER_OK && !seer_writer_ok(&nested))
+      st = SEER_ENOMEM;
     if (st == SEER_OK && !r.cut && !r.bad) {
+      for (size_t k = 0; k + 4 <= nested.len; k += 4) {
+        const uint8_t *p = nested.buf + k;
+        queue_cursor_close(c, (int64_t)((uint32_t)p[0] | (uint32_t)p[1] << 8 |
+                                        (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24));
+      }
+      seer_writer_free(&nested);
       for (size_t i = 0; i < nrows && st == SEER_OK; i++) {
         st = append_row(stmt, rows[i]);
         if (st == SEER_OK)
@@ -6170,15 +6228,16 @@ static SeerStatus o8i_rows_reply(SeerStmt *stmt, SeerWriter *buf, size_t start, 
     }
     o8i_free_staged(rows, nrows, stmt->ncols);
     o8i_status_free(s);
-    if (st != SEER_OK)
-      return st;
-    if (r.bad) {
+    if (st == SEER_OK && r.bad) {
       seer_log(SEER_LOG_ERROR, "o8i: unexpected reply at byte %zu", r.pos);
-      return SEER_EPROTO;
+      st = SEER_EPROTO;
     }
-    st = o8i_recv_more(c, buf); /* cut short: the rest is on its way */
-    if (st != SEER_OK)
+    if (st == SEER_OK)
+      st = o8i_recv_more(c, buf); /* cut short: the rest is on its way */
+    if (st != SEER_OK) {
+      seer_writer_free(&nested);
       return st;
+    }
   }
 }
 
@@ -6197,7 +6256,9 @@ static bool o8i_bind_ok(const SeerBind *b, bool block, const char **why)
     return false;
   }
   if (b->oac_type == ORA_TYPE_REFCURSOR) {
-    *why = "REF CURSOR parameters";
+    if (b->is_out && block)
+      return true;
+    *why = "REF CURSOR parameters other than a PL/SQL block's OUT";
     return false;
   }
   if (b->is_array || b->oac_override != NULL || b->obj_type != NULL || b->temp_lob) {
@@ -6290,6 +6351,13 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
 {
   const uint8_t *v = b->rxd != NULL ? b->rxd[row] : NULL;
   size_t vn = b->rxd != NULL ? b->rxd_len[row] : 0;
+  if (b->oac_type == ORA_TYPE_REFCURSOR) {
+    /* A REF CURSOR sends an empty slot, 01 00 (§19.17a). */
+    seer_writer_u8(val, 0x01);
+    seer_writer_u8(val, 0x00);
+    *size = 1;
+    return SEER_OK;
+  }
   if (b->is_out && b->out_only) {
     /* A pure OUT bind sends the fixed placeholder fd 01 in its slot, and
      * declares its return buffer (§19.14). */
@@ -6347,6 +6415,9 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
   case ORA_TYPE_RAW:
   case ORA_TYPE_LONGRAW:
     type = ORA_TYPE_RAW, charset = 0, csfrm = 0;
+    break;
+  case ORA_TYPE_REFCURSOR:
+    type = ORA_TYPE_REFCURSOR, size = 1, charset = 0, csfrm = 0;
     break;
   default:
     break;
@@ -6830,6 +6901,33 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
   seer_writer_free(&v);
 }
 
+/* A REF CURSOR OUT value (§19.17a): the cursor cell, its columns and id kept
+ * for reading its rows once the reply is in. `ff` and an indicator for a
+ * cursor the block never opened. */
+static void o8i_refcursor_cell(O8iRd *r, SeerStmt *stmt)
+{
+  if (stmt->refcursor_cols != NULL)
+    free_columns(stmt->refcursor_cols, stmt->refcursor_ncols);
+  stmt->refcursor_cols = NULL;
+  stmt->refcursor_ncols = 0;
+  stmt->refcursor_present = false;
+  if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
+    r->pos++;
+    (void)o8r_le16(r);
+    return;
+  }
+  SeerColumn *cols = NULL;
+  int ncols = 0;
+  uint32_t id = 0;
+  o8i_read_cursor_cell(r, false, &cols, &ncols, &id);
+  if (r->cut || r->bad)
+    return;
+  stmt->refcursor_cols = cols;
+  stmt->refcursor_ncols = ncols;
+  stmt->refcursor_id = (int)id;
+  stmt->refcursor_present = id != 0;
+}
+
 /* An 8i block's reply (§19.13-19.14): the bind prompt when the block has
  * binds - 9i's I/O vector at 8i's widths (0b, the flags, a ub2 of requests, a
  * ub2 of iterations, a ub4, eight bytes, then a mask a bind) - then one RXD
@@ -6868,12 +6966,46 @@ static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, O8iStatus *s)
           r->bad = true;
           return;
         }
-        o8i_out_cell(r, &stmt->pbinds[bi]);
+        if (stmt->pbinds[bi].oac_type == ORA_TYPE_REFCURSOR)
+          o8i_refcursor_cell(r, stmt);
+        else
+          o8i_out_cell(r, &stmt->pbinds[bi]);
       }
     }
   }
   if (!r->cut && !r->bad)
     o8i_read_status(r, s);
+}
+
+static SeerStatus o8i_fetch_rest(SeerStmt *stmt, uint32_t cursor, O8iStatus *s);
+static SeerStatus o8i_resolve_lobs(SeerStmt *stmt);
+
+/* A REF CURSOR OUT's rows become the statement's result set: its columns came
+ * in its cell; its rows are fetched by its id with OALL8 fetches, as a
+ * query's after the first batch, and the cursor is closed with the next call
+ * (§19.17a, #166). */
+static SeerStatus o8i_drain_refcursor(SeerStmt *stmt)
+{
+  uint32_t cursor = (uint32_t)stmt->refcursor_id;
+  stmt->refcursor_present = false;
+  free_rows(stmt);
+  free_columns(stmt->cols, stmt->ncols);
+  stmt->cols = stmt->refcursor_cols;
+  stmt->ncols = stmt->refcursor_ncols;
+  stmt->refcursor_cols = NULL;
+  stmt->refcursor_ncols = 0;
+  seer_log(SEER_LOG_DEBUG, "o8i: REF CURSOR %u (%d columns)", (unsigned)cursor, stmt->ncols);
+  O8iStatus s = {0};
+  SeerStatus st = o8i_fetch_rest(stmt, cursor, &s);
+  if (st == SEER_OK && (s.code == 0 || s.code == 1403))
+    st = o8i_resolve_lobs(stmt);
+  queue_cursor_close(stmt->conn, cursor);
+  if (st == SEER_OK && s.code != 0 && s.code != 1403)
+    st = o8i_fail(stmt->conn, &s);
+  o8i_status_free(&s);
+  stmt->cols_adopted = true;
+  stmt->cur = -1;
+  return st;
 }
 
 /* An anonymous PL/SQL block (BEGIN / DECLARE) or a CALL, on the OALL8 as
@@ -6937,15 +7069,62 @@ static SeerStatus o8i_execute_block(SeerStmt *stmt)
   if (s.cursor != 0)
     queue_cursor_close(c, s.cursor);
   if (s.code != 0 && s.code != 1403) {
+    stmt->refcursor_present = false;
     st = o8i_fail(c, &s);
     o8i_status_free(&s);
     return st;
   }
   o8i_status_free(&s);
-  stmt->affected = (long)s.rows;
+  long rows = (long)s.rows;
+  if (stmt->refcursor_present) {
+    st = o8i_drain_refcursor(stmt);
+    if (st != SEER_OK)
+      return st;
+  }
+  stmt->affected = rows;
   stmt->executed = true;
   if (c->autocommit)
     return seer_o8i_tran(c, true);
+  return SEER_OK;
+}
+
+/* Fetch a cursor's rows by its id after a first batch whose status is *s,
+ * to a batch that ends with ORA-01403 or brings no rows; *s is the last
+ * batch's status. A LONG column returns one row a fetch, and only up to the
+ * fetch's LONG size: ask for all of it (seerdb #377). */
+static SeerStatus o8i_fetch_rest(SeerStmt *stmt, uint32_t cursor, O8iStatus *s)
+{
+  SeerConn *c = stmt->conn;
+  bool has_long = false;
+  for (int i = 0; i < stmt->ncols; i++)
+    if (stmt->cols[i].ora_type == ORA_TYPE_LONG || stmt->cols[i].ora_type == ORA_TYPE_LONGRAW)
+      has_long = true;
+  while (s->code == 0 && cursor != 0) {
+    o8i_status_free(s);
+    size_t before = stmt->nrows;
+    SeerWriter w, buf;
+    if (!seer_writer_init(&w, 128))
+      return SEER_ENOMEM;
+    o8i_closing(c, &w);
+    o8i_all8(c, &w, 0x40, cursor, NULL, 0, false, 0, 0x7FFFFFFF, 0, 0, has_long ? 1 : PREFETCH_ROWS,
+             O8I_STMT_SELECT);
+    SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+    seer_writer_free(&w);
+    if (st == SEER_OK && !seer_writer_init(&buf, 2048))
+      st = SEER_ENOMEM;
+    if (st != SEER_OK)
+      return st;
+    st = o8i_recv_more(c, &buf);
+    if (st == SEER_OK)
+      st = o8i_rows_reply(stmt, &buf, 0, s);
+    seer_writer_free(&buf);
+    if (st != SEER_OK)
+      return st;
+    seer_log(SEER_LOG_DEBUG, "o8i: fetch on cursor %u: %zu rows, status ORA-%05u", (unsigned)cursor,
+             stmt->nrows - before, (unsigned)s->code);
+    if (stmt->nrows == before)
+      break;
+  }
   return SEER_OK;
 }
 
@@ -7059,38 +7238,9 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
   uint32_t cursor = s.cursor;
   seer_log(SEER_LOG_DEBUG, "o8i: execute: %d columns, %zu rows, cursor %u, status ORA-%05u",
            stmt->ncols, stmt->nrows, (unsigned)cursor, (unsigned)s.code);
-  bool has_long = false;
-  for (int i = 0; i < stmt->ncols; i++)
-    if (stmt->cols[i].ora_type == ORA_TYPE_LONG || stmt->cols[i].ora_type == ORA_TYPE_LONGRAW)
-      has_long = true;
-
-  /* Fetch the rest by the cursor. A LONG column returns one row a fetch, and
-   * only up to the fetch's LONG size: ask for all of it (seerdb #377). */
-  while (s.code == 0 && cursor != 0) {
-    o8i_status_free(&s);
-    size_t before = stmt->nrows;
-    if (!seer_writer_init(&w, 128))
-      return SEER_ENOMEM;
-    o8i_closing(c, &w);
-    o8i_all8(c, &w, 0x40, cursor, NULL, 0, false, 0, 0x7FFFFFFF, 0, 0, has_long ? 1 : PREFETCH_ROWS,
-             O8I_STMT_SELECT);
-    st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
-    seer_writer_free(&w);
-    if (st == SEER_OK && !seer_writer_init(&buf, 2048))
-      st = SEER_ENOMEM;
-    if (st != SEER_OK)
-      return st;
-    st = o8i_recv_more(c, &buf);
-    if (st == SEER_OK)
-      st = o8i_rows_reply(stmt, &buf, 0, &s);
-    seer_writer_free(&buf);
-    if (st != SEER_OK)
-      return st;
-    seer_log(SEER_LOG_DEBUG, "o8i: fetch on cursor %u: %zu rows, status ORA-%05u", (unsigned)cursor,
-             stmt->nrows - before, (unsigned)s.code);
-    if (stmt->nrows == before)
-      break;
-  }
+  st = o8i_fetch_rest(stmt, cursor, &s);
+  if (st != SEER_OK)
+    return st;
   if (s.code == 0 || s.code == 1403) {
     st = o8i_resolve_lobs(stmt);
     if (st != SEER_OK) {
