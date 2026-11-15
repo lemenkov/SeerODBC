@@ -47,7 +47,7 @@ static const Gate GATES[] = {
      "9i's TRUNC takes no TIMESTAMP WITH LOCAL TIME ZONE (ORA-00932)"},
     {"multi-batch fetch with a repeated column", 8, 8, GATE_SERVER,
      "8i has no CONNECT BY level row generator"},
-    {"nested CURSOR() column", 8, 9, GATE_TODO, "CURSOR() columns before 10g (#166)"},
+    {"nested CURSOR() column", 8, 8, GATE_TODO, "CURSOR() columns on 8i (#166)"},
     {"large text bind ahead of another bind (5000 / 40000 bytes)", 9, 9, GATE_TODO,
      "9i text binds over 32512 bytes (#169)"},
     {"typed NULL parameter (COALESCE with NUMBER / DATE)", 8, 8, GATE_SERVER,
