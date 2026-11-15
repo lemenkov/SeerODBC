@@ -179,7 +179,7 @@ SeerStatus seer_unsubscribe(SeerConn *conn);
  * so commit to make the message available. RAW enqueue / dequeue and their
  * options work on every release: 10g and later in the AQ protocol, 9i and 8i as
  * PL/SQL on DBMS_AQ (the account needs EXECUTE on it), where a payload is at
- * most 32512 bytes and a 9i dequeue returns at most 2000 (#189). The object and
+ * most 32512 bytes. The object and
  * JSON forms are 12c+ (SEER_ENOTIMPL before, #173). */
 /* Enqueue options (all optional; a NULL options pointer means the defaults that
  * seer_aq_enq_raw uses). */
