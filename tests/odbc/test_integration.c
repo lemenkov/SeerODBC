@@ -68,8 +68,8 @@ static const Gate GATES[] = {
     {"large CLOB OUT parameter; CLOB + BLOB via RETURNING", 8, 9, GATE_TODO,
      "LOB OUT parameters and LOBs via RETURNING before 10g (#167)"},
     {"column annotations", 8, 21, GATE_SERVER, "no ANNOTATIONS before 23ai"},
-    {"REF CURSOR rows holding a CURSOR() column", 8, 9, GATE_TODO,
-     "CURSOR() columns and REF CURSOR parameters before 10g (#166)"},
+    {"REF CURSOR rows holding a CURSOR() column", 8, 8, GATE_TODO,
+     "CURSOR() columns and REF CURSOR parameters on 8i (#166)"},
     {"implicit result rows holding a CURSOR() column", 8, 11, GATE_SERVER,
      "no DBMS_SQL.RETURN_RESULT before 12c"},
     {"implicit results", 8, 11, GATE_SERVER, "no DBMS_SQL.RETURN_RESULT before 12c"},
@@ -1966,8 +1966,10 @@ static void check_refcursor_nested_cursor(SQLHDBC dbc)
 {
   /* Opened from a string: 11g's PL/SQL compiler refuses a cursor expression
    * in a static OPEN ... FOR (PLS-00103 / ORA-06550). */
-  const char *query = "'SELECT level a, CURSOR(SELECT 1 FROM dual) c, ''tail'' t "
-                      "FROM dual CONNECT BY level <= 30'";
+  /* rownum over all_objects, not CONNECT BY on dual, which 9i ends after the
+   * first fetch batch. */
+  const char *query = "'SELECT rownum a, CURSOR(SELECT 1 FROM dual) c, ''tail'' t "
+                      "FROM all_objects WHERE rownum <= 30'";
   char why[300] = "", blk[512];
   if (!gated("REF CURSOR rows holding a CURSOR() column")) {
     const char *name = "REF CURSOR rows holding a CURSOR() column";

@@ -124,6 +124,7 @@
 #define O7_OPEN 0x02         /* OOPEN: allocate a server cursor  */
 #define O7_DESCRIBE 0x62     /* describe columns (metadata RPA)  */
 #define O7_CLOSE 0x14        /* close cursor                     */
+#define O7_FREE 0x08         /* free a closed cursor (#166)      */
 #define FV2_BIND_PROMPT 0x0B /* 9i PL/SQL block "send the binds" prompt token */
 
 /* 23ai fast-auth (PROTOCOL.md §20): PRO+DTY+OSESSKEY bundled in one message,

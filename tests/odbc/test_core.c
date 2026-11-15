@@ -36,6 +36,7 @@
 #define T_VARCHAR 1
 #define T_NUMBER 2
 #define T_RAW 23
+#define T_REFCURSOR 102
 
 static int pass_n, fail_n, skip_n;
 void pass(const char *n)
@@ -67,6 +68,11 @@ static const Gate GATES[] = {
     /* core_sessionless.c */
     {"sessionless transactions", 8, 21, GATE_SERVER, "no sessionless transactions before 23ai"},
     /* core_objbind.c */
+    {"REF CURSOR OUT: its rows, 320 times on one session", 8, 8, GATE_TODO,
+     "REF CURSOR OUT on 8i (#166)"},
+    {"a 400-row query with a CURSOR() column", 8, 8, GATE_TODO, "CURSOR() columns on 8i (#166)"},
+    {"a 400-row query with a CURSOR() column", 10, 26, GATE_SERVER,
+     "from 10g the server holds each nested cursor while its query is open (ORA-01000)"},
     {"object binds", 8, 9, GATE_TODO, "object, collection and PL/SQL-type binds before 10g (#172)"},
     {"package record bind", 10, 11, GATE_TODO, "package types before 12c (#193)"},
     {"package record nesting a record bind", 10, 11, GATE_TODO, "package types before 12c (#193)"},
@@ -1967,6 +1973,75 @@ static void check_wide_out(void)
   seer_stmt_close(s);
 }
 
+/* A REF CURSOR OUT bind's rows become the statement's result set. 9i frees
+ * the cursor only on a close followed by a free (0x08); a close alone left
+ * one open per block, ORA-01000 within open_cursors blocks (#166). */
+static void check_refcursor_rounds(void)
+{
+  const char *name = "REF CURSOR OUT: its rows, 320 times on one session";
+  GATE(name);
+  int round = 0;
+  long got = 0;
+  SeerStatus st = SEER_OK;
+  for (; round < 320 && st == SEER_OK; round++) {
+    SeerStmt *s = NULL;
+    st = seer_stmt_prepare(C, "BEGIN OPEN :1 FOR SELECT 7, 'seven' FROM dual; END;", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_out(s, 1, T_REFCURSOR, 0);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    got = 0;
+    while (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+      const char *v = NULL;
+      int isnull = 0;
+      if (seer_stmt_get_string(s, 0, &v, &isnull) == SEER_OK && v != NULL && atol(v) == 7)
+        got++;
+    }
+    if (st == SEER_OK && got != 1)
+      st = SEER_EPROTO;
+    seer_stmt_close(s);
+  }
+  if (st == SEER_OK)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "round %d: st=%d rows=%ld %.80s", round, (int)st, got,
+             seer_last_error(C) ? seer_last_error(C) : "");
+    fail(name, m);
+  }
+}
+
+/* A query whose 400 rows each hold a CURSOR() column: each row's nested
+ * cursor is freed before the next fetch batch, so the query outlives
+ * open_cursors (300 on the beds) on 9i (#196). */
+static void check_cursor_column_rows(void)
+{
+  const char *name = "a 400-row query with a CURSOR() column";
+  GATE(name);
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(
+      C, "SELECT CURSOR(SELECT 1 FROM dual), rownum FROM all_objects WHERE rownum <= 400", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  int rows = 0, nulls = 0;
+  while (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+    const char *v = NULL;
+    int isnull = 0;
+    rows++;
+    if (seer_stmt_get_string(s, 0, &v, &isnull) == SEER_OK && isnull)
+      nulls++;
+  }
+  seer_stmt_close(s);
+  if (st == SEER_OK && rows == 400 && nulls == 400)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "st=%d rows=%d nulls=%d %.80s", (int)st, rows, nulls,
+             st != SEER_OK && seer_last_error(C) ? seer_last_error(C) : "");
+    fail(name, m);
+  }
+}
+
 /* PL/SQL blocks (seerdb PROTOCOL.md §19.13-19.14, #134): IN values inline,
  * OUT and IN OUT values back in one round trip, bound by order of appearance
  * (#146); a NULL and a never-assigned OUT; a 4000-character OUT,
@@ -2419,6 +2494,8 @@ int main(void)
   check_refused_commit();
   check_blocks();
   check_wide_out();
+  check_refcursor_rounds();
+  check_cursor_column_rows();
   check_lobs();
   check_urowid();
   check_bfile_missing();
