@@ -2015,11 +2015,14 @@ static SeerStatus seer_ttc_tran(SeerConn *conn, uint8_t func)
   st = seer_ttc_recv(conn, &resp, &rlen);
   if (st != SEER_OK)
     return st;
+  /* A refused commit (ORA-02091: a deferred constraint, the transaction rolled
+   * back) is an error, not a success (#184). */
+  st = seer_conn_call_status(conn, resp, rlen);
   free(resp);
   /* An ordinary commit/rollback ends any active sessionless transaction (§31);
    * the server rides a SYNC piggyback on this response, harmlessly discarded. */
   conn->sessionless_active = false;
-  return SEER_OK;
+  return st;
 }
 
 SeerStatus seer_request_begin(SeerConn *conn)

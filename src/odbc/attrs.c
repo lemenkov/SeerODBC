@@ -10,6 +10,9 @@
  */
 #include "odbc_internal.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 SQLRETURN SQL_API SQLSetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute,
                                 SQLPOINTER ValuePtr, SQLINTEGER StringLength)
 {
@@ -90,9 +93,16 @@ SQLRETURN SQL_API SQLEndTran(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLI
     return seer_odbc_diag(c, "08003", 0, "Connection not open", SQL_ERROR);
 
   SeerStatus st = (CompletionType == SQL_ROLLBACK) ? seer_rollback(c->conn) : seer_commit(c->conn);
-  if (st != SEER_OK)
-    return seer_odbc_diag(c, seer_odbc_sqlstate(st), 0, seer_strerror(st), SQL_ERROR);
-  return SQL_SUCCESS;
+  if (st == SEER_OK)
+    return SQL_SUCCESS;
+  /* A database error carries the server's text and ORA number. A commit the
+   * server rolled back (ORA-02091, a deferred constraint) is ODBC's 40002,
+   * "integrity constraint violation" (#184). */
+  const char *ora = st == SEER_EDB ? seer_last_error(c->conn) : NULL;
+  SQLINTEGER native = (ora != NULL && strncmp(ora, "ORA-", 4) == 0) ? (SQLINTEGER)atoi(ora + 4) : 0;
+  const char *state =
+      (CompletionType == SQL_COMMIT && native == 2091) ? "40002" : seer_odbc_sqlstate(st);
+  return seer_odbc_diag(c, state, native, ora ? ora : seer_strerror(st), SQL_ERROR);
 }
 
 SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute,
