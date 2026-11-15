@@ -74,8 +74,12 @@ static const Gate GATES[] = {
     {"XMLType bind", 9, 9, GATE_TODO, "XMLType on 9i (#168)"},
     {"SQL OBJECT with a BOOLEAN attribute", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
     /* core_aq.c */
-    {"AQ", 8, 11, GATE_TODO, "Advanced Queuing before 12c (#173)"},
-    {"AQ JSON payload", 12, 18, GATE_SERVER, "no JSON queues before 21c"},
+    {"AQ", 8, 10, GATE_TODO, "Advanced Queuing before 11g (#173)"},
+    {"AQ options (correlation + browse)", 11, 11, GATE_TODO, "AQ correlation on 11g (#173)"},
+    {"AQ array round-trip", 11, 11, GATE_TODO, "AQ array enqueue/dequeue on 11g (#173)"},
+    {"AQ multi-consumer", 11, 11, GATE_TODO, "AQ consumer names on 11g (#173)"},
+    {"AQ object payload", 11, 11, GATE_TODO, "AQ object payloads on 11g (#173)"},
+    {"AQ JSON payload", 11, 18, GATE_SERVER, "no JSON queues before 21c"},
 };
 
 int gated_as(const char *gate, const char *name)
