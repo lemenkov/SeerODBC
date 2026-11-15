@@ -212,6 +212,9 @@ struct SeerStmt {
   /* The current cursor is one the statement holds no SQL for (a REF CURSOR,
    * an implicit result): its rows are fetched with a fetch-only OALL8. */
   bool fetch_by_oall8;
+  /* The columns are a drained REF CURSOR's, not this statement's own: the
+   * statement cache keeps the block without them (#198). */
+  bool cols_adopted;
   /* A REF CURSOR captured from a PL/SQL OUT bind (drained into cols/rows). */
   bool refcursor_present;
   int refcursor_id;
@@ -7726,6 +7729,7 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
   free_batch_errors(stmt); /* clear any prior execute's failures */
   free_implicit(stmt);     /* and any prior implicit result sets   */
   stmt->fetch_by_oall8 = false;
+  stmt->cols_adopted = false;
   free(stmt->dml_rowcounts); /* and any prior array-DML row counts   */
   stmt->dml_rowcounts = NULL;
   stmt->n_dml_rowcounts = 0;
@@ -7872,6 +7876,10 @@ retry_exec:
   /* A REF CURSOR OUT bind: adopt the nested cursor's describe as this
    * statement's result set and drain its rows. */
   if (stmt->refcursor_present) {
+    /* The block keeps its own cursor (closed or cached with the statement);
+     * the REF CURSOR is drained here and then closed. Left in cursor_id, the
+     * block's cursor was never closed: one per block, ORA-01000 (#198). */
+    int64_t block_cursor = stmt->cursor_id;
     stmt->cols = stmt->refcursor_cols;
     stmt->ncols = stmt->refcursor_ncols;
     stmt->refcursor_cols = NULL;
@@ -7880,6 +7888,11 @@ retry_exec:
     seer_log(SEER_LOG_DEBUG, "stmt: draining REF CURSOR %d (%d columns)", stmt->refcursor_id,
              stmt->ncols);
     st = fetch_all_rows(stmt);
+    queue_cursor_close(stmt->conn, stmt->refcursor_id);
+    stmt->refcursor_present = false;
+    stmt->cursor_id = block_cursor;
+    stmt->fetch_by_oall8 = false;
+    stmt->cols_adopted = true;
     if (st != SEER_OK)
       return st;
   }
@@ -8105,9 +8118,13 @@ void seer_stmt_close(SeerStmt *stmt)
       char *binds = stmt->cursor_id > 0 ? bind_signature(stmt) : stmt->reuse_binds;
       if (binds == stmt->reuse_binds)
         stmt->reuse_binds = NULL;
-      stmt_cache_put(c, stmt->sql, keep_cursor, stmt->cols, stmt->ncols, binds);
-      stmt->cols = NULL; /* moved to the cache; don't free */
-      stmt->ncols = 0;
+      if (stmt->cols_adopted) { /* a block: it describes no columns of its own */
+        stmt_cache_put(c, stmt->sql, keep_cursor, NULL, 0, binds);
+      } else {
+        stmt_cache_put(c, stmt->sql, keep_cursor, stmt->cols, stmt->ncols, binds);
+        stmt->cols = NULL; /* moved to the cache; don't free */
+        stmt->ncols = 0;
+      }
     } else if (c->n_close < (int)(sizeof c->close_cursors / sizeof c->close_cursors[0])) {
       c->close_cursors[c->n_close++] = keep_cursor; /* DDL etc: just close */
     }
