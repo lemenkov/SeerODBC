@@ -347,7 +347,7 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] Two-phase commit / XA / distributed transactions — core `seer_tpc_*` API
       (begin/end/prepare/commit/rollback) over the TTC TPC functions (SWITCH 103,
       CHANGE_STATE 104), with the server transaction context held + replayed.
-      9i+ (ENOTIMPL on 8i, #171). Validated 9i/10g/11g/21c/23ai: full 2PC commit is durable
+      Every tier (8i through SYS.JAVA_XA PL/SQL, #171). Validated 8i to 23ai: full 2PC commit is durable
       cross-connection, rollback discards. Exposed via the core API (Unix ODBC
       has no standard XA binding), not the SQL* surface.
 - [x] Sessionless transactions (§31, 23ai+) — a transaction that lives in the DB,

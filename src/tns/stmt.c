@@ -9397,13 +9397,132 @@ static SeerStatus tpc_call(SeerConn *c, SeerWriter *w, bool want_context, uint8_
   return ret;
 }
 
+/* 8i has no native TPC form: its XA runs as PL/SQL on SYS.JAVA_XA (seerdb
+ * PROTOCOL.md §28, "Before 12c"). Each xa_*_new function takes the format id,
+ * the gtrid and bqual as RAW and up to two numbers, and returns an X/Open XA
+ * code, or the number of an ORA error (positive, e.g. 24756). */
+#define XA_TMNOFLAGS 0x00000000L
+#define XA_TMJOIN 0x00200000L
+#define XA_TMRESUME 0x08000000L
+#define XA_TMSUCCESS 0x04000000L
+#define XA_TMSUSPEND 0x02000000L
+#define XA_OK 0
+#define XA_RDONLY 3
+
+static const char *xa_code_name(long rc)
+{
+  switch (rc) {
+  case 3:
+    return "XA_RDONLY";
+  case -2:
+    return "XAER_ASYNC";
+  case -3:
+    return "XAER_RMERR";
+  case -4:
+    return "XAER_NOTA";
+  case -5:
+    return "XAER_INVAL";
+  case -6:
+    return "XAER_PROTO";
+  case -7:
+    return "XAER_RMFAIL";
+  case -8:
+    return "XAER_DUPID";
+  case -9:
+    return "XAER_OUTSIDE";
+  default:
+    return rc >= 100 && rc <= 107 ? "XA_RB*" : "unknown";
+  }
+}
+
+/* Call JAVA_XA.`fn`(format id, gtrid, bqual[, a[, b]]) and return its XA code
+ * in *rc. SEER_OK means the call ran, whatever code it returned. */
+static SeerStatus o8i_xa_call(SeerConn *c, const char *fn, const SeerXid *xid, int nextra,
+                              int64_t a, int64_t b, long *rc)
+{
+  static const char *const tail[] = {")); END;", ", :5)); END;", ", :5, :6)); END;"};
+  char sql[128];
+  snprintf(sql, sizeof sql, "BEGIN :1 := TO_CHAR(JAVA_XA.%s(:2, :3, :4%s", fn, tail[nextra]);
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(c, sql, &s);
+  if (st != SEER_OK)
+    return st;
+  st = seer_stmt_bind_out(s, 1, ORA_TYPE_VARCHAR, 40);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_int64(s, 2, xid->format_id);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_raw(s, 3, xid->gtrid, xid->gtrid_len);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_raw(s, 4, xid->bqual, xid->bqual_len);
+  if (st == SEER_OK && nextra >= 1)
+    st = seer_stmt_bind_int64(s, 5, a);
+  if (st == SEER_OK && nextra >= 2)
+    st = seer_stmt_bind_int64(s, 6, b);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  const void *d = NULL;
+  size_t n = 0;
+  int isnull = 0, isbin = 0;
+  if (st == SEER_OK && seer_stmt_out_data(s, 1, &d, &n, &isnull, &isbin) != SEER_OK)
+    st = SEER_EPROTO;
+  if (st == SEER_OK) {
+    char num[24];
+    if (isnull || n == 0 || n >= sizeof num) {
+      st = SEER_EPROTO;
+    } else {
+      memcpy(num, d, n);
+      num[n] = '\0';
+      char *end = NULL;
+      *rc = strtol(num, &end, 10);
+      if (end == num || *end != '\0')
+        st = SEER_EPROTO;
+    }
+  }
+  seer_stmt_close(s);
+  return st;
+}
+
+/* Turn an XA code other than those `fn` accepts into an error on the connection. */
+static SeerStatus o8i_xa_result(SeerConn *c, const char *fn, long rc, bool rdonly_ok)
+{
+  if (rc == XA_OK || (rdonly_ok && rc == XA_RDONLY))
+    return SEER_OK;
+  char m[96];
+  if (rc > 107) /* past the XA codes: an ORA error number (24756, "transaction does not exist") */
+    snprintf(m, sizeof m, "ORA-%05ld (from JAVA_XA.%s)", rc, fn);
+  else
+    snprintf(m, sizeof m, "JAVA_XA.%s returned XA code %ld (%s)", fn, rc, xa_code_name(rc));
+  char *d = strdup(m);
+  if (d != NULL) {
+    free(c->last_error);
+    c->last_error = d;
+    c->last_error_offset = 0;
+  }
+  return SEER_EDB;
+}
+
+static SeerStatus o8i_tpc(SeerConn *c, const char *fn, const SeerXid *xid, int nextra, int64_t a,
+                          int64_t b, bool rdonly_ok, long *rc_out)
+{
+  long rc = 0;
+  SeerStatus st = o8i_xa_call(c, fn, xid, nextra, a, b, &rc);
+  if (st != SEER_OK)
+    return st;
+  if (rc_out != NULL)
+    *rc_out = rc;
+  return o8i_xa_result(c, fn, rc, rdonly_ok);
+}
+
 SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, uint32_t timeout)
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
-  /* 8i has no native form (#171): refuse before any wire activity. */
-  if (conn->is_8i)
-    return SEER_ENOTIMPL;
+  if (conn->is_8i) {
+    int64_t xf = (flags & SEER_TPC_BEGIN_JOIN)     ? XA_TMJOIN
+                 : (flags & SEER_TPC_BEGIN_RESUME) ? XA_TMRESUME
+                                                   : XA_TMNOFLAGS;
+    return o8i_tpc(conn, "xa_start_new", xid, 2, timeout, xf, false, NULL);
+  }
   SeerWriter w;
   SeerStatus st = seer_tpc_build_switch(conn, &w, TNS_TPC_TXN_START, xid, flags, timeout);
   if (st != SEER_OK)
@@ -9425,6 +9544,9 @@ SeerStatus seer_tpc_end(SeerConn *conn, const SeerXid *xid, uint32_t flags)
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
+  if (conn->is_8i)
+    return o8i_tpc(conn, "xa_end_new", xid, 1,
+                   (flags & SEER_TPC_END_SUSPEND) ? XA_TMSUSPEND : XA_TMSUCCESS, 0, false, NULL);
   SeerWriter w;
   SeerStatus st = seer_tpc_build_switch(conn, &w, TNS_TPC_TXN_DETACH, xid, flags, 0);
   if (st != SEER_OK)
@@ -9440,6 +9562,13 @@ SeerStatus seer_tpc_prepare(SeerConn *conn, const SeerXid *xid, int *commit_need
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
+  if (conn->is_8i) {
+    long rc = 0;
+    SeerStatus st = o8i_tpc(conn, "xa_prepare_new", xid, 0, 0, 0, true, &rc);
+    if (st == SEER_OK && commit_needed != NULL)
+      *commit_needed = rc != XA_RDONLY;
+    return st;
+  }
   SeerWriter w;
   SeerStatus st = tpc_build_change_state(conn, &w, TNS_TPC_TXN_PREPARE, 0, xid);
   if (st != SEER_OK)
@@ -9459,6 +9588,8 @@ SeerStatus seer_tpc_commit(SeerConn *conn, const SeerXid *xid, int one_phase)
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
+  if (conn->is_8i) /* the last argument is one-phase: 1 commits without a prepare */
+    return o8i_tpc(conn, "xa_commit_new", xid, 1, one_phase ? 1 : 0, 0, false, NULL);
   uint32_t want = one_phase ? TNS_TPC_TXN_STATE_READ_ONLY : TNS_TPC_TXN_STATE_COMMITTED;
   SeerWriter w;
   SeerStatus st = tpc_build_change_state(conn, &w, TNS_TPC_TXN_COMMIT, want, xid);
@@ -9481,6 +9612,8 @@ SeerStatus seer_tpc_rollback(SeerConn *conn, const SeerXid *xid)
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
+  if (conn->is_8i)
+    return o8i_tpc(conn, "xa_rollback_new", xid, 0, 0, 0, false, NULL);
   SeerWriter w;
   SeerStatus st =
       tpc_build_change_state(conn, &w, TNS_TPC_TXN_ABORT, TNS_TPC_TXN_STATE_ABORTED, xid);
