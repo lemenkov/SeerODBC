@@ -9799,7 +9799,8 @@ static void aq_two_lengths(SeerWriter *w, const uint8_t *data, size_t n, uint8_t
  * front: the 12c length byte shifted what follows (an enqueue got ORA-00600
  * [kpoaqeq: payload], a correlation dequeue ORA-21700; seerdb, measured on
  * 11.2.0.2 against JDBC thin's AQ, PROTOCOL.md §29, 2026-11-15). An enqueue's
- * correlation is in the message properties and keeps its lengths. */
+ * correlation is in the message properties and keeps its lengths. 10.2 takes
+ * the same form (seerdb, against JDBC thin 11.2 on 10.2.0.5). */
 static void aq_data_string(SeerWriter *w, const char *str, size_t n, uint8_t fv)
 {
   if (fv < TTC_FIELD_VERSION_12_1)
@@ -9966,8 +9967,8 @@ SeerStatus seer_aq_enq_raw_opt(SeerConn *conn, const char *queue_name, const uin
 {
   if (conn == NULL || queue_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_11_2)
-    return SEER_ENOTIMPL; /* 10g and older: not measured (#173) */
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* 9i and 8i: DBMS_AQ only (#173) */
 
   unsigned pri = opt ? opt->priority : 0;
   unsigned dly = opt ? opt->delay : 0;
@@ -10278,8 +10279,8 @@ SeerStatus seer_aq_deq_raw_opt(SeerConn *conn, const char *queue_name, const See
 {
   if (conn == NULL || queue_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_11_2)
-    return SEER_ENOTIMPL; /* 10g and older: not measured (#173) */
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* 9i and 8i: DBMS_AQ only (#173) */
   if (payload != NULL)
     *payload = NULL;
   if (payload_len != NULL)
