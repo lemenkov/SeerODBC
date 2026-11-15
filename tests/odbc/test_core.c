@@ -66,8 +66,16 @@ static const Gate GATES[] = {
     /* core_sessionless.c */
     {"sessionless transactions", 8, 21, GATE_SERVER, "no sessionless transactions before 23ai"},
     /* core_objbind.c */
-    {"object binds", 8, 11, GATE_TODO,
-     "object, collection and PL/SQL-type binds before 12c (#172)"},
+    {"object binds", 8, 9, GATE_TODO, "object, collection and PL/SQL-type binds before 10g (#172)"},
+    {"assoc-array bind (NUMBER)", 10, 11, GATE_TODO, "associative arrays before 12c (#172)"},
+    {"assoc-array bind (VARCHAR)", 10, 11, GATE_TODO, "associative arrays before 12c (#172)"},
+    {"OUT assoc-array (NUMBER)", 10, 11, GATE_TODO, "associative arrays before 12c (#172)"},
+    {"package record bind", 10, 11, GATE_TODO, "package types before 12c (#172)"},
+    {"package record nesting a record bind", 10, 11, GATE_TODO, "package types before 12c (#172)"},
+    {"package nested table bind", 10, 11, GATE_TODO, "package types before 12c (#172)"},
+    {"package index-by table bind", 10, 11, GATE_TODO, "package types before 12c (#172)"},
+    {"package record OUT bind", 10, 11, GATE_TODO, "package types before 12c (#172)"},
+    {"index-by table OUT bind", 10, 11, GATE_TODO, "package types before 12c (#172)"},
     {"native JSON bind", 8, 18, GATE_SERVER, "no JSON type before 21c"},
     {"native VECTOR bind", 8, 21, GATE_SERVER, "no VECTOR type before 23ai"},
     {"XMLType bind", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
@@ -78,9 +86,17 @@ static const Gate GATES[] = {
     {"AQ JSON payload", 8, 18, GATE_SERVER, "no JSON queues before 21c"},
 };
 
+int feature_gated(const char *gate)
+{
+  return gate_find(GATES, sizeof GATES / sizeof GATES[0], gate) != NULL;
+}
+
 int gated_as(const char *gate, const char *name)
 {
-  const Gate *g = gate_find(GATES, sizeof GATES / sizeof GATES[0], gate);
+  /* The check's own gate first, then the feature's it falls under. */
+  const Gate *g = gate_find(GATES, sizeof GATES / sizeof GATES[0], name);
+  if (g == NULL && strcmp(gate, name) != 0)
+    g = gate_find(GATES, sizeof GATES / sizeof GATES[0], gate);
   if (g == NULL)
     return 0;
   char why[256];

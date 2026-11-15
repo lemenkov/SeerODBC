@@ -8574,7 +8574,10 @@ static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
   seer_enc_sb4(&oac, 0);   /* charset */
   seer_writer_u8(&oac, 0); /* csfrm */
   seer_enc_sb4(&oac, 0);   /* LOB prefetch length */
-  seer_enc_sb4(&oac, 0);   /* oaccolid */
+  /* No oaccolid before 12.2: 11g and 10g answer it with a fatal ORA-03106
+   * (seerdb PROTOCOL.md, measured against JDBC thin 11.2, #172). */
+  if (fv >= TTC_FIELD_VERSION_12_2)
+    seer_enc_sb4(&oac, 0); /* oaccolid */
   if (!seer_writer_ok(&oac)) {
     seer_writer_free(&oac);
     goto fail;
@@ -8675,8 +8678,8 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
 {
   if (stmt == NULL || schema == NULL || type_name == NULL || (n_attrs > 0 && attr_values == NULL))
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL; /* object binds are 12c+ */
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* object binds: 10g+ (9i and 8i, #172) */
 
   uint8_t oid[16];
   SeerWriter img;
@@ -8691,8 +8694,8 @@ SeerStatus seer_stmt_bind_object_out(SeerStmt *stmt, int param, const char *sche
 {
   if (stmt == NULL || schema == NULL || type_name == NULL)
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL; /* object binds are 12c+ */
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* object binds: 10g+ (9i and 8i, #172) */
   uint8_t oid[16];
   SeerStatus st = obj_lookup_oid(stmt->conn, schema, type_name, oid);
   if (st != SEER_OK)
@@ -8966,8 +8969,8 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
 {
   if (stmt == NULL || schema == NULL || type_name == NULL || (n_elems > 0 && elem_values == NULL))
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL; /* collection binds are 12c+ */
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* collection binds: 10g+ (9i and 8i, #172) */
 
   uint8_t oid[16];
   SeerStatus st = obj_lookup_oid(stmt->conn, schema, type_name, oid);

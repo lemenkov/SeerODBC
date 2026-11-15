@@ -235,12 +235,13 @@ void core_objbind(void)
       seer_stmt_close(ins);
       ins = NULL;
       seer_commit(c);
-      /* Server side: 6 characters in 12 AL16UTF16 bytes; elements 1/2, 3/6. */
+      /* Server side: 6 characters in 12 AL16UTF16 bytes; elements 1/2, 3/6
+       * (MIN and MAX of the two, as 10g has no LISTAGG). */
       int lens = readback_has(c,
                               "SELECT LENGTH(t.o.a) || '/' || LENGTHB(t.o.a) || ' ' || "
-                              "(SELECT LISTAGG(LENGTH(column_value) || '/' || "
-                              "LENGTHB(column_value), ',') WITHIN GROUP (ORDER BY 1) "
-                              "FROM TABLE(t.l)) FROM seernc_t t",
+                              "(SELECT MIN(LENGTH(column_value) || '/' || LENGTHB(column_value)) "
+                              "|| ',' || MAX(LENGTH(column_value) || '/' || "
+                              "LENGTHB(column_value)) FROM TABLE(t.l)) FROM seernc_t t",
                               "6/12 ", "1/2,3/6");
       int text = readback_has(c, "SELECT o FROM seernc_t", attrs[0], "plain") &&
                  readback_has(c, "SELECT l FROM seernc_t", elems[0], "abc");

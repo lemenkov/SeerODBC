@@ -321,7 +321,7 @@ SeerStatus seer_stmt_bind_null(SeerStmt *stmt, int param);
  * re-typing the column. */
 SeerStatus seer_stmt_bind_null_typed(SeerStmt *stmt, int param, int ora_type);
 
-/* Bind a SQL OBJECT (ADT) parameter (12c+). The type is `schema`.`type_name`;
+/* Bind a SQL OBJECT (ADT) parameter (10g+; #172). The type is `schema`.`type_name`;
  * its attribute values are supplied as text in attribute order (a NULL entry is
  * a SQL NULL attribute), and `n_attrs` must match the type's attribute count.
  * The driver looks up the type and encodes each value as its attribute's Oracle
@@ -333,7 +333,7 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
                                  const char *type_name, const char *const *attr_values,
                                  int n_attrs);
 
-/* Bind an OUT parameter of an object or collection type (12c+), named as for
+/* Bind an OUT parameter of an object or collection type (10g+), named as for
  * seer_stmt_bind_object (a package type as "PKG.TYPE"). After execute,
  * seer_stmt_out_data returns the value rendered as text, as a fetched object
  * is: "v1, v2, ..." for an object, "[e1, e2, ...]" for a collection ("[k: e,
@@ -371,7 +371,7 @@ SeerStatus seer_stmt_bind_vector_sparse_f64(SeerStmt *stmt, int param, int num_d
 SeerStatus seer_stmt_bind_vector_sparse_i8(SeerStmt *stmt, int param, int num_dimensions, int nnz,
                                            const uint32_t *indices, const int8_t *values);
 
-/* Bind a collection (VARRAY / nested table) parameter (12c+). `type_name` is the
+/* Bind a collection (VARRAY / nested table) parameter (10g+). `type_name` is the
  * collection type; `elem_values` are its `n_elems` element values as text (a NULL
  * entry is a SQL NULL element), each encoded as the collection's element type.
  * A collection type declared in a PL/SQL package is named "PKG.TYPE"; an
