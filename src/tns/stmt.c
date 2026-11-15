@@ -10510,8 +10510,18 @@ SeerStatus seer_aq_enq_raw_array(SeerConn *conn, const char *queue_name, int cou
 {
   if (conn == NULL || queue_name == NULL || count <= 0 || payloads == NULL || lens == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (conn->field_version < TTC_FIELD_VERSION_12_2) {
+    /* No reference client sends ARRAY_AQ (145) before 12c, so its form there is
+     * unknown: enqueue one message at a time instead. Visibility is on commit,
+     * so the outcome in the transaction is the same (#187). */
+    for (int i = 0; i < count; i++) {
+      SeerStatus st = seer_aq_enq_raw(conn, queue_name, payloads[i], lens[i],
+                                      msgids != NULL ? msgids + 16 * (size_t)i : NULL);
+      if (st != SEER_OK)
+        return st;
+    }
+    return SEER_OK;
+  }
 
   SeerWriter w;
   SeerStatus st = aq_build_array_enq_raw(conn, &w, queue_name, count, payloads, lens);
@@ -10639,12 +10649,31 @@ SeerStatus seer_aq_deq_raw_array(SeerConn *conn, const char *queue_name, int max
   if (conn == NULL || queue_name == NULL || max_count <= 0 || payloads == NULL || lens == NULL ||
       out_count == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
   *out_count = 0;
   for (int i = 0; i < max_count; i++) {
     payloads[i] = NULL;
     lens[i] = 0;
+  }
+  if (conn->field_version < TTC_FIELD_VERSION_12_2) {
+    /* One message at a time before 12c (#187): wait for the first, then take
+     * what is already there, stopping at the first empty dequeue. */
+    for (int i = 0; i < max_count; i++) {
+      SeerStatus st = seer_aq_deq_raw(conn, queue_name, i == 0 ? wait_seconds : 0, &payloads[i],
+                                      &lens[i], NULL);
+      if (st == SEER_ENODATA)
+        break;
+      if (st != SEER_OK) {
+        for (int k = 0; k <= i; k++) {
+          free(payloads[k]);
+          payloads[k] = NULL;
+          lens[k] = 0;
+        }
+        *out_count = 0;
+        return st;
+      }
+      *out_count = i + 1;
+    }
+    return SEER_OK;
   }
 
   SeerWriter w;

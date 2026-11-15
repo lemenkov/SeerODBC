@@ -318,7 +318,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 
 - [x] Advanced Queuing (AQ), 12c+; RAW enqueue / dequeue also on 10g and 11g, with
       their options (priority, delay, expiration, correlation, browse,
-      consumer names); object and array forms before 12c are #173:
+      consumer names) and the array calls, one message at a time (#187);
+      object payloads before 12c are #173:
         * [x] RAW enqueue - seer_aq_enq_raw (TNS_FUNC_AQ_ENQ 121); minimal msg
           props, ON_COMMIT, persistent; returns the 16-byte msgid.
         * [x] RAW dequeue - seer_aq_deq_raw (TNS_FUNC_AQ_DEQ 122); FIRST_MSG one-shot,

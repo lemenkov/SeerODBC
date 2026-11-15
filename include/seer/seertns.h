@@ -218,7 +218,8 @@ SeerStatus seer_aq_enq_json(SeerConn *conn, const char *queue_name, const char *
 
 /* Bulk-enqueue `count` RAW messages to `queue_name` in one round-trip.
  * payloads[i]/lens[i] give each message; `msgids`, if non-NULL, must hold
- * count*16 bytes and receives the assigned message ids. 12c+. */
+ * count*16 bytes and receives the assigned message ids. On 10g and 11g, which
+ * have no known form for the array call, the messages go one at a time (#187). */
 SeerStatus seer_aq_enq_raw_array(SeerConn *conn, const char *queue_name, int count,
                                  const uint8_t *const *payloads, const size_t *lens,
                                  uint8_t *msgids);
@@ -227,7 +228,8 @@ SeerStatus seer_aq_enq_raw_array(SeerConn *conn, const char *queue_name, int cou
  * round-trip. `payloads` and `lens` are caller-allocated arrays of max_count;
  * each dequeued message's payload is malloc'd into payloads[i] (caller frees)
  * with its length in lens[i]. *out_count receives the number actually dequeued
- * (0 when the queue is empty). 12c+. */
+ * (0 when the queue is empty). On 10g and 11g it dequeues one at a time: the
+ * first waits `wait_seconds`, the rest take only what is already queued (#187). */
 SeerStatus seer_aq_deq_raw_array(SeerConn *conn, const char *queue_name, int max_count,
                                  uint32_t wait_seconds, uint8_t **payloads, size_t *lens,
                                  int *out_count);

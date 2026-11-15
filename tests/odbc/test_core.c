@@ -75,7 +75,6 @@ static const Gate GATES[] = {
     {"SQL OBJECT with a BOOLEAN attribute", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
     /* core_aq.c */
     {"AQ", 8, 9, GATE_TODO, "Advanced Queuing before 10g (#173)"},
-    {"AQ array round-trip", 10, 11, GATE_TODO, "AQ array enqueue/dequeue before 12c (#173)"},
     {"AQ object payload", 10, 11, GATE_TODO, "AQ object payloads before 12c (#173)"},
     {"AQ JSON payload", 10, 18, GATE_SERVER, "no JSON queues before 21c"},
 };
