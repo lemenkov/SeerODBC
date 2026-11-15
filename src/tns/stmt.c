@@ -5692,7 +5692,7 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
     }
   }
   if (!o8r_has(r, 1))
-    return;
+    return; /* cut: the caller reads on until the status arrives */
   if (r->b[r->pos] != TTI_OER) {
     r->bad = true;
     return;
@@ -5735,6 +5735,18 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
     }
     seer_writer_free(&m);
   }
+}
+
+/* Test-only: read an 8i status reply; 0 when well formed (*code the ORA code),
+ * -1 when malformed, 1 when cut short. */
+int seer_test_o8i_status(const uint8_t *buf, size_t len, uint32_t *code)
+{
+  O8iRd r = {.b = buf, .n = len};
+  O8iStatus s;
+  o8i_read_status(&r, &s);
+  *code = s.code;
+  o8i_status_free(&s);
+  return r.bad ? -1 : r.cut ? 1 : 0;
 }
 
 /* The 8i describe (seerdb _O8I_DESCRIBE): TTI_DCB, a 25-byte preamble value,

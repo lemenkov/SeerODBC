@@ -138,6 +138,9 @@ bool seer_conn_error_from_reply(SeerConn *c, const uint8_t *buf, size_t len, siz
 /* Put a bare "ORA-NNNNN" on c->last_error, for a reply that carries the code
  * and no message (the 8i and 9i logins). */
 void seer_conn_error_code(SeerConn *c, long code);
+/* Test-only: read an 8i status reply (stmt.c): 0 well formed, -1 malformed,
+ * 1 cut short. */
+int seer_test_o8i_status(const uint8_t *buf, size_t len, uint32_t *code);
 SeerStatus seer_test_o8i_all8(uint8_t seq, bool fetch, uint32_t cursor, const char *sql,
                               uint32_t rows, uint8_t **out, size_t *outlen);
 

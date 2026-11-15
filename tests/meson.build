@@ -120,6 +120,14 @@ test_o8i_stmt = executable('test_o8i_stmt',
 )
 test('8i oall8', test_o8i_stmt)
 
+# 8i status reply behind an RPA: a reply that ends after the RPA is malformed,
+# not a success (#176).
+test_o8i_status = executable('test_o8i_status',
+  'unit/test_o8i_status.c',
+  dependencies : [test_dep, seertns_dep],
+)
+test('8i status', test_o8i_status)
+
 # A LOBOPS reply's content, whole or cut short (a short chunk is an error, not
 # a silently truncated LOB).
 test_lob_content = executable('test_lob_content',
