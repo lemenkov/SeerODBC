@@ -212,6 +212,10 @@ struct SeerStmt {
   /* The current cursor is one the statement holds no SQL for (a REF CURSOR,
    * an implicit result): its rows are fetched with a fetch-only OALL8. */
   bool fetch_by_oall8;
+  /* 9i: the nested cursors a fetch batch's CURSOR() cells opened, freed
+   * before the next batch. */
+  uint32_t *fv2_nested;
+  size_t fv2_nnested, fv2_nested_cap;
   /* The columns are a drained REF CURSOR's, not this statement's own: the
    * statement cache keeps the block without them (#198). */
   bool cols_adopted;
@@ -4387,6 +4391,69 @@ static void fv2_close_cursor(SeerConn *c, uint32_t cursor)
   seer_writer_free(&w);
 }
 
+/* Free a 9i server cursor: function 0x08, the close's schema. A close alone
+ * leaves a REF CURSOR, or a nested cursor while its query is open, allocated
+ * until the session ends (ORA-01000); ojdbc14 sends close, then free, on the
+ * same id (seerdb, measured on 9.2.0.4; #166, #196). */
+static void fv2_free_cursor(SeerConn *c, uint32_t cursor)
+{
+  SeerWriter w;
+  if (!seer_writer_init(&w, 16))
+    return;
+  seer_writer_u8(&w, TTI_FUN);
+  seer_writer_u8(&w, O7_FREE);
+  seer_writer_u8(&w, 0);
+  seer_enc_sb4(&w, cursor);
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  if (seer_writer_ok(&w) && fv2_txn(c, w.buf, w.len, &resp, &rlen) == SEER_OK)
+    free(resp);
+  seer_writer_free(&w);
+}
+
+/* A 9i cursor value - a CURSOR() cell, a REF CURSOR OUT - is the cursor's id as
+ * a value (`02 01 02` is id 2): a length byte and the id's big-endian bytes
+ * (seerdb PROTOCOL.md §19.17a, measured against ojdbc14 on 9.2.0.4; #166). */
+static uint32_t fv2_cursor_id(const uint8_t *v, size_t n)
+{
+  if (n >= 2 && n <= 5 && v[0] == n - 1) {
+    v++;
+    n--;
+  }
+  uint32_t id = 0;
+  for (size_t i = 0; i < n && i < 4; i++)
+    id = id << 8 | v[i];
+  return id;
+}
+
+static void fv2_note_nested(SeerStmt *stmt, uint32_t id)
+{
+  if (id == 0)
+    return;
+  if (stmt->fv2_nnested == stmt->fv2_nested_cap) {
+    size_t cap = stmt->fv2_nested_cap ? stmt->fv2_nested_cap * 2 : 16;
+    uint32_t *n = realloc(stmt->fv2_nested, cap * sizeof *n);
+    if (n == NULL)
+      return; /* best-effort: the query's close still frees it */
+    stmt->fv2_nested = n;
+    stmt->fv2_nested_cap = cap;
+  }
+  stmt->fv2_nested[stmt->fv2_nnested++] = id;
+}
+
+/* Close and free the nested cursors a fetch batch opened, before the next
+ * batch. ODBC has no nested-cursor type, so their rows are not read. */
+static void fv2_free_nested(SeerStmt *stmt)
+{
+  for (size_t i = 0; i < stmt->fv2_nnested; i++) {
+    fv2_close_cursor(stmt->conn, stmt->fv2_nested[i]);
+    fv2_free_cursor(stmt->conn, stmt->fv2_nested[i]);
+  }
+  free(stmt->fv2_nested);
+  stmt->fv2_nested = NULL;
+  stmt->fv2_nnested = stmt->fv2_nested_cap = 0;
+}
+
 /* The ORA code carried by a short pre-10g OER (token, ub4 rows, ub4 code); 0 if
  * `resp` is not an OER, -1 on a truncated one. */
 static int64_t fv2_oer_code(const uint8_t *resp, size_t rlen)
@@ -4916,10 +4983,10 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
           r.pos += 2; /* 81 01 = NULL (leave cell zeroed) */
         } else if (ct == ORA_TYPE_REFCURSOR) {
           /* A CURSOR() cell: the nested cursor's id. ODBC has no nested-cursor
-           * type, so the cell is NULL, as on 10g+. Closing the query frees its
-           * nested cursors; a close of each, as ojdbc14 sends, freed none while
-           * the query was open (9.2.0.4, #166, #196). */
+           * type, so the cell is NULL, as on 10g+; the cursor is closed and
+           * freed before the next batch (#166, #196). */
           (void)seer_reader_u8(&r); /* present indicator */
+          fv2_note_nested(stmt, fv2_cursor_id(val, vlen));
         } else {
           (void)seer_reader_u8(&r); /* present indicator (0x00) */
           if (vlen > 0) {
@@ -5063,6 +5130,12 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
       type = b->oac_type;
       maxsize = b->oac_size;
       charset = 31;
+      csfrm = 0;
+      break;
+    case ORA_TYPE_REFCURSOR: /* a REF CURSOR OUT: type 102, length 1 (#166) */
+      type = ORA_TYPE_REFCURSOR;
+      maxsize = 1;
+      charset = 0;
       csfrm = 0;
       break;
     default:
@@ -7185,6 +7258,9 @@ static SeerStatus fv2_fetch_cursor(SeerStmt *stmt, uint32_t cursor, int64_t *err
       return st;
     size_t nadded = 0;
     st = fv2_decode_rows(stmt, resp, rlen, errcode, &nadded);
+    /* Each CURSOR() cell of the batch opened a cursor: free them before the
+     * next batch, or a query of more rows than open_cursors fails (#196). */
+    fv2_free_nested(stmt);
     /* A query can fail as its rows are made - 1 / 0 is ORA-01476 - and the
      * fetch's reply carries the error: keep its text while the reply is in
      * hand. Taken only after it was freed, the error had no text (#159). */
@@ -7372,7 +7448,15 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
       } else {
         if (seer_reader_remaining(&r) > 0)
           r.pos += 1; /* present indicator */
-        if (vlen > 0)
+        if (b->oac_type == ORA_TYPE_REFCURSOR) {
+          /* The opened cursor's id: its rows become the statement's result
+           * set once the block is done (#166). */
+          uint32_t id = fv2_cursor_id(val, vlen);
+          if (id != 0) {
+            stmt->refcursor_id = (int)id;
+            stmt->refcursor_present = true;
+          }
+        } else if (vlen > 0)
           decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, val, vlen, &b->out);
       }
       free(val);
@@ -7586,8 +7670,36 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
 
   /* End the statement on the cursor (best-effort). */
   fv2_close_cursor(c, cursor);
-  if (failed)
+  if (failed) {
+    stmt->refcursor_present = false;
     return SEER_EDB;
+  }
+
+  /* A REF CURSOR OUT: read the cursor the block opened as a query's own -
+   * describe, execute + fetch to ORA-01403 - adopting its rows as this
+   * statement's result set, as the 10g+ path does; then close and free it
+   * (seerdb, ojdbc14 on 9.2.0.4; #166). */
+  if (stmt->refcursor_present) {
+    uint32_t rc = (uint32_t)stmt->refcursor_id;
+    stmt->refcursor_present = false;
+    free_rows(stmt);
+    free_columns(stmt->cols, stmt->ncols);
+    stmt->cols = NULL;
+    stmt->ncols = 0;
+    int64_t errcode = 0;
+    st = fv2_describe_cursor(stmt, rc);
+    if (st == SEER_OK)
+      st = fv2_fetch_cursor(stmt, rc, &errcode);
+    if (st == SEER_OK && stmt->nplobs > 0)
+      fv2_resolve_lobs(stmt);
+    fv2_close_cursor(c, rc);
+    fv2_free_cursor(c, rc);
+    if (st != SEER_OK)
+      return st;
+    if (errcode != 0 && errcode != 1403)
+      return SEER_EDB;
+    stmt->cur = -1;
+  }
 
   stmt->affected = (long)rowcount;
   stmt->executed = true;
