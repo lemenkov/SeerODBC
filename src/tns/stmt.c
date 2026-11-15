@@ -4436,7 +4436,7 @@ static char *fv2_chunked_message(const uint8_t *resp, size_t rlen, size_t i)
 /* What a 9i status says (seerdb PROTOCOL.md §19.3, its _O7_STATUS_HEAD): the
  * OER token, then rows, ORA code, two array-error fields, cursor and error
  * position (a ub4 each), then sql type and fatal (a byte each), flags (a ub2),
- * cursor options and UPI parameter (a byte each), and the warning flags. */
+ * cursor options (a ub4), UPI parameter (a byte), and the warning flags. */
 typedef struct {
   int64_t rows;
   int64_t code;
@@ -4499,7 +4499,10 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
   (void)seer_reader_u8(&r); /* sql type */
   (void)seer_reader_u8(&r); /* fatal */
   (void)seer_dec_sb4(&r);   /* flags (ub2) */
-  (void)seer_reader_u8(&r); /* cursor options */
+  /* Cursor options are a compressed integer: 0 (`00`) on a plain session, 8
+   * (`01 08`) on one that logged on with the XA names (#171). Read as a byte,
+   * the 8 shifted the warning flags. */
+  (void)seer_dec_sb4(&r);   /* cursor options */
   (void)seer_reader_u8(&r); /* UPI parameter */
   uint8_t warnings = seer_reader_u8(&r);
   if (seer_reader_ok(&r)) { /* a short status ends after the code */
@@ -9250,7 +9253,9 @@ static void tpc_xid_payload(SeerWriter *w, const SeerXid *xid)
   seer_writer_bytes(w, buf, sizeof buf);
 }
 
-/* Build a TXN_SWITCH (begin/end) message, replaying any stored context. */
+/* Build a TXN_SWITCH (begin/end) message, replaying any stored context. Before
+ * 11g the internal and external names are absent: their pointers, lengths and
+ * bytes (seerdb PROTOCOL.md §28, "Before 12c"). */
 SeerStatus seer_tpc_build_switch(SeerConn *c, SeerWriter *w, uint32_t op, const SeerXid *xid,
                                  uint32_t flags, uint32_t timeout)
 {
@@ -9271,10 +9276,12 @@ SeerStatus seer_tpc_build_switch(SeerConn *c, SeerWriter *w, uint32_t op, const 
   seer_writer_u8(w, 1);
   seer_writer_u8(w, 1);
   seer_writer_u8(w, 1); /* ptrs */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* internal name: none */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* external name: none */
+  if (c->field_version >= TTC_FIELD_VERSION_11_2) {
+    seer_writer_u8(w, 0);
+    seer_enc_sb4(w, 0); /* internal name: none */
+    seer_writer_u8(w, 0);
+    seer_enc_sb4(w, 0); /* external name: none */
+  }
   if (c->tpc_context != NULL)
     seer_writer_bytes(w, c->tpc_context, c->tpc_context_len);
   if (xid != NULL)
@@ -9283,7 +9290,8 @@ SeerStatus seer_tpc_build_switch(SeerConn *c, SeerWriter *w, uint32_t op, const 
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
-/* Build a TXN_CHANGE_STATE (prepare/commit/abort) message. */
+/* Build a TXN_CHANGE_STATE (prepare/commit/abort) message. 9i has no flags:
+ * the context follows the out-state pointer (PROTOCOL.md §28). */
 static SeerStatus tpc_build_change_state(SeerConn *c, SeerWriter *w, uint32_t op, uint32_t state,
                                          const SeerXid *xid)
 {
@@ -9302,7 +9310,8 @@ static SeerStatus tpc_build_change_state(SeerConn *c, SeerWriter *w, uint32_t op
   seer_enc_sb4(w, 0); /* timeout */
   seer_enc_sb4(w, state);
   seer_writer_u8(w, 1); /* out-state pointer */
-  seer_enc_sb4(w, 0);   /* flags */
+  if (c->field_version >= TTC_FIELD_VERSION_10_2)
+    seer_enc_sb4(w, 0); /* flags */
   if (c->tpc_context != NULL)
     seer_writer_bytes(w, c->tpc_context, c->tpc_context_len);
   if (xid != NULL)
@@ -9332,6 +9341,7 @@ static SeerStatus tpc_call(SeerConn *c, SeerWriter *w, bool want_context, uint8_
   SeerStmt tmp = {.conn = c};
   OerResult oer = {0};
   SeerStatus ret = SEER_OK;
+  bool fv2 = c->field_version < TTC_FIELD_VERSION_10_2; /* 9i */
   uint8_t tok = seer_reader_u8(&r);
 
   if (tok == TTI_RPA) {
@@ -9356,12 +9366,26 @@ static SeerStatus tpc_call(SeerConn *c, SeerWriter *w, bool want_context, uint8_
       *state = (uint32_t)seer_dec_sb4(&r);
     }
     if (seer_reader_remaining(&r) > 0 && seer_reader_u8(&r) == TTI_OER) {
-      parse_oer(&r, &tmp, &oer);
-      if (oer.err_code != 0)
-        ret = SEER_EDB;
+      if (fv2) {
+        size_t at = rlen - seer_reader_remaining(&r) - 1;
+        if (fv2_oer_code(resp + at, rlen - at) != 0) {
+          fv2_set_error(c, resp + at, rlen - at);
+          ret = SEER_EDB;
+        }
+        r.pos = r.len; /* 9i's short status: read by the fv2 helpers */
+      } else {
+        parse_oer(&r, &tmp, &oer);
+        if (oer.err_code != 0)
+          ret = SEER_EDB;
+      }
     }
   } else if (tok == TTI_OER) {
-    parse_oer(&r, &tmp, &oer);
+    if (fv2) {
+      fv2_set_error(c, resp, rlen);
+      r.pos = r.len;
+    } else {
+      parse_oer(&r, &tmp, &oer);
+    }
     ret = SEER_EDB;
   } else {
     ret = SEER_EPROTO;
@@ -9377,9 +9401,8 @@ SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, ui
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
-  /* 11g takes the 12c form as is. 10g rejects it (ORA-00600 [12333]) and 9i and
-   * 8i drop or stall on it: refuse before any wire activity (#171). */
-  if (conn->field_version < TTC_FIELD_VERSION_11_2)
+  /* 8i has no native form (#171): refuse before any wire activity. */
+  if (conn->is_8i)
     return SEER_ENOTIMPL;
   SeerWriter w;
   SeerStatus st = seer_tpc_build_switch(conn, &w, TNS_TPC_TXN_START, xid, flags, timeout);
