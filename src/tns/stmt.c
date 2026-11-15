@@ -4911,6 +4911,12 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
         }
         if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81) {
           r.pos += 2; /* 81 01 = NULL (leave cell zeroed) */
+        } else if (ct == ORA_TYPE_REFCURSOR) {
+          /* A CURSOR() cell: the nested cursor's id. ODBC has no nested-cursor
+           * type, so the cell is NULL, as on 10g+. Closing the query frees its
+           * nested cursors; a close of each, as ojdbc14 sends, freed none while
+           * the query was open (9.2.0.4, #166, #196). */
+          (void)seer_reader_u8(&r); /* present indicator */
         } else {
           (void)seer_reader_u8(&r); /* present indicator (0x00) */
           if (vlen > 0) {
@@ -7034,6 +7040,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
 /* The first calls of a 9i query: the session's cursor, the parse (with any
  * binds) and the describe, which sets the statement's columns. The cursor is
  * left open on the parsed statement for the caller to execute or close. */
+static SeerStatus fv2_describe_cursor(SeerStmt *stmt, uint32_t cursor);
 static SeerStatus fv2_parse_describe(SeerStmt *stmt, uint32_t *out_cursor)
 {
   SeerConn *c = stmt->conn;
@@ -7066,6 +7073,22 @@ static SeerStatus fv2_parse_describe(SeerStmt *stmt, uint32_t *out_cursor)
   resp = NULL;
 
   /* Call 2: describe columns. */
+  st = fv2_describe_cursor(stmt, cursor);
+  if (st != SEER_OK)
+    return st;
+  *out_cursor = cursor;
+  return SEER_OK;
+}
+
+/* Describe the query open on `cursor` into stmt->cols: the statement's own
+ * cursor after its parse, or a REF CURSOR's id (#166). */
+static SeerStatus fv2_describe_cursor(SeerStmt *stmt, uint32_t cursor)
+{
+  SeerConn *c = stmt->conn;
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  SeerWriter w;
+  SeerStatus st;
   if (!seer_writer_init(&w, 16))
     return SEER_ENOMEM;
   seer_writer_u8(&w, TTI_FUN);
@@ -7096,7 +7119,6 @@ static SeerStatus fv2_parse_describe(SeerStmt *stmt, uint32_t *out_cursor)
     return st;
   stmt->cols = cols;
   stmt->ncols = ncols;
-  *out_cursor = cursor;
   return SEER_OK;
 }
 
@@ -7116,28 +7138,19 @@ static SeerStatus fv2_describe_only(SeerStmt *stmt)
   return SEER_OK;
 }
 
-static SeerStatus fv2_execute_select(SeerStmt *stmt)
+/* Fetch every row of the query open on `cursor` into the statement: the ALL7
+ * execute + fetch (02 80 50), re-sent per batch until ORA-01403 or a batch
+ * with no rows. *errcode is the batch's ORA code (0, 1403 or an error, its
+ * text then on the connection). */
+static SeerStatus fv2_fetch_cursor(SeerStmt *stmt, uint32_t cursor, int64_t *errcode)
 {
   SeerConn *c = stmt->conn;
-  free_rows(stmt);
-  free_columns(stmt->cols, stmt->ncols);
-  stmt->cols = NULL;
-  stmt->ncols = 0;
-
+  int ncols = stmt->ncols;
   uint8_t *resp = NULL;
   size_t rlen = 0;
   SeerStatus st;
   SeerWriter w;
-
-  /* Calls 0-2: the cursor, the parse and the describe. */
-  uint32_t cursor = 0;
-  st = fv2_parse_describe(stmt, &cursor);
-  if (st != SEER_OK)
-    return st;
-  int ncols = stmt->ncols;
-
-  /* Call 3: execute + fetch (re-sent per batch until ORA-01403 / no rows). */
-  int64_t errcode = 0;
+  *errcode = 0;
   for (;;) {
     if (!seer_writer_init(&w, 48 + (size_t)ncols * 24))
       return SEER_ENOMEM;
@@ -7168,24 +7181,47 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
     if (st != SEER_OK)
       return st;
     size_t nadded = 0;
-    st = fv2_decode_rows(stmt, resp, rlen, &errcode, &nadded);
+    st = fv2_decode_rows(stmt, resp, rlen, errcode, &nadded);
     /* A query can fail as its rows are made - 1 / 0 is ORA-01476 - and the
      * fetch's reply carries the error: keep its text while the reply is in
      * hand. Taken only after it was freed, the error had no text (#159). */
-    if (st == SEER_OK && errcode != 0 && errcode != 1403) {
+    if (st == SEER_OK && *errcode != 0 && *errcode != 1403) {
       free(c->last_error);
       c->last_error = NULL;
       fv2_set_error(c, resp, rlen);
       if (c->last_error == NULL)
-        seer_conn_error_code(c, (long)errcode);
+        seer_conn_error_code(c, (long)*errcode);
     }
     free(resp);
     resp = NULL;
     if (st != SEER_OK)
       return st;
-    if (errcode == 1403 || nadded == 0)
+    if (*errcode == 1403 || nadded == 0)
       break;
   }
+
+  return SEER_OK;
+}
+
+static SeerStatus fv2_execute_select(SeerStmt *stmt)
+{
+  SeerConn *c = stmt->conn;
+  free_rows(stmt);
+  free_columns(stmt->cols, stmt->ncols);
+  stmt->cols = NULL;
+  stmt->ncols = 0;
+
+  /* Calls 0-2: the cursor, the parse and the describe. */
+  uint32_t cursor = 0;
+  SeerStatus st = fv2_parse_describe(stmt, &cursor);
+  if (st != SEER_OK)
+    return st;
+
+  /* Call 3: execute + fetch, then the nested cursors its rows opened. */
+  int64_t errcode = 0;
+  st = fv2_fetch_cursor(stmt, cursor, &errcode);
+  if (st != SEER_OK)
+    return st;
 
   /* Resolve any captured LOB locators (TTI_LOBOPS) while the cursor is open. */
   if (stmt->nplobs > 0)
