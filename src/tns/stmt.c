@@ -9365,8 +9365,10 @@ SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, ui
 {
   if (conn == NULL || !xid_valid(xid))
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_1)
-    return SEER_ENOTIMPL; /* TPC is 12c+ */
+  /* 11g takes the 12c form as is. 10g rejects it (ORA-00600 [12333]) and 9i and
+   * 8i drop or stall on it: refuse before any wire activity (#171). */
+  if (conn->field_version < TTC_FIELD_VERSION_11_2)
+    return SEER_ENOTIMPL;
   SeerWriter w;
   SeerStatus st = seer_tpc_build_switch(conn, &w, TNS_TPC_TXN_START, xid, flags, timeout);
   if (st != SEER_OK)

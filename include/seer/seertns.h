@@ -108,7 +108,7 @@ SeerStatus seer_rollback(SeerConn *conn);
 SeerStatus seer_request_begin(SeerConn *conn);
 SeerStatus seer_request_end(SeerConn *conn);
 
-/* Two-phase commit / XA (distributed transactions, 12c+). A global transaction
+/* Two-phase commit / XA (distributed transactions, 11g+). A global transaction
  * is identified by an Xid (format id + global transaction id + branch
  * qualifier). The branch lifecycle is: begin -> [DML] -> end -> prepare ->
  * commit (or rollback at any point). The opaque transaction context the server
@@ -128,7 +128,8 @@ typedef struct {
 #define SEER_TPC_END_SUSPEND 0x00100000 /* suspend (resume-able) end   */
 
 /* Begin (or join/resume) a global transaction branch. `timeout` is the seconds
- * the server holds an idle branch (0 = server default). 12c+ only. */
+ * the server holds an idle branch (0 = server default). SEER_ENOTIMPL before 11g
+ * (#171). */
 SeerStatus seer_tpc_begin(SeerConn *conn, const SeerXid *xid, uint32_t flags, uint32_t timeout);
 /* End the local work on the branch (detach); flags SEER_TPC_END_*. */
 SeerStatus seer_tpc_end(SeerConn *conn, const SeerXid *xid, uint32_t flags);
