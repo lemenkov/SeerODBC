@@ -1296,7 +1296,7 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
   seer_enc_sb4(w, (uint32_t)ulen); /* user length               */
   seer_enc_sb4(w, 0x101);          /* logon mode, with the proof */
   seer_writer_u8(w, 1);
-  seer_enc_sb4(w, 6); /* key/value pairs */
+  seer_enc_sb4(w, 8); /* key/value pairs */
   seer_writer_u8(w, 1);
   seer_writer_u8(w, 1);
   seer_writer_bytes(w, user, ulen); /* raw, as below 12.1 */
@@ -1305,6 +1305,11 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
   seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0, false);
   seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0, false);
   seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0, false);
+  /* 9i takes a distributed transaction only on a session that logged on with
+   * these names (ORA-02048 otherwise). The keys carry their NUL, as JDBC thin's
+   * XA connection sends them (#171). */
+  seer_enc_kv(w, "AUTH_INTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
+  seer_enc_kv(w, "AUTH_EXTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
   seer_enc_kv(w, "AUTH_ACL", 8, ACL, sizeof ACL - 1, 0, false);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
