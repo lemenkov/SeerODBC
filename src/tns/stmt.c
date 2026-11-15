@@ -4999,11 +4999,14 @@ static int fv2_long_binds(const SeerStmt *stmt)
   return need;
 }
 
-/* Whether a 9i IN bind is past the inline limits - text past 4000 bytes, RAW
- * past 2000 - and so declared at a block's 32767. */
+/* Whether a 9i bind is past the inline limits - text past 4000 bytes, RAW
+ * past 2000 - and so declared at a block's 32767. An IN bind is measured by its
+ * value, an OUT by the size asked for; either way 9.2 holds at most 32512, and
+ * an OUT's value comes back in the chunked long form (seerdb PROTOCOL.md
+ * §19.3.1, measured against ojdbc14; #189). */
 static bool fv2_block_wide(const SeerBind *b)
 {
-  if (b->is_out || b->oac_charset == 2000)
+  if (b->oac_charset == 2000)
     return false;
   if (b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW)
     return b->oac_size > 2000;
@@ -9969,8 +9972,7 @@ static SeerStatus aq_enq_send(SeerConn *conn, SeerWriter *w, uint8_t msgid[16])
  * (seerdb PROTOCOL.md §29: 9.2 closes a thin session on the native enqueue,
  * and 8.1.7 has no native form in any reference client). Every option is a
  * field of DBMS_AQ's PL/SQL records, set in the block (#173). */
-#define PLSQL_AQ_MAX_RAW 32512       /* the largest RAW a 9i block takes in (§19.3.1) */
-#define PLSQL_AQ_MAX_RAW_OUT_9I 2000 /* 9i's RAW OUT bind is inline-only (#189) */
+#define PLSQL_AQ_MAX_RAW 32512 /* the most RAW a 9i block takes or returns (§19.3.1) */
 
 static SeerStatus plsql_aq_stmt(SeerConn *c, const char *sql, SeerStmt **out)
 {
@@ -10046,8 +10048,7 @@ static SeerStatus plsql_aq_deq(SeerConn *c, const char *queue_name, const SeerAq
   if (st == SEER_OK)
     st = seer_stmt_bind_text(s, 5, queue_name, (int)strlen(queue_name));
   if (st == SEER_OK)
-    st = seer_stmt_bind_out(s, 6, ORA_TYPE_RAW,
-                            c->is_8i ? PLSQL_AQ_MAX_RAW : PLSQL_AQ_MAX_RAW_OUT_9I);
+    st = seer_stmt_bind_out(s, 6, ORA_TYPE_RAW, PLSQL_AQ_MAX_RAW);
   if (st == SEER_OK)
     st = seer_stmt_bind_out(s, 7, ORA_TYPE_RAW, 16);
   if (st == SEER_OK)

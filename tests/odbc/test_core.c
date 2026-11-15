@@ -35,6 +35,7 @@
 
 #define T_VARCHAR 1
 #define T_NUMBER 2
+#define T_RAW 23
 
 static int pass_n, fail_n, skip_n;
 void pass(const char *n)
@@ -1930,6 +1931,45 @@ static void check_refused_commit(void)
   }
 }
 
+/* PL/SQL OUT values past the inline limits - text past 4000 bytes, RAW past
+ * 2000 - come back whole. 9i declares such an OUT at 32767, as a wide IN, and
+ * returns it in the chunked long form (seerdb PROTOCOL.md §19.3.1, #189). */
+static void check_wide_out(void)
+{
+  const char *name = "PL/SQL OUT past the inline limits: 5000-char text, 3000-byte RAW";
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(
+      C, "BEGIN :1 := RPAD('x', 5000, 'y'); :2 := UTL_RAW.COPIES(HEXTORAW('A5'), 3000); END;", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 1, T_VARCHAR, 5000);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 2, T_RAW, 3000);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  const void *t = NULL, *r = NULL;
+  size_t tl = 0, rl = 0;
+  int tn = 1, rn = 1, tb = 0, rb = 0;
+  int ok = 0;
+  if (st == SEER_OK && seer_stmt_out_data(s, 1, &t, &tl, &tn, &tb) == SEER_OK &&
+      seer_stmt_out_data(s, 2, &r, &rl, &rn, &rb) == SEER_OK && !tn && !rn && tl == 5000 &&
+      rl == 3000) {
+    const char *tc = t;
+    const uint8_t *rc = r;
+    ok = tc[0] == 'x' && tc[4999] == 'y';
+    for (size_t i = 0; ok && i < rl; i++)
+      ok = rc[i] == 0xA5;
+  }
+  if (ok)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "st=%d text=%zu raw=%zu %.80s", (int)st, tl, rl,
+             st != SEER_OK && seer_last_error(C) ? seer_last_error(C) : "");
+    fail(name, m);
+  }
+  seer_stmt_close(s);
+}
+
 /* PL/SQL blocks (seerdb PROTOCOL.md §19.13-19.14, #134): IN values inline,
  * OUT and IN OUT values back in one round trip, bound by order of appearance
  * (#146); a NULL and a never-assigned OUT; a 4000-character OUT,
@@ -2381,6 +2421,7 @@ int main(void)
   check_alter_session_and_compile();
   check_refused_commit();
   check_blocks();
+  check_wide_out();
   check_lobs();
   check_urowid();
   check_bfile_missing();
