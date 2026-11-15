@@ -9035,14 +9035,17 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
  * with the ARRAY flag (0x40) set and the declared capacity in the max-array-
  * elements field. `length` is the element's max byte size. Returns malloc'd bytes
  * in *out_len (caller owns), or NULL. 12c+ OAC shape. */
-static uint8_t *aa_build_oac(uint8_t dtype, uint32_t length, uint32_t charset, uint8_t csfrm,
-                             uint32_t capacity, size_t *out_len)
+static uint8_t *aa_build_oac(uint8_t fv, uint8_t dtype, uint32_t length, uint32_t charset,
+                             uint8_t csfrm, uint32_t capacity, size_t *out_len)
 {
   SeerWriter w;
   if (!seer_writer_init(&w, 48))
     return NULL;
   seer_writer_u8(&w, dtype);
-  seer_writer_u8(&w, 0x41); /* TNS_BIND_USE_INDICATORS | ARRAY */
+  /* TNS_BIND_USE_INDICATORS | ARRAY; below 12.1 the flags are 03 | ARRAY, as
+   * JDBC thin 11.2 sends them, and there is no oaccolid (seerdb, measured on
+   * 11g XE and 10.2.0.5; #172). */
+  seer_writer_u8(&w, fv < TTC_FIELD_VERSION_12_1 ? 0x43 : 0x41);
   seer_writer_u8(&w, 0);
   seer_writer_u8(&w, 0);
   seer_enc_sb4(&w, length);                  /* element max length */
@@ -9053,7 +9056,8 @@ static uint8_t *aa_build_oac(uint8_t dtype, uint32_t length, uint32_t charset, u
   seer_enc_sb4(&w, charset);                 /* charset id (ub2) */
   seer_writer_u8(&w, csfrm);                 /* character set form */
   seer_enc_sb4(&w, 0);                       /* LOB prefetch length */
-  seer_enc_sb4(&w, 0);                       /* oaccolid */
+  if (fv >= TTC_FIELD_VERSION_12_2)
+    seer_enc_sb4(&w, 0); /* oaccolid */
   if (!seer_writer_ok(&w)) {
     seer_writer_free(&w);
     return NULL;
@@ -9088,8 +9092,8 @@ SeerStatus seer_stmt_bind_out_array(SeerStmt *stmt, int param, int ora_type, int
 {
   if (stmt == NULL || capacity <= 0)
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* associative arrays: 10g+ (9i and 8i, #172) */
 
   uint8_t dtype = (ora_type == ORA_TYPE_NUMBER) ? ORA_TYPE_NUMBER : ORA_TYPE_VARCHAR;
   uint32_t length = (dtype == ORA_TYPE_NUMBER) ? 22 : (uint32_t)(elem_size > 0 ? elem_size : 2000);
@@ -9097,7 +9101,8 @@ SeerStatus seer_stmt_bind_out_array(SeerStmt *stmt, int param, int ora_type, int
   uint8_t csfrm = (dtype == ORA_TYPE_NUMBER) ? 0 : 1;
 
   size_t oac_len = 0;
-  uint8_t *oac = aa_build_oac(dtype, length, charset, csfrm, (uint32_t)capacity, &oac_len);
+  uint8_t *oac = aa_build_oac(stmt->conn->field_version, dtype, length, charset, csfrm,
+                              (uint32_t)capacity, &oac_len);
   if (oac == NULL)
     return SEER_ENOMEM;
   uint8_t *rxd = malloc(1); /* empty-array placeholder (ub4 count 0) */
@@ -9152,8 +9157,8 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
 {
   if (stmt == NULL || n < 0 || (n > 0 && values == NULL))
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL; /* the array-bind OAC shape is 12c+ */
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* associative arrays: 10g+ (9i and 8i, #172) */
 
   /* RXD: ub4 element count, then each element <ub1 len><NUMBER bytes>. */
   SeerWriter rxd;
@@ -9172,7 +9177,8 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
   }
 
   size_t oac_len = 0;
-  uint8_t *oac = aa_build_oac(ORA_TYPE_NUMBER, 22, 0, 0, (uint32_t)n, &oac_len);
+  uint8_t *oac =
+      aa_build_oac(stmt->conn->field_version, ORA_TYPE_NUMBER, 22, 0, 0, (uint32_t)n, &oac_len);
   if (oac == NULL) {
     seer_writer_free(&rxd);
     return SEER_ENOMEM;
@@ -9185,8 +9191,8 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
 {
   if (stmt == NULL || n < 0 || (n > 0 && values == NULL) || elem_size <= 0)
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* associative arrays: 10g+ (9i and 8i, #172) */
 
   /* RXD: ub4 count, then each element as a length-framed CHR value. */
   SeerWriter rxd;
@@ -9210,7 +9216,8 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
   }
 
   size_t oac_len = 0;
-  uint8_t *oac = aa_build_oac(ORA_TYPE_VARCHAR, (uint32_t)elem_size, 873, 1, (uint32_t)n, &oac_len);
+  uint8_t *oac = aa_build_oac(stmt->conn->field_version, ORA_TYPE_VARCHAR, (uint32_t)elem_size, 873,
+                              1, (uint32_t)n, &oac_len);
   if (oac == NULL) {
     seer_writer_free(&rxd);
     return SEER_ENOMEM;

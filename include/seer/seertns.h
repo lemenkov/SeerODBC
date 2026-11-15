@@ -380,7 +380,7 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
                                      const char *type_name, const char *const *elem_values,
                                      int n_elems);
 
-/* Bind a PL/SQL associative array (index-by table) as a single parameter (12c+):
+/* Bind a PL/SQL associative array (index-by table) as a single parameter (10g+):
  * the whole `values` array goes in one call. For text, `elem_size` is the
  * declared element max length and a NULL entry is a SQL NULL element. The matching
  * statement is a PL/SQL block whose parameter is an index-by table of NUMBER /
@@ -389,7 +389,7 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
 SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *const *values, int n,
                                      int elem_size);
 
-/* Bind a PL/SQL associative-array OUT parameter (12c+): the server fills up to
+/* Bind a PL/SQL associative-array OUT parameter (10g+): the server fills up to
  * `capacity` elements of `ora_type` (2 NUMBER / 1 VARCHAR; `elem_size` is the
  * per-element max for VARCHAR). After execute, read the results with
  * seer_stmt_out_array_len and seer_stmt_out_array_get. */
