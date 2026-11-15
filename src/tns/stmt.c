@@ -10129,8 +10129,8 @@ SeerStatus seer_aq_enq_object(SeerConn *conn, const char *queue_name, const char
   if (conn == NULL || queue_name == NULL || type_schema == NULL || type_name == NULL ||
       (n_attrs > 0 && attr_values == NULL))
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* 9i and 8i: no object binds there (#172) */
 
   uint8_t oid[16];
   SeerWriter img;
@@ -10476,8 +10476,8 @@ SeerStatus seer_aq_deq_object(SeerConn *conn, const char *queue_name, const char
 {
   if (conn == NULL || queue_name == NULL || type_schema == NULL || type_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_2)
-    return SEER_ENOTIMPL;
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* 9i and 8i: no object binds there (#172) */
   if (out_text != NULL)
     *out_text = NULL;
 
