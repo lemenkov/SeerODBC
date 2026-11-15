@@ -316,7 +316,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 
 ## Sessions / infrastructure
 
-- [x] Advanced Queuing (AQ), 12c+; RAW enqueue / dequeue also on 10g and 11g, with
+- [x] Advanced Queuing (AQ), 12c+; RAW enqueue / dequeue also on 8i to 11g (8i/9i as
+      DBMS_AQ PL/SQL; a 9i dequeue returns at most 2000 bytes, #189), with
       their options (priority, delay, expiration, correlation, browse,
       consumer names) and the array calls, one message at a time (#187);
       object payloads before 12c are #173:
