@@ -372,6 +372,13 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
 SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema,
                               const char *type_name, const uint8_t *ref, size_t len);
 
+/* Bind a REF OUT parameter of a PL/SQL block (#241), the type it references
+ * named as for seer_stmt_bind_ref. Its value is read with seer_stmt_out_data,
+ * as the REF's bytes (binary; NULL for a NULL REF). 9i and 12c+; SEER_ENOTIMPL
+ * on 8i (its OUT form isn't measured yet) and on 10g / 11g. */
+SeerStatus seer_stmt_bind_ref_out(SeerStmt *stmt, int param, const char *type_schema,
+                                  const char *type_name);
+
 /* Bind an OUT parameter of an object or collection type (10g+), named as for
  * seer_stmt_bind_object (a package type as "PKG.TYPE"). After execute,
  * seer_stmt_out_data returns the value rendered as text, as a fetched object
