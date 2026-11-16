@@ -56,6 +56,36 @@ SQLRETURN SQL_API SQLGetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute,
   }
 }
 
+/* SQL_ATTR_TXN_ISOLATION (#220): the two levels Oracle has - and SQLGetInfo
+ * advertises - set for the session's next transactions with ALTER SESSION;
+ * the others, which it hasn't, refused (HYC00). Not yet connected, the level
+ * is kept and applied once logged in. */
+SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level)
+{
+  const char *sql = NULL;
+  if (level == SQL_TXN_SERIALIZABLE)
+    sql = "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE";
+  else if (level == SQL_TXN_READ_COMMITTED)
+    sql = "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED";
+  else
+    return seer_odbc_diag(c, "HYC00", 0,
+                          "Oracle has only the READ COMMITTED and SERIALIZABLE isolation levels",
+                          SQL_ERROR);
+  if (c->connected && c->conn != NULL) {
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(c->conn, sql, &s);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    seer_stmt_close(s);
+    if (st != SEER_OK) {
+      const char *ora = st == SEER_EDB ? seer_last_error(c->conn) : NULL;
+      return seer_odbc_diag(c, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
+    }
+  }
+  c->txn_isolation = level;
+  return SQL_SUCCESS;
+}
+
 SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute,
                                     SQLPOINTER ValuePtr, SQLINTEGER StringLength)
 {
@@ -72,6 +102,8 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   }
   if (Attribute == SQL_ATTR_LOGIN_TIMEOUT) /* seconds; takes effect at the next connect */
     c->login_timeout = (long)(SQLULEN)ValuePtr;
+  if (Attribute == SQL_ATTR_TXN_ISOLATION)
+    return seer_odbc_apply_isolation(c, (SQLUINTEGER)(SQLULEN)ValuePtr);
   /* Connection timeout, tracing, etc.: accept as no-ops. */
   return SQL_SUCCESS;
 }
@@ -127,6 +159,9 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   case SQL_ATTR_CONNECTION_DEAD:
     *(SQLUINTEGER *)ValuePtr =
         c->connected && !seer_conn_lost(c->conn) ? SQL_CD_FALSE : SQL_CD_TRUE;
+    return SQL_SUCCESS;
+  case SQL_ATTR_TXN_ISOLATION: /* unset: the server's default, READ COMMITTED */
+    *(SQLUINTEGER *)ValuePtr = c->txn_isolation ? c->txn_isolation : SQL_TXN_READ_COMMITTED;
     return SQL_SUCCESS;
   case SQL_ATTR_LOGIN_TIMEOUT: /* unset: the 30 s default */
     *(SQLUINTEGER *)ValuePtr = (SQLUINTEGER)(c->login_timeout < 0 ? 30 : c->login_timeout);

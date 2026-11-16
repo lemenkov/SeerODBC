@@ -2961,6 +2961,79 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+/* SQL_ATTR_TXN_ISOLATION (#220), which SQLGetInfo advertises: a session set
+ * to SERIALIZABLE before connecting keeps reading the value its transaction
+ * first saw while another session changes and commits it; switched to READ
+ * COMMITTED while connected, it sees the next change at once. REPEATABLE READ,
+ * which Oracle hasn't, is refused (HYC00). */
+static void check_txn_isolation(SQLHDBC b, const char *drv, const char *host, const char *port,
+                                const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "SQL_ATTR_TXN_ISOLATION (SERIALIZABLE / READ COMMITTED)";
+  char err[256] = "", v[16] = "", m[600] = "";
+  exec_do(b, "DROP TABLE seer_iso_t", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(b, "CREATE TABLE seer_iso_t (n NUMBER)", err, sizeof err)) ||
+      !SQL_SUCCEEDED(exec_do(b, "INSERT INTO seer_iso_t VALUES (1)", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC a;
+  SQLAllocHandle(SQL_HANDLE_DBC, e, &a);
+  SQLSetConnectAttr(a, SQL_ATTR_TXN_ISOLATION, (SQLPOINTER)(uintptr_t)SQL_TXN_SERIALIZABLE, 0);
+  char cs[640];
+  snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;", drv, host,
+           port ? port : "1521", svc, user, pwd);
+  SQLCHAR o[256];
+  SQLSMALLINT ol;
+  SQLRETURN rc =
+      SQLDriverConnect(a, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
+  SQLUINTEGER level = 0;
+  if (rc != SQL_SUCCESS) {
+    diag_text(SQL_HANDLE_DBC, a, err, sizeof err);
+    snprintf(m, sizeof m, "connect rc=%d %s", (int)rc, err);
+  } else {
+    SQLGetConnectAttr(a, SQL_ATTR_TXN_ISOLATION, &level, 0, NULL);
+    SQLSetConnectAttr(a, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+    char v1[16] = "", v2[16] = "", v3[16] = "";
+    exec_scalar(a, "SELECT n FROM seer_iso_t", v1, sizeof v1, err, sizeof err);
+    exec_do(b, "UPDATE seer_iso_t SET n = 2", err, sizeof err); /* b autocommits */
+    exec_scalar(a, "SELECT n FROM seer_iso_t", v2, sizeof v2, err, sizeof err);
+    SQLEndTran(SQL_HANDLE_DBC, a, SQL_COMMIT);
+    SQLRETURN rr = SQLSetConnectAttr(a, SQL_ATTR_TXN_ISOLATION,
+                                     (SQLPOINTER)(uintptr_t)SQL_TXN_READ_COMMITTED, 0);
+    exec_scalar(a, "SELECT n FROM seer_iso_t", v, sizeof v, err, sizeof err);
+    exec_do(b, "UPDATE seer_iso_t SET n = 3", err, sizeof err);
+    exec_scalar(a, "SELECT n FROM seer_iso_t", v3, sizeof v3, err, sizeof err);
+    SQLEndTran(SQL_HANDLE_DBC, a, SQL_COMMIT);
+    SQLRETURN rx = SQLSetConnectAttr(a, SQL_ATTR_TXN_ISOLATION,
+                                     (SQLPOINTER)(uintptr_t)SQL_TXN_REPEATABLE_READ, 0);
+    SQLCHAR st[6] = "";
+    SQLINTEGER nat = 0;
+    SQLSMALLINT len = 0;
+    SQLCHAR msg[200];
+    if (!SQL_SUCCEEDED(rx))
+      SQLGetDiagRec(SQL_HANDLE_DBC, a, 1, st, &nat, msg, sizeof msg, &len);
+    if (level != SQL_TXN_SERIALIZABLE || strcmp(v1, "1") != 0 || strcmp(v2, "1") != 0 ||
+        !SQL_SUCCEEDED(rr) || strcmp(v3, "3") != 0 || SQL_SUCCEEDED(rx) ||
+        strcmp((char *)st, "HYC00") != 0)
+      snprintf(m, sizeof m,
+               "level %u; serializable read %s then %s (want 1, 1); read committed %s (want 3); "
+               "REPEATABLE READ rc=%d '%s' %s",
+               (unsigned)level, v1, v2, v3, (int)rx, (char *)st, err);
+    SQLDisconnect(a);
+  }
+  SQLFreeHandle(SQL_HANDLE_DBC, a);
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  exec_do(b, "DROP TABLE seer_iso_t", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQL_ATTR_LOGIN_TIMEOUT (#216): 3 s, and a HOST list whose first address
  * never answers (192.0.2.1, TEST-NET-1) reaches the server in well under the
  * 30 s default; the attribute reads back. CONNECT_TIMEOUT that isn't a number
@@ -3997,6 +4070,7 @@ int main(void)
   check_unreachable_error(drv, svc, user, pwd);
   check_query_timeout(drv, host, port, svc, user, pwd);
   check_login_timeout(drv, host, port, svc, user, pwd);
+  check_txn_isolation(dbc, drv, host, port, svc, user, pwd);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

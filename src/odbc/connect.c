@@ -257,6 +257,17 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   c->connected = 1;
   seer_set_autocommit(conn, c->autocommit == SQL_AUTOCOMMIT_ON);
   ret = SQL_SUCCESS;
+  /* An isolation level set before connecting takes effect now (#220). The
+   * session is up either way: a level the server refused is a warning, 01S02
+   * (option value changed), not a failed connect. */
+  if (c->txn_isolation != 0 && c->txn_isolation != SQL_TXN_READ_COMMITTED &&
+      !SQL_SUCCEEDED(seer_odbc_apply_isolation(c, c->txn_isolation))) {
+    c->txn_isolation = 0;
+    ret = seer_odbc_diag(c, "01S02", 0,
+                         "The transaction isolation level could not be set; the session "
+                         "keeps the server's default, READ COMMITTED",
+                         SQL_SUCCESS_WITH_INFO);
+  }
 
 out:
   free(host);
