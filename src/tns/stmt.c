@@ -121,6 +121,7 @@ typedef struct {
   int64_t out_full_len; /* RETURNING value the server truncated: its real length, else 0 */
   uint8_t ret_lob;      /* RETURNING target declared as this LOB type (CLOB/BLOB), else 0 */
   uint8_t fv2_lob;      /* 9i: bound for this execute as a temporary LOB of this type (#169) */
+  uint8_t lob_out;      /* bound OUT as a CLOB / BLOB (seer_stmt_bind_out), else 0 (#214) */
   uint8_t *ret_locator; /* its returned locator, resolved after the response */
   size_t ret_loclen;
   bool is_array;     /* PL/SQL associative-array (index-by table) bind  */
@@ -2034,6 +2035,7 @@ static SeerStatus store_bind_ex(SeerStmt *s, int param, uint8_t oac_type, uint32
   }
   b->is_out = is_out;
   b->out_only = false;
+  b->lob_out = 0;
   if (oac_size > b->oac_size)
     b->oac_size = oac_size;
   free(b->rxd[it]);
@@ -2655,6 +2657,17 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
     oac_size = 1;
     oac_charset = 871;
     break;
+  case ORA_TYPE_BLOB: /* a BLOB OUT (#214): a wide RAW, a LOB bind before 10g */
+    oac_type = ORA_TYPE_RAW;
+    oac_size = (uint32_t)(max_size > 0 ? max_size : 32767);
+    oac_flag = 16;
+    break;
+  case ORA_TYPE_CLOB: /* a CLOB OUT (#214): a wide text, a LOB bind before 10g */
+    oac_type = ORA_TYPE_VARCHAR;
+    oac_size = (uint32_t)(max_size > 0 ? max_size : 32767);
+    oac_charset = 873;
+    oac_flag = 16;
+    break;
   case ORA_TYPE_VARCHAR:
   default:
     oac_type = ORA_TYPE_VARCHAR;
@@ -2684,6 +2697,17 @@ SeerStatus seer_stmt_bind_out(SeerStmt *stmt, int param, int ora_type, int max_s
       store_bind(stmt, param, oac_type, oac_size, oac_charset, oac_flag, true, rxd, rxd_len);
   if (st == SEER_OK)
     stmt->pbinds[param - 1].out_only = true;
+  /* A CLOB / BLOB OUT on 8i and 9i: the LOB itself, its locator read back
+   * (seerdb PROTOCOL.md §19.17b, as a RETURNING target since #215). 8.1.7
+   * converts no CLOB to text, so `? := c` takes nothing else there; 9.2 does,
+   * but the LOB carries past 32512. 10g+ keeps the wide text / RAW, which it
+   * converts to (#214). */
+  if (st == SEER_OK && (ora_type == ORA_TYPE_CLOB || ora_type == ORA_TYPE_BLOB) &&
+      stmt->conn->field_version < TTC_FIELD_VERSION_10_2) {
+    SeerBind *b = &stmt->pbinds[param - 1];
+    b->lob_out = (uint8_t)ora_type;
+    b->ret_lob = (uint8_t)ora_type;
+  }
   return st;
 }
 
@@ -8380,7 +8404,9 @@ static SeerStatus fv2_execute_in_block(SeerStmt *stmt)
    * bytes and reported success. */
   for (int i = 0; i < stmt->npbinds; i++) {
     SeerBind *b = &stmt->pbinds[i];
-    b->ret_lob = 0;
+    b->ret_lob = b->lob_out; /* an explicit CLOB / BLOB OUT stays one (#214) */
+    if (b->ret_lob != 0)
+      continue;
     if (b->is_out && b->oac_size > 4000 && b->oac_type == ORA_TYPE_VARCHAR)
       b->ret_lob = ORA_TYPE_CLOB;
     else if (b->is_out && b->oac_size > 4000 && b->oac_type == ORA_TYPE_RAW)

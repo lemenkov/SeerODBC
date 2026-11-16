@@ -28,6 +28,19 @@
 #define SQL_REFCURSOR (-9999)
 #endif
 
+/* SeerODBC extension SQL types: a CLOB / BLOB OUT parameter of a PL/SQL block,
+ * SQLBindParameter(..., SQL_PARAM_OUTPUT, SQL_C_CHAR / SQL_C_BINARY,
+ * SQL_SEER_CLOB / SQL_SEER_BLOB, size, ...) (#214). On 8i, which converts no
+ * CLOB to text, `? := c` needs it; SQL_LONGVARCHAR there is a LONG / text
+ * bind. On every other release it's the same as SQL_LONGVARCHAR /
+ * SQL_LONGVARBINARY. */
+#ifndef SQL_SEER_CLOB
+#define SQL_SEER_CLOB (-9998)
+#endif
+#ifndef SQL_SEER_BLOB
+#define SQL_SEER_BLOB (-9997)
+#endif
+
 /* SeerODBC extension SQLColAttribute field identifier: the column's 23ai SQL
  * annotations, returned as a "name=value\n..." character string (name-only
  * annotations have an empty value; empty string when the column has none). */

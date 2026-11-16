@@ -61,8 +61,8 @@ static const Gate GATES[] = {
      "a large PL/SQL bind isn't promoted to a temporary LOB before 12c"},
     {"VECTOR column dimensions / format (SQLColAttribute)", 8, 21, GATE_SERVER,
      "no VECTOR type before 23ai"},
-    {"large CLOB OUT parameter", 8, 8, GATE_TODO,
-     "a PL/SQL CLOB OUT on 8i needs a LOB bind type (#214)"},
+    {"large CLOB OUT parameter", 8, 8, GATE_SERVER,
+     "8.1.7 converts no CLOB to text: a CLOB OUT binds as SQL_SEER_CLOB there (#214)"},
     {"column annotations", 8, 21, GATE_SERVER, "no ANNOTATIONS before 23ai"},
     {"implicit result rows holding a CURSOR() column", 8, 11, GATE_SERVER,
      "no DBMS_SQL.RETURN_RESULT before 12c"},
@@ -1740,6 +1740,45 @@ static void check_temp_lobs_freed(SQLHDBC dbc)
     pass(name);
   else
     fail(name, why);
+}
+
+/* A CLOB and a BLOB OUT parameter of a PL/SQL block bound as the driver's
+ * SQL_SEER_CLOB / SQL_SEER_BLOB (#214): on 8i the only way, as 8.1.7 converts
+ * no CLOB to text; on every other release the same as SQL_LONGVARCHAR /
+ * SQL_LONGVARBINARY. */
+#define SQL_SEER_CLOB (-9998)
+#define SQL_SEER_BLOB (-9997)
+static void check_lob_out_ext_types(SQLHDBC dbc)
+{
+  const char *name = "CLOB / BLOB OUT parameters as SQL_SEER_CLOB / SQL_SEER_BLOB";
+  static char cbuf[20001];
+  static unsigned char bbuf[20000];
+  SQLLEN ci = 0, bi = 0;
+  char err[256] = "", m[400] = "";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  cbuf[0] = '\0';
+  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_SEER_CLOB, 20000, 0, cbuf, sizeof cbuf,
+                   &ci);
+  SQLBindParameter(st, 2, SQL_PARAM_OUTPUT, SQL_C_BINARY, SQL_SEER_BLOB, 20000, 0, bbuf,
+                   sizeof bbuf, &bi);
+  SQLRETURN rc = SQLExecDirect(
+      st,
+      (SQLCHAR *)"DECLARE c CLOB; b BLOB; BEGIN DBMS_LOB.CREATETEMPORARY(c, TRUE); "
+                 "DBMS_LOB.CREATETEMPORARY(b, TRUE); FOR i IN 1 .. 10 LOOP "
+                 "DBMS_LOB.WRITEAPPEND(c, 1000, RPAD('o', 1000, 'o')); END LOOP; FOR i IN 1 .. 3 "
+                 "LOOP DBMS_LOB.WRITEAPPEND(b, 2000, UTL_RAW.COPIES(HEXTORAW('AB'), 2000)); END "
+                 "LOOP; ? := c; ? := b; END;",
+      SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (SQL_SUCCEEDED(rc) && strlen(cbuf) == 10000 && bi == 6000 && bbuf[5999] == 0xAB)
+    pass(name);
+  else {
+    snprintf(m, sizeof m, "rc=%d clob=%zu blob=%ld %s", (int)rc, strlen(cbuf), (long)bi, err);
+    fail(name, m);
+  }
 }
 
 /* A large CLOB OUT parameter, and a CLOB + BLOB returned by DML RETURNING into
@@ -4246,6 +4285,7 @@ int main(void)
   check_max_rows(dbc);
   check_cursor_attrs(dbc);
   check_getinfo_answers(dbc, user, svc);
+  check_lob_out_ext_types(dbc);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

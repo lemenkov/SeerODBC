@@ -249,6 +249,14 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   `SQLBindParameter(..., SQL_PARAM_OUTPUT, SQL_C_DEFAULT, SQL_REFCURSOR, ...)`,
   execute, then `SQLNumResultCols`/`SQLFetch`/`SQLGetData`. Verified live:
   `{call seer_rc(?)}` opening a 3-row cursor fetched back in full.
+- **Done — CLOB / BLOB OUT parameters by type (#214).** Two more extension SQL
+  types, `SQL_SEER_CLOB` (-9998) and `SQL_SEER_BLOB` (-9997), bind a PL/SQL
+  block's CLOB / BLOB OUT parameter as the LOB:
+  `SQLBindParameter(..., SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_SEER_CLOB, size, ...)`.
+  On 8i, which converts no CLOB to text, it is the only way `? := c` works
+  (a `SQL_LONGVARCHAR` there is a LONG / text bind); on 9i it binds the LOB
+  too, past the 32512 bytes a text bind holds. On 10g and later it is the same
+  as `SQL_LONGVARCHAR` / `SQL_LONGVARBINARY`, which those releases convert to.
 - **Done — 10g / 12c auth variants.** `auth.c` now dispatches on the verifier
   the server offers (`seer_o5logon`): AUTH_VFR_DATA only -> 11g AES-192/SHA-1
   (unchanged); both AUTH_VFR_DATA + AUTH_PBKDF2_CSK_SALT -> 12c AES-256, KeySess
