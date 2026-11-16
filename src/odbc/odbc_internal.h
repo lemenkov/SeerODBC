@@ -88,6 +88,7 @@ typedef struct {
   SQLUINTEGER autocommit;
   long login_timeout;        /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
   SQLUINTEGER txn_isolation; /* SQL_ATTR_TXN_ISOLATION, 0 = the server's default (#220) */
+  SQLUINTEGER conn_timeout;  /* SQL_ATTR_CONNECTION_TIMEOUT, seconds; 0 = none (#228) */
   char *browse_cs;           /* SQLBrowseConnect: accumulated attributes */
   char dbms_ver[64];         /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
 } OdbcDbc;
@@ -204,6 +205,8 @@ SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level);
 /* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call
  * to the server (#209). */
 void seer_odbc_arm_timeout(OdbcStmt *s);
+/* Arm SQL_ATTR_CONNECTION_TIMEOUT for a call that isn't a statement's (#228). */
+void seer_odbc_arm_conn_timeout(OdbcDbc *c);
 
 /* Run a driver-generated query with positional text binds and ready the
  * statement for SQLFetch/SQLGetData. Defined in exec.c, used by catalog.c. */

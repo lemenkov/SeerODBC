@@ -545,6 +545,7 @@ SQLRETURN seer_odbc_describe_prepared(OdbcStmt *s)
 {
   if (s == NULL || s->core != NULL || s->sql == NULL || s->dbc == NULL || !s->dbc->connected)
     return SQL_SUCCESS;
+  seer_odbc_arm_timeout(s);
   SeerStatus st = seer_stmt_prepare(s->dbc->conn, s->sql, &s->core);
   if (st == SEER_OK)
     st = seer_stmt_describe(s->core);

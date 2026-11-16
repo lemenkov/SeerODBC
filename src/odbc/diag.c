@@ -152,12 +152,24 @@ SQLRETURN seer_odbc_diag(SQLHANDLE handle, const char *state, SQLINTEGER native,
   return ret;
 }
 
+static void arm_seconds(SeerConn *conn, SQLULEN sec)
+{
+  seer_set_call_timeout(conn, sec > 2000000 ? 2000000000 : (int)sec * 1000);
+}
+
+/* A statement's calls: its SQL_ATTR_QUERY_TIMEOUT, or without one the
+ * connection's SQL_ATTR_CONNECTION_TIMEOUT (#209, #228). */
 void seer_odbc_arm_timeout(OdbcStmt *s)
 {
   if (s == NULL || s->dbc == NULL || s->dbc->conn == NULL)
     return;
-  SQLULEN sec = s->query_timeout;
-  seer_set_call_timeout(s->dbc->conn, sec > 2000000 ? 2000000000 : (int)sec * 1000);
+  arm_seconds(s->dbc->conn, s->query_timeout ? s->query_timeout : s->dbc->conn_timeout);
+}
+
+void seer_odbc_arm_conn_timeout(OdbcDbc *c)
+{
+  if (c != NULL && c->conn != NULL)
+    arm_seconds(c->conn, c->conn_timeout);
 }
 
 SQLRETURN seer_odbc_exec_error(OdbcStmt *s, SeerStatus st)
