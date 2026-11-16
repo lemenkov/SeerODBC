@@ -219,6 +219,8 @@ struct SeerStmt {
   /* The columns are a drained REF CURSOR's, not this statement's own: the
    * statement cache keeps the block without them (#198). */
   bool cols_adopted;
+  /* seer_stmt_set_max_rows: rows past it are neither kept nor fetched (#221). */
+  size_t max_rows;
   /* A REF CURSOR captured from a PL/SQL OUT bind (drained into cols/rows). */
   bool refcursor_present;
   int refcursor_id;
@@ -1021,8 +1023,38 @@ static bool bvc_bit_set(const uint8_t *bv, size_t bvlen, int idx)
   return (bv[byte] & (1u << (idx % 8))) != 0;
 }
 
+/* Whether the statement holds as many rows as seer_stmt_set_max_rows allows. */
+static bool rows_full(const SeerStmt *stmt)
+{
+  return stmt->max_rows > 0 && stmt->nrows >= stmt->max_rows;
+}
+
 static SeerStatus append_row(SeerStmt *stmt, SeerCell *row)
 {
+  if (rows_full(stmt)) {
+    /* Past the limit (#221): the row goes, and the LOB and object reads its
+     * cells queued, which name its index, go with it. */
+    for (int k = 0; k < stmt->ncols; k++)
+      free(row[k].data);
+    free(row);
+    size_t kept = 0;
+    for (size_t k = 0; k < stmt->nplobs; k++) {
+      if (stmt->plobs[k].row >= stmt->nrows)
+        free(stmt->plobs[k].locator);
+      else
+        stmt->plobs[kept++] = stmt->plobs[k];
+    }
+    stmt->nplobs = kept;
+    kept = 0;
+    for (size_t k = 0; k < stmt->npobjs; k++) {
+      if (stmt->pobjs[k].row >= stmt->nrows)
+        free(stmt->pobjs[k].image);
+      else
+        stmt->pobjs[kept++] = stmt->pobjs[k];
+    }
+    stmt->npobjs = kept;
+    return SEER_OK;
+  }
   if (stmt->nrows == stmt->rows_cap) {
     size_t cap = stmt->rows_cap ? stmt->rows_cap * 2 : 16;
     SeerCell **nr = realloc(stmt->rows, cap * sizeof *nr);
@@ -4267,7 +4299,7 @@ static void free_implicit(SeerStmt *stmt)
  * cursor handle) from ever being sent a FETCH. */
 static bool more_rows_pending(const SeerStmt *stmt, int64_t cursor_id, int64_t err_code)
 {
-  return stmt->ncols > 0 && cursor_id != 0 && err_code != 1403;
+  return stmt->ncols > 0 && cursor_id != 0 && err_code != 1403 && !rows_full(stmt);
 }
 
 /* Fetch every remaining row of stmt->cursor_id into stmt->rows (one FETCH is
@@ -7222,7 +7254,7 @@ static SeerStatus o8i_fetch_rest(SeerStmt *stmt, uint32_t cursor, O8iStatus *s)
   for (int i = 0; i < stmt->ncols; i++)
     if (stmt->cols[i].ora_type == ORA_TYPE_LONG || stmt->cols[i].ora_type == ORA_TYPE_LONGRAW)
       has_long = true;
-  while (s->code == 0 && cursor != 0) {
+  while (s->code == 0 && cursor != 0 && !rows_full(stmt)) {
     o8i_status_free(s);
     size_t before = stmt->nrows;
     SeerWriter w, buf;
@@ -7548,7 +7580,7 @@ static SeerStatus fv2_fetch_cursor(SeerStmt *stmt, uint32_t cursor, int64_t *err
     resp = NULL;
     if (st != SEER_OK)
       return st;
-    if (*errcode == 1403 || nadded == 0)
+    if (*errcode == 1403 || nadded == 0 || rows_full(stmt))
       break;
   }
 
@@ -8041,6 +8073,14 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   stmt->executed = true;
   if (c->autocommit)
     seer_commit(c);
+  return SEER_OK;
+}
+
+SeerStatus seer_stmt_set_max_rows(SeerStmt *stmt, size_t max_rows)
+{
+  if (stmt == NULL)
+    return SEER_EPARAM;
+  stmt->max_rows = max_rows;
   return SEER_OK;
 }
 

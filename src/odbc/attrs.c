@@ -219,6 +219,9 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_QUERY_TIMEOUT: /* seconds a call may wait for the server */
     s->query_timeout = (SQLULEN)(uintptr_t)ValuePtr;
     return SQL_SUCCESS;
+  case SQL_ATTR_MAX_ROWS: /* rows a query returns at most, from the next execute */
+    s->max_rows = (SQLULEN)(uintptr_t)ValuePtr;
+    return SQL_SUCCESS;
   default:
     /* Cursor type, etc.: accept as no-ops. */
     return SQL_SUCCESS;
@@ -268,6 +271,9 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
   case SQL_ATTR_QUERY_TIMEOUT:
     *(SQLULEN *)ValuePtr = s->query_timeout;
+    return SQL_SUCCESS;
+  case SQL_ATTR_MAX_ROWS:
+    *(SQLULEN *)ValuePtr = s->max_rows;
     return SQL_SUCCESS;
   case SQL_ATTR_PARAMSET_SIZE:
     *(SQLULEN *)ValuePtr = s->paramset_size ? s->paramset_size : 1;

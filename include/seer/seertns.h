@@ -278,6 +278,11 @@ SeerStatus seer_aq_deq_json(SeerConn *conn, const char *queue_name, uint32_t wai
  * is in flight. The blocked call returns the server's ORA-01013 (cancelled). */
 void seer_cancel(SeerConn *conn);
 
+/* Limit a query's result to its first `max_rows` rows (0, the default: no
+ * limit), for the executes that follow: rows past it are neither kept nor
+ * fetched from the server (SQL_ATTR_MAX_ROWS, #221). */
+SeerStatus seer_stmt_set_max_rows(SeerStmt *stmt, size_t max_rows);
+
 /* Bound each round trip to the server to `ms` milliseconds (0, the default:
  * no bound), as python-oracledb's call_timeout. A reply that hasn't started
  * within it gets the interrupt seer_cancel sends: the server stops the call,
