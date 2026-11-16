@@ -35,6 +35,8 @@ typedef WSAPOLLFD seer_pollfd;
 /* Nonblocking connect() reports "in progress" as WSAEWOULDBLOCK, not EINPROGRESS. */
 #define SEER_EINTR WSAEINTR
 #define SEER_EINPROGRESS WSAEWOULDBLOCK
+#define SEER_ECONNREFUSED WSAECONNREFUSED
+#define SEER_ETIMEDOUT WSAETIMEDOUT
 
 static inline int seer_sock_errno(void)
 {
@@ -61,6 +63,8 @@ typedef struct pollfd seer_pollfd;
 
 #define SEER_EINTR EINTR
 #define SEER_EINPROGRESS EINPROGRESS
+#define SEER_ECONNREFUSED ECONNREFUSED
+#define SEER_ETIMEDOUT ETIMEDOUT
 
 static inline int seer_sock_errno(void)
 {

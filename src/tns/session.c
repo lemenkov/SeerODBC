@@ -293,6 +293,16 @@ static void log_refuse(SeerConn *conn, const uint8_t *body, size_t len)
 
 /* ------------------------------------------------------------- public API */
 
+/* The connection's error text, when there is one to give. */
+static void set_conn_error(SeerConn *conn, const char *m)
+{
+  char *d = m != NULL ? strdup(m) : NULL;
+  if (d == NULL)
+    return;
+  free(conn->last_error);
+  conn->last_error = d;
+}
+
 /* One address: the TNS handshake, then the login. *accepted says the
  * listener let the connection through (an ACCEPT came), after which another
  * address would give the same answer. */
@@ -326,17 +336,24 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
 
   for (;;) {
     if (conn->t == NULL) {
-      st = seer_transport_connect(cur_host, cur_port, 0, &conn->t);
-      if (st != SEER_OK)
+      char why[320];
+      st = seer_transport_connect_diag(cur_host, cur_port, 0, &conn->t, why, sizeof why);
+      if (st != SEER_OK) {
+        set_conn_error(conn, why[0] ? why : NULL);
         goto fail;
+      }
       if (params->expire_time > 0) /* minutes -> seconds; each socket, redirects too */
         seer_transport_set_keepalive(conn->t, params->expire_time * 60);
       /* TCPS: wrap the (possibly redirected) socket in TLS before any TNS
        * bytes flow. The SNI / verified hostname is the host we dialled. */
       if (params->use_tls) {
         st = seer_transport_start_tls(conn->t, cur_host, params->tls_ca, params->tls_verify);
-        if (st != SEER_OK)
+        if (st != SEER_OK) {
+          char m[320];
+          snprintf(m, sizeof m, "TLS handshake with %s:%u failed", cur_host, (unsigned)cur_port);
+          set_conn_error(conn, m);
           goto fail;
+        }
       }
     }
 
@@ -561,6 +578,13 @@ SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char 
 
   const char *list = params->host;
   SeerStatus st = SEER_EPARAM;
+  char tried[1024] = ""; /* "addr: why; " for each address passed over */
+  int ntried = 0;
+  char local[320];
+  if (err == NULL || errlen == 0) {
+    err = local;
+    errlen = sizeof local;
+  }
   for (const char *a = list;;) {
     const char *comma = strchr(a, ',');
     size_t n = comma ? (size_t)(comma - a) : strlen(a);
@@ -576,13 +600,34 @@ SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char 
     }
     one.host = host;
     bool accepted = false;
-    if (err != NULL && errlen > 0)
-      err[0] = '\0';
+    err[0] = '\0';
     st = connect_address(&one, out, err, errlen, &accepted);
-    if (st == SEER_OK || accepted || comma == NULL)
+    if (st == SEER_OK || accepted)
       return st;
-    seer_log(SEER_LOG_WARNING, "connect: %s:%u failed (%s), trying the next address", host,
-             (unsigned)one.port, err != NULL && err[0] ? err : seer_strerror(st));
+    /* This address's failure as the list names it: a transport error names
+     * its address already, a listener's ORA- refusal is prefixed with it. */
+    char this_one[400];
+    int w;
+    if (!err[0] || strncmp(err, "ORA-", 4) == 0)
+      w = snprintf(this_one, sizeof this_one, "%s:%u: %s", host, (unsigned)one.port,
+                   err[0] ? err : seer_strerror(st));
+    else
+      w = snprintf(this_one, sizeof this_one, "%s", err);
+    if (w < 0) /* cut short at the buffer is fine; an encoding error leaves it empty */
+      this_one[0] = '\0';
+    if (comma == NULL) {
+      /* Every address failed: name each, the last one's error last (#203). A
+       * single address keeps its own text (an ORA- code ODBC reads). */
+      if (ntried > 0)
+        snprintf(err, errlen, "no address in HOST answered: %s%s", tried, this_one);
+      else if (!err[0])
+        snprintf(err, errlen, "%s", this_one);
+      return st;
+    }
+    seer_log(SEER_LOG_WARNING, "connect: %s failed, trying the next address", this_one);
+    size_t tl = strlen(tried);
+    snprintf(tried + tl, sizeof tried - tl, "%s; ", this_one);
+    ntried++;
     a = comma + 1;
   }
 }

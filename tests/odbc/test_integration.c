@@ -2840,6 +2840,42 @@ static void check_connect_error(const char *drv, const char *host, const char *p
   pass(name);
 }
 
+/* An unreachable address says which and why (#203): a closed port is
+ * "connection to 127.0.0.1:1 refused" (a connection-class 08 state), not a bare
+ * "I/O error". */
+static void check_unreachable_error(const char *drv, const char *svc, const char *user,
+                                    const char *pwd)
+{
+  const char *name = "an unreachable server names the address and the cause";
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC d;
+  SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+  char cs[640];
+  snprintf(cs, sizeof cs, "DRIVER=%s;HOST=127.0.0.1;PORT=1;SERVICE=%s;UID=%s;PWD=%s;", drv, svc,
+           user, pwd);
+  SQLCHAR o[256], state[6] = "", msg[400] = "";
+  SQLSMALLINT ol, len = 0;
+  SQLINTEGER native = 0;
+  SQLRETURN rc =
+      SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
+  if (!SQL_SUCCEEDED(rc))
+    SQLGetDiagRec(SQL_HANDLE_DBC, d, 1, state, &native, msg, sizeof msg, &len);
+  else
+    SQLDisconnect(d);
+  SQLFreeHandle(SQL_HANDLE_DBC, d);
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  if (!SQL_SUCCEEDED(rc) && strncmp((char *)state, "08", 2) == 0 &&
+      strstr((char *)msg, "127.0.0.1:1 refused") != NULL)
+    pass(name);
+  else {
+    char m[600];
+    snprintf(m, sizeof m, "rc=%d state '%s' '%s'", (int)rc, (char *)state, (char *)msg);
+    fail(name, m);
+  }
+}
+
 /* Connect-time failover (#201): HOST lists addresses, tried in order. A
  * closed port ahead of the server is passed over; a wrong password, refused
  * after the listener accepted, is the answer (ORA-01017) and not passed over
@@ -3745,6 +3781,7 @@ int main(void)
   check_expire_time(drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
+  check_unreachable_error(drv, svc, user, pwd);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

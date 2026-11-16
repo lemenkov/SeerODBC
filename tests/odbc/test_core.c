@@ -2436,6 +2436,15 @@ static void check_connect_failover(void)
     if (!ok)
       snprintf(m, sizeof m, "HOST=%s: the query failed", hosts);
   }
+  /* Every address failing names each, with its cause (#203). */
+  p.host = "127.0.0.1:1,127.0.0.1:2";
+  c = NULL;
+  if (m[0] == '\0' &&
+      ((st = seer_connect_diag(&p, &c, why, sizeof why)) != SEER_EIO ||
+       strstr(why, "127.0.0.1:1 refused") == NULL || strstr(why, "127.0.0.1:2 refused") == NULL)) {
+    snprintf(m, sizeof m, "HOST=%s: status %d '%s'", p.host, (int)st, why);
+    seer_disconnect(c);
+  }
   p.host = "127.0.0.1:port";
   c = NULL;
   if (m[0] == '\0' && (st = seer_connect_diag(&p, &c, why, sizeof why)) != SEER_EPARAM) {
