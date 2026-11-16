@@ -122,9 +122,9 @@ for any function where only one width is exported.
   SEER_TEST_USER=pyo SEER_TEST_PASS=pyo123 meson test -C build 'odbc integration'
   ```
   `tests/odbc/run-matrix.sh` runs it across every reachable server version and
-  prints a support matrix — **10g, 11g, 21c and 23ai all pass** (10g at fv4, 23ai
-  natively at fv24; the earlier 10g-login and 23ai-framing gaps are closed). The
-  script also runs the core-API suite (`tests/odbc/test_core.c`) on every tier.
+  prints a support matrix — **all eight tiers, 8i to 26ai, pass** (8i in its own
+  OALL8 dialect, 9i at fv2, 10g at fv4, 23ai natively at fv24). The script also
+  runs the core-API suite (`tests/odbc/test_core.c`) on every tier.
   Both suites run one set of checks on every tier, 8i to 26ai, each skipped with
   its reason where the release lacks what it needs or SeerODBC doesn't reach it
   yet (`tests/odbc/gates.h`, keyed on the `SEER_TEST_RELEASE` the script passes
@@ -135,7 +135,8 @@ for any function where only one width is exported.
   `tests/odbc/matrix.env` (see `matrix.env.example`); `--only` / `--skip`
   select tiers, and an unreachable tier is reported and skipped. The run exits
   non-zero if any tier has a failing check.
-- **Live validation**: each feature is exercised against the full 10g/11g/18c/21c/23ai
-  matrix through unixODBC (isql + C clients), plus the 9i core-API tier. See
+- **Live validation**: each feature is exercised against the full
+  8i/9i/10g/11g/18c/21c/23ai/26ai matrix through unixODBC (isql + C clients) and
+  the core API. See
   `docs/ARCHITECTURE.md` "Protocol progress" and `docs/ROADMAP.md` for the
   per-feature inventory.

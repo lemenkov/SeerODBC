@@ -26,15 +26,26 @@ protocol variant with no feature behind it is not a gap.
       in one round trip as §19.13-19.14, and DML RETURNING through a block,
       #134; CLOB / BLOB columns in one TTI_LOBOPS READ and BFILE by FILE_OPEN,
       GETLEN, READ and FILE_CLOSE as §19.15 / §19.17, #135; a UROWID holding a
-      physical rowid rendered as that ROWID, #136).
+      physical rowid rendered as that ROWID, #136). Since then: REF CURSOR OUT
+      and `CURSOR()` columns (#166), LOB OUT and LOBs via RETURNING (#167, #214),
+      objects and collections read (#168) and bound (#172), REF binds IN (#241),
+      associative arrays (#253), AQ RAW / object payloads through DBMS_AQ, XA via
+      SYS.JAVA_XA (#171), query timeouts (#209). Both suites run on it. Open:
+      a REF OUT parameter (#241) and package-level types (#193).
 - [x] 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
       TTI_ALL8 we send 10g+), DML/DDL, binds, PL/SQL blocks (IN/OUT), CLOB/BLOB/BFILE
-      read, and national-charset binds — all fv-gated so 10g+ is untouched. See the
+      read, and national-charset binds — all fv-gated so 10g+ is untouched. Since
+      then: REF CURSOR OUT and `CURSOR()` columns (#166), LOB OUT and RETURNING
+      (#167), temporary-LOB binds past 32512 bytes (#169), objects, collections,
+      XMLType and REFs read (#168) and bound (#172, #241, REF OUT included), AQ,
+      XA (#171), query timeouts (#209); both suites run on it. Open: associative
+      arrays (#254, no reference client in 9.2's compact form) and package-level
+      types (#193). See the
       per-feature `[x]` entries below and seerdb's [`docs/PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) §19. Wired
-      into `run-matrix.sh` as a **local-only** 9i row (SID-addressed; the shared
-      core-API suite `tests/odbc/test_core.c` runs on it as on every tier, #148); it is deliberately *not*
+      into `run-matrix.sh` as a **local-only** 9i row (SID-addressed; both the
+      ODBC and the core-API suite run on it as on every tier, #148); it is deliberately *not*
       a meson `test()` so `meson test` / GitHub CI never reference 9i (9i and 10g
       stay local; 11g/21c/23ai are the intended public-CI tier). Override the
       endpoint with `SEER_9I_*`.
