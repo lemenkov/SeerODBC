@@ -123,7 +123,8 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     *(SQLUINTEGER *)ValuePtr = c->autocommit;
     return SQL_SUCCESS;
   case SQL_ATTR_CONNECTION_DEAD:
-    *(SQLUINTEGER *)ValuePtr = c->connected ? SQL_CD_FALSE : SQL_CD_TRUE;
+    *(SQLUINTEGER *)ValuePtr =
+        c->connected && !seer_conn_lost(c->conn) ? SQL_CD_FALSE : SQL_CD_TRUE;
     return SQL_SUCCESS;
   default:
     *(SQLINTEGER *)ValuePtr = 0;
@@ -175,6 +176,9 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_CONCURRENCY: /* updatable cursor opt-in */
     s->concurrency = (SQLULEN)(uintptr_t)ValuePtr;
     return SQL_SUCCESS;
+  case SQL_ATTR_QUERY_TIMEOUT: /* seconds a call may wait for the server */
+    s->query_timeout = (SQLULEN)(uintptr_t)ValuePtr;
+    return SQL_SUCCESS;
   default:
     /* Cursor type, etc.: accept as no-ops. */
     return SQL_SUCCESS;
@@ -221,6 +225,9 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
   case SQL_ATTR_CONCURRENCY:
     *(SQLULEN *)ValuePtr = s->concurrency ? s->concurrency : SQL_CONCUR_READ_ONLY;
+    return SQL_SUCCESS;
+  case SQL_ATTR_QUERY_TIMEOUT:
+    *(SQLULEN *)ValuePtr = s->query_timeout;
     return SQL_SUCCESS;
   case SQL_ATTR_PARAMSET_SIZE:
     *(SQLULEN *)ValuePtr = s->paramset_size ? s->paramset_size : 1;

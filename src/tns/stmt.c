@@ -8076,8 +8076,10 @@ retry_exec:
   if (oer.err_code != 0 && oer.err_code != 1403 && !batch_summary) {
     /* A reused cached cursor can be invalidated server-side (e.g. DDL
      * recreated the referenced object -> ORA-00942). Drop the stale cursor
-     * and its describe and retry once with a full parse before surfacing. */
-    if (was_reuse) {
+     * and its describe and retry once with a full parse before surfacing -
+     * but not a call stopped by a cancel or the call timeout (ORA-01013),
+     * which the retry would run again (#209; the wider question is #210). */
+    if (was_reuse && oer.err_code != 1013) {
       was_reuse = false;
       queue_cursor_close(stmt->conn, stmt->reuse_cursor); /* the stale cursor */
       stmt->reuse_cursor = 0;

@@ -134,6 +134,12 @@ static const uint8_t TYPE_OVERRIDES[] = {
  * the last is smaller and flags 0x0000. The server reassembles them. */
 SeerStatus seer_ttc_send(SeerConn *c, const uint8_t *msg, size_t len)
 {
+  if (c->t == NULL) { /* closed: a call timeout the server never answered */
+    free(c->last_error);
+    c->last_error = strdup("the connection is closed (a call timed out and the server did not "
+                           "answer the interrupt)");
+    return SEER_EIO;
+  }
   /* Body bytes per non-final fragment: SDU minus the 8-byte header and 2-byte
    * data flags. With no SDU yet (pre-accept) send the whole message at once.
    * With ANO active each fragment's body is the (larger) wrapped ciphertext,
@@ -261,6 +267,89 @@ static bool more_fragments(SeerConn *c, size_t total, const SeerWriter *acc)
   return true; /* data (or an error the next read reports) */
 }
 
+void seer_set_call_timeout(SeerConn *c, int ms)
+{
+  if (c == NULL)
+    return;
+  c->call_timeout_ms = ms > 0 ? ms : 0;
+  c->call_timed_out = false;
+}
+
+int seer_call_timed_out(const SeerConn *c)
+{
+  return c != NULL && c->call_timed_out;
+}
+
+int seer_conn_lost(const SeerConn *c)
+{
+  return c == NULL || c->t == NULL;
+}
+
+/* The call timeout (#209): wait for the reply to start; past the limit, send
+ * the interrupt (as seer_cancel) and wait as long again, at least 5 s, for the
+ * server's answer to it - its break and ORA-01013, read on as any reply. A
+ * server can leave the interrupt unanswered: measured, 21c in a row-lock wait
+ * and 10g / 11g in a PL/SQL loop (seerdb's break the same). The call then
+ * fails and the connection is closed, its state unknown: left open, the next
+ * call read the late answer as its own, or waited forever. */
+static SeerStatus await_reply(SeerConn *c, bool *interrupted)
+{
+  *interrupted = false;
+  if (c->call_timeout_ms <= 0 || c->t == NULL)
+    return SEER_OK;
+  int r = seer_transport_wait_readable(c->t, c->call_timeout_ms);
+  if (r != 0)
+    return SEER_OK; /* readable, or a socket error the read reports */
+  seer_log(SEER_LOG_WARNING, "ttc: no reply within the call timeout (%d ms): interrupting",
+           c->call_timeout_ms);
+  c->call_timed_out = true;
+  *interrupted = true;
+  const uint8_t interrupt[3] = {0x01, 0x00, 0x03};
+  if (seer_packet_send(c->t, TNS_PT_MARKER, interrupt, sizeof interrupt) == SEER_OK &&
+      seer_transport_wait_readable(c->t, c->call_timeout_ms < 5000 ? 5000 : c->call_timeout_ms) !=
+          0)
+    return SEER_OK;
+  free(c->last_error);
+  c->last_error = strdup("call timeout: the server did not answer the interrupt, so the "
+                         "connection was closed");
+  seer_log(SEER_LOG_ERROR, "ttc: %s", c->last_error ? c->last_error : "interrupt unanswered");
+  seer_transport_close(c->t);
+  c->t = NULL;
+  return SEER_EIO;
+}
+
+static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen);
+
+/* A call that finished, its reply normal, after the call timeout's interrupt
+ * went out: the interrupt found nothing running. The server answers it on its
+ * own straight after - a break, then ORA-01013 once reset (11g, live) - and
+ * left unread that was the NEXT call's answer: an unrelated statement failed
+ * with ORA-01013 (seerdb PROTOCOL.md §25). Read and drop it here; the call
+ * keeps its result. With no answer in 5 s the connection's state is unknown,
+ * and it is closed. */
+static void absorb_late_interrupt(SeerConn *c)
+{
+  if (seer_transport_wait_readable(c->t, 5000) > 0) {
+    int saved = c->call_timeout_ms;
+    c->call_timeout_ms = 0;
+    uint8_t *o = NULL;
+    size_t ol = 0;
+    SeerStatus st = recv_message(c, &o, &ol);
+    c->call_timeout_ms = saved;
+    free(o);
+    seer_log(SEER_LOG_DEBUG,
+             "ttc: the call finished before its interrupt; drained the "
+             "interrupt's answer (%zu bytes)",
+             ol);
+    if (st == SEER_OK)
+      return;
+  }
+  seer_log(SEER_LOG_ERROR, "ttc: the server did not answer a late interrupt; closing the "
+                           "connection");
+  seer_transport_close(c->t);
+  c->t = NULL;
+}
+
 static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
 {
   *out = NULL;
@@ -273,6 +362,13 @@ static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
   bool sent_reset = false; /* one client reset per break episode (§1.4) */
 
   c->in_call = true; /* blocked waiting for the server: cancellable */
+  bool interrupted = false;
+  SeerStatus wst = await_reply(c, &interrupted);
+  if (wst != SEER_OK) {
+    c->in_call = false;
+    seer_writer_free(&acc);
+    return wst;
+  }
   for (;;) {
     uint8_t type = 0;
     uint8_t *body = NULL;
@@ -343,6 +439,8 @@ static SeerStatus recv_message(SeerConn *c, uint8_t **out, size_t *outlen)
     seer_writer_free(&acc);
     return SEER_ENOMEM;
   }
+  if (interrupted && !sent_reset)
+    absorb_late_interrupt(c);
   *out = acc.buf;
   *outlen = acc.len;
   return SEER_OK;

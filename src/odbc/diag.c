@@ -59,6 +59,8 @@ void seer_odbc_diag_free(SQLHANDLE handle)
 static const char *ora_sqlstate(SQLINTEGER code)
 {
   switch (code) {
+  case 1013: /* user requested cancel of current operation */
+    return "HY008";
   case 1:    /* unique constraint violated */
   case 1400: /* cannot insert NULL */
   case 1407: /* cannot update to NULL */
@@ -150,16 +152,30 @@ SQLRETURN seer_odbc_diag(SQLHANDLE handle, const char *state, SQLINTEGER native,
   return ret;
 }
 
+void seer_odbc_arm_timeout(OdbcStmt *s)
+{
+  if (s == NULL || s->dbc == NULL || s->dbc->conn == NULL)
+    return;
+  SQLULEN sec = s->query_timeout;
+  seer_set_call_timeout(s->dbc->conn, sec > 2000000 ? 2000000000 : (int)sec * 1000);
+}
+
 SQLRETURN seer_odbc_exec_error(OdbcStmt *s, SeerStatus st)
 {
   SeerConn *c = s->dbc != NULL ? s->dbc->conn : NULL;
-  /* The server's text belongs to a database error; any other failure is
-   * described by its own status, not by whatever ORA text came last. */
-  const char *ora = st == SEER_EDB ? seer_last_error(c) : NULL;
+  /* The server's text belongs to a database error, and the call timeout's
+   * own text to the connection it closed; any other failure is described by
+   * its own status, not by whatever ORA text came last. */
+  const char *ora =
+      st == SEER_EDB || (st == SEER_EIO && seer_call_timed_out(c)) ? seer_last_error(c) : NULL;
   /* The native error is the ORA number, as SQLGetDiagRec callers expect. */
   SQLINTEGER native = (ora != NULL && strncmp(ora, "ORA-", 4) == 0) ? (SQLINTEGER)atoi(ora + 4) : 0;
-  SQLRETURN r =
-      seer_odbc_diag(s, seer_odbc_sqlstate(st), native, ora ? ora : seer_strerror(st), SQL_ERROR);
+  /* Stopped by SQL_ATTR_QUERY_TIMEOUT: HYT00, the timeout's state, where
+   * SQLCancel's ORA-01013 is HY008 (#209). */
+  const char *state = (st == SEER_EDB || st == SEER_EIO) && seer_call_timed_out(c)
+                          ? "HYT00"
+                          : seer_odbc_sqlstate(st);
+  SQLRETURN r = seer_odbc_diag(s, state, native, ora ? ora : seer_strerror(st), SQL_ERROR);
   OdbcHeader *h = (OdbcHeader *)s;
   if (h->diag.count > 0)
     h->diag.recs[h->diag.count - 1].error_offset = (SQLINTEGER)seer_last_error_offset(c);

@@ -22,6 +22,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -2954,6 +2955,79 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+/* SQL_ATTR_QUERY_TIMEOUT (#209): a 1 s limit stops an 8 s PL/SQL loop with
+ * HYT00 within the timeout and the 5 s the driver waits for the server to
+ * answer its interrupt (the loop outlasts both). Then the connection either works (the server
+ * answered: 21c and later) or reports itself dead and fails fast (it didn't:
+ * 10g / 11g here) - never a call that hangs. Its own connection, as the
+ * timeout may close it. */
+static void check_query_timeout(const char *drv, const char *host, const char *port,
+                                const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "SQL_ATTR_QUERY_TIMEOUT stops a long call with HYT00";
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC d;
+  SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+  char cs[640], m[600] = "";
+  snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;", drv, host,
+           port ? port : "1521", svc, user, pwd);
+  SQLCHAR o[256];
+  SQLSMALLINT ol;
+  if (!SQL_SUCCEEDED(SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol,
+                                      SQL_DRIVER_NOPROMPT))) {
+    skip(name, "connect failed");
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+    SQLFreeHandle(SQL_HANDLE_ENV, e);
+    return;
+  }
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, d, &st);
+  SQLULEN got = 0;
+  SQLSetStmtAttr(st, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(uintptr_t)1, 0);
+  SQLGetStmtAttr(st, SQL_ATTR_QUERY_TIMEOUT, &got, 0, NULL);
+  time_t t0 = time(NULL);
+  SQLRETURN rc = SQLExecDirect(
+      st,
+      (SQLCHAR
+           *)"DECLARE t DATE := SYSDATE + 8/86400; BEGIN WHILE SYSDATE < t LOOP NULL; END LOOP; "
+             "END;",
+      SQL_NTS);
+  long took = (long)(time(NULL) - t0);
+  SQLCHAR state[6] = "", msg[300] = "";
+  SQLINTEGER native = 0;
+  SQLSMALLINT len = 0;
+  if (!SQL_SUCCEEDED(rc))
+    SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, msg, sizeof msg, &len);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (got != 1)
+    snprintf(m, sizeof m, "SQLGetStmtAttr returned %lu, want 1", (unsigned long)got);
+  else if (SQL_SUCCEEDED(rc) || strcmp((char *)state, "HYT00") != 0 || took > 9)
+    snprintf(m, sizeof m, "rc=%d state '%s' after %ld s: %s", (int)rc, (char *)state, took,
+             (char *)msg);
+  if (m[0] == '\0') {
+    /* Usable, or dead and saying so: the next call doesn't hang. */
+    SQLUINTEGER dead = SQL_CD_FALSE;
+    SQLGetConnectAttr(d, SQL_ATTR_CONNECTION_DEAD, &dead, 0, NULL);
+    char one[16] = "", err[256] = "";
+    t0 = time(NULL);
+    SQLRETURN r2 = exec_scalar(d, "SELECT 1 FROM dual", one, sizeof one, err, sizeof err);
+    took = (long)(time(NULL) - t0);
+    if (dead == SQL_CD_FALSE && !(SQL_SUCCEEDED(r2) && strcmp(one, "1") == 0))
+      snprintf(m, sizeof m, "connection alive but the next query failed: %s", err);
+    else if (dead == SQL_CD_TRUE && (SQL_SUCCEEDED(r2) || took > 2))
+      snprintf(m, sizeof m, "connection dead but the next query rc=%d after %ld s", (int)r2, took);
+  }
+  SQLDisconnect(d);
+  SQLFreeHandle(SQL_HANDLE_DBC, d);
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Connect-time failover (#201): HOST lists addresses, tried in order. A
  * closed port ahead of the server is passed over; a wrong password, refused
  * after the listener accepted, is the answer (ORA-01017) and not passed over
@@ -3861,6 +3935,7 @@ int main(void)
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
+  check_query_timeout(drv, host, port, svc, user, pwd);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

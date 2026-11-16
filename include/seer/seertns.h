@@ -274,6 +274,23 @@ SeerStatus seer_aq_deq_json(SeerConn *conn, const char *queue_name, uint32_t wai
  * is in flight. The blocked call returns the server's ORA-01013 (cancelled). */
 void seer_cancel(SeerConn *conn);
 
+/* Bound each round trip to the server to `ms` milliseconds (0, the default:
+ * no bound), as python-oracledb's call_timeout. A reply that hasn't started
+ * within it gets the interrupt seer_cancel sends: the server stops the call,
+ * which fails with its ORA-01013, and the connection stays usable. A server
+ * that doesn't answer the interrupt either (seen in lock waits and PL/SQL
+ * loops) fails the call as SEER_EIO and the connection is closed
+ * (seer_conn_lost). Setting it clears seer_call_timed_out. */
+void seer_set_call_timeout(SeerConn *conn, int ms);
+
+/* Whether a call since the last seer_set_call_timeout was stopped by the
+ * timeout (its ORA-01013 is then the timeout's, not a seer_cancel's). */
+int seer_call_timed_out(const SeerConn *conn);
+
+/* Whether the connection to the server is gone: closed by a call timeout the
+ * server never answered (#209). Every later call fails with SEER_EIO. */
+int seer_conn_lost(const SeerConn *conn);
+
 /* Statement lifecycle. A literal SELECT (no bind variables) is supported:
  * prepare the text, execute it, then fetch rows one at a time. */
 SeerStatus seer_stmt_prepare(SeerConn *conn, const char *sql, SeerStmt **out);

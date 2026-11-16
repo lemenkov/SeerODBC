@@ -161,11 +161,12 @@ typedef struct {
   SQLUSMALLINT *row_status; /* SQL_ATTR_ROW_STATUS_PTR */
   long rowset_start;        /* 0-based first row of the current rowset, -1 = none */
   /* Updatable cursor (positioned update/delete via SQLSetPos). */
-  SQLULEN concurrency; /* SQL_ATTR_CONCURRENCY, default READ_ONLY */
-  int updatable;       /* this result set supports positioned DML */
-  char *base_table;    /* table for the synthesized UPDATE/DELETE */
-  int rowid_col;       /* core column index of the hidden ROWID, -1 = none */
-  char **rowids;       /* per-row ROWID strings, [num_rowids] */
+  SQLULEN concurrency;   /* SQL_ATTR_CONCURRENCY, default READ_ONLY */
+  SQLULEN query_timeout; /* SQL_ATTR_QUERY_TIMEOUT, seconds; 0 = none (#209) */
+  int updatable;         /* this result set supports positioned DML */
+  char *base_table;      /* table for the synthesized UPDATE/DELETE */
+  int rowid_col;         /* core column index of the hidden ROWID, -1 = none */
+  char **rowids;         /* per-row ROWID strings, [num_rowids] */
   size_t num_rowids;
 } OdbcStmt;
 
@@ -195,6 +196,9 @@ void seer_odbc_diag_free(SQLHANDLE handle);
 
 /* Map a core SeerStatus to an ODBC SQLSTATE string. */
 const char *seer_odbc_sqlstate(SeerStatus st);
+/* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call
+ * to the server (#209). */
+void seer_odbc_arm_timeout(OdbcStmt *s);
 
 /* Run a driver-generated query with positional text binds and ready the
  * statement for SQLFetch/SQLGetData. Defined in exec.c, used by catalog.c. */
