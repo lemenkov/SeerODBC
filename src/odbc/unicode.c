@@ -482,7 +482,10 @@ SQLRETURN SQL_API SQLGetDiagFieldW(SQLSMALLINT htype, SQLHANDLE handle, SQLSMALL
                                    SQLSMALLINT field, SQLPOINTER val, SQLSMALLINT cap,
                                    SQLSMALLINT *len)
 {
-  if (field != SQL_DIAG_SQLSTATE && field != SQL_DIAG_MESSAGE_TEXT)
+  if (field != SQL_DIAG_SQLSTATE && field != SQL_DIAG_MESSAGE_TEXT &&
+      field != SQL_DIAG_CLASS_ORIGIN && field != SQL_DIAG_SUBCLASS_ORIGIN &&
+      field != SQL_DIAG_SERVER_NAME && field != SQL_DIAG_CONNECTION_NAME &&
+      field != SQL_DIAG_DYNAMIC_FUNCTION) /* the string fields (#257) */
     return SQLGetDiagField(htype, handle, rec, field, val, cap, len);
   SQLCHAR tmp[1024] = {0};
   SQLSMALLINT alen = 0;

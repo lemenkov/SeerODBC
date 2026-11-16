@@ -2250,6 +2250,57 @@ static void check_ref_params(SQLHDBC dbc)
   exec_do(dbc, "DROP TYPE seer_orf", err, sizeof err);
 }
 
+/* SQLGetDiagField's other fields (#257): after an UPDATE of 3 rows the
+ * statement's ROW_COUNT is 3 and its DYNAMIC_FUNCTION "UPDATE WHERE" (82); a
+ * failed SELECT's record (42S22) has class origin ISO 9075, subclass origin
+ * ODBC 3.0 and no column; a message cut short is SQL_SUCCESS_WITH_INFO. */
+static void check_diag_fields(SQLHDBC dbc)
+{
+  const char *name = "SQLGetDiagField: row count, dynamic function, origins, truncation";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_diagf", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_diagf (n NUMBER)", err, sizeof err);
+  exec_do(dbc, "INSERT INTO seer_diagf SELECT rownum FROM all_objects WHERE rownum <= 3", err,
+          sizeof err);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"UPDATE seer_diagf SET n = n + 1", SQL_NTS);
+  SQLLEN rows = -1;
+  SQLINTEGER code = -1;
+  char fn[32] = "";
+  SQLSMALLINT l = 0;
+  SQLGetDiagField(SQL_HANDLE_STMT, st, 0, SQL_DIAG_ROW_COUNT, &rows, 0, NULL);
+  SQLGetDiagField(SQL_HANDLE_STMT, st, 0, SQL_DIAG_DYNAMIC_FUNCTION, fn, sizeof fn, &l);
+  SQLGetDiagField(SQL_HANDLE_STMT, st, 0, SQL_DIAG_DYNAMIC_FUNCTION_CODE, &code, 0, NULL);
+  if (!SQL_SUCCEEDED(rc) || rows != 3 || strcmp(fn, "UPDATE WHERE") != 0 ||
+      code != SQL_DIAG_UPDATE_WHERE)
+    snprintf(m, sizeof m, "UPDATE: rc=%d row count %ld, function '%s' code %d", (int)rc, (long)rows,
+             fn, (int)code);
+  SQLFreeStmt(st, SQL_CLOSE);
+  if (m[0] == '\0') {
+    rc = SQLExecDirect(st, (SQLCHAR *)"SELECT nonexistent FROM dual", SQL_NTS);
+    char cls[16] = "", sub[16] = "", small[8] = "";
+    SQLINTEGER col = 0;
+    SQLSMALLINT ml = 0;
+    SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_CLASS_ORIGIN, cls, sizeof cls, &l);
+    SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_SUBCLASS_ORIGIN, sub, sizeof sub, &l);
+    SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_COLUMN_NUMBER, &col, 0, NULL);
+    SQLRETURN mr =
+        SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_MESSAGE_TEXT, small, sizeof small, &ml);
+    if (rc != SQL_ERROR || strcmp(cls, "ISO 9075") != 0 || strcmp(sub, "ODBC 3.0") != 0 ||
+        col != SQL_NO_COLUMN_NUMBER || mr != SQL_SUCCESS_WITH_INFO || ml <= 7)
+      snprintf(m, sizeof m,
+               "error record: rc=%d class '%s' subclass '%s' column %d, cut message rc=%d len %d",
+               (int)rc, cls, sub, (int)col, (int)mr, (int)ml);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_diagf", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Column bindings live until unbound (#244): bound before the first
  * execute, they fill on the fetch; the same statement executed again with a
  * new parameter fills the same buffer; after SQL_UNBIND a fetch leaves it be. */
@@ -4654,6 +4705,7 @@ int main(void)
     check_maxlength_noscan(dbc);
     check_attr_getters_rowop(dbc);
     check_ref_params(dbc);
+    check_diag_fields(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

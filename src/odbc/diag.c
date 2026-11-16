@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strncasecmp, as exec.c */
 
 #include "odbc_internal.h"
 
@@ -234,6 +235,117 @@ SQLRETURN SQL_API SQLGetDiagRec(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMA
   return SQL_SUCCESS;
 }
 
+/* A string diag field into the application's buffer: SQL_SUCCESS_WITH_INFO
+ * when cut short, the full length reported either way (#257). */
+static SQLRETURN diag_string(const char *v, SQLPOINTER buf, SQLSMALLINT cap, SQLSMALLINT *len)
+{
+  size_t n = strlen(v);
+  if (len != NULL)
+    *len = (SQLSMALLINT)n;
+  if (buf == NULL || cap <= 0)
+    return SQL_SUCCESS;
+  size_t k = n < (size_t)cap - 1 ? n : (size_t)cap - 1;
+  memcpy(buf, v, k);
+  ((char *)buf)[k] = '\0';
+  return k < n ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
+}
+
+/* Whether an SQLSTATE's subclass is ODBC's own rather than ISO SQL's / X/Open
+ * CLI's (SQL_DIAG_SUBCLASS_ORIGIN, #257). */
+static int odbc_subclass(const char *st)
+{
+  static const char *const odbc[] = {"01S00", "01S01", "01S02", "01S06", "01S07", "07S01", "08S01",
+                                     "21S01", "21S02", "25S01", "25S02", "25S03", "42S01", "42S02",
+                                     "42S11", "42S12", "42S21", "42S22", "HY095", "HY097", "HY098",
+                                     "HY099", "HY100", "HY101", "HY105", "HY107", "HY109", "HY110",
+                                     "HY111", "HYT00", "HYT01"};
+  if (strncmp(st, "IM", 2) == 0)
+    return 1;
+  for (size_t i = 0; i < sizeof odbc / sizeof odbc[0]; i++)
+    if (strcmp(st, odbc[i]) == 0)
+      return 1;
+  return 0;
+}
+
+/* The executed statement's kind by ODBC's names (SQL_DIAG_DYNAMIC_FUNCTION and
+ * its code, #257), from its first words; "" / unknown for the rest. */
+static void dynamic_function(const char *sql, const char **name, SQLINTEGER *code)
+{
+  *name = "";
+  *code = SQL_DIAG_UNKNOWN_STATEMENT;
+  if (sql == NULL)
+    return;
+  const char *w[6];
+  size_t wl[6];
+  int nw = 0;
+  for (const char *p = sql; *p != '\0' && nw < 6;) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '(')
+      p++;
+    const char *b = p;
+    while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' && *p != '(')
+      p++;
+    if (p > b) {
+      w[nw] = b;
+      wl[nw++] = (size_t)(p - b);
+    }
+  }
+#define IS(i, kw) (nw > (i) && wl[i] == sizeof(kw) - 1 && strncasecmp(w[i], kw, wl[i]) == 0)
+  if (nw == 0)
+    return;
+  if (IS(0, "INSERT")) {
+    *name = "INSERT", *code = SQL_DIAG_INSERT;
+  } else if (IS(0, "UPDATE")) {
+    *name = "UPDATE WHERE", *code = SQL_DIAG_UPDATE_WHERE;
+  } else if (IS(0, "DELETE")) {
+    *name = "DELETE WHERE", *code = SQL_DIAG_DELETE_WHERE;
+  } else if (IS(0, "SELECT") || IS(0, "WITH")) {
+    *name = "SELECT CURSOR", *code = SQL_DIAG_SELECT_CURSOR;
+  } else if (IS(0, "CALL") || IS(0, "BEGIN") || IS(0, "DECLARE")) {
+    *name = "CALL", *code = SQL_DIAG_CALL; /* {call} runs as a block */
+  } else if (IS(0, "GRANT")) {
+    *name = "GRANT", *code = SQL_DIAG_GRANT;
+  } else if (IS(0, "REVOKE")) {
+    *name = "REVOKE", *code = SQL_DIAG_REVOKE;
+  } else if (IS(0, "CREATE") || IS(0, "DROP") || IS(0, "ALTER")) {
+    int create = IS(0, "CREATE"), drop = IS(0, "DROP");
+    for (int i = 1; i < nw; i++) { /* past OR REPLACE, GLOBAL TEMPORARY, UNIQUE, ... */
+      if (IS(i, "TABLE")) {
+        *name = create ? "CREATE TABLE" : drop ? "DROP TABLE" : "ALTER TABLE";
+        *code = create ? SQL_DIAG_CREATE_TABLE : drop ? SQL_DIAG_DROP_TABLE : SQL_DIAG_ALTER_TABLE;
+        break;
+      }
+      if (IS(i, "VIEW") && (create || drop)) {
+        *name = create ? "CREATE VIEW" : "DROP VIEW";
+        *code = create ? SQL_DIAG_CREATE_VIEW : SQL_DIAG_DROP_VIEW;
+        break;
+      }
+      if (IS(i, "INDEX") && (create || drop)) {
+        *name = create ? "CREATE INDEX" : "DROP INDEX";
+        *code = create ? SQL_DIAG_CREATE_INDEX : SQL_DIAG_DROP_INDEX;
+        break;
+      }
+    }
+  }
+#undef IS
+}
+
+/* The connection a handle belongs to, NULL for an environment. */
+static OdbcDbc *handle_dbc(OdbcHeader *h)
+{
+  switch (h->type) {
+  case SQL_HANDLE_DBC:
+    return (OdbcDbc *)h;
+  case SQL_HANDLE_STMT:
+    return ((OdbcStmt *)h)->dbc;
+  case SQL_HANDLE_DESC: {
+    OdbcStmt *s = (OdbcStmt *)((OdbcDesc *)h)->stmt;
+    return s != NULL ? s->dbc : NULL;
+  }
+  default:
+    return NULL;
+  }
+}
+
 SQLRETURN SQL_API SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLINT RecNumber,
                                   SQLSMALLINT DiagIdentifier, SQLPOINTER DiagInfoPtr,
                                   SQLSMALLINT BufferLength, SQLSMALLINT *StringLengthPtr)
@@ -248,6 +360,28 @@ SQLRETURN SQL_API SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLS
     if (DiagInfoPtr != NULL)
       *(SQLINTEGER *)DiagInfoPtr = h->diag.count;
     return SQL_SUCCESS;
+  }
+  /* The statement's header fields (#257): the rows its DML affected, as
+   * SQLRowCount, and the kind of statement it ran. */
+  if (DiagIdentifier == SQL_DIAG_ROW_COUNT || DiagIdentifier == SQL_DIAG_DYNAMIC_FUNCTION ||
+      DiagIdentifier == SQL_DIAG_DYNAMIC_FUNCTION_CODE) {
+    if (h->type != SQL_HANDLE_STMT)
+      return SQL_ERROR; /* a statement's field only */
+    OdbcStmt *s = (OdbcStmt *)h;
+    if (DiagIdentifier == SQL_DIAG_ROW_COUNT) {
+      if (DiagInfoPtr != NULL)
+        *(SQLLEN *)DiagInfoPtr = s->core ? (SQLLEN)seer_stmt_row_count(s->core) : 0;
+      return SQL_SUCCESS;
+    }
+    const char *fn;
+    SQLINTEGER code;
+    dynamic_function(s->core != NULL ? s->sql : NULL, &fn, &code);
+    if (DiagIdentifier == SQL_DIAG_DYNAMIC_FUNCTION_CODE) {
+      if (DiagInfoPtr != NULL)
+        *(SQLINTEGER *)DiagInfoPtr = code;
+      return SQL_SUCCESS;
+    }
+    return diag_string(fn, DiagInfoPtr, BufferLength, StringLengthPtr);
   }
 
   if (RecNumber < 1 || RecNumber > h->diag.count)
@@ -266,10 +400,25 @@ SQLRETURN SQL_API SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLS
       *(SQLINTEGER *)DiagInfoPtr = rec->native;
     return SQL_SUCCESS;
   case SQL_DIAG_MESSAGE_TEXT:
-    if (DiagInfoPtr != NULL && BufferLength > 0)
-      snprintf(DiagInfoPtr, (size_t)BufferLength, "%s", rec->message);
-    if (StringLengthPtr != NULL)
-      *StringLengthPtr = (SQLSMALLINT)strlen(rec->message);
+    return diag_string(rec->message, DiagInfoPtr, BufferLength, StringLengthPtr);
+  /* The record's origins, source and column (#257). */
+  case SQL_DIAG_CLASS_ORIGIN:
+    return diag_string(strncmp(rec->state, "IM", 2) == 0 ? "ODBC 3.0" : "ISO 9075", DiagInfoPtr,
+                       BufferLength, StringLengthPtr);
+  case SQL_DIAG_SUBCLASS_ORIGIN:
+    return diag_string(odbc_subclass(rec->state) ? "ODBC 3.0" : "ISO 9075", DiagInfoPtr,
+                       BufferLength, StringLengthPtr);
+  case SQL_DIAG_SERVER_NAME: { /* as SQL_DATA_SOURCE_NAME */
+    OdbcDbc *c = handle_dbc(h);
+    return diag_string(c != NULL && c->info_dsn != NULL ? c->info_dsn : "", DiagInfoPtr,
+                       BufferLength, StringLengthPtr);
+  }
+  case SQL_DIAG_CONNECTION_NAME:
+    return diag_string("", DiagInfoPtr, BufferLength, StringLengthPtr);
+  case SQL_DIAG_COLUMN_NUMBER:
+    if (DiagInfoPtr != NULL)
+      *(SQLINTEGER *)DiagInfoPtr =
+          rec->row_number == SQL_NO_ROW_NUMBER ? SQL_NO_COLUMN_NUMBER : SQL_COLUMN_NUMBER_UNKNOWN;
     return SQL_SUCCESS;
   case SQL_DIAG_ROW_NUMBER:
     if (DiagInfoPtr != NULL)
