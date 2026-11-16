@@ -293,23 +293,13 @@ static void log_refuse(SeerConn *conn, const uint8_t *body, size_t len)
 
 /* ------------------------------------------------------------- public API */
 
-SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char *err, size_t errlen)
+/* One address: the TNS handshake, then the login. *accepted says the
+ * listener let the connection through (an ACCEPT came), after which another
+ * address would give the same answer. */
+static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, char *err,
+                                  size_t errlen, bool *accepted)
 {
-  if (err != NULL && errlen > 0)
-    err[0] = '\0';
-  if (params == NULL || out == NULL || params->host == NULL)
-    return SEER_EPARAM;
-  *out = NULL;
-
-  /* Sharding keys are not on the thin wire (§37): shard routing is an OCI-only
-   * capability below the TTC/TNS protocol, so a non-empty key can't be honoured.
-   * Reject up front (accepted for API parity) rather than connect and mislead. */
-  if ((params->shardingkey && params->shardingkey[0]) ||
-      (params->supershardingkey && params->supershardingkey[0])) {
-    seer_log(SEER_LOG_WARNING, "sharding keys are not supported in thin mode (§37): shard "
-                               "routing is available only through the OCI-based client");
-    return SEER_ENOTIMPL;
-  }
+  *accepted = false;
 
   SeerWriter body;
   SeerStatus st = build_connect_body(params, &body);
@@ -402,6 +392,7 @@ SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char 
       seer_log(SEER_LOG_INFO, "TNS: ACCEPT from %s:%u (version=%u, sdu=%u, large=%d, eor=%d)",
                cur_host, cur_port, conn->version, conn->sdu,
                conn->version >= TNS_VERSION_MIN_LARGE_SDU, conn->supports_eor);
+      *accepted = true;
       break; /* TNS session established; proceed to TTC negotiation */
     }
 
@@ -494,6 +485,106 @@ fail:
     snprintf(err, errlen, "%s", conn->last_error);
   seer_disconnect(conn);
   return st;
+}
+
+/* One address of a HOST list into host / *port: `host`, `host:port` or
+ * `[ipv6]:port`; a bare IPv6 literal (two colons or more) is a host. Without a
+ * port of its own the address keeps *port. */
+static SeerStatus parse_address(const char *a, size_t n, char *host, size_t hostcap, uint16_t *port)
+{
+  while (n > 0 && (*a == ' ' || *a == '\t'))
+    a++, n--;
+  while (n > 0 && (a[n - 1] == ' ' || a[n - 1] == '\t'))
+    n--;
+  const char *h = a, *colon = NULL;
+  size_t hn = n;
+  if (n > 0 && a[0] == '[') {
+    const char *close = memchr(a, ']', n);
+    if (close == NULL)
+      return SEER_EPARAM;
+    h = a + 1;
+    hn = (size_t)(close - h);
+    size_t rest = n - (size_t)(close + 1 - a);
+    if (rest > 0) {
+      if (close[1] != ':')
+        return SEER_EPARAM;
+      colon = close + 1;
+    }
+  } else {
+    const char *c1 = memchr(a, ':', n);
+    if (c1 != NULL && memchr(c1 + 1, ':', n - (size_t)(c1 + 1 - a)) == NULL) {
+      colon = c1;
+      hn = (size_t)(c1 - a);
+    }
+  }
+  if (hn == 0 || hn >= hostcap)
+    return SEER_EPARAM;
+  memcpy(host, h, hn);
+  host[hn] = '\0';
+  if (colon != NULL) {
+    const char *d = colon + 1, *end = a + n;
+    unsigned long v = 0;
+    if (d == end)
+      return SEER_EPARAM;
+    for (; d < end; d++) {
+      if (*d < '0' || *d > '9' || (v = v * 10 + (unsigned long)(*d - '0')) > 65535)
+        return SEER_EPARAM;
+    }
+    if (v == 0)
+      return SEER_EPARAM;
+    *port = (uint16_t)v;
+  }
+  return SEER_OK;
+}
+
+/* Connect-time failover (#201): HOST may list addresses, comma-separated,
+ * tried in order. A failure before the listener accepts - no TCP connect, no
+ * TLS, a REFUSE such as ORA-12514 - moves on to the next; one after it (a
+ * wrong password, an error at login) is the answer, as another address would
+ * give the same. With every address failing, the last one's error is. */
+SeerStatus seer_connect_diag(const SeerConnParams *params, SeerConn **out, char *err, size_t errlen)
+{
+  if (err != NULL && errlen > 0)
+    err[0] = '\0';
+  if (params == NULL || out == NULL || params->host == NULL)
+    return SEER_EPARAM;
+  *out = NULL;
+  /* Sharding keys are not on the thin wire (§37): shard routing is an OCI-only
+   * capability below the TTC/TNS protocol, so a non-empty key can't be honoured.
+   * Reject up front (accepted for API parity) rather than connect and mislead. */
+  if ((params->shardingkey && params->shardingkey[0]) ||
+      (params->supershardingkey && params->supershardingkey[0])) {
+    seer_log(SEER_LOG_WARNING, "sharding keys are not supported in thin mode (§37): shard "
+                               "routing is available only through the OCI-based client");
+    return SEER_ENOTIMPL;
+  }
+
+  const char *list = params->host;
+  SeerStatus st = SEER_EPARAM;
+  for (const char *a = list;;) {
+    const char *comma = strchr(a, ',');
+    size_t n = comma ? (size_t)(comma - a) : strlen(a);
+    char host[256];
+    SeerConnParams one = *params;
+    one.port = params->port ? params->port : 1521;
+    st = parse_address(a, n, host, sizeof host, &one.port);
+    if (st != SEER_OK) {
+      seer_log(SEER_LOG_ERROR, "connect: bad address '%.*s' in HOST", (int)n, a);
+      if (err != NULL && errlen > 0)
+        snprintf(err, errlen, "bad address '%.*s' in HOST", (int)n, a);
+      return st;
+    }
+    one.host = host;
+    bool accepted = false;
+    if (err != NULL && errlen > 0)
+      err[0] = '\0';
+    st = connect_address(&one, out, err, errlen, &accepted);
+    if (st == SEER_OK || accepted || comma == NULL)
+      return st;
+    seer_log(SEER_LOG_WARNING, "connect: %s:%u failed (%s), trying the next address", host,
+             (unsigned)one.port, err != NULL && err[0] ? err : seer_strerror(st));
+    a = comma + 1;
+  }
 }
 
 SeerStatus seer_connect(const SeerConnParams *params, SeerConn **out)

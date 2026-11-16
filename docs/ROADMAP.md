@@ -112,7 +112,13 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       behind a firewall stays open and one whose peer is gone fails instead of
       hanging; `(EXPIRE_TIME=...)` goes in the connect descriptor as
       python-oracledb writes it (seerdb PROTOCOL.md §2.1).
-- [ ] Connection failover / TAF
+- [x] Connect-time failover — `HOST` takes a comma-separated address list
+      (`host`, `host:port`, `[ipv6]:port`; without a port an address uses `PORT`),
+      tried in order. A failure before the listener accepts (no TCP connect, no
+      TLS, a REFUSE such as ORA-12514) moves on to the next address; one after it
+      (a wrong password, a login error) is the answer. Live on 11g: a closed port
+      ahead of the bed, and 10g's ORA-12514 ahead of 11g on the same box (#201).
+- [ ] Transparent application failover (TAF): re-establishing a session lost mid-use
 - [x] 9i O3LOGON handshake — **live-authenticated to a 9i VM** (127.0.0.1:1526,
       SID=orcl). `seer_o3logon` (DES-decrypt AUTH_SESSKEY under the DES verifier,
       DES-encrypt the padded password; reuses the 10g DES machinery; pinned to the

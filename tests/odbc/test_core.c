@@ -2412,6 +2412,42 @@ static void check_cache_bind_types(void)
     fail(name, m);
 }
 
+/* Connect-time failover (#201): a HOST list whose first address is a closed
+ * port reaches the server behind it; a malformed address is refused before
+ * any connect (SEER_EPARAM). */
+static void check_connect_failover(void)
+{
+  const char *name = "connect-time failover across a HOST list";
+  char hosts[320], m[400] = "";
+  snprintf(hosts, sizeof hosts, "127.0.0.1:1, %s:%u", P.host, (unsigned)P.port);
+  SeerConnParams p = P;
+  p.host = hosts;
+  SeerConn *c = NULL;
+  char why[256] = "";
+  SeerStatus st = seer_connect_diag(&p, &c, why, sizeof why);
+  if (st != SEER_OK) {
+    snprintf(m, sizeof m, "HOST=%s: status %d %s", hosts, (int)st, why);
+  } else {
+    SeerStmt *s = NULL;
+    int ok = seer_stmt_prepare(c, "SELECT 1 FROM dual", &s) == SEER_OK &&
+             seer_stmt_execute(s) == SEER_OK && seer_stmt_fetch(s) == SEER_OK;
+    seer_stmt_close(s);
+    seer_disconnect(c);
+    if (!ok)
+      snprintf(m, sizeof m, "HOST=%s: the query failed", hosts);
+  }
+  p.host = "127.0.0.1:port";
+  c = NULL;
+  if (m[0] == '\0' && (st = seer_connect_diag(&p, &c, why, sizeof why)) != SEER_EPARAM) {
+    snprintf(m, sizeof m, "HOST=%s: status %d, want SEER_EPARAM", p.host, (int)st);
+    seer_disconnect(c);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 int main(void)
 {
   if (getenv("SEER_TEST_HOST") == NULL) {
@@ -2443,6 +2479,7 @@ int main(void)
   }
 
   check_select_scalar();
+  check_connect_failover();
   check_zero_length_columns();
   check_zero_size_numbers();
   check_select_table();

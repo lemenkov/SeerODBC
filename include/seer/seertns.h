@@ -40,6 +40,12 @@ typedef struct SeerConn SeerConn;
 typedef struct SeerStmt SeerStmt;
 
 typedef struct {
+  /* The listener's host, or a comma-separated list of addresses for
+   * connect-time failover: each `host`, `host:port` or `[ipv6]:port`, a port
+   * of its own overriding `port`. They are tried in order; a failure before
+   * the listener accepts (no TCP connect, no TLS, a refusal such as
+   * ORA-12514) moves on to the next, one after it (a wrong password, a login
+   * error) is returned. With all failing, the last address's error is. */
   const char *host;
   uint16_t port;            /* default 1521 */
   const char *service_name; /* service name (SERVICE_NAME in the descriptor) */
