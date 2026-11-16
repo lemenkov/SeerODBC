@@ -57,6 +57,11 @@ typedef struct {
   uint32_t vector_dims;
   uint8_t vector_format;
   char *annotations; /* 23ai: "name=value\n..." serialized map, or NULL */
+  /* The describe's precision and scale (#259): NUMBER(p,s)'s p and s (0 and
+   * -127 for a NUMBER without them, -127 for a FLOAT); a TIMESTAMP's scale is
+   * its fractional-second digits. */
+  int precision;
+  int scale;
   /* SQL OBJECT (ADT, type 109) columns: the object type's identity, and its
    * attribute layout (Oracle type per attribute) once resolved/cached. */
   char *type_schema;
@@ -718,15 +723,15 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
 
   for (int64_t i = 0; i < ncols; i++) {
     uint8_t type = seer_reader_u8(r);
-    (void)seer_reader_u8(r); /* flags     */
-    (void)seer_reader_u8(r); /* precision */
+    (void)seer_reader_u8(r);               /* flags     */
+    cols[i].precision = seer_reader_u8(r); /* precision */
     if (fv >= TTC_FIELD_VERSION_12_1)
-      (void)seer_reader_u8(r); /* scale: a raw sb1 from 12.1 */
+      cols[i].scale = (int8_t)seer_reader_u8(r); /* scale: a raw sb1 from 12.1 */
     else
-      (void)seer_dec_sb4(r);            /* scale: variable on 11g */
-    int64_t data_len = seer_dec_sb4(r); /* buffer size (data length) */
-    (void)seer_dec_sb4(r);              /* max array elems */
-    (void)seer_dec_sb4(r);              /* cont flags */
+      cols[i].scale = (int)seer_dec_sb4(r); /* scale: variable on 11g */
+    int64_t data_len = seer_dec_sb4(r);     /* buffer size (data length) */
+    (void)seer_dec_sb4(r);                  /* max array elems */
+    (void)seer_dec_sb4(r);                  /* cont flags */
     int64_t oidlen = seer_dec_sb4(r);
     if (oidlen > 0)
       seer_skip_chunked(r);
@@ -4966,9 +4971,9 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
 static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
 {
   uint8_t data_type = seer_reader_u8(r);
-  (void)seer_reader_u8(r); /* flag       */
-  (void)seer_reader_u8(r); /* precision  */
-  (void)seer_dec_sb4(r);   /* data_scale */
+  (void)seer_reader_u8(r);            /* flag       */
+  col->precision = seer_reader_u8(r); /* precision  */
+  col->scale = (int)seer_dec_sb4(r);  /* data_scale */
   int64_t max_len = seer_dec_sb4(r);
   (void)seer_dec_sb4(r); /* _mal       */
   (void)seer_dec_sb4(r); /* _fl2       */
@@ -6133,7 +6138,9 @@ static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *
   for (uint32_t i = 0; i < n && !r->cut && !r->bad; i++) {
     SeerColumn *col = &cols[i];
     col->ora_type = o8r_u8(r);
-    o8r_skip(r, 3); /* flags, precision, scale */
+    o8r_skip(r, 1); /* flags */
+    col->precision = o8r_u8(r);
+    col->scale = (int8_t)o8r_u8(r);
     col->max_size = o8r_le32(r);
     (void)o8r_le32(r); /* max array */
     (void)o8r_le32(r); /* continuation flags */
@@ -9299,6 +9306,20 @@ int seer_stmt_col_size(SeerStmt *stmt, int col)
   if (stmt == NULL || col < 0 || col >= stmt->ncols)
     return 0;
   return (int)stmt->cols[col].max_size;
+}
+
+int seer_stmt_col_precision(SeerStmt *stmt, int col)
+{
+  if (stmt == NULL || col < 0 || col >= stmt->ncols)
+    return 0;
+  return stmt->cols[col].precision;
+}
+
+int seer_stmt_col_scale(SeerStmt *stmt, int col)
+{
+  if (stmt == NULL || col < 0 || col >= stmt->ncols)
+    return 0;
+  return stmt->cols[col].scale;
 }
 
 int seer_stmt_col_nullable(SeerStmt *stmt, int col)
