@@ -2840,6 +2840,63 @@ static void check_connect_error(const char *drv, const char *host, const char *p
   pass(name);
 }
 
+/* Connect-time failover (#201): HOST lists addresses, tried in order. A
+ * closed port ahead of the server is passed over; a wrong password, refused
+ * after the listener accepted, is the answer (ORA-01017) and not passed over
+ * to the dead address behind it. */
+static void check_connect_failover(const char *drv, const char *host, const char *port,
+                                   const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "connect-time failover across a HOST list";
+  const char *p = port ? port : "1521";
+  char hosts[2][320];
+  snprintf(hosts[0], sizeof hosts[0], "127.0.0.1:1,%s", host);
+  snprintf(hosts[1], sizeof hosts[1], "%s:%s,127.0.0.1:1", host, p);
+  const char *pwds[2] = {pwd, "not-the-password"};
+  for (int k = 0; k < 2; k++) {
+    SQLHENV e;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+    SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+    SQLHDBC d;
+    SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+    char cs[800], m[600] = "", err[256] = "", one[16] = "";
+    snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;", drv, hosts[k], p,
+             svc, user, pwds[k]);
+    SQLCHAR o[256], state[6] = "", msg[400] = "";
+    SQLSMALLINT ol, len = 0;
+    SQLINTEGER native = 0;
+    SQLRETURN rc =
+        SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
+    int ok;
+    if (k == 0) {
+      ok = SQL_SUCCEEDED(rc) &&
+           SQL_SUCCEEDED(exec_scalar(d, "SELECT 1 FROM dual", one, sizeof one, err, sizeof err)) &&
+           strcmp(one, "1") == 0;
+      if (!ok) {
+        if (!SQL_SUCCEEDED(rc))
+          diag_text(SQL_HANDLE_DBC, d, err, sizeof err);
+        snprintf(m, sizeof m, "HOST=%s: %s", hosts[k], err[0] ? err : "query failed");
+      }
+    } else {
+      if (!SQL_SUCCEEDED(rc))
+        SQLGetDiagRec(SQL_HANDLE_DBC, d, 1, state, &native, msg, sizeof msg, &len);
+      ok = !SQL_SUCCEEDED(rc) && native == 1017;
+      if (!ok)
+        snprintf(m, sizeof m, "HOST=%s, wrong password: rc=%d native=%ld '%s'", hosts[k], (int)rc,
+                 (long)native, (char *)msg);
+    }
+    if (SQL_SUCCEEDED(rc))
+      SQLDisconnect(d);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+    SQLFreeHandle(SQL_HANDLE_ENV, e);
+    if (!ok) {
+      fail(name, m);
+      return;
+    }
+  }
+  pass(name);
+}
+
 /* EXPIRE_TIME: a connection with dead-connection detection on logs in and runs
  * (the descriptor carries (EXPIRE_TIME=n), the socket TCP keepalive), and a
  * value that isn't a whole number of minutes is refused before connecting. */
@@ -3687,6 +3744,7 @@ int main(void)
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_expire_time(drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
+  check_connect_failover(drv, host, port, svc, user, pwd);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

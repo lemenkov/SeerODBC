@@ -75,7 +75,8 @@ DRIVER={SeerODBC};HOST=db.example.com;PORT=1521;SERVICE=ORCLPDB1;UID=scott;PWD=t
 
 The keywords are the same as on Linux and macOS. They include `SID=` for old
 servers, `SSL=1` / `TLSCA=` for TCPS, `CCLASS=` / `PURITY=` for DRCP,
-`EXPIRE_TIME=` and `LOBINLINE=1`.
+`EXPIRE_TIME=` and `LOBINLINE=1`. `HOST=` may list several addresses,
+comma-separated (`HOST=db1,db2:1522`), tried in order until one answers.
 
 **With a data source (DSN)**, made in the *ODBC Data Source Administrator*
 (`odbcad32.exe`, or *ODBC Data Sources* in the Start menu; the 64-bit one for
