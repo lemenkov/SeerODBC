@@ -189,18 +189,34 @@ SeerStatus seer_ttc_send(SeerConn *c, const uint8_t *msg, size_t len)
   return SEER_OK;
 }
 
+/* Interrupt the call in flight (seerdb PROTOCOL.md §25, #224): a server that
+ * advertised CAN_RECV_ATTENTION gets an out-of-band break, an urgent byte its
+ * attention handler sees at once; any other - or a TLS socket, where urgent
+ * data would ride outside the stream - the in-band INTERRUPT marker, which a
+ * server acts on only at points of its choosing. Measured: 9.2 answers the
+ * urgent byte in a PL/SQL loop and in a row-lock wait, the marker only once
+ * the loop ends. */
+static SeerStatus send_break(SeerConn *c)
+{
+  if (c->supports_oob && seer_transport_send_oob(c->t) == SEER_OK) {
+    seer_log(SEER_LOG_DEBUG, "ttc: out-of-band break sent");
+    return SEER_OK;
+  }
+  const uint8_t interrupt[3] = {0x01, 0x00, 0x03};
+  seer_log(SEER_LOG_DEBUG, "ttc: in-band interrupt sent");
+  return seer_packet_send(c->t, TNS_PT_MARKER, interrupt, sizeof interrupt);
+}
+
 void seer_cancel(SeerConn *c)
 {
   /* Only interrupt a call actually blocked in seer_ttc_recv; sending a break
    * to an idle connection would leave a stray reset marker desyncing the next
-   * call. Safe to call from another thread (a bare marker send vs the read).
-   * In-band INTERRUPT marker (§15): the server interrupts the running call and
-   * answers with break/reset markers + the inline ORA-01013, which the blocked
-   * recv drains and surfaces. */
+   * call. Safe to call from another thread (a bare send vs the read). The
+   * server interrupts the running call and answers with break/reset markers +
+   * the inline ORA-01013, which the blocked recv drains and surfaces. */
   if (c == NULL || c->t == NULL || !c->in_call)
     return;
-  const uint8_t interrupt[3] = {0x01, 0x00, 0x03};
-  seer_packet_send(c->t, TNS_PT_MARKER, interrupt, sizeof interrupt);
+  (void)send_break(c);
 }
 
 /* Receive one complete TTC message, reassembling across TNS_DATA packets. Each
@@ -304,8 +320,7 @@ static SeerStatus await_reply(SeerConn *c, bool *interrupted)
            c->call_timeout_ms);
   c->call_timed_out = true;
   *interrupted = true;
-  const uint8_t interrupt[3] = {0x01, 0x00, 0x03};
-  if (seer_packet_send(c->t, TNS_PT_MARKER, interrupt, sizeof interrupt) == SEER_OK &&
+  if (send_break(c) == SEER_OK &&
       seer_transport_wait_readable(c->t, c->call_timeout_ms < 5000 ? 5000 : c->call_timeout_ms) !=
           0)
     return SEER_OK;

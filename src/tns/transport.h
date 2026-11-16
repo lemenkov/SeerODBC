@@ -63,6 +63,11 @@ SeerStatus seer_transport_write_all(SeerTransport *t, const void *buf, size_t le
  * error. */
 int seer_transport_wait_readable(SeerTransport *t, int timeout_ms);
 
+/* Send one byte of TCP urgent data, an out-of-band break (#224). Plain TCP
+ * only: SEER_ENOTIMPL on a TLS socket, where it would ride outside the TLS
+ * stream. */
+SeerStatus seer_transport_send_oob(SeerTransport *t);
+
 /* Read exactly `len` bytes (looping over short reads). SEER_EIO on EOF or
  * error before `len` bytes arrive. */
 SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len);

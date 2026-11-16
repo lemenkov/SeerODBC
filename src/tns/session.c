@@ -373,8 +373,10 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
     if (type == TNS_PT_ACCEPT) {
       SeerReader r;
       seer_reader_init(&r, rbody, rlen);
-      conn->version = seer_reader_u16(&r);       /* body off 0 */
-      (void)seer_reader_u16(&r);                 /* body off 2: service options */
+      conn->version = seer_reader_u16(&r); /* body off 0 */
+      /* body off 2: service options; CAN_RECV_ATTENTION (0x0400) says the
+       * server takes an out-of-band break (seerdb PROTOCOL.md §25, #224). */
+      conn->supports_oob = (seer_reader_u16(&r) & 0x0400) != 0;
       uint16_t legacy_sdu = seer_reader_u16(&r); /* body off 4 (ub2)   */
       /* A >= 315 ("large SDU") accept carries the real negotiated SDU as a
        * ub4 at body offset 24; below that the legacy ub2 at offset 4 is it. */

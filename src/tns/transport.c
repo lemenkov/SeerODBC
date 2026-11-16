@@ -107,6 +107,15 @@ void seer_transport_set_keepalive(SeerTransport *t, int idle_s)
     seer_sock_set_keepalive(t->fd, idle_s);
 }
 
+SeerStatus seer_transport_send_oob(SeerTransport *t)
+{
+  if (t == NULL)
+    return SEER_EPARAM;
+  if (t->ssl != NULL)
+    return SEER_ENOTIMPL;
+  return send(t->fd, "!", 1, MSG_OOB) == 1 ? SEER_OK : SEER_EIO;
+}
+
 int seer_transport_wait_readable(SeerTransport *t, int timeout_ms)
 {
   if (t == NULL)
