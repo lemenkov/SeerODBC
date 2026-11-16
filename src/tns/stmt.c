@@ -5286,6 +5286,10 @@ static bool fv2_block_wide(const SeerBind *b)
 
 static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
 {
+  if (b->oac_type == ORA_TYPE_ADT && b->oac_override != NULL) { /* an object (#172) */
+    seer_writer_bytes(w, b->oac_override, b->oac_override_len);
+    return;
+  }
   uint8_t type = ORA_TYPE_VARCHAR;
   uint32_t maxsize = 4000, charset = 873;
   uint8_t csfrm = 1;
@@ -6522,6 +6526,8 @@ static bool o8i_bind_ok(const SeerBind *b, bool block, const char **why)
     *why = "REF CURSOR parameters other than a PL/SQL block's OUT";
     return false;
   }
+  if (b->oac_type == ORA_TYPE_ADT && b->oac_override != NULL)
+    return true; /* an object or collection (#172) */
   if (b->is_array || b->oac_override != NULL || b->obj_type != NULL || b->temp_lob) {
     *why = "array, object and LOB parameters";
     return false;
@@ -6677,6 +6683,10 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
  * 4000 bytes the server reads it as LONG, after the others (o8i_binds). */
 static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
 {
+  if (b->oac_type == ORA_TYPE_ADT && b->oac_override != NULL) { /* an object (#172) */
+    seer_writer_bytes(w, b->oac_override, b->oac_override_len);
+    return;
+  }
   uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1, flag = 0x03;
   uint32_t charset = 31;
   if (b->ret_lob != 0) {
@@ -7190,6 +7200,35 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
 {
   free(b->out.data);
   b->out = (SeerCell){0};
+  if (b->oac_type == ORA_TYPE_ADT && b->obj_type != NULL) {
+    /* An object or collection: the bind value's form - the 8i row cell
+     * without its trailer (§19.17c, #172). The image is decoded by the
+     * type's layout once the reply is in. Read as a plain value it left the
+     * status misaligned and the block's cursor id wrong. */
+    for (int k = 0; k < 3; k++)
+      if (o8r_le32(r) > 0)
+        o8r_value(r, NULL);
+    (void)o8r_le16(r); /* version */
+    uint32_t imglen = o8r_le32(r);
+    (void)o8r_le16(r); /* flags */
+    SeerWriter img;
+    if (!seer_writer_init(&img, 64)) {
+      r->bad = true;
+      return;
+    }
+    if (imglen > 0)
+      o8r_value(r, &img);
+    free(b->out_image);
+    b->out_image = NULL;
+    b->out_imagelen = 0;
+    if (!r->cut && !r->bad && imglen > 0 && seer_writer_ok(&img)) {
+      b->out_image = img.buf;
+      b->out_imagelen = img.len;
+    } else {
+      seer_writer_free(&img);
+    }
+    return;
+  }
   if (b->ret_lob != 0) {
     /* A LOB: a LE ub4 length, the locator as a value, a ub2 indicator, and
      * no return code; NULL is a zero length and ff ff (§19.17b, #167). The
@@ -7414,6 +7453,11 @@ static SeerStatus o8i_execute_block(SeerStmt *stmt)
   }
   o8i_status_free(&s);
   long rows = (long)s.rows;
+  /* OUT objects, decoded by their types' layouts (#172). */
+  st = resolve_out_objects(stmt);
+  if (st != SEER_OK)
+    return st;
+
   /* The LOBs the block returned, read by their locators before the next call
    * (§19.15's single READ; #167): CLOB text in WE8ISO8859P1, BLOB bytes. */
   for (int k = 0; k < stmt->npbinds; k++) {
@@ -8197,6 +8241,26 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
       free(b->ret_locator);
       b->ret_locator = NULL;
       b->ret_loclen = 0;
+      if (b->oac_type == ORA_TYPE_ADT && b->obj_type != NULL) {
+        /* An OUT object: the row cell's form, type block included, then the
+         * indicator (§19.17c, #172); decoded by its layout after the block. */
+        free(b->out.data);
+        b->out = (SeerCell){0};
+        uint8_t *img = NULL;
+        size_t il = 0;
+        if (read_object_image(&r, &img, &il) != SEER_OK) {
+          free(img);
+          break;
+        }
+        if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
+          r.pos += 2;
+        else if (seer_reader_remaining(&r) > 0)
+          r.pos += 1;
+        free(b->out_image);
+        b->out_image = img;
+        b->out_imagelen = il;
+        continue;
+      }
       if (b->ret_lob != 0) {
         /* A LOB: a column's LOB cell (§19.5) - a ub4 length, the locator as a
          * value and a ub4 indicator; NULL is a zero length and 81 01. A NULL
@@ -8500,6 +8564,11 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
       return SEER_EDB;
     stmt->cur = -1;
   }
+
+  /* OUT objects, decoded by their types' layouts (#172). */
+  st = resolve_out_objects(stmt);
+  if (st != SEER_OK)
+    return st;
 
   /* The LOBs the block returned, read by their locators before anything else
    * goes to the server (§19.5 GETLEN + READ, #167): CLOB text, BLOB bytes. */
@@ -9552,6 +9621,83 @@ static SeerStatus obj_encode_null_value(SeerWriter *bv, const uint8_t oid[16], u
  * the size an object column describes with - so a value coming back has
  * room. The type is kept on the bind to decode a returned value. Takes
  * ownership of `img` (always frees it). */
+static void o8w_le32(SeerWriter *w, uint32_t v);
+static void o8w_chr(SeerWriter *w, const uint8_t *p, size_t n);
+
+/* An object or collection bind's descriptor and value before 10g (seerdb
+ * PROTOCOL.md §19.17c, #172), into oac / bv:
+ * - 9i (ojdbc14 on 9.2.0.4): a scalar's descriptor with the type's OID and
+ *   version - 6d 01 00 00, the size (the image's; 0x7FFFFFFF for a NULL or
+ *   an OUT), 00 00, the OID as a value, version 1, charset 31, form 0. The
+ *   value is the row cell's frame without the type block: the type-OID,
+ *   object-OID, snapshot and version fields empty, the image's length, flags
+ *   01 01 and the image; a NULL is 00 00 00 00 00 01 01.
+ * - 8i (OCI 9.2 against 8.1.7): the same descriptor at 8i's widths, 42 bytes,
+ *   size 2000. The value is the 8i row cell without its trailer: the 36-byte
+ *   type block (00 22 02 08, the OID, 16 bytes ending 00 01 00 01), the
+ *   object OID's and snapshot's lengths, version, image length, flags 01 00
+ *   and the image; a NULL has a zero length and no image. */
+static SeerStatus obj_legacy_bind(SeerConn *c, const uint8_t oid[16], const uint8_t *img,
+                                  size_t imglen, bool is_out, SeerWriter *oac, SeerWriter *bv)
+{
+  if (c->is_8i) {
+    seer_writer_u8(oac, ORA_TYPE_ADT);
+    seer_writer_u8(oac, 0x00);
+    seer_writer_u8(oac, 0x00);
+    seer_writer_u8(oac, 0x00);
+    o8w_le32(oac, 2000);
+    o8w_le32(oac, 0); /* max array */
+    o8w_le32(oac, 0); /* cont flags */
+    o8w_le32(oac, 16);
+    seer_writer_u8(oac, 16);
+    seer_writer_bytes(oac, oid, 16);
+    seer_writer_u8(oac, 0x01); /* version 1, LE */
+    seer_writer_u8(oac, 0x00);
+    seer_writer_u8(oac, 0x00); /* charset */
+    seer_writer_u8(oac, 0x00);
+    seer_writer_u8(oac, 0x00); /* form */
+
+    uint8_t block[36] = {0x00, 0x22, 0x02, 0x08};
+    memcpy(block + 4, oid, 16);
+    block[33] = 0x01;
+    block[35] = 0x01;
+    o8w_le32(bv, 36);
+    o8w_chr(bv, block, sizeof block);
+    o8w_le32(bv, 0);          /* object OID */
+    o8w_le32(bv, 0);          /* snapshot */
+    seer_writer_u8(bv, 0x00); /* version (ub2) */
+    seer_writer_u8(bv, 0x00);
+    o8w_le32(bv, (uint32_t)imglen);
+    seer_writer_u8(bv, 0x01); /* flags 01 00 */
+    seer_writer_u8(bv, 0x00);
+    if (imglen > 0)
+      o8w_chr(bv, img, imglen);
+  } else {
+    seer_writer_u8(oac, ORA_TYPE_ADT);
+    seer_writer_u8(oac, 0x01);
+    seer_writer_u8(oac, 0x00);
+    seer_writer_u8(oac, 0x00);
+    seer_enc_sb4(oac, imglen > 0 && !is_out ? (uint32_t)imglen : 0x7FFFFFFFu);
+    seer_writer_u8(oac, 0x00); /* max array */
+    seer_writer_u8(oac, 0x00); /* cont flags */
+    seer_enc_sb4(oac, 16);
+    seer_writer_u8(oac, 16);
+    seer_writer_bytes(oac, oid, 16);
+    seer_enc_sb4(oac, 1);  /* version */
+    seer_enc_sb4(oac, 31); /* charset */
+    seer_writer_u8(oac, 0x00);
+
+    for (int k = 0; k < 4; k++) /* type OID, object OID, snapshot, version: empty */
+      seer_writer_u8(bv, 0x00);
+    seer_enc_sb4(bv, (uint32_t)imglen);
+    seer_writer_u8(bv, 0x01); /* flags 01 01 */
+    seer_writer_u8(bv, 0x01);
+    if (imglen > 0 && obj_append_chr(bv, img, imglen, c->field_version) != SEER_OK)
+      return SEER_ENOMEM;
+  }
+  return seer_writer_ok(oac) && seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+}
+
 static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
                                  const char *type_name, const uint8_t oid[16], SeerWriter *img,
                                  bool is_out)
@@ -9567,6 +9713,15 @@ static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
   if (!seer_writer_init(&bv, 64 + imglen)) {
     seer_writer_free(img);
     return SEER_ENOMEM;
+  }
+  if (fv < TTC_FIELD_VERSION_10_2) { /* 9i and 8i (#172) */
+    if (!seer_writer_init(&oac, 64))
+      goto fail;
+    if (obj_legacy_bind(stmt->conn, oid, img->buf, imglen, is_out, &oac, &bv) != SEER_OK) {
+      seer_writer_free(&oac);
+      goto fail;
+    }
+    goto store;
   }
   if ((imglen > 0 ? obj_encode_bind_value(&bv, oid, img->buf, imglen, fv)
                   : obj_encode_null_value(&bv, oid, fv)) != SEER_OK)
@@ -9599,6 +9754,7 @@ static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
     goto fail;
   }
 
+store:
   seer_writer_free(img); /* image now copied into bv */
   SeerColumn *type = calloc(1, sizeof *type);
   if (type == NULL || (type->type_schema = strdup(schema)) == NULL ||
@@ -9694,8 +9850,6 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
 {
   if (stmt == NULL || schema == NULL || type_name == NULL || (n_attrs > 0 && attr_values == NULL))
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* object binds: 10g+ (9i and 8i, #172) */
 
   uint8_t oid[16];
   SeerWriter img;
@@ -9710,8 +9864,6 @@ SeerStatus seer_stmt_bind_object_out(SeerStmt *stmt, int param, const char *sche
 {
   if (stmt == NULL || schema == NULL || type_name == NULL)
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* object binds: 10g+ (9i and 8i, #172) */
   uint8_t oid[16];
   SeerStatus st = obj_lookup_oid(stmt->conn, schema, type_name, oid);
   if (st != SEER_OK)
@@ -9985,8 +10137,6 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
 {
   if (stmt == NULL || schema == NULL || type_name == NULL || (n_elems > 0 && elem_values == NULL))
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* collection binds: 10g+ (9i and 8i, #172) */
 
   uint8_t oid[16];
   SeerStatus st = obj_lookup_oid(stmt->conn, schema, type_name, oid);
