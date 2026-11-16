@@ -68,9 +68,6 @@ static const Gate GATES[] = {
     /* core_sessionless.c */
     {"sessionless transactions", 8, 21, GATE_SERVER, "no sessionless transactions before 23ai"},
     /* core_objbind.c */
-    {"REF CURSOR OUT: its rows, 320 times on one session", 8, 8, GATE_TODO,
-     "REF CURSOR OUT on 8i (#166)"},
-    {"a 400-row query with a CURSOR() column", 8, 8, GATE_TODO, "CURSOR() columns on 8i (#166)"},
     {"a 400-row query with a CURSOR() column", 10, 26, GATE_SERVER,
      "from 10g the server holds each nested cursor while its query is open (ORA-01000)"},
     {"object binds", 8, 9, GATE_TODO, "object, collection and PL/SQL-type binds before 10g (#172)"},
