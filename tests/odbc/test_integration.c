@@ -1416,16 +1416,18 @@ static void check_error_native_and_offset(SQLHDBC dbc)
   SQLCHAR state[6] = "";
   SQLINTEGER native = 0, off = -1;
   SQLSMALLINT ml = 0;
+  SQLCHAR msg[200] = "";
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT nonexistent FROM dual", SQL_NTS);
-  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, NULL, 0, &ml);
+  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, msg, sizeof msg, &ml);
   SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_SEER_ERROR_OFFSET, &off, 0, NULL);
   SQLFreeHandle(SQL_HANDLE_STMT, st);
   if (rc == SQL_ERROR && native == 904 && off == 7)
     pass(name);
   else {
-    char m[200];
-    snprintf(m, sizeof m, "rc=%d native=%d offset=%d", rc, (int)native, (int)off);
+    char m[400]; /* the text too: once on 9i it lacked the ORA- prefix (#246) */
+    snprintf(m, sizeof m, "rc=%d native=%d offset=%d state '%s' '%s'", rc, (int)native, (int)off,
+             (char *)state, (char *)msg);
     fail(name, m);
   }
 }
