@@ -728,7 +728,7 @@ static int banner_major(const uint8_t *s, size_t n)
  * whose PRO has none (seerdb PROTOCOL.md §19.8); `*major` (may be NULL) is the
  * banner's release. */
 static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool *req_bnd,
-                            bool *str32k, int *major)
+                            bool *str32k, int *major, uint16_t *db_charset)
 {
   if (req_bnd != NULL)
     *req_bnd = false;
@@ -747,8 +747,10 @@ static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool
     o++;
   if (major != NULL)
     *major = banner_major(b + banner, o - banner);
-  o += 1; /* the NUL itself */
-  o += 2; /* charset id (LE) */
+  o += 1;                               /* the NUL itself */
+  if (db_charset != NULL && o + 2 <= n) /* the database charset id (LE) */
+    *db_charset = (uint16_t)(b[o] | (b[o + 1] << 8));
+  o += 2;
   o += 1; /* server flags    */
   if (o + 2 > n)
     return SEER_EPROTO;
@@ -1262,7 +1264,7 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   uint8_t server_fv = 0;
   bool req_bnd = false, str32k = false;
   int major = 0;
-  st = parse_pro(resp, rlen, &server_fv, &req_bnd, &str32k, &major);
+  st = parse_pro(resp, rlen, &server_fv, &req_bnd, &str32k, &major, &conn->db_charset);
   free(resp);
   /* Oracle 8i (8.1.x) carries no caps to negotiate: pin field version 2, as
    * 9i, and take the 8i login and statement dialect (seerdb §19.8). */
