@@ -54,8 +54,6 @@ static const Gate GATES[] = {
      "object types before 10g (#168)"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
     {"SQL OBJECT with an XMLType attribute", 9, 9, GATE_TODO, "object types before 10g (#168)"},
-    {"SQL OBJECT with CLOB / BLOB attributes", 8, 9, GATE_TODO,
-     "LOB attributes of an object before 10g (#168)"},
     {"describe after SQLPrepare, before SQLExecute", 8, 8, GATE_SERVER,
      "8i describes a query as it executes"},
     {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 11, GATE_SERVER,
@@ -1290,8 +1288,15 @@ static void check_object_lob_attrs(SQLHDBC dbc)
     return;
   }
   exec_do(dbc, "CREATE TABLE seer_lot (o seer_lo)", err, sizeof err);
-  exec_do(dbc, "INSERT INTO seer_lot VALUES (seer_lo(1, 'hello clob', HEXTORAW('CAFE'), 7))", err,
-          sizeof err);
+  /* Empty LOBs, then written through their locators: 8i and 9i take no text
+   * for a CLOB attribute in the constructor (ORA-00932), 8i no TO_CLOB. */
+  exec_do(
+      dbc,
+      "DECLARE c CLOB; b BLOB; BEGIN INSERT INTO seer_lot VALUES (seer_lo(1, EMPTY_CLOB(), "
+      "EMPTY_BLOB(), 7)); SELECT t.o.c, t.o.b INTO c, b FROM seer_lot t FOR UPDATE; "
+      "DBMS_LOB.WRITEAPPEND(c, 10, 'hello clob'); DBMS_LOB.WRITEAPPEND(b, 2, HEXTORAW('CAFE')); "
+      "END;",
+      err, sizeof err);
   SQLRETURN rc = exec_scalar(dbc, "SELECT o FROM seer_lot", out, sizeof out, err, sizeof err);
   exec_do(dbc, "DROP TABLE seer_lot", err, sizeof err);
   exec_do(dbc, "DROP TYPE seer_lo", err, sizeof err);
