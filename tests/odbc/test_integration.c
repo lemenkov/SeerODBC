@@ -3201,10 +3201,14 @@ static void check_login_timeout(const char *drv, const char *host, const char *p
  * answered: 21c and later) or reports itself dead and fails fast (it didn't:
  * 10g / 11g here) - never a call that hangs. Its own connection, as the
  * timeout may close it. */
+/* With `per_connection`, the limit is SQL_ATTR_CONNECTION_TIMEOUT, which a
+ * statement without a query timeout of its own takes (#228). */
 static void check_query_timeout(const char *drv, const char *host, const char *port,
-                                const char *svc, const char *user, const char *pwd)
+                                const char *svc, const char *user, const char *pwd,
+                                int per_connection)
 {
-  const char *name = "SQL_ATTR_QUERY_TIMEOUT stops a long call with HYT00";
+  const char *name = per_connection ? "SQL_ATTR_CONNECTION_TIMEOUT stops a long call with HYT00"
+                                    : "SQL_ATTR_QUERY_TIMEOUT stops a long call with HYT00";
   SQLHENV e;
   SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
   SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
@@ -3225,8 +3229,15 @@ static void check_query_timeout(const char *drv, const char *host, const char *p
   SQLHSTMT st;
   SQLAllocHandle(SQL_HANDLE_STMT, d, &st);
   SQLULEN got = 0;
-  SQLSetStmtAttr(st, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(uintptr_t)1, 0);
-  SQLGetStmtAttr(st, SQL_ATTR_QUERY_TIMEOUT, &got, 0, NULL);
+  if (per_connection) {
+    SQLUINTEGER cg = 0;
+    SQLSetConnectAttr(d, SQL_ATTR_CONNECTION_TIMEOUT, (SQLPOINTER)(uintptr_t)1, 0);
+    SQLGetConnectAttr(d, SQL_ATTR_CONNECTION_TIMEOUT, &cg, 0, NULL);
+    got = cg;
+  } else {
+    SQLSetStmtAttr(st, SQL_ATTR_QUERY_TIMEOUT, (SQLPOINTER)(uintptr_t)1, 0);
+    SQLGetStmtAttr(st, SQL_ATTR_QUERY_TIMEOUT, &got, 0, NULL);
+  }
   time_t t0 = time(NULL);
   SQLRETURN rc = SQLExecDirect(
       st,
@@ -3242,7 +3253,7 @@ static void check_query_timeout(const char *drv, const char *host, const char *p
     SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, msg, sizeof msg, &len);
   SQLFreeHandle(SQL_HANDLE_STMT, st);
   if (got != 1)
-    snprintf(m, sizeof m, "SQLGetStmtAttr returned %lu, want 1", (unsigned long)got);
+    snprintf(m, sizeof m, "the attribute read back %lu, want 1", (unsigned long)got);
   else if (SQL_SUCCEEDED(rc) || strcmp((char *)state, "HYT00") != 0 || took > 9)
     snprintf(m, sizeof m, "rc=%d state '%s' after %ld s: %s", (int)rc, (char *)state, took,
              (char *)msg);
@@ -4175,7 +4186,8 @@ int main(void)
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
-  check_query_timeout(drv, host, port, svc, user, pwd);
+  check_query_timeout(drv, host, port, svc, user, pwd, 0);
+  check_query_timeout(drv, host, port, svc, user, pwd, 1);
   check_login_timeout(drv, host, port, svc, user, pwd);
   check_txn_isolation(dbc, drv, host, port, svc, user, pwd);
   check_max_rows(dbc);

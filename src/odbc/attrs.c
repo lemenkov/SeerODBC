@@ -102,6 +102,8 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   }
   if (Attribute == SQL_ATTR_LOGIN_TIMEOUT) /* seconds; takes effect at the next connect */
     c->login_timeout = (long)(SQLULEN)ValuePtr;
+  if (Attribute == SQL_ATTR_CONNECTION_TIMEOUT) /* seconds any call may wait (#228) */
+    c->conn_timeout = (SQLUINTEGER)(SQLULEN)ValuePtr;
   if (Attribute == SQL_ATTR_TXN_ISOLATION)
     return seer_odbc_apply_isolation(c, (SQLUINTEGER)(SQLULEN)ValuePtr);
   /* Connection timeout, tracing, etc.: accept as no-ops. */
@@ -126,6 +128,7 @@ SQLRETURN SQL_API SQLEndTran(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLI
   if (!c->connected || c->conn == NULL)
     return seer_odbc_diag(c, "08003", 0, "Connection not open", SQL_ERROR);
 
+  seer_odbc_arm_conn_timeout(c);
   SeerStatus st = (CompletionType == SQL_ROLLBACK) ? seer_rollback(c->conn) : seer_commit(c->conn);
   if (st == SEER_OK)
     return SQL_SUCCESS;
@@ -159,6 +162,9 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   case SQL_ATTR_CONNECTION_DEAD:
     *(SQLUINTEGER *)ValuePtr =
         c->connected && !seer_conn_lost(c->conn) ? SQL_CD_FALSE : SQL_CD_TRUE;
+    return SQL_SUCCESS;
+  case SQL_ATTR_CONNECTION_TIMEOUT:
+    *(SQLUINTEGER *)ValuePtr = c->conn_timeout;
     return SQL_SUCCESS;
   case SQL_ATTR_TXN_ISOLATION: /* unset: the server's default, READ COMMITTED */
     *(SQLUINTEGER *)ValuePtr = c->txn_isolation ? c->txn_isolation : SQL_TXN_READ_COMMITTED;
