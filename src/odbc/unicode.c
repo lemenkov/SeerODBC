@@ -205,6 +205,19 @@ static int is_string_info(SQLUSMALLINT t)
   case SQL_DATA_SOURCE_READ_ONLY:
   case SQL_NEED_LONG_DATA_LEN:
   case SQL_MULTIPLE_ACTIVE_TXN:
+  case SQL_DATA_SOURCE_NAME: /* the strings SQLGetInfo answers since #234 */
+  case SQL_USER_NAME:
+  case SQL_SERVER_NAME:
+  case SQL_DATABASE_NAME:
+  case SQL_MULT_RESULT_SETS:
+  case SQL_PROCEDURES:
+  case SQL_COLUMN_ALIAS:
+  case SQL_LIKE_ESCAPE_CLAUSE:
+  case SQL_EXPRESSIONS_IN_ORDERBY:
+  case SQL_ORDER_BY_COLUMNS_IN_SELECT:
+  case SQL_ROW_UPDATES:
+  case SQL_DESCRIBE_PARAMETER:
+  case SQL_OUTER_JOINS:
     return 1;
   default:
     return 0;

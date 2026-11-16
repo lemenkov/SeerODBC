@@ -89,8 +89,11 @@ typedef struct {
   long login_timeout;        /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
   SQLUINTEGER txn_isolation; /* SQL_ATTR_TXN_ISOLATION, 0 = the server's default (#220) */
   SQLUINTEGER conn_timeout;  /* SQL_ATTR_CONNECTION_TIMEOUT, seconds; 0 = none (#228) */
-  char *browse_cs;           /* SQLBrowseConnect: accumulated attributes */
-  char dbms_ver[64];         /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
+  char *browse_cs;
+  /* For SQLGetInfo (#234): the DSN connected through ("" without one), the
+   * user and the service or SID, kept from the connect. */
+  char *info_dsn, *info_user, *info_server; /* SQLBrowseConnect: accumulated attributes */
+  char dbms_ver[64]; /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
 } OdbcDbc;
 
 /* A column binding set by SQLBindCol. */

@@ -255,6 +255,12 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   c->conn = conn;
   c->dbms_ver[0] = '\0'; /* resolved again for this server */
   c->connected = 1;
+  free(c->info_dsn);
+  free(c->info_user);
+  free(c->info_server);
+  c->info_dsn = strdup(dsn != NULL ? dsn : "");
+  c->info_user = strdup(user != NULL ? user : "");
+  c->info_server = strdup(svc);
   seer_set_autocommit(conn, c->autocommit == SQL_AUTOCOMMIT_ON);
   ret = SQL_SUCCESS;
   /* An isolation level set before connecting takes effect now (#220). The
