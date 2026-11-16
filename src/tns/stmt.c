@@ -3984,6 +3984,53 @@ static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_
  * minted it - a ub2 length, then that many bytes - and that ub2 is part of the
  * locator, so the whole field goes to TTI_LOBOPS like a column LOB's locator
  * (seerdb PROTOCOL.md §21.14). CLOB -> UTF-8 text, BLOB -> hex. */
+static int64_t fv2_lob_getlen(SeerConn *c, const uint8_t *loc, size_t loclen);
+static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, int64_t amount,
+                               uint8_t **content, size_t *contentlen);
+static SeerStatus o8i_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, SeerWriter *content);
+static SeerStatus o8i_text_cell(SeerCell *cell, const uint8_t *p, size_t n);
+
+/* A LOB attribute's content on 9i and 8i, by the locator - the same form a
+ * column's has there - with that release's own LOB calls: 9i's GETLEN + READ
+ * (its text in the session's charset, UTF-8), 8i's single READ (its text in
+ * WE8ISO8859P1). The 10g+ read, which these took before, they answer with
+ * nothing usable (#168). */
+static SeerStatus decode_lob_attr_legacy(SeerConn *conn, uint8_t type, const uint8_t *f, size_t n,
+                                         SeerCell *cell)
+{
+  bool clob = type == ORA_TYPE_CLOB;
+  if (conn->is_8i) {
+    SeerWriter content;
+    if (!seer_writer_init(&content, 256))
+      return SEER_ENOMEM;
+    SeerStatus st = o8i_lob_read(conn, f, n, &content);
+    if (st == SEER_OK && !seer_writer_ok(&content))
+      st = SEER_ENOMEM;
+    if (st == SEER_OK && clob)
+      st = o8i_text_cell(cell, content.buf, content.len);
+    else if (st == SEER_OK)
+      cell_set_text(cell, hex_dup(content.buf, content.len)); /* as 10g+ renders a BLOB */
+    seer_writer_free(&content);
+    return st;
+  }
+  uint8_t *content = NULL;
+  size_t clen = 0;
+  int64_t amount = fv2_lob_getlen(conn, f, n);
+  if (amount < 0)
+    return SEER_EPROTO;
+  if (amount > 0 && fv2_lob_read(conn, f, n, amount, &content, &clen) != SEER_OK) {
+    free(content);
+    return SEER_EPROTO;
+  }
+  SeerStatus st = SEER_OK;
+  if (clob)
+    st = cell_set_bytes(cell, content ? content : (const uint8_t *)"", clen, false);
+  else
+    cell_set_text(cell, hex_dup(content, clen)); /* as 10g+ renders a BLOB */
+  free(content);
+  return st;
+}
+
 static SeerStatus decode_lob_attr(SeerConn *conn, uint8_t type, const uint8_t *f, size_t n,
                                   SeerCell *cell)
 {
@@ -3992,6 +4039,8 @@ static SeerStatus decode_lob_attr(SeerConn *conn, uint8_t type, const uint8_t *f
   size_t loclen = (size_t)f[0] << 8 | f[1];
   if (loclen == 0 || 2 + loclen != n)
     return SEER_EPROTO;
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return decode_lob_attr_legacy(conn, type, f, n, cell);
   uint8_t *raw = NULL;
   size_t rawlen = 0;
   SeerStatus st = seer_lob_read(conn, f, n, &raw, &rawlen);
