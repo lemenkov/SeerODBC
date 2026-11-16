@@ -91,7 +91,7 @@ SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
     seer_odbc_diag_free(&s->ipd);
     free(s->binds);
     for (int i = 0; i < s->num_params; i++)
-      free(s->params[i].dae_buf);
+      free(s->params[i].dae_buf), free(s->params[i].ref_type);
     free(s->params);
     free(s->param_rows);
     free(s->sql);

@@ -64,6 +64,12 @@ static const Gate GATES[] = {
     {"large CLOB OUT parameter", 8, 8, GATE_SERVER,
      "8.1.7 converts no CLOB to text: a CLOB OUT binds as SQL_SEER_CLOB there (#214)"},
     {"column annotations", 8, 21, GATE_SERVER, "no ANNOTATIONS before 23ai"},
+    {"REF IN parameter (SQL_SEER_REF)", 10, 11, GATE_TODO,
+     "REF binds on 10g / 11g: no measured thin form (#241)"},
+    {"REF OUT parameter (SQL_SEER_REF)", 8, 8, GATE_TODO,
+     "REF OUT on 8i: its pure-OUT value isn't measured (#241)"},
+    {"REF OUT parameter (SQL_SEER_REF)", 10, 11, GATE_TODO,
+     "REF binds on 10g / 11g: no measured thin form (#241)"},
     {"implicit result rows holding a CURSOR() column", 8, 11, GATE_SERVER,
      "no DBMS_SQL.RETURN_RESULT before 12c"},
     {"implicit results", 8, 11, GATE_SERVER, "no DBMS_SQL.RETURN_RESULT before 12c"},
@@ -2129,6 +2135,119 @@ static void check_attr_getters_rowop(SQLHDBC dbc)
     pass(name);
   else
     fail(name, m);
+}
+
+/* SQL_SEER_REF (#241): a REF read from REF(t) as bytes, bound back IN with
+ * its type named in the IPD (SQL_DESC_SEER_REF_TYPE), finds its row; a block's
+ * REF OUT hands back a REF that does the same; without the type the bind is
+ * refused with a message saying what's missing. */
+#define SQL_SEER_REF (-9996)
+#define SQL_DESC_SEER_REF_TYPE 19116
+static SQLRETURN ref_param(SQLHSTMT st, SQLSMALLINT io, unsigned char *buf, SQLLEN cap, SQLLEN *ind,
+                           const char *type)
+{
+  SQLRETURN rc =
+      SQLBindParameter(st, 1, io, SQL_C_BINARY, SQL_SEER_REF, (SQLULEN)cap, 0, buf, cap, ind);
+  SQLHDESC ipd = NULL;
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLGetStmtAttr(st, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, NULL);
+  if (SQL_SUCCEEDED(rc) && type != NULL)
+    rc = SQLSetDescField(ipd, 1, SQL_DESC_SEER_REF_TYPE, (SQLPOINTER)type, SQL_NTS);
+  return rc;
+}
+
+static int ref_finds(SQLHDBC dbc, unsigned char *ref, SQLLEN rl, const char *type, char *got,
+                     size_t gotn, char *err, int errn)
+{
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLLEN ind = rl;
+  SQLRETURN rc = ref_param(st, SQL_PARAM_INPUT, ref, rl, &ind, type);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLExecDirect(st, (SQLCHAR *)"SELECT t.n FROM seer_ort t WHERE REF(t) = ?", SQL_NTS);
+  SQLLEN gi = 0;
+  got[0] = '\0';
+  if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+    SQLGetData(st, 1, SQL_C_CHAR, got, (SQLLEN)gotn, &gi);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, errn);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  return SQL_SUCCEEDED(rc);
+}
+
+static void check_ref_params(SQLHDBC dbc)
+{
+  const char *in_name = "REF IN parameter (SQL_SEER_REF)";
+  const char *out_name = "REF OUT parameter (SQL_SEER_REF)";
+  int run_in = !gated(in_name), run_out = !gated(out_name);
+  if (!run_in && !run_out)
+    return;
+  char err[256] = "", user[64] = "", type[160];
+  exec_do(dbc, "DROP TABLE seer_ort", err, sizeof err);
+  exec_do(dbc, "DROP TYPE seer_orf", err, sizeof err);
+  exec_do(dbc, "CREATE TYPE seer_orf AS OBJECT (n NUMBER)", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_ort OF seer_orf", err, sizeof err);
+  exec_do(dbc, "INSERT INTO seer_ort VALUES (seer_orf(7))", err, sizeof err);
+  exec_do(dbc, "INSERT INTO seer_ort VALUES (seer_orf(8))", err, sizeof err);
+  exec_scalar(dbc, "SELECT USER FROM dual", user, sizeof user, err, sizeof err);
+  snprintf(type, sizeof type, "%s.SEER_ORF", user);
+
+  if (run_in) {
+    unsigned char ref[512];
+    SQLLEN rl = 0;
+    char got[16] = "", m[600] = "";
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLRETURN rc =
+        SQLExecDirect(st, (SQLCHAR *)"SELECT REF(t) FROM seer_ort t WHERE t.n = 7", SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+      SQLGetData(st, 1, SQL_C_BINARY, ref, sizeof ref, &rl);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (rl <= 0 || rl > (SQLLEN)sizeof ref)
+      snprintf(m, sizeof m, "REF(t) read %ld bytes", (long)rl);
+    else if (!ref_finds(dbc, ref, rl, type, got, sizeof got, err, sizeof err) ||
+             strcmp(got, "7") != 0)
+      snprintf(m, sizeof m, "the REF (%ld bytes) bound IN found '%s', want 7: %s", (long)rl, got,
+               err);
+    else { /* no type named: refused, saying so */
+      err[0] = '\0';
+      int ok = ref_finds(dbc, ref, rl, NULL, got, sizeof got, err, sizeof err);
+      if (ok || strstr(err, "SQL_DESC_SEER_REF_TYPE") == NULL)
+        snprintf(m, sizeof m, "without a type: ok=%d '%s'", ok, err);
+    }
+    if (m[0] == '\0')
+      pass(in_name);
+    else
+      fail(in_name, m);
+  }
+
+  if (run_out) {
+    unsigned char ref[512];
+    SQLLEN ind = 0;
+    char got[16] = "", m[600] = "";
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLRETURN rc = ref_param(st, SQL_PARAM_OUTPUT, ref, sizeof ref, &ind, type);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLExecDirect(st,
+                         (SQLCHAR *)"DECLARE x REF seer_orf; BEGIN SELECT REF(t) INTO x FROM "
+                                    "seer_ort t WHERE t.n = 8; ? := x; END;",
+                         SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (!SQL_SUCCEEDED(rc) || ind <= 0 || ind > (SQLLEN)sizeof ref)
+      snprintf(m, sizeof m, "OUT: rc=%d, %ld bytes %s", (int)rc, (long)ind, err);
+    else if (!ref_finds(dbc, ref, ind, type, got, sizeof got, err, sizeof err) ||
+             strcmp(got, "8") != 0)
+      snprintf(m, sizeof m, "the OUT REF (%ld bytes) found '%s', want 8: %s", (long)ind, got, err);
+    if (m[0] == '\0')
+      pass(out_name);
+    else
+      fail(out_name, m);
+  }
+  exec_do(dbc, "DROP TABLE seer_ort", err, sizeof err);
+  exec_do(dbc, "DROP TYPE seer_orf", err, sizeof err);
 }
 
 /* Column bindings live until unbound (#244): bound before the first
@@ -4534,6 +4653,7 @@ int main(void)
     check_bindcol_lifetime(dbc);
     check_maxlength_noscan(dbc);
     check_attr_getters_rowop(dbc);
+    check_ref_params(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

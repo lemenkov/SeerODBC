@@ -589,6 +589,19 @@ SQLRETURN SQL_API SQLSetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
     case SQL_DESC_LENGTH:
       p->column_size = (SQLULEN)(intptr_t)ValuePtr;
       break;
+    case SQL_DESC_SEER_REF_TYPE: { /* the type a SQL_SEER_REF refers to (#241) */
+      free(p->ref_type);
+      p->ref_type = NULL;
+      if (ValuePtr == NULL)
+        break;
+      size_t n = BufferLength == SQL_NTS ? strlen((const char *)ValuePtr) : (size_t)BufferLength;
+      p->ref_type = malloc(n + 1);
+      if (p->ref_type == NULL)
+        return seer_odbc_diag(d, "HY001", 0, "Out of memory", SQL_ERROR);
+      memcpy(p->ref_type, ValuePtr, n);
+      p->ref_type[n] = '\0';
+      break;
+    }
     default:
       break;
     }
@@ -1043,7 +1056,7 @@ SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option)
     return SQL_SUCCESS;
   case SQL_RESET_PARAMS:
     for (int i = 0; i < s->num_params; i++)
-      free(s->params[i].dae_buf);
+      free(s->params[i].dae_buf), free(s->params[i].ref_type);
     free(s->params);
     s->params = NULL;
     s->num_params = 0;

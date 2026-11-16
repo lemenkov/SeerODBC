@@ -41,6 +41,18 @@
 #define SQL_SEER_BLOB (-9997)
 #endif
 
+/* SeerODBC extension SQL type: a REF parameter (#241), its value the REF's
+ * bytes as a REF column reads them, SQL_C_BINARY with the byte length in the
+ * indicator; SQL_PARAM_INPUT or SQL_PARAM_OUTPUT. The type the REF refers to is
+ * named "SCHEMA.TYPE" in the parameter's IPD record, with
+ * SQLSetDescField(ipd, n, SQL_DESC_SEER_REF_TYPE, "SCHEMA.TYPE", SQL_NTS): ODBC's
+ * own SQL_DESC_TYPE_NAME is read-only there. 8i, 9i and 12c+ take a REF IN;
+ * 9i and 12c+ a REF OUT. */
+#ifndef SQL_SEER_REF
+#define SQL_SEER_REF (-9996)
+#endif
+#define SQL_DESC_SEER_REF_TYPE 19116
+
 /* SeerODBC extension SQLColAttribute field identifier: the column's 23ai SQL
  * annotations, returned as a "name=value\n..." character string (name-only
  * annotations have an empty value; empty string when the column has none). */
@@ -137,6 +149,7 @@ typedef struct {
   char *dae_buf;
   size_t dae_len;
   size_t dae_cap;
+  char *ref_type; /* SQL_DESC_SEER_REF_TYPE: "SCHEMA.TYPE" a REF refers to (#241) */
 } OdbcParam;
 
 /* The four ODBC descriptors of a statement (SQL_ATTR_*_DESC): application/
