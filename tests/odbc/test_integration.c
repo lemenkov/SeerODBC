@@ -548,6 +548,79 @@ static void check_zero_length_columns(SQLHDBC dbc)
   }
 }
 
+/* Run `sql` (execute, then fetch), and the first diag record's state and
+ * native error of whichever call failed; 0 when nothing failed. */
+static int sql_state_of(SQLHDBC dbc, const char *sql, char state[6], SQLINTEGER *native)
+{
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS);
+  if (SQL_SUCCEEDED(rc)) {
+    SQLSMALLINT nc = 0;
+    SQLNumResultCols(st, &nc);
+    if (nc > 0)
+      rc = SQLFetch(st);
+  }
+  int failed = !SQL_SUCCEEDED(rc) && rc != SQL_NO_DATA;
+  state[0] = '\0';
+  *native = 0;
+  if (failed) {
+    SQLCHAR msg[256];
+    SQLSMALLINT len = 0;
+    SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, (SQLCHAR *)state, native, msg, sizeof msg, &len);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  return failed;
+}
+
+/* Server errors carry the SQLSTATE their ORA code means, not HY000 (#207):
+ * what pyodbc and others map to IntegrityError, ProgrammingError, DataError. */
+static void check_server_error_states(SQLHDBC dbc)
+{
+  const char *name = "server errors carry their SQLSTATE";
+  char st[6];
+  SQLINTEGER native;
+  sql_state_of(dbc, "DROP TABLE seer_sqlstate_t", st, &native);
+  if (sql_state_of(dbc,
+                   "CREATE TABLE seer_sqlstate_t (id NUMBER PRIMARY KEY, n NUMBER(2) NOT NULL)", st,
+                   &native) ||
+      sql_state_of(dbc, "INSERT INTO seer_sqlstate_t VALUES (1, 1)", st, &native)) {
+    char m[64];
+    snprintf(m, sizeof m, "setup failed: %s ORA-%05ld", st, (long)native);
+    skip(name, m);
+    return;
+  }
+  static const struct {
+    const char *sql, *state;
+    long code;
+  } cases[] = {
+      {"INSERT INTO seer_sqlstate_t VALUES (1, 2)", "23000", 1},
+      {"INSERT INTO seer_sqlstate_t VALUES (2, NULL)", "23000", 1400},
+      {"SELECT * FROM seer_no_such_table", "42S02", 942},
+      {"CREATE TABLE seer_sqlstate_t (x NUMBER)", "42S01", 955},
+      {"SELECT seer_no_such_column FROM dual", "42S22", 904},
+      {"SELECT FROM dual", "42000", 936},
+      {"SELECT 1/0 FROM dual", "22012", 1476},
+      {"SELECT TO_NUMBER('x') FROM dual", "22018", 1722},
+      {"INSERT INTO seer_sqlstate_t VALUES (3, 123)", "22003", 1438},
+      {"SELECT TO_DATE('2020-13-01', 'YYYY-MM-DD') FROM dual", "22008", 1843},
+  };
+  char m[600] = "";
+  for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+    int failed = sql_state_of(dbc, cases[k].sql, st, &native);
+    if (!failed || native != cases[k].code || strcmp(st, cases[k].state) != 0) {
+      size_t ml = strlen(m);
+      snprintf(m + ml, sizeof m - ml, "%s'%s': want %s ORA-%05ld, got %s ORA-%05ld", ml ? "; " : "",
+               cases[k].sql, cases[k].state, cases[k].code, failed ? st : "(none)", (long)native);
+    }
+  }
+  sql_state_of(dbc, "DROP TABLE seer_sqlstate_t", st, &native);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* A CURSOR(...) column (nested cursor, type 102) has its own row form - a
  * length byte, an inline describe and a ub2 cursor id. ODBC has no nested
  * cursor type, so the driver reports it as NULL; what matters is that the
@@ -3691,6 +3764,7 @@ int main(void)
   check_batch_resume_repeated_column(dbc);
   check_aggregate_null_warning(dbc);
   check_nested_cursor_column(dbc);
+  check_server_error_states(dbc);
   check_length_boundaries(dbc);
   check_typed_null(dbc);
   check_statement_kind(dbc);
