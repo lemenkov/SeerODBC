@@ -178,12 +178,15 @@ typedef struct {
   SQLULEN n_param_rows;
   SQLLEN *dml_row_counts; /* SQL_ATTR_SEER_DML_ROW_COUNTS (app buffer) */
   /* Row-array (block) fetch. */
-  SQLULEN row_array_size;   /* SQL_ATTR_ROW_ARRAY_SIZE, default 1 */
-  SQLULEN row_bind_type;    /* SQL_ATTR_ROW_BIND_TYPE (0 = by column) */
-  SQLLEN *row_bind_offset;  /* SQL_ATTR_ROW_BIND_OFFSET_PTR (#243) */
-  SQLULEN *rows_fetched;    /* SQL_ATTR_ROWS_FETCHED_PTR */
-  SQLUSMALLINT *row_status; /* SQL_ATTR_ROW_STATUS_PTR */
-  long rowset_start;        /* 0-based first row of the current rowset, -1 = none */
+  SQLULEN row_array_size;      /* SQL_ATTR_ROW_ARRAY_SIZE, default 1 */
+  SQLULEN row_bind_type;       /* SQL_ATTR_ROW_BIND_TYPE (0 = by column) */
+  SQLLEN *row_bind_offset;     /* SQL_ATTR_ROW_BIND_OFFSET_PTR (#243) */
+  SQLUSMALLINT *row_operation; /* SQL_ATTR_ROW_OPERATION_PTR: SQL_ROW_IGNORE rows (#250) */
+  SQLULEN retrieve_data;       /* SQL_ATTR_RETRIEVE_DATA: SQL_RD_OFF fetches fill nothing */
+  SQLLEN *fetch_bookmark;      /* SQL_ATTR_FETCH_BOOKMARK_PTR, kept (no bookmarks) */
+  SQLULEN *rows_fetched;       /* SQL_ATTR_ROWS_FETCHED_PTR */
+  SQLUSMALLINT *row_status;    /* SQL_ATTR_ROW_STATUS_PTR */
+  long rowset_start;           /* 0-based first row of the current rowset, -1 = none */
   /* Updatable cursor (positioned update/delete via SQLSetPos). */
   SQLULEN concurrency;   /* SQL_ATTR_CONCURRENCY, default READ_ONLY */
   SQLULEN query_timeout; /* SQL_ATTR_QUERY_TIMEOUT, seconds; 0 = none (#209) */

@@ -2037,6 +2037,100 @@ static void check_maxlength_noscan(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* #250: every standard attribute reads back at its own width and default; a
+ * bulk SQLSetPos DELETE skips the rows ROW_OPERATION_PTR marks
+ * SQL_ROW_IGNORE; with RETRIEVE_DATA off a fetch fills nothing. */
+static void check_attr_getters_rowop(SQLHDBC dbc)
+{
+  const char *name = "attribute getters' widths; SQLSetPos skips ignored rows; RETRIEVE_DATA";
+  char err[256] = "", m[600] = "";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  static const SQLINTEGER zero_attrs[] = {SQL_ATTR_KEYSET_SIZE,        SQL_ATTR_USE_BOOKMARKS,
+                                          SQL_ATTR_ENABLE_AUTO_IPD,    SQL_ATTR_METADATA_ID,
+                                          SQL_ATTR_FETCH_BOOKMARK_PTR, SQL_ATTR_ROW_OPERATION_PTR};
+  for (size_t k = 0; k < sizeof zero_attrs / sizeof zero_attrs[0] && m[0] == '\0'; k++) {
+    SQLULEN v = (SQLULEN)-1; /* every byte set: a 4-byte write leaves half of it */
+    SQLGetStmtAttr(st, zero_attrs[k], &v, 0, NULL);
+    if (v != 0)
+      snprintf(m, sizeof m, "stmt attribute %d read 0x%llx, want 0", (int)zero_attrs[k],
+               (unsigned long long)v);
+  }
+  SQLULEN rd = 0;
+  SQLGetStmtAttr(st, SQL_ATTR_RETRIEVE_DATA, &rd, 0, NULL);
+  if (m[0] == '\0' && rd != SQL_RD_ON)
+    snprintf(m, sizeof m, "RETRIEVE_DATA read %lu, want SQL_RD_ON", (unsigned long)rd);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (m[0] == '\0') {
+    char cat[16] = "xyz";
+    SQLINTEGER cl = -1;
+    SQLULEN ae = (SQLULEN)-1;
+    SQLGetConnectAttr(dbc, SQL_ATTR_CURRENT_CATALOG, cat, sizeof cat, &cl);
+    SQLGetConnectAttr(dbc, SQL_ATTR_ASYNC_ENABLE, &ae, 0, NULL);
+    if (cat[0] != '\0' || cl != 0 || ae != 0)
+      snprintf(m, sizeof m, "CURRENT_CATALOG '%s' (%d), connection ASYNC_ENABLE 0x%llx", cat,
+               (int)cl, (unsigned long long)ae);
+  }
+
+  if (m[0] == '\0') { /* bulk delete, rows 2 and 4 ignored */
+    exec_do(dbc, "DROP TABLE seer_rowop", err, sizeof err);
+    exec_do(dbc, "CREATE TABLE seer_rowop (id NUMBER)", err, sizeof err);
+    exec_do(dbc, "INSERT INTO seer_rowop SELECT rownum FROM all_objects WHERE rownum <= 4", err,
+            sizeof err);
+    SQLINTEGER ids[4] = {0};
+    SQLLEN ind[4] = {0};
+    SQLUSMALLINT op[4] = {SQL_ROW_PROCEED, SQL_ROW_IGNORE, SQL_ROW_PROCEED, SQL_ROW_IGNORE};
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLSetStmtAttr(st, SQL_ATTR_CONCURRENCY, (SQLPOINTER)SQL_CONCUR_VALUES, 0);
+    SQLSetStmtAttr(st, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)(SQLULEN)4, 0);
+    SQLSetStmtAttr(st, SQL_ATTR_ROW_OPERATION_PTR, op, 0);
+    SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT id FROM seer_rowop ORDER BY id", SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLBindCol(st, 1, SQL_C_SLONG, ids, 0, ind);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(st);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLSetPos(st, 0, SQL_DELETE, SQL_LOCK_NO_CHANGE);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    char left[64] = "", e2[256] = "";
+    exec_scalar(dbc, "SELECT COUNT(*) || ':' || MIN(id) || ':' || MAX(id) FROM seer_rowop", left,
+                sizeof left, e2, sizeof e2);
+    if (!SQL_SUCCEEDED(rc) || strcmp(left, "2:2:4") != 0)
+      snprintf(m, sizeof m, "bulk delete with rows 2, 4 ignored: rc=%d, left '%s' (want 2:2:4) %s",
+               (int)rc, left, err);
+  }
+
+  if (m[0] == '\0') { /* RETRIEVE_DATA off, then on */
+    SQLINTEGER id = -1;
+    SQLLEN ind = 0;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT id FROM seer_rowop ORDER BY id", SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLBindCol(st, 1, SQL_C_SLONG, &id, 0, &ind);
+    SQLSetStmtAttr(st, SQL_ATTR_RETRIEVE_DATA, (SQLPOINTER)SQL_RD_OFF, 0);
+    SQLRETURN f1 = SQL_SUCCEEDED(rc) ? SQLFetch(st) : rc;
+    SQLINTEGER after_off = id;
+    /* ROW_NUMBER: the Driver Manager answers it itself until a row is current */
+    SQLULEN rown = (SQLULEN)-1;
+    SQLGetStmtAttr(st, SQL_ATTR_ROW_NUMBER, &rown, 0, NULL);
+    SQLSetStmtAttr(st, SQL_ATTR_RETRIEVE_DATA, (SQLPOINTER)SQL_RD_ON, 0);
+    SQLRETURN f2 = SQL_SUCCEEDED(f1) ? SQLFetch(st) : f1;
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (!SQL_SUCCEEDED(f1) || !SQL_SUCCEEDED(f2) || after_off != -1 || id != 4 || rown != 1)
+      snprintf(m, sizeof m,
+               "RETRIEVE_DATA: off fetch rc=%d left %d (want -1), row number 0x%llx (want 1), on "
+               "fetch rc=%d read %d (want 4)",
+               (int)f1, (int)after_off, (unsigned long long)rown, (int)f2, (int)id);
+  }
+  exec_do(dbc, "DROP TABLE seer_rowop", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Column bindings live until unbound (#244): bound before the first
  * execute, they fill on the fetch; the same statement executed again with a
  * new parameter fills the same buffer; after SQL_UNBIND a fetch leaves it be. */
@@ -4439,6 +4533,7 @@ int main(void)
     check_rowwise_binds(dbc);
     check_bindcol_lifetime(dbc);
     check_maxlength_noscan(dbc);
+    check_attr_getters_rowop(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

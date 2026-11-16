@@ -846,12 +846,21 @@ static void pos_range(OdbcStmt *s, long row, long *first, long *last)
   }
 }
 
+/* A bulk SQLSetPos (row < 0, every row of the rowset) skips the rows
+ * SQL_ATTR_ROW_OPERATION_PTR marks SQL_ROW_IGNORE (#250); acted on, a row
+ * the application excluded was updated or deleted. */
+static bool pos_ignored(const OdbcStmt *s, long row, long r)
+{
+  return row < 0 && s->row_operation != NULL &&
+         s->row_operation[r - s->rowset_start] == SQL_ROW_IGNORE;
+}
+
 SQLRETURN seer_odbc_pos_delete(OdbcStmt *s, long row)
 {
   long first, last;
   pos_range(s, row, &first, &last);
   for (long r = first; r <= last; r++) {
-    if (r < 0 || (size_t)r >= s->num_rowids || s->rowids[r] == NULL)
+    if (r < 0 || (size_t)r >= s->num_rowids || s->rowids[r] == NULL || pos_ignored(s, row, r))
       continue;
     char sql[256];
     snprintf(sql, sizeof sql, "DELETE FROM %s WHERE ROWID = :1", s->base_table);
@@ -875,7 +884,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
   long first, last;
   pos_range(s, row, &first, &last);
   for (long r = first; r <= last; r++) {
-    if (r < 0 || (size_t)r >= s->num_rowids || s->rowids[r] == NULL)
+    if (r < 0 || (size_t)r >= s->num_rowids || s->rowids[r] == NULL || pos_ignored(s, row, r))
       continue;
     long elem = r - s->rowset_start; /* index within the bound rowset */
     if (elem < 0)

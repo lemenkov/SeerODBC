@@ -146,8 +146,6 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
                                     SQLPOINTER ValuePtr, SQLINTEGER BufferLength,
                                     SQLINTEGER *StringLengthPtr)
 {
-  (void)BufferLength;
-  (void)StringLengthPtr;
   OdbcDbc *c = (OdbcDbc *)ConnectionHandle;
   if (c == NULL)
     return SQL_INVALID_HANDLE;
@@ -172,8 +170,22 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   case SQL_ATTR_LOGIN_TIMEOUT: /* unset: the 30 s default */
     *(SQLUINTEGER *)ValuePtr = (SQLUINTEGER)(c->login_timeout < 0 ? 30 : c->login_timeout);
     return SQL_SUCCESS;
-  default:
-    *(SQLINTEGER *)ValuePtr = 0;
+  /* #250: a string and the pointer-wide ones, which the catch-all wrote as
+   * four zero bytes. Oracle has no catalogs: the current one is empty. */
+  case SQL_ATTR_CURRENT_CATALOG:
+    if (BufferLength > 0)
+      *(SQLCHAR *)ValuePtr = '\0';
+    if (StringLengthPtr != NULL)
+      *StringLengthPtr = 0;
+    return SQL_SUCCESS;
+  case SQL_ATTR_ASYNC_ENABLE:
+    *(SQLULEN *)ValuePtr = SQL_ASYNC_ENABLE_OFF;
+    return SQL_SUCCESS;
+  case SQL_ATTR_QUIET_MODE:
+    *(SQLPOINTER *)ValuePtr = NULL;
+    return SQL_SUCCESS;
+  default: /* the 32-bit ones: ACCESS_MODE read-write, AUTO_IPD and METADATA_ID false, ... */
+    *(SQLUINTEGER *)ValuePtr = 0;
     return SQL_SUCCESS;
   }
 }
@@ -231,6 +243,23 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   /* Where bound data lives and which parameter sets run (#243). */
   case SQL_ATTR_PARAM_BIND_OFFSET_PTR:
     s->param_bind_offset = (SQLLEN *)ValuePtr;
+    return SQL_SUCCESS;
+  /* #250: the rows a bulk SQLSetPos skips, whether a fetch fills the
+   * buffers, and the bookmark pointer (kept; SeerODBC has no bookmarks). */
+  case SQL_ATTR_ROW_OPERATION_PTR:
+    s->row_operation = (SQLUSMALLINT *)ValuePtr;
+    return SQL_SUCCESS;
+  case SQL_ATTR_RETRIEVE_DATA:
+    s->retrieve_data = (SQLULEN)(uintptr_t)ValuePtr;
+    return SQL_SUCCESS;
+  case SQL_ATTR_FETCH_BOOKMARK_PTR:
+    s->fetch_bookmark = (SQLLEN *)ValuePtr;
+    return SQL_SUCCESS;
+  case SQL_ATTR_METADATA_ID: /* catalog arguments as identifiers: not yet */
+    if ((SQLULEN)(uintptr_t)ValuePtr != SQL_FALSE)
+      return seer_odbc_diag(s, "HYC00", 0,
+                            "SQL_ATTR_METADATA_ID is not supported: catalog arguments are patterns",
+                            SQL_ERROR);
     return SQL_SUCCESS;
   case SQL_ATTR_MAX_LENGTH: /* bytes of a char / binary value returned (#248) */
     s->max_length = (SQLULEN)(uintptr_t)ValuePtr;
@@ -337,6 +366,29 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
   case SQL_ATTR_MAX_LENGTH:
     *(SQLULEN *)ValuePtr = s->max_length;
+    return SQL_SUCCESS;
+  /* The rest of the standard attributes, each at its own width and default
+   * (#250): the catch-all below wrote a 4-byte zero, half of a SQLULEN. */
+  case SQL_ATTR_ROW_OPERATION_PTR:
+    *(SQLUSMALLINT **)ValuePtr = s->row_operation;
+    return SQL_SUCCESS;
+  case SQL_ATTR_FETCH_BOOKMARK_PTR:
+    *(SQLLEN **)ValuePtr = s->fetch_bookmark;
+    return SQL_SUCCESS;
+  case SQL_ATTR_RETRIEVE_DATA:
+    *(SQLULEN *)ValuePtr = s->retrieve_data == SQL_RD_OFF ? SQL_RD_OFF : SQL_RD_ON;
+    return SQL_SUCCESS;
+  case SQL_ATTR_ROW_NUMBER: /* the current row, 1-based; 0 with none */
+    *(SQLULEN *)ValuePtr = s->rowset_start >= 0 ? (SQLULEN)s->rowset_start + 1 : 0;
+    return SQL_SUCCESS;
+  case SQL_ATTR_KEYSET_SIZE:
+  case SQL_ATTR_USE_BOOKMARKS: /* SQL_UB_OFF */
+  case SQL_ATTR_ENABLE_AUTO_IPD:
+  case SQL_ATTR_METADATA_ID:
+    *(SQLULEN *)ValuePtr = 0;
+    return SQL_SUCCESS;
+  case SQL_ATTR_SIMULATE_CURSOR: /* positioned DML by ROWID: one row each */
+    *(SQLULEN *)ValuePtr = SQL_SC_UNIQUE;
     return SQL_SUCCESS;
   case SQL_ATTR_NOSCAN:
     *(SQLULEN *)ValuePtr = s->noscan;
