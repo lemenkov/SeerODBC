@@ -10531,7 +10531,7 @@ SeerStatus seer_stmt_bind_out_array(SeerStmt *stmt, int param, int ora_type, int
     return SEER_OK;
   }
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#172) */
+    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
   uint32_t charset = (dtype == ORA_TYPE_NUMBER) ? 0 : 873;
   uint8_t csfrm = (dtype == ORA_TYPE_NUMBER) ? 0 : 1;
@@ -10612,7 +10612,7 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
     return aa_store(stmt, param, ORA_TYPE_NUMBER, 22, v.buf, v.len, oac, ol);
   }
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#172) */
+    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
   /* RXD: ub4 element count, then each element <ub1 len><NUMBER bytes>. */
   SeerWriter rxd;
@@ -10675,7 +10675,7 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
     return aa_store(stmt, param, ORA_TYPE_VARCHAR, (uint32_t)elem_size, v.buf, v.len, oac, ol);
   }
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#172) */
+    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
   /* RXD: ub4 count, then each element as a length-framed CHR value. */
   SeerWriter rxd;

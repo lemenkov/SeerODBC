@@ -189,8 +189,8 @@ SeerStatus seer_unsubscribe(SeerConn *conn);
  * so commit to make the message available. RAW enqueue / dequeue and their
  * options work on every release: 10g and later in the AQ protocol, 9i and 8i as
  * PL/SQL on DBMS_AQ (the account needs EXECUTE on it), where a payload is at
- * most 32512 bytes. Object payloads are 10g+ (9i and 8i have no object binds,
- * #172); JSON payloads need a 21c+ JSON queue. */
+ * most 32512 bytes. Object payloads work from 8i on (8i and 9i through the
+ * DBMS_AQ blocks, #172); JSON payloads need a 21c+ JSON queue. */
 /* Enqueue options (all optional; a NULL options pointer means the defaults that
  * seer_aq_enq_raw uses). */
 typedef struct {
@@ -353,7 +353,7 @@ SeerStatus seer_stmt_bind_null(SeerStmt *stmt, int param);
  * re-typing the column. */
 SeerStatus seer_stmt_bind_null_typed(SeerStmt *stmt, int param, int ora_type);
 
-/* Bind a SQL OBJECT (ADT) parameter (10g+; #172). The type is `schema`.`type_name`;
+/* Bind a SQL OBJECT (ADT) parameter (8i and later; #172). The type is `schema`.`type_name`;
  * its attribute values are supplied as text in attribute order (a NULL entry is
  * a SQL NULL attribute), and `n_attrs` must match the type's attribute count.
  * The driver looks up the type and encodes each value as its attribute's Oracle
@@ -426,19 +426,20 @@ SeerStatus seer_stmt_bind_collection(SeerStmt *stmt, int param, const char *sche
                                      const char *type_name, const char *const *elem_values,
                                      int n_elems);
 
-/* Bind a PL/SQL associative array (index-by table) as a single parameter (10g+):
- * the whole `values` array goes in one call. For text, `elem_size` is the
- * declared element max length and a NULL entry is a SQL NULL element. The matching
+/* Bind a PL/SQL associative array (index-by table) as a single parameter (8i and
+ * 10g+; SEER_ENOTIMPL on 9i, #254): the whole `values` array goes in one call.
+ * For text, `elem_size` is the declared element max length and a NULL entry is
+ * a SQL NULL element. The matching
  * statement is a PL/SQL block whose parameter is an index-by table of NUMBER /
  * VARCHAR2. (Distinct from array DML, which iterates a statement N times.) */
 SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *values, int n);
 SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *const *values, int n,
                                      int elem_size);
 
-/* Bind a PL/SQL associative-array OUT parameter (10g+): the server fills up to
- * `capacity` elements of `ora_type` (2 NUMBER / 1 VARCHAR; `elem_size` is the
- * per-element max for VARCHAR). After execute, read the results with
- * seer_stmt_out_array_len and seer_stmt_out_array_get. */
+/* Bind a PL/SQL associative-array OUT parameter (8i and 10g+; not 9i, #254):
+ * the server fills up to `capacity` elements of `ora_type` (2 NUMBER /
+ * 1 VARCHAR; `elem_size` is the per-element max for VARCHAR). After execute,
+ * read the results with seer_stmt_out_array_len and seer_stmt_out_array_get. */
 SeerStatus seer_stmt_bind_out_array(SeerStmt *stmt, int param, int ora_type, int elem_size,
                                     int capacity);
 /* Number of elements returned in an OUT assoc-array bind. */
