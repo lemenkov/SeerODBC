@@ -86,9 +86,10 @@ typedef struct {
   SeerConn *conn;
   int connected;
   SQLUINTEGER autocommit;
-  long login_timeout; /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
-  char *browse_cs;    /* SQLBrowseConnect: accumulated attributes */
-  char dbms_ver[64];  /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
+  long login_timeout;        /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
+  SQLUINTEGER txn_isolation; /* SQL_ATTR_TXN_ISOLATION, 0 = the server's default (#220) */
+  char *browse_cs;           /* SQLBrowseConnect: accumulated attributes */
+  char dbms_ver[64];         /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
 } OdbcDbc;
 
 /* A column binding set by SQLBindCol. */
@@ -197,6 +198,8 @@ void seer_odbc_diag_free(SQLHANDLE handle);
 
 /* Map a core SeerStatus to an ODBC SQLSTATE string. */
 const char *seer_odbc_sqlstate(SeerStatus st);
+/* Apply SQL_ATTR_TXN_ISOLATION's level on the connection (#220). */
+SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level);
 /* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call
  * to the server (#209). */
 void seer_odbc_arm_timeout(OdbcStmt *s);
