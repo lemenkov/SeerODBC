@@ -2961,6 +2961,55 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+/* Rows a statement's query returns. */
+static long count_rows(SQLHSTMT st, const char *sql)
+{
+  if (!SQL_SUCCEEDED(SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS)))
+    return -1;
+  long n = 0;
+  while (SQL_SUCCEEDED(SQLFetch(st)))
+    n++;
+  SQLCloseCursor(st);
+  return n;
+}
+
+/* SQL_ATTR_MAX_ROWS (#221): 5 caps a 400-row query at 5 rows and reads back;
+ * 0 lifts the cap; a capped query with a CLOB column - whose rows past the cap
+ * leave no LOB reads behind - returns 5 too. */
+static void check_max_rows(SQLHDBC dbc)
+{
+  const char *name = "SQL_ATTR_MAX_ROWS caps a result";
+  const char *q400 = "SELECT rownum FROM all_objects WHERE rownum <= 400";
+  char err[256] = "", m[300] = "";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLSetStmtAttr(st, SQL_ATTR_MAX_ROWS, (SQLPOINTER)(uintptr_t)5, 0);
+  SQLULEN got = 0;
+  SQLGetStmtAttr(st, SQL_ATTR_MAX_ROWS, &got, 0, NULL);
+  long capped = count_rows(st, q400);
+  SQLSetStmtAttr(st, SQL_ATTR_MAX_ROWS, (SQLPOINTER)(uintptr_t)0, 0);
+  long all = count_rows(st, q400);
+  exec_do(dbc, "DROP TABLE seer_maxrows_t", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_maxrows_t (n NUMBER, c CLOB)", err, sizeof err);
+  exec_do(dbc,
+          "INSERT INTO seer_maxrows_t SELECT rownum, EMPTY_CLOB() FROM all_objects WHERE "
+          "rownum <= 150",
+          err, sizeof err);
+  SQLSetStmtAttr(st, SQL_ATTR_MAX_ROWS, (SQLPOINTER)(uintptr_t)5, 0);
+  long lobs = count_rows(st, "SELECT n, c FROM seer_maxrows_t");
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_maxrows_t", err, sizeof err);
+  if (got != 5 || capped != 5 || all != 400 || lobs != 5)
+    snprintf(m, sizeof m,
+             "reads back %lu; capped %ld (want 5), uncapped %ld (want 400), with a CLOB %ld "
+             "(want 5) %s",
+             (unsigned long)got, capped, all, lobs, err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQL_ATTR_TXN_ISOLATION (#220), which SQLGetInfo advertises: a session set
  * to SERIALIZABLE before connecting keeps reading the value its transaction
  * first saw while another session changes and commits it; switched to READ
@@ -4071,6 +4120,7 @@ int main(void)
   check_query_timeout(drv, host, port, svc, user, pwd);
   check_login_timeout(drv, host, port, svc, user, pwd);
   check_txn_isolation(dbc, drv, host, port, svc, user, pwd);
+  check_max_rows(dbc);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

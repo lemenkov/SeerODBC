@@ -432,6 +432,7 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     return pr;
 
   seer_odbc_arm_timeout(s);
+  seer_stmt_set_max_rows(s->core, (size_t)s->max_rows);
   SeerStatus st = seer_stmt_execute(s->core);
   if (st != SEER_OK)
     return seer_odbc_exec_error(s, st);
