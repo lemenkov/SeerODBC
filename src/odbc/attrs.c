@@ -222,6 +222,34 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_MAX_ROWS: /* rows a query returns at most, from the next execute */
     s->max_rows = (SQLULEN)(uintptr_t)ValuePtr;
     return SQL_SUCCESS;
+  /* The cursor (#226): forward-only, or the buffered static one SQLFetchScroll
+   * scrolls - what SQL_SCROLL_OPTIONS advertises. A keyset-driven or dynamic
+   * one becomes static, a sensitive one insensitive, with 01S02 (option value
+   * changed), as ODBC has a driver substitute what it lacks. */
+  case SQL_ATTR_CURSOR_TYPE: {
+    SQLULEN v = (SQLULEN)(uintptr_t)ValuePtr;
+    if (v == SQL_CURSOR_FORWARD_ONLY || v == SQL_CURSOR_STATIC) {
+      s->cursor_type = v;
+      return SQL_SUCCESS;
+    }
+    s->cursor_type = SQL_CURSOR_STATIC;
+    return seer_odbc_diag(s, "01S02", 0, "Cursor type changed to SQL_CURSOR_STATIC",
+                          SQL_SUCCESS_WITH_INFO);
+  }
+  case SQL_ATTR_CURSOR_SCROLLABLE:
+    s->cursor_type = (SQLULEN)(uintptr_t)ValuePtr == SQL_SCROLLABLE ? SQL_CURSOR_STATIC
+                                                                    : SQL_CURSOR_FORWARD_ONLY;
+    return SQL_SUCCESS;
+  case SQL_ATTR_CURSOR_SENSITIVITY: {
+    SQLULEN v = (SQLULEN)(uintptr_t)ValuePtr;
+    if (v == SQL_UNSPECIFIED || v == SQL_INSENSITIVE) {
+      s->sensitivity = v;
+      return SQL_SUCCESS;
+    }
+    s->sensitivity = SQL_INSENSITIVE;
+    return seer_odbc_diag(s, "01S02", 0, "Cursor sensitivity changed to SQL_INSENSITIVE",
+                          SQL_SUCCESS_WITH_INFO);
+  }
   default:
     /* Cursor type, etc.: accept as no-ops. */
     return SQL_SUCCESS;
@@ -274,6 +302,15 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
   case SQL_ATTR_MAX_ROWS:
     *(SQLULEN *)ValuePtr = s->max_rows;
+    return SQL_SUCCESS;
+  case SQL_ATTR_CURSOR_TYPE:
+    *(SQLULEN *)ValuePtr = s->cursor_type;
+    return SQL_SUCCESS;
+  case SQL_ATTR_CURSOR_SCROLLABLE:
+    *(SQLULEN *)ValuePtr = s->cursor_type == SQL_CURSOR_STATIC ? SQL_SCROLLABLE : SQL_NONSCROLLABLE;
+    return SQL_SUCCESS;
+  case SQL_ATTR_CURSOR_SENSITIVITY:
+    *(SQLULEN *)ValuePtr = s->sensitivity;
     return SQL_SUCCESS;
   case SQL_ATTR_PARAMSET_SIZE:
     *(SQLULEN *)ValuePtr = s->paramset_size ? s->paramset_size : 1;

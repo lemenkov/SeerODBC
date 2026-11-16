@@ -166,6 +166,8 @@ typedef struct {
   SQLULEN concurrency;   /* SQL_ATTR_CONCURRENCY, default READ_ONLY */
   SQLULEN query_timeout; /* SQL_ATTR_QUERY_TIMEOUT, seconds; 0 = none (#209) */
   SQLULEN max_rows;      /* SQL_ATTR_MAX_ROWS; 0 = no limit (#221) */
+  SQLULEN cursor_type;   /* SQL_ATTR_CURSOR_TYPE: FORWARD_ONLY (0) or STATIC (#226) */
+  SQLULEN sensitivity;   /* SQL_ATTR_CURSOR_SENSITIVITY: UNSPECIFIED (0) or INSENSITIVE */
   int updatable;         /* this result set supports positioned DML */
   char *base_table;      /* table for the synthesized UPDATE/DELETE */
   int rowid_col;         /* core column index of the hidden ROWID, -1 = none */
