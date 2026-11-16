@@ -48,6 +48,7 @@ struct SeerConn {
    * so we opt in via the DTY cap and the server terminates every response with
    * a TTI_END_OF_RESPONSE (29) token. Prerequisite for request pipelining. */
   bool supports_eor;
+  bool supports_oob; /* the accept offered CAN_RECV_ATTENTION: OOB breaks (#224) */
   /* Pipelining (§32/#158): the token written into the fun-header (0 = ordinary
    * call; 1..N tags a pipelined op so the server can correlate its response). */
   uint32_t pipeline_token;
