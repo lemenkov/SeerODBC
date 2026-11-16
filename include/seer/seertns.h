@@ -365,6 +365,13 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
                                  const char *type_name, const char *const *attr_values,
                                  int n_attrs);
 
+/* Bind a REF IN (#241): `ref` / `len` are the REF's bytes, as a REF column or
+ * REF() reads them; `type_schema` / `type_name` name the type it references.
+ * 8i, 9i and 12c+; SEER_ENOTIMPL on 10g / 11g, which have no measured form.
+ * A NULL REF is SEER_EPARAM (unfilled, 8i and 9i answer ORA-00600). */
+SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema,
+                              const char *type_name, const uint8_t *ref, size_t len);
+
 /* Bind an OUT parameter of an object or collection type (10g+), named as for
  * seer_stmt_bind_object (a package type as "PKG.TYPE"). After execute,
  * seer_stmt_out_data returns the value rendered as text, as a fetched object

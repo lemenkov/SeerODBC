@@ -844,6 +844,65 @@ void core_objbind(void)
     else
       pass(name);
   }
+  /* A REF bind (#241): REF(t) read back as its bytes and bound in to find
+   * its row again; a NULL REF refused before anything is sent. */
+  if (!gated_as("REF bind", "REF bind")) {
+    const char *name = "REF bind";
+    run(c, "DROP TABLE seer_rft");
+    run(c, "DROP TYPE seer_rfo");
+    run(c, "CREATE TYPE seer_rfo AS OBJECT (n NUMBER)");
+    run(c, "CREATE TABLE seer_rft OF seer_rfo");
+    run(c, "INSERT INTO seer_rft VALUES (seer_rfo(7))");
+    run(c, "INSERT INTO seer_rft VALUES (seer_rfo(8))");
+    uint8_t ref[512];
+    size_t rl = 0;
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(c, "SELECT REF(t) FROM seer_rft t WHERE t.n = 7", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+      const void *d = NULL;
+      size_t l = 0;
+      int isnull = 0, isbin = 0;
+      if (seer_stmt_get_data(s, 0, &d, &l, &isnull, &isbin) == SEER_OK && d != NULL &&
+          l <= sizeof ref) {
+        memcpy(ref, d, l);
+        rl = l;
+      }
+    }
+    seer_stmt_close(s);
+    char got[32] = "";
+    s = NULL;
+    st = rl > 0 ? seer_stmt_prepare(c, "SELECT t.n FROM seer_rft t WHERE REF(t) = :1", &s)
+                : SEER_EPROTO;
+    if (st == SEER_OK)
+      st = seer_stmt_bind_ref(s, 1, schema, "SEER_RFO", ref, rl);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK) {
+      const char *v = NULL;
+      int isnull = 0;
+      if (seer_stmt_get_string(s, 0, &v, &isnull) == SEER_OK && v != NULL)
+        snprintf(got, sizeof got, "%s", v);
+    }
+    seer_stmt_close(s);
+    s = NULL;
+    SeerStatus nul = SEER_OK;
+    if (seer_stmt_prepare(c, "SELECT 1 FROM dual WHERE :1 IS NULL", &s) == SEER_OK)
+      nul = seer_stmt_bind_ref(s, 1, schema, "SEER_RFO", NULL, 0);
+    seer_stmt_close(s);
+    run(c, "DROP TABLE seer_rft");
+    run(c, "DROP TYPE seer_rfo");
+    if (st == SEER_OK && strcmp(got, "7") == 0 && nul == SEER_EPARAM)
+      pass(name);
+    else {
+      char m[200];
+      snprintf(m, sizeof m, "REF of %zu bytes: status %d, row '%s'; NULL REF %d %s", rl, (int)st,
+               got, (int)nul, seer_last_error(c) ? seer_last_error(c) : "");
+      fail(name, m);
+    }
+  }
+
   run(c, "DROP PROCEDURE seer_oip");
   run(c, "DROP PACKAGE seer_pko");
   run(c, "DROP TYPE seer_on");
