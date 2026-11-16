@@ -63,6 +63,7 @@ typedef struct {
   char *type_name;
   uint8_t *toid; /* 9i: the type OID from the describe, for the define (#168) */
   size_t toidlen;
+  uint32_t type_version; /* 9i: the describe's type version, echoed in the define */
   uint8_t *obj_attr_types;
   uint8_t *obj_attr_elem;  /* parallel: per attr, collection element type or 0 */
   int n_obj_attrs;         /* -1 = layout not yet fetched, 0 = fetched/empty */
@@ -4248,6 +4249,10 @@ static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_
     return cell_set_bytes(cell, content, clen, false);
 
   if (xflag & XML_FLAG_LOB) { /* a CLOB locator */
+    /* 9i and 8i read it with their own LOB calls, as a LOB attribute's
+     * (#168); the 10g+ read they answer with nothing usable. */
+    if (conn->field_version < TTC_FIELD_VERSION_10_2)
+      return decode_lob_attr_legacy(conn, ORA_TYPE_CLOB, content, clen, cell);
     if (xflag & XML_FLAG_LEGACY_STORAGE)
       return SEER_ENOTIMPL; /* 11g CLOB-stored XMLType */
     uint8_t *raw = NULL;
@@ -4899,9 +4904,11 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
   }
   if (col->ora_type == ORA_TYPE_ADT && col->toid != NULL) {
     /* An object or collection names its type, as ojdbc14 defines one: the
-     * open-ended size, the type OID as a value and version 1 (seerdb
-     * PROTOCOL.md §19.17c). Defined without them, 9.2 failed the fetch with
-     * ORA-00600 [kkdogty01] (#168). */
+     * open-ended size, the type OID as a value and the version - both as the
+     * describe gave them (seerdb PROTOCOL.md §19.17c). Defined without them,
+     * 9.2 failed the fetch with ORA-00600 [kkdogty01] (#168); so it did for
+     * an XMLType column, whose describe gives an all-zero OID and version
+     * 256, defined with version 1. */
     seer_writer_u8(w, deftype);
     seer_writer_u8(w, flag);
     seer_writer_u8(w, 0);
@@ -4912,7 +4919,7 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
     seer_enc_sb4(w, (uint32_t)col->toidlen);
     seer_writer_u8(w, (uint8_t)col->toidlen);
     seer_writer_bytes(w, col->toid, col->toidlen);
-    seer_enc_sb4(w, 1); /* version */
+    seer_enc_sb4(w, col->type_version ? col->type_version : 1); /* version */
     seer_enc_sb4(w, charset);
     seer_writer_u8(w, 0);
     return;
@@ -4956,7 +4963,7 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
     col->toid = toid; /* kept: the define names the type by it */
     col->toidlen = tl;
   }
-  (void)seer_dec_sb4(r); /* _vsn       */
+  col->type_version = (uint32_t)seer_dec_sb4(r); /* _vsn */
   int64_t charset = seer_dec_sb4(r);
   (void)seer_reader_u8(r); /* csfrm      */
   /* Before the name: null_ok(1B) + name-length-in-bytes(1B), then the name length

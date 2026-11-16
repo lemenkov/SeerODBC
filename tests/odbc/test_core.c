@@ -86,7 +86,6 @@ static const Gate GATES[] = {
     {"native JSON bind", 8, 18, GATE_SERVER, "no JSON type before 21c"},
     {"native VECTOR bind", 8, 21, GATE_SERVER, "no VECTOR type before 23ai"},
     {"XMLType bind", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
-    {"XMLType bind", 9, 9, GATE_TODO, "XMLType on 9i (#168)"},
     {"SQL OBJECT with a BOOLEAN attribute", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
     /* core_aq.c */
     {"AQ object payload", 8, 9, GATE_TODO, "AQ object payloads on 9i and 8i (#172)"},
