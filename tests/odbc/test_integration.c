@@ -2961,6 +2961,64 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+/* The first diag record's SQLSTATE of a handle, into st[6]. */
+static void diag_state(SQLSMALLINT type, SQLHANDLE h, char st[6])
+{
+  SQLINTEGER nat = 0;
+  SQLSMALLINT len = 0;
+  SQLCHAR msg[128];
+  st[0] = '\0';
+  SQLGetDiagRec(type, h, 1, (SQLCHAR *)st, &nat, msg, sizeof msg, &len);
+}
+
+/* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
+ * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
+ * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
+static void check_cursor_attrs(SQLHDBC dbc)
+{
+  const char *name = "cursor attributes kept, KEYSET / SENSITIVE substituted (01S02)";
+  char m[400] = "", st[6];
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLULEN type = 99, scroll = 99, sens = 99;
+  SQLSetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, (SQLPOINTER)(uintptr_t)SQL_CURSOR_STATIC, 0);
+  SQLGetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, &type, 0, NULL);
+  if (type != SQL_CURSOR_STATIC)
+    snprintf(m, sizeof m, "STATIC read back as %lu", (unsigned long)type);
+  SQLRETURN rc =
+      SQLSetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, (SQLPOINTER)(uintptr_t)SQL_CURSOR_KEYSET_DRIVEN, 0);
+  diag_state(SQL_HANDLE_STMT, s, st);
+  SQLGetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, &type, 0, NULL);
+  if (!m[0] &&
+      (rc != SQL_SUCCESS_WITH_INFO || strcmp(st, "01S02") != 0 || type != SQL_CURSOR_STATIC))
+    snprintf(m, sizeof m, "KEYSET_DRIVEN: rc=%d '%s', reads %lu", (int)rc, st, (unsigned long)type);
+  SQLSetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, (SQLPOINTER)(uintptr_t)SQL_CURSOR_FORWARD_ONLY, 0);
+  SQLSetStmtAttr(s, SQL_ATTR_CURSOR_SCROLLABLE, (SQLPOINTER)(uintptr_t)SQL_SCROLLABLE, 0);
+  SQLGetStmtAttr(s, SQL_ATTR_CURSOR_SCROLLABLE, &scroll, 0, NULL);
+  SQLGetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, &type, 0, NULL);
+  if (!m[0] && (scroll != SQL_SCROLLABLE || type != SQL_CURSOR_STATIC))
+    snprintf(m, sizeof m, "SCROLLABLE: reads %lu, type %lu", (unsigned long)scroll,
+             (unsigned long)type);
+  rc = SQLSetStmtAttr(s, SQL_ATTR_CURSOR_SENSITIVITY, (SQLPOINTER)(uintptr_t)SQL_SENSITIVE, 0);
+  diag_state(SQL_HANDLE_STMT, s, st);
+  SQLGetStmtAttr(s, SQL_ATTR_CURSOR_SENSITIVITY, &sens, 0, NULL);
+  if (!m[0] && (rc != SQL_SUCCESS_WITH_INFO || strcmp(st, "01S02") != 0 || sens != SQL_INSENSITIVE))
+    snprintf(m, sizeof m, "SENSITIVE: rc=%d '%s', reads %lu", (int)rc, st, (unsigned long)sens);
+  char v[16] = "";
+  SQLLEN ind = 0;
+  if (!m[0] &&
+      (!SQL_SUCCEEDED(SQLExecDirect(
+           s, (SQLCHAR *)"SELECT rownum FROM all_objects WHERE rownum <= 5", SQL_NTS)) ||
+       !SQL_SUCCEEDED(SQLFetchScroll(s, SQL_FETCH_ABSOLUTE, 3)) ||
+       !SQL_SUCCEEDED(SQLGetData(s, 1, SQL_C_CHAR, v, sizeof v, &ind)) || strcmp(v, "3") != 0))
+    snprintf(m, sizeof m, "SQL_FETCH_ABSOLUTE 3 read '%s'", v);
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Rows a statement's query returns. */
 static long count_rows(SQLHSTMT st, const char *sql)
 {
@@ -4121,6 +4179,7 @@ int main(void)
   check_login_timeout(drv, host, port, svc, user, pwd);
   check_txn_isolation(dbc, drv, host, port, svc, user, pwd);
   check_max_rows(dbc);
+  check_cursor_attrs(dbc);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 
