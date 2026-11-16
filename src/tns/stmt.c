@@ -5317,8 +5317,8 @@ static bool fv2_block_wide(const SeerBind *b)
 
 static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
 {
-  if (b->oac_type == ORA_TYPE_ADT && b->oac_override != NULL) { /* an object (#172) */
-    seer_writer_bytes(w, b->oac_override, b->oac_override_len);
+  if ((b->oac_type == ORA_TYPE_ADT || b->oac_type == ORA_TYPE_REF) && b->oac_override != NULL) {
+    seer_writer_bytes(w, b->oac_override, b->oac_override_len); /* an object, a REF */
     return;
   }
   uint8_t type = ORA_TYPE_VARCHAR;
@@ -6557,8 +6557,8 @@ static bool o8i_bind_ok(const SeerBind *b, bool block, const char **why)
     *why = "REF CURSOR parameters other than a PL/SQL block's OUT";
     return false;
   }
-  if (b->oac_type == ORA_TYPE_ADT && b->oac_override != NULL)
-    return true; /* an object or collection (#172) */
+  if ((b->oac_type == ORA_TYPE_ADT || b->oac_type == ORA_TYPE_REF) && b->oac_override != NULL)
+    return true; /* an object or collection (#172), a REF (#241) */
   if (b->is_array || b->oac_override != NULL || b->obj_type != NULL || b->temp_lob) {
     *why = "array, object and LOB parameters";
     return false;
@@ -6714,8 +6714,8 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
  * 4000 bytes the server reads it as LONG, after the others (o8i_binds). */
 static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
 {
-  if (b->oac_type == ORA_TYPE_ADT && b->oac_override != NULL) { /* an object (#172) */
-    seer_writer_bytes(w, b->oac_override, b->oac_override_len);
+  if ((b->oac_type == ORA_TYPE_ADT || b->oac_type == ORA_TYPE_REF) && b->oac_override != NULL) {
+    seer_writer_bytes(w, b->oac_override, b->oac_override_len); /* an object, a REF */
     return;
   }
   uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1, flag = 0x03;
@@ -9890,6 +9890,106 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
   if (st != SEER_OK)
     return st;
   return obj_store_bind(stmt, param, schema, type_name, oid, &img, false);
+}
+
+/* A REF bind (#241): the referenced type's OID in a descriptor of each
+ * release's own (seerdb PROTOCOL.md §19.17c and bus 77 / 79), the REF bytes as
+ * the value. 10g and 11g have no measured thin form; a NULL REF isn't sent on
+ * any release (unfilled, 8.1.7 and 9.2 answer ORA-00600 [kokeermd1]). */
+SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema,
+                              const char *type_name, const uint8_t *ref, size_t len)
+{
+  if (stmt == NULL || type_schema == NULL || type_name == NULL || ref == NULL || len == 0 ||
+      len > 4000)
+    return SEER_EPARAM;
+  SeerConn *c = stmt->conn;
+  uint8_t fv = c->field_version;
+  bool o8i = c->is_8i, o9i = !o8i && fv < TTC_FIELD_VERSION_10_2;
+  if (!o8i && !o9i && fv < TTC_FIELD_VERSION_12_1) {
+    seer_log(SEER_LOG_WARNING, "stmt: a REF bind on 10g / 11g is not supported (#241)");
+    return SEER_ENOTIMPL;
+  }
+  uint8_t oid[16];
+  SeerStatus st = obj_lookup_oid(c, type_schema, type_name, oid);
+  if (st != SEER_OK)
+    return st;
+  SeerWriter oac, v;
+  if (!seer_writer_init(&oac, 64))
+    return SEER_ENOMEM;
+  if (!seer_writer_init(&v, len + 16)) {
+    seer_writer_free(&oac);
+    return SEER_ENOMEM;
+  }
+  if (o8i) { /* OCIBindObject (SQLT_REF) on 8.1.7: the 8i object descriptor, type 111 */
+    seer_writer_u8(&oac, ORA_TYPE_REF);
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00);
+    o8w_le32(&oac, 2000);
+    o8w_le32(&oac, 0);
+    o8w_le32(&oac, 0);
+    o8w_le32(&oac, 16);
+    seer_writer_u8(&oac, 16);
+    seer_writer_bytes(&oac, oid, 16);
+    seer_writer_u8(&oac, 0x01); /* version 1 */
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00); /* charset */
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00); /* form */
+    o8w_chr(&v, ref, len);
+  } else if (o9i) { /* ojdbc14 9.0.2 on 9.2.0.4 */
+    seer_writer_u8(&oac, ORA_TYPE_REF);
+    seer_writer_u8(&oac, 0x01);
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00);
+    seer_enc_sb4(&oac, (uint32_t)len);
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00);
+    seer_enc_sb4(&oac, 16);
+    seer_writer_u8(&oac, 16);
+    seer_writer_bytes(&oac, oid, 16);
+    seer_enc_sb4(&oac, 1);  /* version */
+    seer_enc_sb4(&oac, 31); /* charset */
+    seer_writer_u8(&oac, 0x00);
+    if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
+      st = SEER_ENOMEM;
+  } else { /* 12c+, a JDBC thin capture (seerdb #139) */
+    seer_writer_u8(&oac, ORA_TYPE_REF);
+    seer_writer_u8(&oac, 0x03);
+    seer_writer_u8(&oac, 0x00);
+    seer_writer_u8(&oac, 0x00);
+    seer_enc_sb4(&oac, 4000);
+    seer_enc_sb4(&oac, 0); /* max array */
+    seer_enc_sb4(&oac, 0); /* cont flags */
+    seer_enc_sb4(&oac, 16);
+    if (obj_append_chr(&oac, oid, 16, fv) != SEER_OK)
+      st = SEER_ENOMEM;
+    seer_enc_sb4(&oac, 1); /* version */
+    seer_enc_sb4(&oac, 2); /* charset */
+    seer_writer_u8(&oac, 0x00);
+    seer_enc_sb4(&oac, 0); /* LOB prefetch */
+    if (fv >= TTC_FIELD_VERSION_12_2)
+      seer_enc_sb4(&oac, 0); /* oaccolid; 12.1 refuses it (seerdb #1144) */
+    if (st == SEER_OK && obj_append_chr(&v, ref, len, fv) != SEER_OK)
+      st = SEER_ENOMEM;
+  }
+  if (st == SEER_OK && (!seer_writer_ok(&oac) || !seer_writer_ok(&v)))
+    st = SEER_ENOMEM;
+  if (st != SEER_OK) {
+    seer_writer_free(&oac);
+    seer_writer_free(&v);
+    return st;
+  }
+  st = store_bind(stmt, param, ORA_TYPE_REF, (uint32_t)len, 0, 0, false, v.buf, v.len);
+  if (st != SEER_OK) {
+    seer_writer_free(&oac);
+    return st;
+  } /* store_bind freed v.buf */
+  SeerBind *b = &stmt->pbinds[param - 1];
+  free(b->oac_override);
+  b->oac_override = oac.buf;
+  b->oac_override_len = oac.len;
+  return SEER_OK;
 }
 
 SeerStatus seer_stmt_bind_object_out(SeerStmt *stmt, int param, const char *schema,
