@@ -327,7 +327,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       DBMS_AQ PL/SQL, payloads up to 32512 bytes), with
       their options (priority, delay, expiration, correlation, browse,
       consumer names) and the array calls, one message at a time (#187);
-      object payloads also on 10g and 11g (9i and 8i, #172):
+      object payloads on every release from 8i (8i/9i through the DBMS_AQ
+      blocks, #172):
         * [x] RAW enqueue - seer_aq_enq_raw (TNS_FUNC_AQ_ENQ 121); minimal msg
           props, ON_COMMIT, persistent; returns the 16-byte msgid.
         * [x] RAW dequeue - seer_aq_deq_raw (TNS_FUNC_AQ_DEQ 122); FIRST_MSG one-shot,
