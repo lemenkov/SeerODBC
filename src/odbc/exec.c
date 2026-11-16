@@ -379,7 +379,7 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
 
 /* Prepare the statement text: NUL-terminate, then run the SQL preprocessor
  * (escape expansion + '?' marker rewrite, see sqlprep.c). */
-static char *dup_sql(SQLCHAR *text, SQLINTEGER len)
+static char *dup_sql(const OdbcStmt *s, SQLCHAR *text, SQLINTEGER len)
 {
   size_t n = (len == SQL_NTS) ? strlen((const char *)text) : (size_t)len;
   char *raw = malloc(n + 1);
@@ -387,7 +387,8 @@ static char *dup_sql(SQLCHAR *text, SQLINTEGER len)
     return NULL;
   memcpy(raw, text, n);
   raw[n] = '\0';
-  char *out = seer_sql_prepare(raw);
+  /* With SQL_ATTR_NOSCAN on, the escapes go as written (#248). */
+  char *out = seer_sql_prepare_scan(raw, s->noscan != SQL_NOSCAN_ON);
   free(raw);
   return out;
 }
@@ -614,7 +615,7 @@ SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR *StatementText,
   if (StatementText == NULL)
     return seer_odbc_diag(s, "HY009", 0, "NULL statement text", SQL_ERROR);
 
-  char *sql = dup_sql(StatementText, TextLength);
+  char *sql = dup_sql(s, StatementText, TextLength);
   if (sql == NULL)
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   free(s->sql);
@@ -653,7 +654,7 @@ SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR *StatementText
   if (StatementText == NULL)
     return seer_odbc_diag(s, "HY009", 0, "NULL statement text", SQL_ERROR);
 
-  char *sql = dup_sql(StatementText, TextLength);
+  char *sql = dup_sql(s, StatementText, TextLength);
   if (sql == NULL)
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   free(s->sql);

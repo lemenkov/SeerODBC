@@ -232,6 +232,12 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_PARAM_BIND_OFFSET_PTR:
     s->param_bind_offset = (SQLLEN *)ValuePtr;
     return SQL_SUCCESS;
+  case SQL_ATTR_MAX_LENGTH: /* bytes of a char / binary value returned (#248) */
+    s->max_length = (SQLULEN)(uintptr_t)ValuePtr;
+    return SQL_SUCCESS;
+  case SQL_ATTR_NOSCAN: /* escapes left as written (#248) */
+    s->noscan = (SQLULEN)(uintptr_t)ValuePtr;
+    return SQL_SUCCESS;
   case SQL_ATTR_ROW_BIND_OFFSET_PTR:
     s->row_bind_offset = (SQLLEN *)ValuePtr;
     return SQL_SUCCESS;
@@ -328,6 +334,12 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
   case SQL_ATTR_PARAM_BIND_OFFSET_PTR:
     *(SQLLEN **)ValuePtr = s->param_bind_offset;
+    return SQL_SUCCESS;
+  case SQL_ATTR_MAX_LENGTH:
+    *(SQLULEN *)ValuePtr = s->max_length;
+    return SQL_SUCCESS;
+  case SQL_ATTR_NOSCAN:
+    *(SQLULEN *)ValuePtr = s->noscan;
     return SQL_SUCCESS;
   case SQL_ATTR_ROW_BIND_OFFSET_PTR:
     *(SQLLEN **)ValuePtr = s->row_bind_offset;

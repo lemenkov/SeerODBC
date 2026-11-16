@@ -258,6 +258,13 @@ static char *rewrite_params(const char *in)
 
 char *seer_sql_prepare(const char *raw)
 {
+  return seer_sql_prepare_scan(raw, 1);
+}
+
+char *seer_sql_prepare_scan(const char *raw, int scan)
+{
+  if (!scan)
+    return rewrite_params(raw);
   char *esc = translate_escapes(raw);
   if (esc == NULL)
     return NULL;

@@ -1977,6 +1977,66 @@ static void check_rowwise_binds(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQL_ATTR_MAX_LENGTH and SQL_ATTR_NOSCAN (#248): a 10-byte limit cuts a
+ * VARCHAR2 to 10 bytes - in SQLGetData and a bound fetch alike, no 01004 -
+ * and leaves a NUMBER whole; NOSCAN on sends an escape to the server as
+ * written, which refuses it, where the default translates it. */
+static void check_maxlength_noscan(SQLHDBC dbc)
+{
+  const char *name = "SQL_ATTR_MAX_LENGTH cuts char data; SQL_ATTR_NOSCAN skips escapes";
+  char m[400] = "";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLSetStmtAttr(st, SQL_ATTR_MAX_LENGTH, (SQLPOINTER)(SQLULEN)10, 0);
+  SQLULEN ml = 0;
+  SQLGetStmtAttr(st, SQL_ATTR_MAX_LENGTH, &ml, 0, NULL);
+  char bound[64] = "", got[64] = "", num[32] = "";
+  SQLLEN bind_ind = 0, got_ind = 0, num_ind = 0;
+  SQLRETURN rc = SQLExecDirect(
+      st, (SQLCHAR *)"SELECT RPAD('a', 30, 'b'), RPAD('c', 30, 'd'), 12345678901234 FROM dual",
+      SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLBindCol(st, 1, SQL_C_CHAR, bound, sizeof bound, &bind_ind);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLFetch(st);
+  SQLRETURN g = SQL_ERROR, gn = SQL_ERROR;
+  if (rc == SQL_SUCCESS) {
+    g = SQLGetData(st, 2, SQL_C_CHAR, got, sizeof got, &got_ind);
+    gn = SQLGetData(st, 3, SQL_C_CHAR, num, sizeof num, &num_ind);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (ml != 10 || rc != SQL_SUCCESS || strcmp(bound, "abbbbbbbbb") != 0 || bind_ind != 10 ||
+      g != SQL_SUCCESS || strcmp(got, "cddddddddd") != 0 || got_ind != 10 || gn != SQL_SUCCESS ||
+      strcmp(num, "12345678901234") != 0)
+    snprintf(m, sizeof m,
+             "max length %lu: fetch rc=%d '%s' (%ld), getdata rc=%d '%s' (%ld), number '%s'",
+             (unsigned long)ml, (int)rc, bound, (long)bind_ind, (int)g, got, (long)got_ind, num);
+
+  if (m[0] == '\0') {
+    const char *esc = "SELECT {fn UCASE('x')} FROM dual";
+    char out[16] = "";
+    SQLLEN ind = 0;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    rc = SQLExecDirect(st, (SQLCHAR *)esc, SQL_NTS); /* translated: X */
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+      SQLGetData(st, 1, SQL_C_CHAR, out, sizeof out, &ind);
+    SQLFreeStmt(st, SQL_CLOSE);
+    SQLSetStmtAttr(st, SQL_ATTR_NOSCAN, (SQLPOINTER)SQL_NOSCAN_ON, 0);
+    SQLULEN ns = 0;
+    SQLGetStmtAttr(st, SQL_ATTR_NOSCAN, &ns, 0, NULL);
+    SQLRETURN r2 = SQLExecDirect(st, (SQLCHAR *)esc, SQL_NTS); /* as written: the server refuses */
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (strcmp(out, "X") != 0 || ns != SQL_NOSCAN_ON || SQL_SUCCEEDED(r2))
+      snprintf(m, sizeof m,
+               "escape translated to '%s' (want X); NOSCAN %lu, its execute rc=%d (want an error)",
+               out, (unsigned long)ns, (int)r2);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Column bindings live until unbound (#244): bound before the first
  * execute, they fill on the fetch; the same statement executed again with a
  * new parameter fills the same buffer; after SQL_UNBIND a fetch leaves it be. */
@@ -4378,6 +4438,7 @@ int main(void)
     check_array_batch(dbc);
     check_rowwise_binds(dbc);
     check_bindcol_lifetime(dbc);
+    check_maxlength_noscan(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
