@@ -44,6 +44,10 @@ static int ora_type_for_sql(SQLSMALLINT t)
     return 23; /* RAW */
   case SQL_REFCURSOR:
     return 102; /* REF CURSOR */
+  case SQL_SEER_CLOB:
+    return 112; /* CLOB (#214) */
+  case SQL_SEER_BLOB:
+    return 113; /* BLOB (#214) */
   default:
     return 1; /* VARCHAR */
   }
