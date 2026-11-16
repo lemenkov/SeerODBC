@@ -61,6 +61,8 @@ typedef struct {
    * attribute layout (Oracle type per attribute) once resolved/cached. */
   char *type_schema;
   char *type_name;
+  uint8_t *toid; /* 9i: the type OID from the describe, for the define (#168) */
+  size_t toidlen;
   uint8_t *obj_attr_types;
   uint8_t *obj_attr_elem;  /* parallel: per attr, collection element type or 0 */
   int n_obj_attrs;         /* -1 = layout not yet fetched, 0 = fetched/empty */
@@ -84,6 +86,7 @@ static void free_columns(SeerColumn *cols, int n)
     free(cols[i].annotations);
     free(cols[i].type_schema);
     free(cols[i].type_name);
+    free(cols[i].toid);
     free(cols[i].obj_attr_types);
     free(cols[i].obj_attr_elem);
     free(cols[i].elem_obj_types);
@@ -4845,6 +4848,26 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
   default:
     break;
   }
+  if (col->ora_type == ORA_TYPE_ADT && col->toid != NULL) {
+    /* An object or collection names its type, as ojdbc14 defines one: the
+     * open-ended size, the type OID as a value and version 1 (seerdb
+     * PROTOCOL.md §19.17c). Defined without them, 9.2 failed the fetch with
+     * ORA-00600 [kkdogty01] (#168). */
+    seer_writer_u8(w, deftype);
+    seer_writer_u8(w, flag);
+    seer_writer_u8(w, 0);
+    seer_writer_u8(w, 0);
+    seer_enc_sb4(w, 0x7FFFFFFFu);
+    seer_writer_u8(w, 0); /* max array */
+    seer_writer_u8(w, 0); /* cont flags */
+    seer_enc_sb4(w, (uint32_t)col->toidlen);
+    seer_writer_u8(w, (uint8_t)col->toidlen);
+    seer_writer_bytes(w, col->toid, col->toidlen);
+    seer_enc_sb4(w, 1); /* version */
+    seer_enc_sb4(w, charset);
+    seer_writer_u8(w, 0);
+    return;
+  }
   seer_writer_u8(w, deftype);
   seer_writer_u8(w, flag);
   seer_writer_u8(w, 0);
@@ -4869,13 +4892,21 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   int64_t max_len = seer_dec_sb4(r);
   (void)seer_dec_sb4(r); /* _mal       */
   (void)seer_dec_sb4(r); /* _fl2       */
-  uint8_t *toid = NULL;
-  size_t toidlen = 0;
-  if (seer_dec_dalc(r, &toid, &toidlen) != SEER_OK) {
-    free(toid);
-    return SEER_EPROTO;
+  /* The type OID: a ub4 length, then - for an object column, 16 bytes - the
+   * value. Read as a bare value it took its length for its first byte, and an
+   * object column's describe failed (#168); other columns send `00`. */
+  int64_t toidlen = seer_dec_sb4(r);
+  if (toidlen > 0) {
+    uint8_t *toid = NULL;
+    size_t tl = 0;
+    if (seer_dec_dalc(r, &toid, &tl) != SEER_OK) {
+      free(toid);
+      return SEER_EPROTO;
+    }
+    free(col->toid);
+    col->toid = toid; /* kept: the define names the type by it */
+    col->toidlen = tl;
   }
-  free(toid);            /* _toid      */
   (void)seer_dec_sb4(r); /* _vsn       */
   int64_t charset = seer_dec_sb4(r);
   (void)seer_reader_u8(r); /* csfrm      */
@@ -4925,10 +4956,13 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   return SEER_OK;
 }
 
-/* Skip a describe's type schema or type name: a ub4 length, then the DALC
- * name when there is one (only an object column names its type). */
-static SeerStatus fv2_skip_type_ident(SeerReader *r)
+/* A describe's type schema or type name: a ub4 length, then the DALC name
+ * when there is one (only an object column names its type). Into *out as a
+ * string when `out` is non-NULL, NULL for none. */
+static SeerStatus fv2_read_type_ident(SeerReader *r, char **out)
 {
+  if (out != NULL)
+    *out = NULL;
   int64_t len = seer_dec_sb4(r);
   if (!seer_reader_ok(r) || len < 0)
     return SEER_EPROTO;
@@ -4937,6 +4971,15 @@ static SeerStatus fv2_skip_type_ident(SeerReader *r)
   uint8_t *v = NULL;
   size_t vl = 0;
   SeerStatus st = seer_dec_dalc(r, &v, &vl);
+  if (st == SEER_OK && out != NULL && vl > 0) {
+    *out = malloc(vl + 1);
+    if (*out == NULL) {
+      free(v);
+      return SEER_ENOMEM;
+    }
+    memcpy(*out, v, vl);
+    (*out)[vl] = '\0';
+  }
   free(v);
   return st;
 }
@@ -4963,10 +5006,23 @@ static SeerStatus fv2_decode_describe(const uint8_t *data, size_t dlen, SeerColu
   if (cols == NULL)
     return SEER_ENOMEM;
   for (int i = 0; i < ncols; i++) {
-    if (fv2_decode_column(&r, &cols[i]) != SEER_OK || fv2_skip_type_ident(&r) != SEER_OK ||
-        fv2_skip_type_ident(&r) != SEER_OK) {
+    char *schema = NULL, *tname = NULL;
+    if (fv2_decode_column(&r, &cols[i]) != SEER_OK || fv2_read_type_ident(&r, &schema) != SEER_OK ||
+        fv2_read_type_ident(&r, &tname) != SEER_OK) {
+      free(schema);
+      free(tname);
       free_columns(cols, ncols);
       return SEER_EPROTO;
+    }
+    /* An object or collection column names its type, whose layout the image
+     * decode reads from the dictionary, as on 10g+ (#168). */
+    if (cols[i].ora_type == ORA_TYPE_ADT && schema != NULL && tname != NULL) {
+      cols[i].type_schema = schema;
+      cols[i].type_name = tname;
+      cols[i].n_obj_attrs = -1;
+    } else {
+      free(schema);
+      free(tname);
     }
   }
   *out_cols = cols;
@@ -5029,6 +5085,28 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
             else if (locv == NULL || loclen == 0)
               free(locv);
           }
+          continue;
+        }
+        if (ct == ORA_TYPE_ADT) {
+          /* An object or collection: 10g+'s framing, a 36-byte type block in
+           * the type OID's place (read the same way, a ub4 length and the
+           * value), then the row's indicator (seerdb PROTOCOL.md §19.17c,
+           * #168). The image is decoded once the rows are in. */
+          uint8_t *img = NULL;
+          size_t imglen = 0;
+          if (read_object_image(&r, &img, &imglen) != SEER_OK) {
+            free(img);
+            for (int k = 0; k < ci; k++)
+              free(row[k].data);
+            free(row);
+            return SEER_EPROTO;
+          }
+          if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
+            r.pos += 2; /* 81 01: NULL */
+          else if (seer_reader_remaining(&r) > 0)
+            r.pos += 1; /* present */
+          if (img != NULL && record_pending_obj(stmt, stmt->nrows, ci, img, imglen) != SEER_OK)
+            free(img);
           continue;
         }
         if (stmt->cols[ci].zero_len) {
@@ -7872,6 +7950,11 @@ static SeerStatus fv2_execute_select(SeerStmt *stmt)
     seer_log(SEER_LOG_DEBUG, "fv2: fetch failed (ORA-%05ld)", (long)errcode);
     return SEER_EDB;
   }
+  /* Object and collection images, decoded by their types' layouts - which
+   * dictionary queries read, on the session's one cursor: so only now that
+   * the query is done with it (#168). */
+  if (stmt->npobjs > 0)
+    resolve_pending_objs(stmt);
   stmt->executed = true;
   stmt->cur = -1;
   return SEER_OK;
