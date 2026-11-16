@@ -288,17 +288,10 @@ SQLRETURN SQL_API SQLMoreResults(SQLHSTMT StatementHandle)
   if (st != SEER_OK)
     return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, seer_strerror(st), SQL_ERROR);
 
-  /* Rebuild the result-column view for the now-current set. */
+  /* The now-current set's columns; the bindings stay (#244). */
   int ncols = seer_stmt_num_cols(s->core);
-  free(s->binds);
-  s->binds = NULL;
-  s->num_binds = 0;
-  if (ncols > 0) {
-    s->binds = calloc((size_t)ncols, sizeof *s->binds);
-    if (s->binds == NULL)
-      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
-    s->num_binds = ncols;
-  }
+  if (seer_odbc_ensure_binds(s, ncols) != 0)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   s->getdata_col = -1;
   s->getdata_off = 0;
   s->rowset_start = -1;
@@ -535,8 +528,8 @@ SQLRETURN SQL_API SQLSetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
   int i = RecNumber - 1;
 
   if (d->kind == SEER_DESC_ARD) {
-    if (RecNumber > s->num_binds)
-      return seer_odbc_diag(d, "07009", 0, "Invalid descriptor index", SQL_ERROR);
+    if (seer_odbc_ensure_binds(s, RecNumber) != 0) /* as SQLBindCol (#244) */
+      return seer_odbc_diag(d, "HY001", 0, "Out of memory", SQL_ERROR);
     OdbcBind *b = &s->binds[i];
     switch (FieldIdentifier) {
     case SQL_DESC_TYPE:
@@ -626,8 +619,8 @@ SQLRETURN SQL_API SQLSetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
   SQLLEN *ind = IndicatorPtr ? IndicatorPtr : StringLengthPtr;
 
   if (d->kind == SEER_DESC_ARD) {
-    if (RecNumber > s->num_binds)
-      return seer_odbc_diag(d, "07009", 0, "Invalid descriptor index", SQL_ERROR);
+    if (seer_odbc_ensure_binds(s, RecNumber) != 0) /* as SQLBindCol (#244) */
+      return seer_odbc_diag(d, "HY001", 0, "Out of memory", SQL_ERROR);
     OdbcBind *b = &s->binds[i];
     b->target_type = Type;
     b->buf = DataPtr;
@@ -653,6 +646,19 @@ SQLRETURN SQL_API SQLSetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
   return SQL_SUCCESS;
 }
 
+int seer_odbc_ensure_binds(OdbcStmt *s, int n)
+{
+  if (n <= s->num_binds)
+    return 0;
+  OdbcBind *nb = realloc(s->binds, (size_t)n * sizeof *nb);
+  if (nb == NULL)
+    return -1;
+  memset(nb + s->num_binds, 0, (size_t)(n - s->num_binds) * sizeof *nb);
+  s->binds = nb;
+  s->num_binds = n;
+  return 0;
+}
+
 SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber,
                              SQLSMALLINT TargetType, SQLPOINTER TargetValuePtr, SQLLEN BufferLength,
                              SQLLEN *StrLen_or_IndPtr)
@@ -661,8 +667,15 @@ SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   if (s == NULL)
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(s);
-  if (ColumnNumber < 1 || ColumnNumber > (SQLUSMALLINT)s->num_binds)
+  if (ColumnNumber < 1)
     return seer_odbc_diag(s, "07009", 0, "Invalid column number", SQL_ERROR);
+  /* Any column, before or after the execute: a number past the result's
+   * columns is reported when a fetch would fill it (#244). */
+  if (ColumnNumber > s->num_binds && (TargetValuePtr != NULL || StrLen_or_IndPtr != NULL) &&
+      seer_odbc_ensure_binds(s, ColumnNumber) != 0)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  if (ColumnNumber > s->num_binds)
+    return SQL_SUCCESS; /* unbinding a column never bound */
 
   OdbcBind *b = &s->binds[ColumnNumber - 1];
   if (TargetValuePtr == NULL && StrLen_or_IndPtr == NULL) {
@@ -725,10 +738,14 @@ static size_t c_elem_stride(SQLSMALLINT t, SQLLEN buflen)
 static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
 {
   SQLRETURN ret = SQL_SUCCESS;
+  int ncols = odbc_visible_cols(s);
   for (int i = 0; i < s->num_binds; i++) {
     OdbcBind *b = &s->binds[i];
     if (!b->bound)
       continue;
+    if (i >= ncols) /* bound, but the result has no such column */
+      return seer_odbc_diag(s, "07009", 0, "Bound column number exceeds the result's columns",
+                            SQL_ERROR);
     const void *val = NULL;
     size_t vlen = 0;
     int is_null = 0, is_binary = 0;

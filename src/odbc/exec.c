@@ -367,15 +367,10 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
     return seer_odbc_exec_error(s, st);
 
   int ncols = seer_stmt_num_cols(s->core);
-  free(s->binds);
-  s->binds = NULL;
-  s->num_binds = 0;
-  if (ncols > 0) {
-    s->binds = calloc((size_t)ncols, sizeof *s->binds);
-    if (s->binds == NULL)
-      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
-    s->num_binds = ncols;
-  }
+  /* The result's columns; the bindings made stay, before the execute too
+   * (#244). Freed and made anew here, every execute unbound them all. */
+  if (seer_odbc_ensure_binds(s, ncols) != 0)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   s->getdata_col = -1;
   s->getdata_off = 0;
   s->rowset_start = -1;
@@ -580,15 +575,10 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     ncols -= 1; /* hide ROWID from the binding array */
   }
 
-  free(s->binds);
-  s->binds = NULL;
-  s->num_binds = 0;
-  if (ncols > 0) {
-    s->binds = calloc((size_t)ncols, sizeof *s->binds);
-    if (s->binds == NULL)
-      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
-    s->num_binds = ncols;
-  }
+  /* The result's columns; the bindings made stay, before the execute too
+   * (#244). Freed and made anew here, every execute unbound them all. */
+  if (seer_odbc_ensure_binds(s, ncols) != 0)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   s->getdata_col = -1;
   s->getdata_off = 0;
   s->rowset_start = -1;
@@ -901,7 +891,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
     if (o < 0 || (size_t)o >= sizeof sql)
       return seer_odbc_diag(s, "HY000", 0, "Updatable cursor statement too long", SQL_ERROR);
     int nset = 0;
-    for (int i = 0; i < s->num_binds; i++) {
+    for (int i = 0; i < s->num_binds && i < odbc_visible_cols(s); i++) {
       if (!s->binds[i].bound)
         continue;
       const char *name = seer_stmt_col_name(s->core, i);
@@ -925,7 +915,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
       return seer_odbc_diag(s, "HY000", 0, "prepare failed", SQL_ERROR);
 
     int k = 0;
-    for (int i = 0; i < s->num_binds; i++) {
+    for (int i = 0; i < s->num_binds && i < odbc_visible_cols(s); i++) {
       OdbcBind *b = &s->binds[i];
       if (!b->bound || seer_stmt_col_name(s->core, i) == NULL)
         continue;
