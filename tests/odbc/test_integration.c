@@ -1854,6 +1854,127 @@ static void check_lob_out(SQLHDBC dbc)
   }
 }
 
+/* Where bound data lives and which sets run (#243): a row-wise parameter
+ * array (PARAM_BIND_TYPE the struct size) with one set marked
+ * SQL_PARAM_IGNORE; the same array again past a PARAM_BIND_OFFSET; a
+ * row-wise block fetch past a ROW_BIND_OFFSET; and ASYNC_ENABLE /
+ * USE_BOOKMARKS on refused with HYC00. */
+typedef struct {
+  SQLINTEGER id;
+  SQLLEN id_ind;
+  char v[12];
+  SQLLEN v_ind;
+} SeerRowwise;
+
+static void check_rowwise_binds(SQLHDBC dbc)
+{
+  const char *name = "row-wise parameter arrays, bind offsets, ignored parameter sets";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_rowwise", err, sizeof err);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_rowwise (id NUMBER, v VARCHAR2(12))", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  SeerRowwise rows[6];
+  memset(rows, 0, sizeof rows);
+  for (int i = 0; i < 6; i++) {
+    rows[i].id = 10 + i;
+    snprintf(rows[i].v, sizeof rows[i].v, "v%d", 10 + i);
+    rows[i].v_ind = SQL_NTS;
+  }
+  SQLUSMALLINT op[3] = {SQL_PARAM_PROCEED, SQL_PARAM_IGNORE, SQL_PARAM_PROCEED};
+  SQLUSMALLINT status[3] = {0, 0, 0};
+  SQLULEN processed = 99;
+  SQLLEN offset = 0;
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAM_BIND_TYPE, (SQLPOINTER)sizeof(SeerRowwise), 0);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)3, 0);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAM_OPERATION_PTR, op, 0);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAM_STATUS_PTR, status, 0);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAMS_PROCESSED_PTR, &processed, 0);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAM_BIND_OFFSET_PTR, &offset, 0);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &rows[0].id, 0,
+                   &rows[0].id_ind);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 12, 0, rows[0].v,
+                   sizeof rows[0].v, &rows[0].v_ind);
+  SQLRETURN rc = SQLPrepare(st, (SQLCHAR *)"INSERT INTO seer_rowwise VALUES (?, ?)", SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLExecute(st); /* rows 10 and 12; 11 ignored */
+  if (!SQL_SUCCEEDED(rc) || processed != 2 || status[0] != SQL_PARAM_SUCCESS ||
+      status[1] != SQL_PARAM_UNUSED || status[2] != SQL_PARAM_SUCCESS) {
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    snprintf(m, sizeof m, "array: rc=%d processed=%lu status=%u/%u/%u %s", (int)rc,
+             (unsigned long)processed, status[0], status[1], status[2], err);
+  }
+  if (m[0] == '\0') { /* the next three structs, by the offset alone */
+    offset = (SQLLEN)(3 * sizeof(SeerRowwise));
+    op[1] = SQL_PARAM_PROCEED;
+    rc = SQLExecute(st); /* rows 13, 14, 15 */
+    if (!SQL_SUCCEEDED(rc) || processed != 3) {
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+      snprintf(m, sizeof m, "offset: rc=%d processed=%lu %s", (int)rc, (unsigned long)processed,
+               err);
+    }
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+
+  if (m[0] == '\0') { /* row-wise block fetch into rows[2..], by the row offset */
+    SeerRowwise got[6];
+    memset(got, 0, sizeof got);
+    SQLULEN fetched = 0;
+    SQLLEN roff = (SQLLEN)(2 * sizeof(SeerRowwise));
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLSetStmtAttr(st, SQL_ATTR_ROW_BIND_TYPE, (SQLPOINTER)sizeof(SeerRowwise), 0);
+    SQLSetStmtAttr(st, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)(SQLULEN)4, 0);
+    SQLSetStmtAttr(st, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0);
+    SQLSetStmtAttr(st, SQL_ATTR_ROW_BIND_OFFSET_PTR, &roff, 0);
+    /* Bound after the execute: before it, see #244. */
+    rc = SQLExecDirect(st, (SQLCHAR *)"SELECT id, v FROM seer_rowwise ORDER BY id", SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLBindCol(st, 1, SQL_C_SLONG, &got[0].id, 0, &got[0].id_ind);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLBindCol(st, 2, SQL_C_CHAR, got[0].v, sizeof got[0].v, &got[0].v_ind);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(st);
+    int ok = SQL_SUCCEEDED(rc) && fetched == 4 && got[0].id == 0 && got[1].id == 0;
+    static const SQLINTEGER want[4] = {10, 12, 13, 14};
+    for (int i = 0; ok && i < 4; i++) {
+      char wv[12];
+      snprintf(wv, sizeof wv, "v%d", (int)want[i]);
+      ok = got[2 + i].id == want[i] && strcmp(got[2 + i].v, wv) == 0;
+    }
+    if (!ok) {
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+      snprintf(m, sizeof m, "fetch: rc=%d fetched=%lu ids %d %d | %d %d %d %d %s", (int)rc,
+               (unsigned long)fetched, (int)got[0].id, (int)got[1].id, (int)got[2].id,
+               (int)got[3].id, (int)got[4].id, (int)got[5].id, err);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+  }
+
+  if (m[0] == '\0') { /* refused, not pretended */
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLRETURN a = SQLSetStmtAttr(st, SQL_ATTR_ASYNC_ENABLE, (SQLPOINTER)SQL_ASYNC_ENABLE_ON, 0);
+    char sa[6] = "", sb[6] = "";
+    SQLINTEGER nat;
+    SQLSMALLINT len;
+    SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, (SQLCHAR *)sa, &nat, NULL, 0, &len);
+    SQLRETURN b = SQLSetStmtAttr(st, SQL_ATTR_USE_BOOKMARKS, (SQLPOINTER)SQL_UB_VARIABLE, 0);
+    SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, (SQLCHAR *)sb, &nat, NULL, 0, &len);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (a != SQL_ERROR || strcmp(sa, "HYC00") != 0 || b != SQL_ERROR || strcmp(sb, "HYC00") != 0)
+      snprintf(m, sizeof m, "ASYNC_ENABLE on: rc=%d '%s'; USE_BOOKMARKS on: rc=%d '%s'", (int)a, sa,
+               (int)b, sb);
+  }
+  exec_do(dbc, "DROP TABLE seer_rowwise", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_array_batch(SQLHDBC dbc)
 {
   SQLHSTMT st;
@@ -4214,6 +4335,7 @@ int main(void)
     check_returning_truncation(dbc);
     check_cache_after_block_ddl(dbc);
     check_array_batch(dbc);
+    check_rowwise_binds(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
