@@ -324,6 +324,7 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "bind failed", SQL_ERROR);
   }
 
+  seer_odbc_arm_timeout(s);
   st = seer_stmt_execute(s->core);
   if (st != SEER_OK)
     return seer_odbc_exec_error(s, st);
@@ -430,6 +431,7 @@ static SQLRETURN exec_finish(OdbcStmt *s)
   if (pr != SQL_SUCCESS)
     return pr;
 
+  seer_odbc_arm_timeout(s);
   SeerStatus st = seer_stmt_execute(s->core);
   if (st != SEER_OK)
     return seer_odbc_exec_error(s, st);
@@ -810,6 +812,7 @@ SQLRETURN seer_odbc_pos_delete(OdbcStmt *s, long row)
     if (seer_stmt_prepare(s->dbc->conn, sql, &dml) != SEER_OK)
       return seer_odbc_diag(s, "HY000", 0, "prepare failed", SQL_ERROR);
     seer_stmt_bind_text(dml, 1, s->rowids[r], -1);
+    seer_odbc_arm_timeout(s);
     SeerStatus st = seer_stmt_execute(dml);
     seer_stmt_close(dml);
     if (st != SEER_OK) {
@@ -885,6 +888,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
     }
     seer_stmt_bind_text(dml, nset + 1, s->rowids[r], -1);
 
+    seer_odbc_arm_timeout(s);
     SeerStatus st = seer_stmt_execute(dml);
     seer_stmt_close(dml);
     if (st != SEER_OK) {

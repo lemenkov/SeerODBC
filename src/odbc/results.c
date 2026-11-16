@@ -281,6 +281,7 @@ SQLRETURN SQL_API SQLMoreResults(SQLHSTMT StatementHandle)
   if (s->core == NULL)
     return SQL_NO_DATA;
 
+  seer_odbc_arm_timeout(s);
   SeerStatus st = seer_stmt_next_result(s->core);
   if (st == SEER_ENODATA)
     return SQL_NO_DATA;
