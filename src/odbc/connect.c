@@ -174,7 +174,6 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
                        : 1;
   if (ctlsca && !ctlsca[0]) {
     free(ctlsca);
-    free(cexpire);
     ctlsca = NULL;
   } /* empty -> system roots */
 
@@ -250,6 +249,7 @@ out:
   free(ctlsca);
   free(ctlsverify);
   free(clobinline);
+  free(cexpire);
   return ret;
 }
 
