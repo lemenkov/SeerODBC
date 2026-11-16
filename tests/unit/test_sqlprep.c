@@ -67,6 +67,19 @@ static void check_updatable(const char *in, const char *want_table, const char *
 
 int main(void)
 {
+  /* --- SQL_ATTR_NOSCAN (#248): escapes left as written, markers rewritten --- */
+  {
+    char *out =
+        seer_sql_prepare_scan("SELECT {fn UCASE(?)} FROM dual WHERE d = {d '2020-01-02'}", 0);
+    eq("noscan", out, "SELECT {fn UCASE(:1)} FROM dual WHERE d = {d '2020-01-02'}");
+    free(out);
+    out = seer_sql_prepare_scan("SELECT {fn UCASE(?)} FROM dual", 1);
+    char *want = seer_sql_prepare("SELECT {fn UCASE(?)} FROM dual");
+    eq("scan", out, want);
+    free(out);
+    free(want);
+  }
+
   /* --- '?' markers -> :1, :2 (string-literal aware) --- */
   check_prepare("SELECT ?+? FROM dual", "SELECT :1+:2 FROM dual");
   check_prepare("SELECT '? not a marker', ? FROM dual", "SELECT '? not a marker', :1 FROM dual");

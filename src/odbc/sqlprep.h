@@ -16,6 +16,10 @@
  * (caller frees), or NULL on allocation failure. */
 char *seer_sql_prepare(const char *raw);
 
+/* As seer_sql_prepare, the escapes left as written when `scan` is 0
+ * (SQL_ATTR_NOSCAN, #248); the '?' markers are rewritten either way. */
+char *seer_sql_prepare_scan(const char *raw, int scan);
+
 /* Count the distinct bind placeholders in a prepared statement: positional
  * :1, :2, ... and named :name / :"Quoted", de-duplicated case-insensitively,
  * ignoring placeholders in string/identifier literals, line/block comments,

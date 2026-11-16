@@ -731,6 +731,32 @@ static size_t c_elem_stride(SQLSMALLINT t, SQLLEN buflen)
   }
 }
 
+/* SQL_ATTR_MAX_LENGTH (#248): a character or binary value as at most that
+ * many bytes, text cut at a UTF-8 character's start. As ODBC has it, the
+ * value is returned as though it were that long: the cut length, no 01004. */
+static size_t max_length_cap(OdbcStmt *s, int col, const void *val, size_t vlen, int is_binary)
+{
+  if (s->max_length == 0 || vlen <= s->max_length || val == NULL)
+    return vlen;
+  switch (seer_stmt_col_type(s->core, col)) {
+  case ORA_TYPE_VARCHAR:
+  case ORA_TYPE_CHAR:
+  case ORA_TYPE_LONG:
+  case ORA_TYPE_CLOB:
+  case ORA_TYPE_RAW:
+  case ORA_TYPE_LONGRAW:
+  case ORA_TYPE_BLOB:
+    break;
+  default:
+    return vlen;
+  }
+  size_t n = (size_t)s->max_length;
+  const unsigned char *p = val;
+  while (!is_binary && n > 0 && (p[n] & 0xC0) == 0x80)
+    n--; /* p[n], the first byte cut, continues a character */
+  return n;
+}
+
 /* Deliver the current core row into the bound columns for rowset element `row`.
  * Column-wise (row_bind_type 0): value at buf + row*elem_stride, indicator at
  * &indicator[row]. Row-wise: both at + row*row_bind_type. Both past the row
@@ -757,6 +783,7 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
 
     /* Column-wise or row-wise (the struct size), past the bind offset
      * (#243). */
+    vlen = max_length_cap(s, i, val, vlen, is_binary);
     void *buf = seer_odbc_bound_at(b->buf, s->row_bind_offset, s->row_bind_type,
                                    c_elem_stride(b->target_type, b->buflen), row);
     SQLLEN *ind =
@@ -965,6 +992,8 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   SeerStatus gst = seer_stmt_get_data(s->core, col, &val, &vlen, &is_null, &is_binary);
   if (gst != SEER_OK) /* a value the server refused carries its ORA text (#158) */
     return seer_odbc_exec_error(s, gst);
+  if (!is_null)
+    vlen = max_length_cap(s, col, val, vlen, is_binary);
 
   /* A repeat call after the value was fully returned signals end-of-column. */
   if (!is_null && s->getdata_off > 0 && (size_t)s->getdata_off >= vlen)

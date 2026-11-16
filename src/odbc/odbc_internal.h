@@ -187,6 +187,8 @@ typedef struct {
   /* Updatable cursor (positioned update/delete via SQLSetPos). */
   SQLULEN concurrency;   /* SQL_ATTR_CONCURRENCY, default READ_ONLY */
   SQLULEN query_timeout; /* SQL_ATTR_QUERY_TIMEOUT, seconds; 0 = none (#209) */
+  SQLULEN max_length;    /* SQL_ATTR_MAX_LENGTH: bytes of a char / binary value, 0 = all (#248) */
+  SQLULEN noscan;        /* SQL_ATTR_NOSCAN: SQL_NOSCAN_ON sends the text unscanned (#248) */
   SQLULEN max_rows;      /* SQL_ATTR_MAX_ROWS; 0 = no limit (#221) */
   SQLULEN cursor_type;   /* SQL_ATTR_CURSOR_TYPE: FORWARD_ONLY (0) or STATIC (#226) */
   SQLULEN sensitivity;   /* SQL_ATTR_CURSOR_SENSITIVITY: UNSPECIFIED (0) or INSENSITIVE */
