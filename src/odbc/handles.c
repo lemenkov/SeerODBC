@@ -56,6 +56,7 @@ SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
     s->row_array_size = 1;
     s->rowset_start = -1;
     s->concurrency = SQL_CONCUR_READ_ONLY;
+    s->retrieve_data = SQL_RD_ON; /* SQL_RD_OFF is 0: calloc would turn retrieval off */
     s->rowid_col = -1;
     /* The implicit descriptors share the statement's lifetime. */
     s->ard.h.type = s->apd.h.type = s->ird.h.type = s->ipd.h.type = SQL_HANDLE_DESC;

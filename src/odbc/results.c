@@ -764,6 +764,8 @@ static size_t max_length_cap(OdbcStmt *s, int col, const void *val, size_t vlen,
 static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
 {
   SQLRETURN ret = SQL_SUCCESS;
+  if (s->retrieve_data == SQL_RD_OFF) /* positioned, nothing filled (#250) */
+    return SQL_SUCCESS;
   int ncols = odbc_visible_cols(s);
   for (int i = 0; i < s->num_binds; i++) {
     OdbcBind *b = &s->binds[i];

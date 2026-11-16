@@ -381,6 +381,14 @@ SQLRETURN SQL_API SQLSetConnectAttrW(SQLHDBC hdbc, SQLINTEGER attr, SQLPOINTER v
 SQLRETURN SQL_API SQLGetConnectAttrW(SQLHDBC hdbc, SQLINTEGER attr, SQLPOINTER val, SQLINTEGER cap,
                                      SQLINTEGER *len)
 {
+  /* The one string attribute: empty (#250), a UTF-16 NUL here. */
+  if (attr == SQL_ATTR_CURRENT_CATALOG && hdbc != NULL) {
+    if (val != NULL && cap >= (SQLINTEGER)sizeof(SQLWCHAR))
+      *(SQLWCHAR *)val = 0;
+    if (len != NULL)
+      *len = 0;
+    return SQL_SUCCESS;
+  }
   return SQLGetConnectAttr(hdbc, attr, val, cap, len);
 }
 
