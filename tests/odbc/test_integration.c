@@ -65,8 +65,8 @@ static const Gate GATES[] = {
      "a large PL/SQL bind isn't promoted to a temporary LOB before 12c"},
     {"VECTOR column dimensions / format (SQLColAttribute)", 8, 21, GATE_SERVER,
      "no VECTOR type before 23ai"},
-    {"large CLOB OUT parameter; CLOB + BLOB via RETURNING", 8, 9, GATE_TODO,
-     "LOB OUT parameters and LOBs via RETURNING before 10g (#167)"},
+    {"large CLOB OUT parameter", 8, 8, GATE_TODO,
+     "a PL/SQL CLOB OUT on 8i needs a LOB bind type (#214)"},
     {"column annotations", 8, 21, GATE_SERVER, "no ANNOTATIONS before 23ai"},
     {"implicit result rows holding a CURSOR() column", 8, 11, GATE_SERVER,
      "no DBMS_SQL.RETURN_RESULT before 12c"},
@@ -1749,39 +1749,48 @@ static void check_temp_lobs_freed(SQLHDBC dbc)
 
 /* A large CLOB OUT parameter, and a CLOB + BLOB returned by DML RETURNING into
  * SQL_LONGVARCHAR / SQL_LONGVARBINARY parameters: the whole values come back
- * (a VARCHAR / RAW return target is capped at 4000 bytes - ORA-22835). */
+ * (a VARCHAR / RAW return target is capped at 4000 bytes - ORA-22835). Two
+ * checks: 8i takes the RETURNING but not the PL/SQL OUT (#214). */
 static void check_lob_out(SQLHDBC dbc)
 {
-  const char *name = "large CLOB OUT parameter; CLOB + BLOB via RETURNING";
-  GATE(name);
   static char buf[20001];
   char err[256] = "", m[400] = "";
   SQLLEN ind = 0;
   SQLHSTMT st;
-  int ok = 1;
-  /* PL/SQL OUT */
-  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
-  buf[0] = '\0';
-  SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 20000, 0, buf, sizeof buf,
-                   &ind);
-  SQLRETURN rc = SQLExecDirect(
-      st, (SQLCHAR *)"DECLARE c CLOB; BEGIN c := RPAD('o', 10000, 'o'); ? := c; END;", SQL_NTS);
-  if (!SQL_SUCCEEDED(rc))
-    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
-  SQLFreeHandle(SQL_HANDLE_STMT, st);
-  if (!SQL_SUCCEEDED(rc) || strlen(buf) != 10000) {
-    snprintf(m, sizeof m, "OUT: rc=%d len=%zu ind=%ld %s", rc, strlen(buf), (long)ind, err);
-    ok = 0;
+  const char *name = "large CLOB OUT parameter";
+  if (!gated(name)) {
+    /* PL/SQL OUT */
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    buf[0] = '\0';
+    SQLBindParameter(st, 1, SQL_PARAM_OUTPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 20000, 0, buf,
+                     sizeof buf, &ind);
+    SQLRETURN rc = SQLExecDirect(
+        st,
+        /* Built with DBMS_LOB: 8.1.7 won't take RPAD's VARCHAR2 into a CLOB
+         * (ORA-06550, #167). */
+        (SQLCHAR *)"DECLARE c CLOB; BEGIN DBMS_LOB.CREATETEMPORARY(c, TRUE); FOR i IN 1 .. 10 LOOP "
+                   "DBMS_LOB.WRITEAPPEND(c, 1000, RPAD('o', 1000, 'o')); END LOOP; ? := c; END;",
+        SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (!SQL_SUCCEEDED(rc) || strlen(buf) != 10000) {
+      snprintf(m, sizeof m, "OUT: rc=%d len=%zu ind=%ld %s", rc, strlen(buf), (long)ind, err);
+      fail(name, m);
+    } else
+      pass(name);
   }
-  /* DML RETURNING a CLOB */
-  if (ok) {
+  name = "CLOB + BLOB via RETURNING";
+  if (!gated(name)) {
     exec_do(dbc, "DROP TABLE seer_lobret", err, sizeof err);
     exec_do(dbc, "CREATE TABLE seer_lobret (c CLOB, b BLOB)", err, sizeof err);
-    /* the BLOB is built in PL/SQL: a SQL RAW expression caps at 2000 bytes */
+    /* Both built in PL/SQL with DBMS_LOB: a SQL RAW expression caps at 2000
+     * bytes, and 8i has no TO_CLOB (#167). */
     exec_do(dbc,
-            "DECLARE b BLOB; BEGIN INSERT INTO seer_lobret VALUES (RPAD(TO_CLOB('r'), 10000, 'r'), "
-            "EMPTY_BLOB()) RETURNING b INTO b; FOR i IN 1 .. 3 LOOP DBMS_LOB.WRITEAPPEND(b, 2000, "
-            "UTL_RAW.COPIES(HEXTORAW('AB'), 2000)); END LOOP; END;",
+            "DECLARE c CLOB; b BLOB; BEGIN INSERT INTO seer_lobret VALUES (EMPTY_CLOB(), "
+            "EMPTY_BLOB()) RETURNING c, b INTO c, b; FOR i IN 1 .. 10 LOOP "
+            "DBMS_LOB.WRITEAPPEND(c, 1000, RPAD('r', 1000, 'r')); END LOOP; FOR i IN 1 .. 3 LOOP "
+            "DBMS_LOB.WRITEAPPEND(b, 2000, UTL_RAW.COPIES(HEXTORAW('AB'), 2000)); END LOOP; END;",
             err, sizeof err);
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
     buf[0] = '\0';
@@ -1792,8 +1801,8 @@ static void check_lob_out(SQLHDBC dbc)
                      sizeof buf, &ind);
     SQLBindParameter(st, 2, SQL_PARAM_OUTPUT, SQL_C_BINARY, SQL_LONGVARBINARY, 20000, 0, bin,
                      sizeof bin, &bind_b);
-    rc = SQLExecDirect(st, (SQLCHAR *)"UPDATE seer_lobret SET c = c RETURNING c, b INTO ?, ?",
-                       SQL_NTS);
+    SQLRETURN rc = SQLExecDirect(
+        st, (SQLCHAR *)"UPDATE seer_lobret SET c = c RETURNING c, b INTO ?, ?", SQL_NTS);
     err[0] = '\0';
     if (!SQL_SUCCEEDED(rc))
       diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
@@ -1805,13 +1814,10 @@ static void check_lob_out(SQLHDBC dbc)
         strcmp(next, "5") != 0) {
       snprintf(m, sizeof m, "RETURNING: rc=%d clob=%zu blob=%ld next='%s' %s", rc, strlen(buf),
                (long)bind_b, next, err);
-      ok = 0;
-    }
+      fail(name, m);
+    } else
+      pass(name);
   }
-  if (ok)
-    pass(name);
-  else
-    fail(name, m);
 }
 
 static void check_array_batch(SQLHDBC dbc)

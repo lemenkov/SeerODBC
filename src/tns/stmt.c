@@ -5177,6 +5177,15 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
     }
   if (fv2_block_wide(b)) /* past the inline limits: a block's 32767 (§19.3.1) */
     maxsize = FV2_BLOCK_WIDE_DECLARED;
+  if (b->ret_lob != 0) {
+    /* A RETURNING target that is a CLOB / BLOB: the LOB at its own OAC,
+     * charset 31, form 1; any size goes, and a pure OUT sends no value
+     * (seerdb PROTOCOL.md §19.17b, ojdbc14 on 9.2.0.4; #167). */
+    type = b->ret_lob;
+    maxsize = FV2_BLOCK_WIDE_DECLARED;
+    charset = 31;
+    csfrm = 1;
+  }
   seer_writer_u8(w, type);
   seer_writer_u8(w, 0x01);
   seer_writer_u8(w, 0);
@@ -6385,6 +6394,19 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
 {
   const uint8_t *v = b->rxd != NULL ? b->rxd[row] : NULL;
   size_t vn = b->rxd != NULL ? b->rxd_len[row] : 0;
+  if (b->ret_lob != 0) {
+    /* A LOB sends a locator even as a pure OUT: an empty one, a LE ub4 86,
+     * the ub1 length 86, 00 54 and 84 zeros. With the OUT placeholder fd 01,
+     * 8.1.7 waits for the value and the call hangs (§19.17b, #167). */
+    o8w_le32(val, 86);
+    seer_writer_u8(val, 86);
+    seer_writer_u8(val, 0x00);
+    seer_writer_u8(val, 0x54);
+    for (int i = 0; i < 84; i++)
+      seer_writer_u8(val, 0);
+    *size = 32;
+    return SEER_OK;
+  }
   if (b->oac_type == ORA_TYPE_REFCURSOR) {
     /* A REF CURSOR sends an empty slot, 01 00 (§19.17a). */
     seer_writer_u8(val, 0x01);
@@ -6437,8 +6459,27 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
  * 4000 bytes the server reads it as LONG, after the others (o8i_binds). */
 static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
 {
-  uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1;
+  uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1, flag = 0x03;
   uint32_t charset = 31;
+  if (b->ret_lob != 0) {
+    /* A RETURNING target that is a CLOB / BLOB: flag 0x01, size 32, a CLOB
+     * with its charset and form, a BLOB with neither (§19.17b, sqlplus 9.2
+     * against 8.1.7; #167). */
+    bool clob = b->ret_lob == ORA_TYPE_CLOB;
+    seer_writer_u8(w, b->ret_lob);
+    seer_writer_u8(w, 0x01);
+    seer_writer_u8(w, 0);
+    seer_writer_u8(w, 0);
+    seer_writer_u8(w, 32);
+    seer_writer_u8(w, 0);
+    for (int i = 0; i < 13; i++)
+      seer_writer_u8(w, 0);
+    for (int i = 3; i >= 0; i--)
+      seer_writer_u8(w, (uint8_t)((clob ? 31u : 0u) >> (8 * i)));
+    seer_writer_u8(w, 0);
+    seer_writer_u8(w, clob ? 1 : 0);
+    return;
+  }
   switch (b->oac_type) {
   case ORA_TYPE_NUMBER:
     type = ORA_TYPE_NUMBER, size = 22, charset = 0, csfrm = 0;
@@ -6459,7 +6500,7 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
   if (size > 0xFFFF)
     size = 0xFFFF;
   seer_writer_u8(w, type);
-  seer_writer_u8(w, 0x03);
+  seer_writer_u8(w, flag);
   seer_writer_u8(w, 0);
   seer_writer_u8(w, 0);
   seer_writer_u8(w, (uint8_t)(size & 0xFF));
@@ -6912,6 +6953,32 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
 {
   free(b->out.data);
   b->out = (SeerCell){0};
+  if (b->ret_lob != 0) {
+    /* A LOB: a LE ub4 length, the locator as a value, a ub2 indicator, and
+     * no return code; NULL is a zero length and ff ff (§19.17b, #167). The
+     * content is read by the locator once the reply is in. */
+    free(b->ret_locator);
+    b->ret_locator = NULL;
+    b->ret_loclen = 0;
+    SeerWriter loc;
+    if (!seer_writer_init(&loc, 96)) {
+      r->bad = true;
+      return;
+    }
+    if (o8r_le32(r) > 0)
+      o8r_value(r, &loc);
+    uint32_t ind = o8r_le16(r);
+    bool blank = true;
+    for (size_t i = 2; i < loc.len; i++)
+      blank &= loc.buf[i] == 0;
+    if (!r->cut && !r->bad && ind != 0xFFFF && loc.len > 2 && !blank && seer_writer_ok(&loc)) {
+      b->ret_locator = loc.buf;
+      b->ret_loclen = loc.len;
+    } else {
+      seer_writer_free(&loc);
+    }
+    return;
+  }
   if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
     r->pos++;
     (void)o8r_le16(r); /* 3105: never assigned */
@@ -7110,6 +7177,28 @@ static SeerStatus o8i_execute_block(SeerStmt *stmt)
   }
   o8i_status_free(&s);
   long rows = (long)s.rows;
+  /* The LOBs the block returned, read by their locators before the next call
+   * (§19.15's single READ; #167): CLOB text in WE8ISO8859P1, BLOB bytes. */
+  for (int k = 0; k < stmt->npbinds; k++) {
+    SeerBind *b = &stmt->pbinds[k];
+    if (b->ret_locator == NULL)
+      continue;
+    SeerWriter content;
+    if (!seer_writer_init(&content, 4096))
+      return SEER_ENOMEM;
+    st = o8i_lob_read(c, b->ret_locator, b->ret_loclen, &content);
+    free(b->ret_locator);
+    b->ret_locator = NULL;
+    b->ret_loclen = 0;
+    if (st == SEER_OK && !seer_writer_ok(&content))
+      st = SEER_ENOMEM;
+    if (st == SEER_OK)
+      st = b->ret_lob == ORA_TYPE_CLOB ? o8i_text_cell(&b->out, content.buf, content.len)
+                                       : cell_set_bytes(&b->out, content.buf, content.len, true);
+    seer_writer_free(&content);
+    if (st != SEER_OK)
+      return st;
+  }
   if (stmt->refcursor_present) {
     st = o8i_drain_refcursor(stmt);
     if (st != SEER_OK)
@@ -7619,6 +7708,40 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
         b->out = (SeerCell){0}; /* NULL */
         continue;
       }
+      free(b->ret_locator);
+      b->ret_locator = NULL;
+      b->ret_loclen = 0;
+      if (b->ret_lob != 0) {
+        /* A LOB: a column's LOB cell (§19.5) - a ub4 length, the locator as a
+         * value and a ub4 indicator; NULL is a zero length and 81 01. A NULL
+         * LOB from a RETURNING comes as a locator all zero past its first two
+         * bytes, which no real one is (§19.17b, #167). */
+        free(b->out.data);
+        b->out = (SeerCell){0};
+        int64_t llen = seer_dec_sb4(&r);
+        if (llen <= 0) {
+          if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
+            r.pos += 2;
+          continue;
+        }
+        uint8_t *loc = NULL;
+        size_t loclen = 0;
+        if (seer_dec_dalc(&r, &loc, &loclen) != SEER_OK) {
+          free(loc);
+          break;
+        }
+        (void)seer_dec_sb4(&r); /* indicator */
+        bool blank = true;
+        for (size_t i = 2; i < loclen; i++)
+          blank &= loc[i] == 0;
+        if (loclen <= 2 || blank) {
+          free(loc);
+          continue;
+        }
+        b->ret_locator = loc;
+        b->ret_loclen = loclen;
+        continue;
+      }
       uint8_t *val = NULL;
       size_t vlen = 0;
       if (seer_dec_dalc(&r, &val, &vlen) != SEER_OK) {
@@ -7694,11 +7817,18 @@ static SeerStatus fv2_execute_in_block(SeerStmt *stmt)
              "stmt: Oracle %s: an array DML with RETURNING or long binds is not supported", rel);
     return SEER_ENOTIMPL;
   }
-  for (int i = 0; i < stmt->npbinds; i++)
-    if (stmt->pbinds[i].is_out && stmt->pbinds[i].ret_lob) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle %s: RETURNING into a LOB is not supported", rel);
-      return SEER_ENOTIMPL;
-    }
+  /* A RETURNING target wider than a VARCHAR2 / RAW column holds is a LOB's,
+   * as on 10g+ (returning_lob_type): bound as the LOB, its locator comes back
+   * and its content is read (#167). Bound as text, 9i cut it to 4000 / 2000
+   * bytes and reported success. */
+  for (int i = 0; i < stmt->npbinds; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    b->ret_lob = 0;
+    if (b->is_out && b->oac_size > 4000 && b->oac_type == ORA_TYPE_VARCHAR)
+      b->ret_lob = ORA_TYPE_CLOB;
+    else if (b->is_out && b->oac_size > 4000 && b->oac_type == ORA_TYPE_RAW)
+      b->ret_lob = ORA_TYPE_BLOB;
+  }
 
   size_t n = strlen(stmt->sql);
   while (n > 0 && (isspace((unsigned char)stmt->sql[n - 1]) || stmt->sql[n - 1] == ';'))
@@ -7883,6 +8013,28 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
     if (errcode != 0 && errcode != 1403)
       return SEER_EDB;
     stmt->cur = -1;
+  }
+
+  /* The LOBs the block returned, read by their locators before anything else
+   * goes to the server (§19.5 GETLEN + READ, #167): CLOB text, BLOB bytes. */
+  for (int k = 0; k < stmt->npbinds; k++) {
+    SeerBind *b = &stmt->pbinds[k];
+    if (b->ret_locator == NULL)
+      continue;
+    uint8_t *content = NULL;
+    size_t clen = 0;
+    int64_t amount = fv2_lob_getlen(c, b->ret_locator, b->ret_loclen);
+    if (amount > 0 &&
+        fv2_lob_read(c, b->ret_locator, b->ret_loclen, amount, &content, &clen) != SEER_OK) {
+      free(content);
+      return SEER_EPROTO;
+    }
+    cell_set_bytes(&b->out, content ? content : (const uint8_t *)"", clen,
+                   b->ret_lob != ORA_TYPE_CLOB);
+    free(content);
+    free(b->ret_locator);
+    b->ret_locator = NULL;
+    b->ret_loclen = 0;
   }
 
   stmt->affected = (long)rowcount;
