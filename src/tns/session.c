@@ -337,7 +337,9 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
   for (;;) {
     if (conn->t == NULL) {
       char why[320];
-      st = seer_transport_connect_diag(cur_host, cur_port, 0, &conn->t, why, sizeof why);
+      /* 0 is the transport's default; "no limit" as the largest bound. */
+      int to = params->connect_timeout_ms < 0 ? 0x7FFFFFFF : params->connect_timeout_ms;
+      st = seer_transport_connect_diag(cur_host, cur_port, to, &conn->t, why, sizeof why);
       if (st != SEER_OK) {
         set_conn_error(conn, why[0] ? why : NULL);
         goto fail;

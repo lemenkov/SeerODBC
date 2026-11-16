@@ -36,6 +36,7 @@ SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
     c->h.type = SQL_HANDLE_DBC;
     c->env = (OdbcEnv *)InputHandle;
     c->autocommit = SQL_AUTOCOMMIT_ON;
+    c->login_timeout = -1;
     *OutputHandle = (SQLHANDLE)c;
     return SQL_SUCCESS;
   }

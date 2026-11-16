@@ -2961,6 +2961,60 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+/* SQL_ATTR_LOGIN_TIMEOUT (#216): 3 s, and a HOST list whose first address
+ * never answers (192.0.2.1, TEST-NET-1) reaches the server in well under the
+ * 30 s default; the attribute reads back. CONNECT_TIMEOUT that isn't a number
+ * of seconds is refused (HY024) before connecting. */
+static void check_login_timeout(const char *drv, const char *host, const char *port,
+                                const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "SQL_ATTR_LOGIN_TIMEOUT bounds a dead address";
+  char m[600] = "";
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    SQLHENV e;
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+    SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+    SQLHDBC d;
+    SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+    char cs[800];
+    if (k == 0) {
+      SQLSetConnectAttr(d, SQL_ATTR_LOGIN_TIMEOUT, (SQLPOINTER)(uintptr_t)3, 0);
+      snprintf(cs, sizeof cs, "DRIVER=%s;HOST=192.0.2.1,%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;", drv,
+               host, port ? port : "1521", svc, user, pwd);
+    } else {
+      snprintf(cs, sizeof cs,
+               "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;CONNECT_TIMEOUT=soon;", drv,
+               host, port ? port : "1521", svc, user, pwd);
+    }
+    SQLCHAR o[256], state[6] = "", msg[300] = "";
+    SQLSMALLINT ol, len = 0;
+    SQLINTEGER native = 0;
+    time_t t0 = time(NULL);
+    SQLRETURN rc =
+        SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
+    long took = (long)(time(NULL) - t0);
+    if (!SQL_SUCCEEDED(rc))
+      SQLGetDiagRec(SQL_HANDLE_DBC, d, 1, state, &native, msg, sizeof msg, &len);
+    if (k == 0) {
+      SQLUINTEGER got = 0;
+      SQLGetConnectAttr(d, SQL_ATTR_LOGIN_TIMEOUT, &got, 0, NULL);
+      if (!SQL_SUCCEEDED(rc) || took > 10 || got != 3)
+        snprintf(m, sizeof m, "3 s timeout: rc=%d after %ld s, reads back %u: %s", (int)rc, took,
+                 (unsigned)got, (char *)msg);
+    } else if (SQL_SUCCEEDED(rc) || strcmp((char *)state, "HY024") != 0) {
+      snprintf(m, sizeof m, "CONNECT_TIMEOUT=soon: rc=%d state '%s'", (int)rc, (char *)state);
+    }
+    if (SQL_SUCCEEDED(rc))
+      SQLDisconnect(d);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+    SQLFreeHandle(SQL_HANDLE_ENV, e);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQL_ATTR_QUERY_TIMEOUT (#209): a 1 s limit stops an 8 s PL/SQL loop with
  * HYT00 within the timeout and the 5 s the driver waits for the server to
  * answer its interrupt (the loop outlasts both). Then the connection either works (the server
@@ -3942,6 +3996,7 @@ int main(void)
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
   check_query_timeout(drv, host, port, svc, user, pwd);
+  check_login_timeout(drv, host, port, svc, user, pwd);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 

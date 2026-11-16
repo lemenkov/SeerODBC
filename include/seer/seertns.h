@@ -89,6 +89,10 @@ typedef struct {
    * until a rollback, so it is opt-in (#183). Ignored on other releases, which
    * take two-phase commit on any session. */
   int xa;
+  /* How long each address may take to connect and log in, in milliseconds:
+   * the TCP connect, then each read and write of the login (#216). 0 keeps
+   * the default, 30 s; below 0, no limit. */
+  int connect_timeout_ms;
 } SeerConnParams;
 
 #define SEER_PURITY_NEW 1
