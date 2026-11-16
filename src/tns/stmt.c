@@ -1848,7 +1848,20 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
     uint8_t tok = seer_reader_u8(&r);
     switch (tok) {
     case TTI_DCB:
-      st = expect_dcb ? parse_dcb(&r, stmt) : SEER_EPROTO;
+      if (expect_dcb) {
+        st = parse_dcb(&r, stmt);
+      } else if (stmt->reuse_cursor > 0) {
+        /* A cached cursor's re-execute keeps its columns, but the server
+         * re-parsed it - another session changed the table - and describes
+         * it anew: the new describe replaces the cached one (#212). */
+        seer_log(SEER_LOG_DEBUG, "stmt: the cached cursor was re-described by the server");
+        free_columns(stmt->cols, stmt->ncols);
+        stmt->cols = NULL;
+        stmt->ncols = 0;
+        st = parse_dcb(&r, stmt);
+      } else {
+        st = SEER_EPROTO;
+      }
       break;
     case TTI_RXH:
       st = parse_rxh(&r, &bv, &bvlen);
@@ -3401,6 +3414,27 @@ static void queue_cursor_close(SeerConn *c, int64_t cursor_id)
 }
 
 /* ------------------------------------------------------------- public API */
+
+/* Whether a cached cursor's error says the cursor itself is stale, so a fresh
+ * parse may succeed (#210): the object or a column gone or retyped, a package
+ * state discarded, the cursor invalid. */
+static bool stale_cursor_error(int64_t code)
+{
+  switch (code) {
+  case 904:  /* invalid identifier */
+  case 932:  /* inconsistent datatypes */
+  case 942:  /* table or view does not exist */
+  case 1001: /* invalid cursor */
+  case 1003: /* no statement parsed */
+  case 1007: /* variable not in select list */
+  case 4061: /* existing state of the package has been invalidated */
+  case 4065: /* not executed, the package has been altered or dropped */
+  case 4068: /* existing state of packages has been discarded */
+    return true;
+  default:
+    return false;
+  }
+}
 
 /* What a cursor's parse depends on in its binds: each one's type, charset
  * form and direction. In SELECT :1 a BINARY_DOUBLE bind makes column 1 a
@@ -8077,9 +8111,10 @@ retry_exec:
     /* A reused cached cursor can be invalidated server-side (e.g. DDL
      * recreated the referenced object -> ORA-00942). Drop the stale cursor
      * and its describe and retry once with a full parse before surfacing -
-     * but not a call stopped by a cancel or the call timeout (ORA-01013),
-     * which the retry would run again (#209; the wider question is #210). */
-    if (was_reuse && oer.err_code != 1013) {
+     * for an error that says the cursor is stale, and no other: retried on
+     * any, a deadlock or lock wait waited twice, and a call stopped by a
+     * cancel or the call timeout ran again (#209, #210). */
+    if (was_reuse && stale_cursor_error(oer.err_code)) {
       was_reuse = false;
       queue_cursor_close(stmt->conn, stmt->reuse_cursor); /* the stale cursor */
       stmt->reuse_cursor = 0;

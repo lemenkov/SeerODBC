@@ -313,10 +313,11 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       describe-less reuse response still decodes rows). Transparent (no API change),
       validated all four servers incl. binds reused at new values; ASan-clean; zero
       regression across the whole suite. Correctness guards: DDL is not cached and
-      flushes the cache (same-session invalidation), and a reuse that errors falls
-      back to one full re-parse (cross-session ORA-00942). Residual limit: a
-      cross-session DDL recreating an object with the same name can yield stale
-      results silently (rare; oracledb is similar).
+      flushes the cache (same-session invalidation); a reuse whose error says the
+      cursor is stale (ORA-00942, 00904, 04068, ...) falls back to one full
+      re-parse, any other error surfaces at once (#210). A cross-session DDL that
+      recreates the table: the server re-parses the cursor itself and describes it
+      anew, and the new describe replaces the cached one (#212).
 - [ ] Server-side scrollable cursors
 - [ ] Continuous Query Notification (CQN)
 

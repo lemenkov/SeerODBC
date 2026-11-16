@@ -2412,6 +2412,75 @@ static void check_cache_bind_types(void)
     fail(name, m);
 }
 
+/* A cached query after another session recreated its table with another
+ * column type (#212): the server re-parses the cursor and describes it anew,
+ * and the rows decode by the new type - not a protocol error. */
+static void check_cache_redescribe(void)
+{
+  const char *name = "a cached query re-described after another session retypes the table";
+  SeerConn *b = NULL;
+  if (seer_connect(&P, &b) != SEER_OK) {
+    skip(name, "second connection failed");
+    return;
+  }
+  run("DROP TABLE seer_redesc_t");
+  run("CREATE TABLE seer_redesc_t (n NUMBER)");
+  run("INSERT INTO seer_redesc_t VALUES (1)");
+  char first[32], again[32], m[200] = "";
+  scalar("SELECT n FROM seer_redesc_t", first, sizeof first); /* cached on close */
+  const char *ddl[] = {"DROP TABLE seer_redesc_t", "CREATE TABLE seer_redesc_t (n VARCHAR2(10))",
+                       "INSERT INTO seer_redesc_t VALUES ('x')"};
+  for (size_t k = 0; k < 3; k++) {
+    SeerStmt *s = NULL;
+    if (seer_stmt_prepare(b, ddl[k], &s) == SEER_OK)
+      seer_stmt_execute(s);
+    seer_stmt_close(s);
+  }
+  seer_disconnect(b);
+  scalar("SELECT n FROM seer_redesc_t", again, sizeof again);
+  if (strcmp(first, "1") != 0 || strcmp(again, "x") != 0)
+    snprintf(m, sizeof m, "first '%s' (want 1), after the retype '%s' (want x) %s", first, again,
+             seer_last_error(C) ? seer_last_error(C) : "");
+  run("DROP TABLE seer_redesc_t");
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* A cached statement that fails is not run again unless the error says its
+ * cursor is stale (#210): a duplicate key on a cached INSERT executes once,
+ * counted by the sequence NEXTVAL it advances even when the row is refused. */
+static void check_cache_no_retry(void)
+{
+  const char *name = "a cached statement that fails runs once";
+  run("DROP TABLE seer_retry_t");
+  run("DROP SEQUENCE seer_retry_s");
+  run("CREATE TABLE seer_retry_t (id NUMBER PRIMARY KEY, n NUMBER)");
+  run("CREATE SEQUENCE seer_retry_s");
+  const char *ins = "INSERT INTO seer_retry_t VALUES (1, seer_retry_s.NEXTVAL)";
+  SeerStatus st[2];
+  for (int k = 0; k < 2; k++) { /* the second runs from the cache, and fails */
+    SeerStmt *s = NULL;
+    st[k] = seer_stmt_prepare(C, ins, &s);
+    if (st[k] == SEER_OK)
+      st[k] = seer_stmt_execute(s);
+    seer_stmt_close(s);
+  }
+  char cur[32];
+  scalar("SELECT seer_retry_s.CURRVAL FROM dual", cur, sizeof cur);
+  run("DROP TABLE seer_retry_t");
+  run("DROP SEQUENCE seer_retry_s");
+  if (st[0] == SEER_OK && st[1] == SEER_EDB && strcmp(cur, "2") == 0)
+    pass(name);
+  else {
+    char m[200];
+    snprintf(m, sizeof m, "insert %d then %d, NEXTVAL taken %s times (want 2)", (int)st[0],
+             (int)st[1], cur);
+    fail(name, m);
+  }
+}
+
 /* Connect-time failover (#201): a HOST list whose first address is a closed
  * port reaches the server behind it; a malformed address is refused before
  * any connect (SEER_EPARAM). */
@@ -2489,6 +2558,8 @@ int main(void)
 
   check_select_scalar();
   check_connect_failover();
+  check_cache_redescribe();
+  check_cache_no_retry();
   check_zero_length_columns();
   check_zero_size_numbers();
   check_select_table();
