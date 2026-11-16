@@ -54,10 +54,74 @@ void seer_odbc_diag_free(SQLHANDLE handle)
   h->diag.cap = 0;
 }
 
-/* Append a record, growing the queue. Returns the new record or NULL on OOM. */
+/* The SQLSTATE of a server error, by what the ORA code means; NULL for one
+ * with no closer state than HY000 (#207). */
+static const char *ora_sqlstate(SQLINTEGER code)
+{
+  switch (code) {
+  case 1:    /* unique constraint violated */
+  case 1400: /* cannot insert NULL */
+  case 1407: /* cannot update to NULL */
+  case 2290: /* check constraint violated */
+  case 2291: /* parent key not found */
+  case 2292: /* child record found */
+    return "23000";
+  case 942: /* table or view does not exist */
+    return "42S02";
+  case 955: /* name is already used by an existing object */
+    return "42S01";
+  case 904: /* invalid identifier */
+    return "42S22";
+  case 900:  /* invalid SQL statement */
+  case 905:  /* missing keyword */
+  case 906:  /* missing left parenthesis */
+  case 907:  /* missing right parenthesis */
+  case 917:  /* missing comma */
+  case 921:  /* unexpected end of SQL command */
+  case 923:  /* FROM keyword not found where expected */
+  case 933:  /* SQL command not properly ended */
+  case 936:  /* missing expression */
+  case 1031: /* insufficient privileges */
+    return "42000";
+  case 60:   /* deadlock detected */
+  case 8177: /* can't serialize access for this transaction */
+    return "40001";
+  case 1476: /* divisor is equal to zero */
+    return "22012";
+  case 1722: /* invalid number */
+    return "22018";
+  case 1438: /* value larger than specified precision */
+    return "22003";
+  case 1401:  /* inserted value too large for column (before 10g) */
+  case 12899: /* value too large for column */
+    return "22001";
+  case 1830: /* date format picture ends before converting entire input */
+  case 1840: /* input value not long enough for date format */
+  case 1841: /* (full) year must be between -4713 and +9999 */
+  case 1858: /* a non-numeric character was found where a numeric was expected */
+  case 1861: /* literal does not match format string */
+    return "22007";
+  case 1843: /* not a valid month */
+  case 1847: /* day of month must be between 1 and last day of month */
+    return "22008";
+  default:
+    return NULL;
+  }
+}
+
+/* Append a record, growing the queue. Returns the new record or NULL on OOM.
+ * A server error's text gives its native error when the caller passed none,
+ * and a general error (HY000) takes the ORA code's own SQLSTATE (#207). */
 static OdbcDiagRec *diag_push(OdbcHeader *h, const char *state, SQLINTEGER native, const char *msg,
                               SQLLEN row)
 {
+  if (native == 0 && msg != NULL && strncmp(msg, "ORA-", 4) == 0)
+    native = (SQLINTEGER)atoi(msg + 4);
+  if (native > 0 && (state == NULL || strcmp(state, "HY000") == 0)) {
+    const char *mapped = ora_sqlstate(native);
+    if (mapped != NULL)
+      state = mapped;
+  }
   if (h->diag.count == h->diag.cap) {
     int cap = h->diag.cap ? h->diag.cap * 2 : 4;
     OdbcDiagRec *r = realloc(h->diag.recs, (size_t)cap * sizeof *r);
