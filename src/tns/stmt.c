@@ -6559,6 +6559,12 @@ static bool o8i_bind_ok(const SeerBind *b, bool block, const char **why)
   }
   if ((b->oac_type == ORA_TYPE_ADT || b->oac_type == ORA_TYPE_REF) && b->oac_override != NULL)
     return true; /* an object or collection (#172), a REF (#241) */
+  if (b->is_array && b->oac_override != NULL) {
+    if (block)
+      return true; /* an associative array (#172) */
+    *why = "associative-array parameters outside a PL/SQL block";
+    return false;
+  }
   if (b->is_array || b->oac_override != NULL || b->obj_type != NULL || b->temp_lob) {
     *why = "array, object and LOB parameters";
     return false;
@@ -6649,6 +6655,11 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
 {
   const uint8_t *v = b->rxd != NULL ? b->rxd[row] : NULL;
   size_t vn = b->rxd != NULL ? b->rxd_len[row] : 0;
+  if (b->is_array) { /* built in 8i's form by the array bind (#172) */
+    seer_writer_bytes(val, v, vn);
+    *size = b->oac_size ? b->oac_size : 1;
+    return SEER_OK;
+  }
   if (b->ret_lob != 0) {
     /* A LOB sends a locator even as a pure OUT: an empty one, a LE ub4 86,
      * the ub1 length 86, 00 54 and 84 zeros. With the OUT placeholder fd 01,
@@ -6714,8 +6725,9 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
  * 4000 bytes the server reads it as LONG, after the others (o8i_binds). */
 static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
 {
-  if ((b->oac_type == ORA_TYPE_ADT || b->oac_type == ORA_TYPE_REF) && b->oac_override != NULL) {
-    seer_writer_bytes(w, b->oac_override, b->oac_override_len); /* an object, a REF */
+  if ((b->oac_type == ORA_TYPE_ADT || b->oac_type == ORA_TYPE_REF || b->is_array) &&
+      b->oac_override != NULL) {
+    seer_writer_bytes(w, b->oac_override, b->oac_override_len); /* an object, a REF, an array */
     return;
   }
   uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1, flag = 0x03;
@@ -7231,6 +7243,53 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
 {
   free(b->out.data);
   b->out = (SeerCell){0};
+  if (b->is_array) {
+    /* An associative array (§19.17c, #172): a LE ub4 count, then each
+     * element as a value and an sb2 indicator, -1 for NULL; no return code,
+     * as the OAC doesn't ask for one (flag 0x04). Text in WE8ISO8859P1. */
+    for (int k = 0; k < b->out_arr_n; k++)
+      free(b->out_arr[k].data);
+    free(b->out_arr);
+    b->out_arr = NULL;
+    b->out_arr_n = 0;
+    uint32_t count = o8r_le32(r);
+    if (r->cut || r->bad)
+      return;
+    if (count > 65535) {
+      r->bad = true;
+      return;
+    }
+    SeerCell *cells = calloc(count ? count : 1, sizeof *cells);
+    if (cells == NULL) {
+      r->bad = true;
+      return;
+    }
+    for (uint32_t e = 0; e < count && !r->cut && !r->bad; e++) {
+      SeerWriter v;
+      if (!seer_writer_init(&v, 32)) {
+        r->bad = true;
+        break;
+      }
+      o8r_value(r, &v);
+      uint16_t ind = (uint16_t)o8r_le16(r);
+      if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v)) {
+        if (b->oac_type == ORA_TYPE_NUMBER)
+          (void)decode_scalar(ORA_TYPE_NUMBER, v.buf, v.len, &cells[e]);
+        else
+          (void)o8i_text_cell(&cells[e], v.buf, v.len);
+      }
+      seer_writer_free(&v);
+    }
+    if (r->cut || r->bad) {
+      for (uint32_t e = 0; e < count; e++)
+        free(cells[e].data);
+      free(cells);
+      return;
+    }
+    b->out_arr = cells;
+    b->out_arr_n = (int)count;
+    return;
+  }
   if (b->oac_type == ORA_TYPE_ADT && b->obj_type != NULL) {
     /* An object or collection: the bind value's form - the 8i row cell
      * without its trailer (§19.17c, #172). The image is decoded by the
@@ -10387,6 +10446,41 @@ static uint8_t *aa_build_oac(uint8_t fv, uint8_t dtype, uint32_t length, uint32_
   return w.buf; /* ownership transferred */
 }
 
+/* An 8i associative-array bind (seerdb PROTOCOL.md §19.17c, bus 84, OCI 9.2
+ * index-by binds on 8.1.7): the 25-byte scalar descriptor with flag 0x43 (the
+ * ARRAY bit 0x40 on the usual 0x03) and the maximum element count, a LE ub4,
+ * at +8 in its reserved bytes. The value is a LE ub4 count, then each element
+ * as a length-prefixed value, a NULL one fd 01; a pure OUT, the count 0. */
+static uint8_t *o8i_aa_oac(uint8_t dtype, uint32_t length, uint32_t capacity, size_t *out_len)
+{
+  bool text = dtype != ORA_TYPE_NUMBER;
+  uint8_t *o = calloc(1, 25);
+  if (o == NULL)
+    return NULL;
+  o[0] = dtype;
+  o[1] = 0x43;
+  if (length > 0xFFFF)
+    length = 0xFFFF;
+  o[4] = (uint8_t)(length & 0xFF);
+  o[5] = (uint8_t)(length >> 8);
+  for (int i = 0; i < 4; i++)
+    o[8 + i] = (uint8_t)((capacity ? capacity : 1) >> (8 * i));
+  o[22] = text ? 31 : 0; /* charset, big-endian ub4 at +19: WE8ISO8859P1 for text */
+  o[24] = text ? 1 : 0;  /* form */
+  *out_len = 25;
+  return o;
+}
+
+static void o8i_aa_elem(SeerWriter *v, const uint8_t *p, size_t n)
+{
+  if (p == NULL) {
+    seer_writer_u8(v, 0xFD); /* a NULL element */
+    seer_writer_u8(v, 0x01);
+  } else {
+    o8w_chr(v, p, n);
+  }
+}
+
 /* Attach a prebuilt array OAC + RXD to a bind position (a single PL/SQL
  * associative-array parameter). Takes ownership of `rxd` and `oac`. */
 static SeerStatus aa_store(SeerStmt *stmt, int param, uint8_t dtype, uint32_t length, uint8_t *rxd,
@@ -10413,11 +10507,32 @@ SeerStatus seer_stmt_bind_out_array(SeerStmt *stmt, int param, int ora_type, int
 {
   if (stmt == NULL || capacity <= 0)
     return SEER_EPARAM;
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* associative arrays: 10g+ (9i and 8i, #172) */
-
   uint8_t dtype = (ora_type == ORA_TYPE_NUMBER) ? ORA_TYPE_NUMBER : ORA_TYPE_VARCHAR;
   uint32_t length = (dtype == ORA_TYPE_NUMBER) ? 22 : (uint32_t)(elem_size > 0 ? elem_size : 2000);
+  if (stmt->conn->is_8i) { /* §19.17c: the count 0 as a pure OUT's value */
+    size_t ol = 0;
+    uint8_t *oac = o8i_aa_oac(dtype, length, (uint32_t)capacity, &ol);
+    uint8_t *rxd = calloc(1, 4);
+    if (oac == NULL || rxd == NULL) {
+      free(oac);
+      free(rxd);
+      return SEER_ENOMEM;
+    }
+    SeerStatus st = store_bind(stmt, param, dtype, length, 0, 0, true, rxd, 4);
+    if (st != SEER_OK) {
+      free(oac);
+      return st;
+    }
+    SeerBind *b = &stmt->pbinds[param - 1];
+    free(b->oac_override);
+    b->oac_override = oac;
+    b->oac_override_len = ol;
+    b->is_array = true;
+    return SEER_OK;
+  }
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#172) */
+
   uint32_t charset = (dtype == ORA_TYPE_NUMBER) ? 0 : 873;
   uint8_t csfrm = (dtype == ORA_TYPE_NUMBER) ? 0 : 1;
 
@@ -10478,8 +10593,26 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
 {
   if (stmt == NULL || n < 0 || (n > 0 && values == NULL))
     return SEER_EPARAM;
+  if (stmt->conn->is_8i) {
+    SeerWriter v;
+    if (!seer_writer_init(&v, 8 + (size_t)n * 24))
+      return SEER_ENOMEM;
+    o8w_le32(&v, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      uint8_t num[24];
+      size_t nn = seer_encode_number_int(values[i], num);
+      o8i_aa_elem(&v, num, nn);
+    }
+    size_t ol = 0;
+    uint8_t *oac = seer_writer_ok(&v) ? o8i_aa_oac(ORA_TYPE_NUMBER, 22, (uint32_t)n, &ol) : NULL;
+    if (oac == NULL) {
+      seer_writer_free(&v);
+      return SEER_ENOMEM;
+    }
+    return aa_store(stmt, param, ORA_TYPE_NUMBER, 22, v.buf, v.len, oac, ol);
+  }
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* associative arrays: 10g+ (9i and 8i, #172) */
+    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#172) */
 
   /* RXD: ub4 element count, then each element <ub1 len><NUMBER bytes>. */
   SeerWriter rxd;
@@ -10512,8 +10645,37 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
 {
   if (stmt == NULL || n < 0 || (n > 0 && values == NULL) || elem_size <= 0)
     return SEER_EPARAM;
+  if (stmt->conn->is_8i) { /* each element in WE8ISO8859P1, the session's charset */
+    SeerWriter v;
+    if (!seer_writer_init(&v, 8 + (size_t)n * 16))
+      return SEER_ENOMEM;
+    o8w_le32(&v, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      if (values[i] == NULL) {
+        o8i_aa_elem(&v, NULL, 0);
+        continue;
+      }
+      size_t ln = 0;
+      uint8_t *l1 = o8i_latin1(values[i], &ln);
+      if (l1 == NULL) {
+        seer_writer_free(&v);
+        return SEER_ENOMEM;
+      }
+      o8i_aa_elem(&v, l1, ln);
+      free(l1);
+    }
+    size_t ol = 0;
+    uint8_t *oac = seer_writer_ok(&v)
+                       ? o8i_aa_oac(ORA_TYPE_VARCHAR, (uint32_t)elem_size, (uint32_t)n, &ol)
+                       : NULL;
+    if (oac == NULL) {
+      seer_writer_free(&v);
+      return SEER_ENOMEM;
+    }
+    return aa_store(stmt, param, ORA_TYPE_VARCHAR, (uint32_t)elem_size, v.buf, v.len, oac, ol);
+  }
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* associative arrays: 10g+ (9i and 8i, #172) */
+    return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#172) */
 
   /* RXD: ub4 count, then each element as a length-framed CHR value. */
   SeerWriter rxd;
