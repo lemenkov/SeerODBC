@@ -125,7 +125,8 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   char *ctlsca = cs ? conn_str_get(cs, "TLSCA") : NULL;
   char *ctlsverify = cs ? conn_str_get(cs, "TLSVERIFY") : NULL;
   char *clobinline = cs ? conn_str_get(cs, "LOBINLINE") : NULL;
-  char *cexpire = cs ? conn_str_get(cs, "EXPIRE_TIME") : NULL; /* TCP keepalive */
+  char *cexpire = cs ? conn_str_get(cs, "EXPIRE_TIME") : NULL;      /* TCP keepalive */
+  char *ctimeout = cs ? conn_str_get(cs, "CONNECT_TIMEOUT") : NULL; /* seconds (#216) */
 
   /* Fill any gaps from the DSN section of odbc.ini. */
   if (dsn != NULL) {
@@ -163,6 +164,8 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       clobinline = dsn_get(dsn, "LOBINLINE");
     if (cexpire == NULL)
       cexpire = dsn_get(dsn, "EXPIRE_TIME");
+    if (ctimeout == NULL)
+      ctimeout = dsn_get(dsn, "CONNECT_TIMEOUT");
   }
 
   /* TLS is requested by SSL=1/yes/true or PROTOCOL=TCPS; verification is on by
@@ -201,6 +204,24 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
     expire_time = (int)v;
   }
 
+  /* The login timeout (#216): SQL_ATTR_LOGIN_TIMEOUT when the application set
+   * it, else CONNECT_TIMEOUT, in seconds; 0 is no limit, as ODBC has it, and
+   * neither keeps the 30 s default. A day at most. */
+  long login_s = c->login_timeout;
+  if (login_s < 0 && ctimeout != NULL && ctimeout[0] != '\0') {
+    char *end = NULL;
+    login_s = strtol(ctimeout, &end, 10);
+    if (*end != '\0' || login_s < 0 || login_s > 86400) {
+      ret = seer_odbc_diag(c, "HY024", 0,
+                           "CONNECT_TIMEOUT must be a whole number of seconds, 0 to 86400",
+                           SQL_ERROR);
+      goto out;
+    }
+  }
+  if (login_s > 86400)
+    login_s = 86400;
+  int connect_timeout_ms = login_s < 0 ? 0 : login_s == 0 ? -1 : (int)login_s * 1000;
+
   SeerConnParams p = {
       .host = host,
       .port = port ? (uint16_t)atoi(port) : 1521,
@@ -214,6 +235,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       .purity = parse_purity(cpurity),
       .lob_inline = flag_is_on(clobinline),
       .expire_time = expire_time,
+      .connect_timeout_ms = connect_timeout_ms,
   };
 
   SeerConn *conn = NULL;
@@ -250,6 +272,7 @@ out:
   free(ctlsverify);
   free(clobinline);
   free(cexpire);
+  free(ctimeout);
   return ret;
 }
 

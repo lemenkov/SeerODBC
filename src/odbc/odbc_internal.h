@@ -86,8 +86,9 @@ typedef struct {
   SeerConn *conn;
   int connected;
   SQLUINTEGER autocommit;
-  char *browse_cs;   /* SQLBrowseConnect: accumulated attributes */
-  char dbms_ver[64]; /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
+  long login_timeout; /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
+  char *browse_cs;    /* SQLBrowseConnect: accumulated attributes */
+  char dbms_ver[64];  /* SQL_DBMS_VER, resolved on first request ("" = not yet) */
 } OdbcDbc;
 
 /* A column binding set by SQLBindCol. */

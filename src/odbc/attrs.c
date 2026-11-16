@@ -70,7 +70,9 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     if (c->connected && c->conn != NULL)
       seer_set_autocommit(c->conn, c->autocommit == SQL_AUTOCOMMIT_ON);
   }
-  /* Login/connection timeouts, tracing, etc.: accept as no-ops. */
+  if (Attribute == SQL_ATTR_LOGIN_TIMEOUT) /* seconds; takes effect at the next connect */
+    c->login_timeout = (long)(SQLULEN)ValuePtr;
+  /* Connection timeout, tracing, etc.: accept as no-ops. */
   return SQL_SUCCESS;
 }
 
@@ -125,6 +127,9 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   case SQL_ATTR_CONNECTION_DEAD:
     *(SQLUINTEGER *)ValuePtr =
         c->connected && !seer_conn_lost(c->conn) ? SQL_CD_FALSE : SQL_CD_TRUE;
+    return SQL_SUCCESS;
+  case SQL_ATTR_LOGIN_TIMEOUT: /* unset: the 30 s default */
+    *(SQLUINTEGER *)ValuePtr = (SQLUINTEGER)(c->login_timeout < 0 ? 30 : c->login_timeout);
     return SQL_SUCCESS;
   default:
     *(SQLINTEGER *)ValuePtr = 0;
