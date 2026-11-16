@@ -324,13 +324,17 @@ void core_objbind(void)
          "  PROCEDURE sum_arr(a IN num_tab, total OUT NUMBER);\n"
          "  PROCEDURE cat_arr(a IN str_tab, result OUT VARCHAR2);\n"
          "  PROCEDURE out_nums(a OUT num_tab);\n"
+         "  PROCEDURE out_strs(a OUT str_tab);\n"
          "END;");
+  /* out_strs' e-acute is a literal: 8.1.7 has no UNISTR. */
   run(c, "CREATE OR REPLACE PACKAGE BODY seeraa AS\n"
          "  PROCEDURE sum_arr(a IN num_tab, total OUT NUMBER) IS BEGIN\n"
          "    total := 0; FOR i IN 1..a.COUNT LOOP total := total + a(i); END LOOP; END;\n"
          "  PROCEDURE cat_arr(a IN str_tab, result OUT VARCHAR2) IS BEGIN\n"
          "    result := NULL; FOR i IN 1..a.COUNT LOOP result := result || a(i); END LOOP; END;\n"
          "  PROCEDURE out_nums(a OUT num_tab) IS BEGIN a(1):=10; a(2):=20; a(3):=30; END;\n"
+         "  PROCEDURE out_strs(a OUT str_tab) IS BEGIN a(1):='x'; a(2):=NULL; a(3):='\xC3\xA9'; "
+         "END;\n"
          "END;");
   if (!gated_as("object binds", "assoc-array bind (NUMBER)")) {
     const char *name = "assoc-array bind (NUMBER)";
@@ -361,9 +365,11 @@ void core_objbind(void)
   if (!gated_as("object binds", "assoc-array bind (VARCHAR)")) {
     const char *name = "assoc-array bind (VARCHAR)";
     SeerStmt *s = NULL;
-    const char *strs[2] = {"foo", "bar"};
+    /* A NULL element and a non-ASCII one: 8i sends NULL as fd 01 and the
+     * text in WE8ISO8859P1 (#172). */
+    const char *strs[3] = {"foo", NULL, "b\xC3\xA4r"};
     seer_stmt_prepare(c, "BEGIN seeraa.cat_arr(:1, :2); END;", &s);
-    SeerStatus b = seer_stmt_bind_text_array(s, 1, strs, 2, 40);
+    SeerStatus b = seer_stmt_bind_text_array(s, 1, strs, 3, 40);
     if (b == SEER_ENOTIMPL) {
       fail(name, "not implemented");
     } else if (b != SEER_OK || seer_stmt_bind_out(s, 2, 1, 100) != SEER_OK ||
@@ -374,7 +380,7 @@ void core_objbind(void)
       size_t dl = 0;
       int isn = 0, isb = 0;
       seer_stmt_out_data(s, 2, &d, &dl, &isn, &isb);
-      if (d != NULL && dl == 6 && memcmp(d, "foobar", 6) == 0)
+      if (d != NULL && dl == 7 && memcmp(d, "foob\xC3\xA4r", 7) == 0)
         pass(name);
       else {
         char m[64];
@@ -410,6 +416,34 @@ void core_objbind(void)
         fail(name, "wrong count / elements");
     }
     seer_stmt_close(s);
+  }
+  if (!gated_as("object binds", "OUT assoc-array (VARCHAR)")) {
+    const char *name = "OUT assoc-array (VARCHAR)";
+    SeerStmt *s = NULL;
+    seer_stmt_prepare(c, "BEGIN seeraa.out_strs(:1); END;", &s);
+    SeerStatus b = seer_stmt_bind_out_array(s, 1, 1 /*VARCHAR*/, 40, 10);
+    char m[200] = "";
+    if (b != SEER_OK || seer_stmt_execute(s) != SEER_OK) {
+      snprintf(m, sizeof m, "bind %d: %s", (int)b,
+               seer_last_error(c) ? seer_last_error(c) : "exec");
+    } else if (seer_stmt_out_array_len(s, 1) != 3) {
+      snprintf(m, sizeof m, "%d elements, want 3", seer_stmt_out_array_len(s, 1));
+    } else { /* x, NULL, e-acute */
+      const char *want[3] = {"x", NULL, "\xC3\xA9"};
+      for (int i = 0; m[0] == '\0' && i < 3; i++) {
+        const char *d = NULL;
+        size_t l = 0;
+        int isn = 0;
+        seer_stmt_out_array_get(s, 1, i, &d, &l, &isn);
+        if (want[i] == NULL ? !isn : (isn || d == NULL || strcmp(d, want[i]) != 0))
+          snprintf(m, sizeof m, "element %d: '%s' null %d", i, d ? d : "", isn);
+      }
+    }
+    seer_stmt_close(s);
+    if (m[0] == '\0')
+      pass(name);
+    else
+      fail(name, m);
   }
   run(c, "DROP PACKAGE seeraa");
 
