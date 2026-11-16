@@ -958,12 +958,13 @@ static void check_returning(void)
 
 /* Text binds past 4000 bytes: 9.2 has no form for one in a plain statement,
  * and takes it in a PL/SQL block, declared VARCHAR 32767 (seerdb PROTOCOL.md
- * §19.3.1), so such a DML runs as a block. A 5000-byte value goes into a CLOB
- * ahead of a NUMBER bind (the two must not swap), the row count is the DML's,
- * and past the 32512 bytes measured to work the bind is refused. */
+ * §19.3.1), so such a DML runs as a block; past 32512 bytes, as a temporary
+ * LOB (#169). A 5000-byte value goes into a CLOB ahead of a NUMBER bind (the
+ * two must not swap), the row count is the DML's, and so does a 32513-byte
+ * one. */
 static void check_long_text_bind(void)
 {
-  const char *name = "text bind over 4000 bytes into a CLOB (5000; 32513 refused on 9i)";
+  const char *name = "text bind over 4000 bytes into a CLOB (5000 and 32513)";
   run("DROP TABLE seer9t");
   run("CREATE TABLE seer9t (c CLOB, id NUMBER)");
   static char big[32514];
@@ -993,12 +994,8 @@ static void check_long_text_bind(void)
   scalar("SELECT COUNT(*) || ':' || MAX(id) || ':' || MAX(DBMS_LOB.GETLENGTH(c)) FROM seer9t", out,
          sizeof out);
   run("DROP TABLE seer9t");
-  /* 9i takes text in a block up to 32512 bytes (seerdb PROTOCOL.md §19.3.1),
-   * and 32513 is refused before it is sent; 8i and 10g+ take it. */
-  bool nine = g_release == 9;
-  const char *want = nine ? "1:42:5000" : "2:43:32513";
-  if (st == SEER_OK && rows == 1 && strcmp(out, want) == 0 &&
-      (nine ? too_long == SEER_ENOTIMPL : too_long == SEER_OK))
+  const char *want = "2:43:32513";
+  if (st == SEER_OK && rows == 1 && strcmp(out, want) == 0 && too_long == SEER_OK)
     pass(name);
   else {
     char m[200];
@@ -1009,10 +1006,11 @@ static void check_long_text_bind(void)
 }
 
 /* RAW binds past 2000 bytes take the same route as long text: a PL/SQL block,
- * declared RAW 32767, values up to 32512 bytes (seerdb PROTOCOL.md §19.3.1). */
+ * declared RAW 32767, values up to 32512 bytes, past that a temporary BLOB
+ * (seerdb PROTOCOL.md §19.3.1, #169). */
 static void check_long_raw_bind(void)
 {
-  const char *name = "RAW bind over 2000 bytes into a BLOB (5000; 32513 refused on 9i)";
+  const char *name = "RAW bind over 2000 bytes into a BLOB (5000 and 32513)";
   run("DROP TABLE seer9w");
   run("CREATE TABLE seer9w (b BLOB, id NUMBER)");
   static unsigned char big[32513];
@@ -1038,10 +1036,8 @@ static void check_long_raw_bind(void)
          "MAX(RAWTOHEX(DBMS_LOB.SUBSTR(b, 1, 5000))) FROM seer9w",
          out, sizeof out);
   run("DROP TABLE seer9w");
-  bool nine = g_release == 9;
-  const char *want = nine ? "1:42:5000:B1" : "2:43:32513:B1";
-  if (sts[0] == SEER_OK && (nine ? sts[1] == SEER_ENOTIMPL : sts[1] == SEER_OK) &&
-      strcmp(out, want) == 0)
+  const char *want = "2:43:32513:B1";
+  if (sts[0] == SEER_OK && sts[1] == SEER_OK && strcmp(out, want) == 0)
     pass(name);
   else {
     char m[200];

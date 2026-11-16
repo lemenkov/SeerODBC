@@ -116,6 +116,7 @@ typedef struct {
   SeerCell out;         /* OUT value captured from the IOV response */
   int64_t out_full_len; /* RETURNING value the server truncated: its real length, else 0 */
   uint8_t ret_lob;      /* RETURNING target declared as this LOB type (CLOB/BLOB), else 0 */
+  uint8_t fv2_lob;      /* 9i: bound for this execute as a temporary LOB of this type (#169) */
   uint8_t *ret_locator; /* its returned locator, resolved after the response */
   size_t ret_loclen;
   bool is_array;     /* PL/SQL associative-array (index-by table) bind  */
@@ -5116,7 +5117,7 @@ static int fv2_long_binds(const SeerStmt *stmt)
   int need = FV2_BINDS_INLINE;
   for (int i = 0; i < stmt->npbinds; i++) {
     const SeerBind *b = &stmt->pbinds[i];
-    if (b->is_out || b->oac_charset == 2000)
+    if (b->is_out || b->oac_charset == 2000 || b->fv2_lob != 0)
       continue;
     switch (b->oac_type) {
     case ORA_TYPE_RAW:
@@ -5148,7 +5149,7 @@ static int fv2_long_binds(const SeerStmt *stmt)
  * §19.3.1, measured against ojdbc14; #189). */
 static bool fv2_block_wide(const SeerBind *b)
 {
-  if (b->oac_charset == 2000)
+  if (b->oac_charset == 2000 || b->fv2_lob != 0)
     return false;
   if (b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW)
     return b->oac_size > 2000;
@@ -5209,6 +5210,15 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
     }
   if (fv2_block_wide(b)) /* past the inline limits: a block's 32767 (§19.3.1) */
     maxsize = FV2_BLOCK_WIDE_DECLARED;
+  if (b->fv2_lob != 0) {
+    /* A value past what 9.2 takes inline, bound as the temporary LOB it was
+     * written to: the LOB at 3876 - under 4000, so a statement doesn't read it
+     * as LONG-class, last - charset 31, form 1 (§19.3.1, #169). */
+    type = b->fv2_lob;
+    maxsize = 3876;
+    charset = 31;
+    csfrm = 1;
+  }
   if (b->ret_lob != 0) {
     /* A RETURNING target that is a CLOB / BLOB: the LOB at its own OAC,
      * charset 31, form 1; any size goes, and a pure OUT sends no value
@@ -7587,6 +7597,250 @@ static SeerStatus fv2_fetch_cursor(SeerStmt *stmt, uint32_t cursor, int64_t *err
   return SEER_OK;
 }
 
+/* ---- 9i: a value past what a statement takes, as a temporary LOB (#169) ----
+ * seerdb PROTOCOL.md §19.3.1, measured from ojdbc14 on 9.2.0.4: 9.2 has no
+ * form for text past 32512 bytes (RAW too), nor for text past 4000 in a query,
+ * but a temporary LOB holding it, bound as the LOB, goes into any statement. */
+
+static SeerStatus o8i_unchunk(const uint8_t *v, size_t n, SeerWriter *out);
+
+/* The empty 86-byte locator CREATE_TEMP takes as its source: 00 54, zeros. */
+static const uint8_t FV2_EMPTY_LOCATOR[86] = {0x00, 0x54};
+
+/* CREATE_TEMP of a CLOB (112) or BLOB (113) of the session's duration (10):
+ * the empty locator as the source, the duration in the destination length and
+ * the amount, the charset form and the type in the short offsets, the charset
+ * after the locator. The reply's RPA carries the new locator. */
+static SeerStatus fv2_create_temp(SeerConn *c, uint8_t type, uint8_t loc[86])
+{
+  bool blob = type == ORA_TYPE_BLOB;
+  const uint8_t mid[] = {
+      0x00, 0x01, 0x0a, 0x01, blob ? 0x00 : 0x01, 0x01, type, 0x01, 0x01, 0x01, 0x02, 0x01,
+      0x10, 0x00, 0x00, 0x00};
+  SeerWriter tw;
+  if (!seer_writer_init(&tw, 16))
+    return SEER_ENOMEM;
+  seer_enc_sb4(&tw, c->db_charset ? c->db_charset : 873u); /* the database charset */
+  seer_enc_sb4(&tw, 10);                                   /* the duration again */
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  SeerStatus st = seer_writer_ok(&tw)
+                      ? fv2_lobop_send(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, mid,
+                                       sizeof mid, tw.buf, tw.len, &resp, &rlen)
+                      : SEER_ENOMEM;
+  seer_writer_free(&tw);
+  if (st == SEER_OK &&
+      (rlen < 3 + 84 || resp[0] != TTI_RPA || resp[1] != 0x00 || resp[2] != 0x54)) {
+    fv2_set_error(c, resp, rlen);
+    st = SEER_EDB;
+  }
+  if (st == SEER_OK)
+    memcpy(loc, resp + 1, 86); /* 00 54 and the body */
+  free(resp);
+  return st;
+}
+
+/* WRITE (op 0x40) `n` bytes at offset 1, `amount` characters of a CLOB or
+ * bytes of a BLOB: the short amount, then the data as TTI_LOB content - a ub1
+ * length and up to 252 bytes, past that 0xFE, 252-byte chunks and a zero. */
+static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_t *data, size_t n,
+                                uint32_t amount)
+{
+  static const uint8_t mid[] = {0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+                                0x00, 0x01, 0x40, 0x00, 0x00, 0x00};
+  SeerWriter tw;
+  if (!seer_writer_init(&tw, n + n / 252 + 16))
+    return SEER_ENOMEM;
+  seer_enc_sb4(&tw, amount);
+  seer_writer_u8(&tw, TTI_LOB);
+  if (n <= 252) {
+    seer_writer_u8(&tw, (uint8_t)n);
+    seer_writer_bytes(&tw, data, n);
+  } else {
+    seer_writer_u8(&tw, 0xFE);
+    for (size_t off = 0; off < n; off += 252) {
+      size_t k = n - off < 252 ? n - off : 252;
+      seer_writer_u8(&tw, (uint8_t)k);
+      seer_writer_bytes(&tw, data + off, k);
+    }
+    seer_writer_u8(&tw, 0);
+  }
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  SeerStatus st = seer_writer_ok(&tw)
+                      ? fv2_lobop_send(c, loc, 86, mid, sizeof mid, tw.buf, tw.len, &resp, &rlen)
+                      : SEER_ENOMEM;
+  seer_writer_free(&tw);
+  if (st == SEER_OK && (rlen < 1 || resp[0] != TTI_RPA)) {
+    fv2_set_error(c, resp, rlen);
+    st = SEER_EDB;
+  }
+  free(resp);
+  return st;
+}
+
+/* FREE_TEMP (op 0x111), as ojdbc14 frees one: the locator, all else zero. */
+static void fv2_free_temp(SeerConn *c, const uint8_t loc[86])
+{
+  static const uint8_t mid[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                0x02, 0x01, 0x11, 0x00, 0x00, 0x00};
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  if (fv2_lobop_send(c, loc, 86, mid, sizeof mid, NULL, 0, &resp, &rlen) == SEER_OK) {
+    if (rlen < 1 || resp[0] != TTI_RPA)
+      seer_log(SEER_LOG_WARNING, "stmt: 9i: a temporary LOB was not freed (reply %02x)",
+               rlen ? resp[0] : 0);
+    else
+      seer_log(SEER_LOG_DEBUG, "stmt: 9i: temporary LOB freed");
+    free(resp);
+  }
+}
+
+/* A CLOB's text as 9.2 reads a LOB write - in the session's charset, UTF-8,
+ * not the database's (measured on 9.2.0.4: an 'é' run converted to the
+ * database's WE8ISO8859P1 came up short of its amount, ORA-22993) - and its
+ * length in characters. */
+static SeerStatus fv2_lob_text(const uint8_t *u8, size_t n, uint8_t **out, size_t *outlen,
+                               uint32_t *chars)
+{
+  uint32_t k = 0;
+  for (size_t i = 0; i < n; i++)
+    k += (u8[i] & 0xC0) != 0x80;
+  *chars = k;
+  *out = malloc(n ? n : 1);
+  if (*out == NULL)
+    return SEER_ENOMEM;
+  memcpy(*out, u8, n);
+  *outlen = n;
+  return SEER_OK;
+}
+
+/* Whether a 9i IN bind needs a temporary LOB: text or RAW past 32512 bytes,
+ * or, in a query, past the inline 4000 / 2000. */
+static bool fv2_needs_temp_lob(const SeerStmt *stmt, const SeerBind *b, bool query)
+{
+  if (b->is_out || b->oac_charset == 2000 || b->rxd == NULL || b->rxd[0] == NULL)
+    return false;
+  bool text = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
+              b->oac_type == ORA_TYPE_LONG;
+  bool raw = b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW;
+  if (!text && !raw)
+    return false;
+  (void)stmt;
+  return b->oac_size > FV2_BLOCK_WIDE_MAX || (query && fv2_block_wide(b));
+}
+
+/* The temporary LOBs of one execute: each promoted bind's locator and the
+ * value it replaced, put back by fv2_temp_lobs_done. */
+typedef struct {
+  int bind;
+  uint8_t loc[86];
+  uint8_t *saved;
+  size_t saved_len;
+} Fv2TempLob;
+
+/* Write each bind that needs one to a temporary LOB and bind the LOB for this
+ * execute: the value a ub4 86 and the locator in 64-byte chunks. */
+static SeerStatus fv2_temp_lobs_begin(SeerStmt *stmt, bool query, Fv2TempLob **out, int *n)
+{
+  *out = NULL;
+  *n = 0;
+  for (int i = 0; i < stmt->npbinds; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    if (!fv2_needs_temp_lob(stmt, b, query))
+      continue;
+    if (stmt->n_iters > 1) {
+      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: an array execute with a value past 32512 "
+                                 "bytes is not supported");
+      return SEER_ENOTIMPL;
+    }
+    bool raw = b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW;
+    SeerWriter v;
+    if (!seer_writer_init(&v, b->rxd_len[0]))
+      return SEER_ENOMEM;
+    SeerStatus st = o8i_unchunk(b->rxd[0], b->rxd_len[0], &v);
+    uint8_t *data = NULL;
+    size_t dlen = 0;
+    uint32_t amount = 0;
+    if (st == SEER_OK && !seer_writer_ok(&v))
+      st = SEER_ENOMEM;
+    if (st == SEER_OK && raw) {
+      data = v.buf;
+      dlen = v.len;
+      amount = (uint32_t)v.len;
+      v.buf = NULL;
+    } else if (st == SEER_OK) {
+      st = fv2_lob_text(v.buf, v.len, &data, &dlen, &amount);
+    }
+    seer_writer_free(&v);
+    Fv2TempLob *t = realloc(*out, (size_t)(*n + 1) * sizeof *t);
+    if (st == SEER_OK && t == NULL)
+      st = SEER_ENOMEM;
+    if (t != NULL)
+      *out = t;
+    if (st == SEER_OK) {
+      t = &(*out)[*n];
+      t->bind = i;
+      t->saved = NULL;
+      st = fv2_create_temp(stmt->conn, raw ? ORA_TYPE_BLOB : ORA_TYPE_CLOB, t->loc);
+      bool made = st == SEER_OK;
+      if (st == SEER_OK && amount > 0)
+        st = fv2_lob_write(stmt->conn, t->loc, data, dlen, amount);
+      if (st == SEER_OK) {
+        SeerWriter bv;
+        if (!seer_writer_init(&bv, 96)) {
+          st = SEER_ENOMEM;
+        } else {
+          seer_enc_sb4(&bv, 86);
+          seer_writer_u8(&bv, 0xFE);
+          seer_writer_u8(&bv, 64);
+          seer_writer_bytes(&bv, t->loc, 64);
+          seer_writer_u8(&bv, 22);
+          seer_writer_bytes(&bv, t->loc + 64, 22);
+          seer_writer_u8(&bv, 0);
+          if (!seer_writer_ok(&bv)) {
+            seer_writer_free(&bv);
+            st = SEER_ENOMEM;
+          } else {
+            t->saved = b->rxd[0];
+            t->saved_len = b->rxd_len[0];
+            b->rxd[0] = bv.buf;
+            b->rxd_len[0] = bv.len;
+            b->fv2_lob = raw ? ORA_TYPE_BLOB : ORA_TYPE_CLOB;
+          }
+        }
+      }
+      if (made && t->saved != NULL)
+        (*n)++; /* bound: fv2_temp_lobs_done puts the value back and frees it */
+      else if (made)
+        fv2_free_temp(stmt->conn, t->loc);
+    }
+    free(data);
+    if (st != SEER_OK)
+      return st;
+    seer_log(SEER_LOG_DEBUG, "stmt: 9i bind %d: %zu bytes as a temporary %s", i + 1, dlen,
+             raw ? "BLOB" : "CLOB");
+  }
+  return SEER_OK;
+}
+
+/* Put the promoted binds' values back and free their temporary LOBs. */
+static void fv2_temp_lobs_done(SeerStmt *stmt, Fv2TempLob *t, int n)
+{
+  for (int k = 0; k < n; k++) {
+    SeerBind *b = &stmt->pbinds[t[k].bind];
+    if (t[k].saved != NULL) {
+      free(b->rxd[0]);
+      b->rxd[0] = t[k].saved;
+      b->rxd_len[0] = t[k].saved_len;
+    }
+    b->fv2_lob = 0;
+    if (stmt->conn->t != NULL)
+      fv2_free_temp(stmt->conn, t[k].loc);
+  }
+  free(t);
+}
+
 static SeerStatus fv2_execute_select(SeerStmt *stmt)
 {
   SeerConn *c = stmt->conn;
@@ -8076,6 +8330,31 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   return SEER_OK;
 }
 
+/* A 9i statement by its kind: a query's four calls, a DML (in a block when its
+ * binds or a RETURNING need one), a block as it is. */
+static SeerStatus fv2_execute_kind(SeerStmt *stmt)
+{
+  StmtKind kind = classify_sql(stmt->sql);
+  int binds = fv2_long_binds(stmt);
+  bool sql = kind == STMT_SELECT || kind == STMT_CHANGE; /* a block goes as it is */
+  if (sql && (binds == FV2_BINDS_NONE || (binds == FV2_BINDS_BLOCK && kind == STMT_SELECT))) {
+    seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: a bind over 32512 bytes, or over 4000 of "
+                               "text / 2000 of RAW in a query, is not supported");
+    return SEER_ENOTIMPL;
+  }
+  if (kind == STMT_SELECT)
+    return fv2_execute_select(stmt);
+  if (kind == STMT_CHANGE) {
+    if (binds == FV2_BINDS_BLOCK) /* long text: only a block takes it */
+      return fv2_execute_in_block(stmt);
+    for (int i = 0; i < stmt->npbinds; i++)
+      if (stmt->pbinds[i].is_out) /* OUT binds on a DML: RETURNING ... INTO */
+        return fv2_execute_in_block(stmt);
+    return fv2_execute_dml(stmt);
+  }
+  return fv2_execute_block(stmt); /* BEGIN / DECLARE */
+}
+
 SeerStatus seer_stmt_set_max_rows(SeerStmt *stmt, size_t max_rows)
 {
   if (stmt == NULL)
@@ -8187,25 +8466,15 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
    * four-call fetch sequence, DML/DDL a single parse-execute. PL/SQL blocks are
    * the next fv2 slice. */
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2) {
-    StmtKind kind = classify_sql(stmt->sql);
-    int binds = fv2_long_binds(stmt);
-    bool sql = kind == STMT_SELECT || kind == STMT_CHANGE; /* a block goes as it is */
-    if (sql && (binds == FV2_BINDS_NONE || (binds == FV2_BINDS_BLOCK && kind == STMT_SELECT))) {
-      seer_log(SEER_LOG_WARNING, "stmt: Oracle 9i: a bind over 32512 bytes, or over 4000 of "
-                                 "text / 2000 of RAW in a query, is not supported");
-      return SEER_ENOTIMPL;
-    }
-    if (kind == STMT_SELECT)
-      return fv2_execute_select(stmt);
-    if (kind == STMT_CHANGE) {
-      if (binds == FV2_BINDS_BLOCK) /* long text: only a block takes it */
-        return fv2_execute_in_block(stmt);
-      for (int i = 0; i < stmt->npbinds; i++)
-        if (stmt->pbinds[i].is_out) /* OUT binds on a DML: RETURNING ... INTO */
-          return fv2_execute_in_block(stmt);
-      return fv2_execute_dml(stmt);
-    }
-    return fv2_execute_block(stmt); /* BEGIN / DECLARE */
+    /* Values past what 9.2 takes inline go as temporary LOBs for this
+     * execute (#169), then the statement runs as any other. */
+    Fv2TempLob *tl = NULL;
+    int ntl = 0;
+    SeerStatus st = fv2_temp_lobs_begin(stmt, classify_sql(stmt->sql) == STMT_SELECT, &tl, &ntl);
+    if (st == SEER_OK)
+      st = fv2_execute_kind(stmt);
+    fv2_temp_lobs_done(stmt, tl, ntl);
+    return st;
   }
 
   if (stmt->described_only) { /* the execute parses and describes afresh */
