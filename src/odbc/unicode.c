@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "charset.h"
+#include "odbc_internal.h" /* SQL_DESC_SEER_REF_TYPE */
 
 /* Decode a SQLWCHAR string (length in characters, or SQL_NTS) to a malloc'd
  * NUL-terminated UTF-8 string. NULL in -> NULL out (a genuinely absent arg). */
@@ -408,6 +409,17 @@ SQLRETURN SQL_API SQLGetStmtAttrW(SQLHSTMT hstmt, SQLINTEGER attr, SQLPOINTER va
 SQLRETURN SQL_API SQLSetDescFieldW(SQLHDESC hdesc, SQLSMALLINT rec, SQLSMALLINT field,
                                    SQLPOINTER val, SQLINTEGER len)
 {
+  /* The one string field it stores, the REF parameter's type (#241): from
+   * UTF-16, its length in bytes. */
+  if (field == SQL_DESC_SEER_REF_TYPE && val != NULL) {
+    char *u8 = w_to_utf8((const SQLWCHAR *)val,
+                         len == SQL_NTS ? SQL_NTS : (SQLLEN)len / (SQLLEN)sizeof(SQLWCHAR));
+    if (u8 == NULL)
+      return SQL_ERROR;
+    SQLRETURN r = SQLSetDescField(hdesc, rec, field, u8, SQL_NTS);
+    free(u8);
+    return r;
+  }
   return SQLSetDescField(hdesc, rec, field, val, len);
 }
 

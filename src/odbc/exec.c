@@ -48,6 +48,8 @@ static int ora_type_for_sql(SQLSMALLINT t)
     return 112; /* CLOB (#214) */
   case SQL_SEER_BLOB:
     return 113; /* BLOB (#214) */
+  case SQL_SEER_REF:
+    return 111; /* REF (#241) */
   default:
     return 1; /* VARCHAR */
   }
@@ -244,6 +246,48 @@ static SQLLEN *param_ind(const OdbcStmt *s, const OdbcParam *p)
   return seer_odbc_bound_at(p->indicator, s->param_bind_offset, 0, 0, 0);
 }
 
+/* A SQL_SEER_REF parameter (#241): the REF's bytes IN, or a REF OUT, the type
+ * it refers to named "SCHEMA.TYPE" in its IPD record (SQL_DESC_SEER_REF_TYPE). */
+static SQLRETURN bind_ref_param(OdbcStmt *s, const OdbcParam *p, int param)
+{
+  const char *dot = p->ref_type != NULL ? strchr(p->ref_type, '.') : NULL;
+  if (dot == NULL || dot == p->ref_type || dot[1] == '\0')
+    return seer_odbc_diag(s, "HY000", 0,
+                          "A SQL_SEER_REF parameter needs its type, \"SCHEMA.TYPE\", in the IPD "
+                          "field SQL_DESC_SEER_REF_TYPE",
+                          SQL_ERROR);
+  char schema[129];
+  size_t sl = (size_t)(dot - p->ref_type);
+  if (sl >= sizeof schema)
+    return seer_odbc_diag(s, "HY000", 0, "The REF parameter's schema name is too long", SQL_ERROR);
+  memcpy(schema, p->ref_type, sl);
+  schema[sl] = '\0';
+  SeerStatus st;
+  if (p->io_type == SQL_PARAM_OUTPUT) {
+    st = seer_stmt_bind_ref_out(s->core, param, schema, dot + 1);
+  } else if (p->io_type == SQL_PARAM_INPUT) {
+    const SQLLEN *indp = param_ind(s, p);
+    const void *v = param_buf(s, p);
+    if (v == NULL || indp == NULL || *indp == SQL_NULL_DATA || *indp <= 0)
+      return seer_odbc_diag(s, "HY000", 0,
+                            "A NULL REF can't be bound (8i and 9i answer ORA-00600 for one); give "
+                            "the REF's bytes and their length",
+                            SQL_ERROR);
+    st = seer_stmt_bind_ref(s->core, param, schema, dot + 1, v, (size_t)*indp);
+  } else {
+    return seer_odbc_diag(s, "HYC00", 0, "An IN OUT REF parameter is not supported", SQL_ERROR);
+  }
+  if (st == SEER_OK)
+    return SQL_SUCCESS;
+  if (st == SEER_EDB) /* the type's lookup failed on the server */
+    return seer_odbc_exec_error(s, st);
+  return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0,
+                        st == SEER_ENOTIMPL ? "REF parameters of this direction are not supported "
+                                              "on this server release"
+                                            : "REF parameter bind failed",
+                        SQL_ERROR);
+}
+
 static SQLRETURN apply_params(OdbcStmt *s)
 {
   SQLULEN n = s->paramset_size ? s->paramset_size : 1;
@@ -261,6 +305,10 @@ static SQLRETURN apply_params(OdbcStmt *s)
       s->param_rows[s->n_param_rows++] = row;
 
   if (n > 1) {
+    for (int i = 0; i < s->num_params; i++)
+      if (s->params[i].bound && s->params[i].sql_type == SQL_SEER_REF)
+        return seer_odbc_diag(s, "HYC00", 0,
+                              "A REF parameter in a parameter array is not supported", SQL_ERROR);
     SQLULEN run = s->n_param_rows;
     SeerStatus st = seer_stmt_set_array_size(s->core, (int)(run > 0 ? run : 1));
     if (st != SEER_OK)
@@ -303,6 +351,12 @@ static SQLRETURN apply_params(OdbcStmt *s)
     OdbcParam *p = &s->params[i];
     int param = i + 1;
 
+    if (p->bound && p->sql_type == SQL_SEER_REF) {
+      SQLRETURN r = bind_ref_param(s, p, param);
+      if (r != SQL_SUCCESS)
+        return r;
+      continue;
+    }
     if (p->dae) { /* value streamed in via SQLPutData */
       if (p->dae_null)
         seer_stmt_bind_null_typed(s->core, param, ora_type_for_sql(p->sql_type));
