@@ -228,6 +228,26 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_MAX_ROWS: /* rows a query returns at most, from the next execute */
     s->max_rows = (SQLULEN)(uintptr_t)ValuePtr;
     return SQL_SUCCESS;
+  /* Where bound data lives and which parameter sets run (#243). */
+  case SQL_ATTR_PARAM_BIND_OFFSET_PTR:
+    s->param_bind_offset = (SQLLEN *)ValuePtr;
+    return SQL_SUCCESS;
+  case SQL_ATTR_ROW_BIND_OFFSET_PTR:
+    s->row_bind_offset = (SQLLEN *)ValuePtr;
+    return SQL_SUCCESS;
+  case SQL_ATTR_PARAM_OPERATION_PTR:
+    s->param_operation = (SQLUSMALLINT *)ValuePtr;
+    return SQL_SUCCESS;
+  /* What SeerODBC doesn't do is refused, so the application can fall back:
+   * every call is synchronous, and there are no bookmarks (#243). */
+  case SQL_ATTR_ASYNC_ENABLE:
+    if ((SQLULEN)(uintptr_t)ValuePtr != SQL_ASYNC_ENABLE_OFF)
+      return seer_odbc_diag(s, "HYC00", 0, "Asynchronous execution is not supported", SQL_ERROR);
+    return SQL_SUCCESS;
+  case SQL_ATTR_USE_BOOKMARKS:
+    if ((SQLULEN)(uintptr_t)ValuePtr != SQL_UB_OFF)
+      return seer_odbc_diag(s, "HYC00", 0, "Bookmarks are not supported", SQL_ERROR);
+    return SQL_SUCCESS;
   /* The cursor (#226): forward-only, or the buffered static one SQLFetchScroll
    * scrolls - what SQL_SCROLL_OPTIONS advertises. A keyset-driven or dynamic
    * one becomes static, a sensitive one insensitive, with 01S02 (option value
@@ -305,6 +325,18 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
   case SQL_ATTR_QUERY_TIMEOUT:
     *(SQLULEN *)ValuePtr = s->query_timeout;
+    return SQL_SUCCESS;
+  case SQL_ATTR_PARAM_BIND_OFFSET_PTR:
+    *(SQLLEN **)ValuePtr = s->param_bind_offset;
+    return SQL_SUCCESS;
+  case SQL_ATTR_ROW_BIND_OFFSET_PTR:
+    *(SQLLEN **)ValuePtr = s->row_bind_offset;
+    return SQL_SUCCESS;
+  case SQL_ATTR_PARAM_OPERATION_PTR:
+    *(SQLUSMALLINT **)ValuePtr = s->param_operation;
+    return SQL_SUCCESS;
+  case SQL_ATTR_ASYNC_ENABLE:
+    *(SQLULEN *)ValuePtr = SQL_ASYNC_ENABLE_OFF;
     return SQL_SUCCESS;
   case SQL_ATTR_MAX_ROWS:
     *(SQLULEN *)ValuePtr = s->max_rows;

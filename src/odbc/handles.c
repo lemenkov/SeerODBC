@@ -92,6 +92,7 @@ SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
     for (int i = 0; i < s->num_params; i++)
       free(s->params[i].dae_buf);
     free(s->params);
+    free(s->param_rows);
     free(s->sql);
     free(s);
     return SQL_SUCCESS;

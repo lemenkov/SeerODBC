@@ -720,7 +720,8 @@ static size_t c_elem_stride(SQLSMALLINT t, SQLLEN buflen)
 
 /* Deliver the current core row into the bound columns for rowset element `row`.
  * Column-wise (row_bind_type 0): value at buf + row*elem_stride, indicator at
- * &indicator[row]. Row-wise: both at + row*row_bind_type. */
+ * &indicator[row]. Row-wise: both at + row*row_bind_type. Both past the row
+ * bind offset. */
 static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
 {
   SQLRETURN ret = SQL_SUCCESS;
@@ -737,19 +738,12 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
       continue;
     }
 
-    void *buf = b->buf;
-    SQLLEN *ind = b->indicator;
-    if (s->row_bind_type == 0) { /* column-wise */
-      if (buf)
-        buf = (char *)buf + row * c_elem_stride(b->target_type, b->buflen);
-      if (ind)
-        ind = ind + row;
-    } else { /* row-wise: row stride = struct size */
-      if (buf)
-        buf = (char *)buf + row * s->row_bind_type;
-      if (ind)
-        ind = (SQLLEN *)((char *)ind + row * s->row_bind_type);
-    }
+    /* Column-wise or row-wise (the struct size), past the bind offset
+     * (#243). */
+    void *buf = seer_odbc_bound_at(b->buf, s->row_bind_offset, s->row_bind_type,
+                                   c_elem_stride(b->target_type, b->buflen), row);
+    SQLLEN *ind =
+        seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type, sizeof(SQLLEN), row);
     SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, b->target_type, buf,
                                     b->buflen, ind, NULL);
     if (r == SQL_SUCCESS_WITH_INFO)

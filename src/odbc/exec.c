@@ -233,12 +233,36 @@ static SQLRETURN exec_finish(OdbcStmt *s);
  * SQL_ATTR_PARAMSET_SIZE > 1 this binds an array (column-wise): one core
  * iteration per row, each row's value read at buf + row*stride. OUT / IN OUT
  * params declare an OUT bind (single-row only). */
+/* A single parameter set's value and indicator, past the bind offset (#243). */
+static void *param_buf(const OdbcStmt *s, const OdbcParam *p)
+{
+  return seer_odbc_bound_at(p->buf, s->param_bind_offset, 0, 0, 0);
+}
+
+static SQLLEN *param_ind(const OdbcStmt *s, const OdbcParam *p)
+{
+  return seer_odbc_bound_at(p->indicator, s->param_bind_offset, 0, 0, 0);
+}
+
 static SQLRETURN apply_params(OdbcStmt *s)
 {
   SQLULEN n = s->paramset_size ? s->paramset_size : 1;
 
+  /* The parameter sets to run, by their row: all of them, less those
+   * SQL_ATTR_PARAM_OPERATION_PTR marks SQL_PARAM_IGNORE (#243). Executed,
+   * an ignored set was inserted or updated like any other. */
+  free(s->param_rows);
+  s->param_rows = malloc((size_t)n * sizeof *s->param_rows);
+  if (s->param_rows == NULL)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  s->n_param_rows = 0;
+  for (SQLULEN row = 0; row < n; row++)
+    if (s->param_operation == NULL || s->param_operation[row] != SQL_PARAM_IGNORE)
+      s->param_rows[s->n_param_rows++] = row;
+
   if (n > 1) {
-    SeerStatus st = seer_stmt_set_array_size(s->core, (int)n);
+    SQLULEN run = s->n_param_rows;
+    SeerStatus st = seer_stmt_set_array_size(s->core, (int)(run > 0 ? run : 1));
     if (st != SEER_OK)
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "array bind setup failed", SQL_ERROR);
     /* Array DML reports per-row status (SQL_ATTR_PARAM_STATUS_PTR), so run
@@ -249,8 +273,9 @@ static SQLRETURN apply_params(OdbcStmt *s)
      * counts so we can fill its buffer after execute. */
     if (s->dml_row_counts != NULL)
       seer_stmt_set_array_dml_rowcounts(s->core, 1);
-    for (SQLULEN row = 0; row < n; row++) {
-      seer_stmt_bind_row(s->core, (int)row);
+    for (SQLULEN k = 0; k < run; k++) {
+      SQLULEN row = s->param_rows[k];
+      seer_stmt_bind_row(s->core, (int)k);
       for (int i = 0; i < s->num_params; i++) {
         OdbcParam *p = &s->params[i];
         int param = i + 1;
@@ -258,9 +283,14 @@ static SQLRETURN apply_params(OdbcStmt *s)
           seer_stmt_bind_null(s->core, param);
           continue;
         }
-        size_t stride = ctype_stride(p->c_type, p->buflen);
-        const void *val = (const char *)p->buf + (size_t)row * stride;
-        SQLLEN ind = p->indicator ? p->indicator[row] : SQL_NTS;
+        /* Row-wise (SQL_ATTR_PARAM_BIND_TYPE the struct size) or by column,
+         * past the bind offset. Read by column whatever the attribute, a
+         * row-wise set came from the next field and ran past the array. */
+        const void *val = seer_odbc_bound_at(p->buf, s->param_bind_offset, s->param_bind_type,
+                                             ctype_stride(p->c_type, p->buflen), row);
+        const SQLLEN *indp = seer_odbc_bound_at(p->indicator, s->param_bind_offset,
+                                                s->param_bind_type, sizeof(SQLLEN), row);
+        SQLLEN ind = indp ? *indp : SQL_NTS;
         st = bind_one_value(s->core, param, p->c_type, p->sql_type, val, ind);
         if (st != SEER_OK)
           return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
@@ -286,8 +316,10 @@ static SQLRETURN apply_params(OdbcStmt *s)
       /* IN OUT: send the application's value in, then mark it OUT (binding it
        * as a pure OUT sent a NULL, so the procedure never saw the input). */
       if (p->io_type == SQL_PARAM_INPUT_OUTPUT && p->sql_type != SQL_REFCURSOR) {
-        SQLLEN ind = p->indicator ? *p->indicator : SQL_NTS;
-        SeerStatus st = bind_one_value(s->core, param, p->c_type, p->sql_type, p->buf, ind);
+        const SQLLEN *indp = param_ind(s, p);
+        SQLLEN ind = indp ? *indp : SQL_NTS;
+        SeerStatus st =
+            bind_one_value(s->core, param, p->c_type, p->sql_type, param_buf(s, p), ind);
         if (st == SEER_OK)
           st = seer_stmt_bind_set_inout(s->core, param, sz);
         if (st != SEER_OK)
@@ -301,8 +333,9 @@ static SQLRETURN apply_params(OdbcStmt *s)
       seer_stmt_bind_null(s->core, param);
       continue;
     }
-    SQLLEN ind = p->indicator ? *p->indicator : SQL_NTS;
-    SeerStatus st = bind_one_value(s->core, param, p->c_type, p->sql_type, p->buf, ind);
+    const SQLLEN *indp = param_ind(s, p);
+    SQLLEN ind = indp ? *indp : SQL_NTS;
+    SeerStatus st = bind_one_value(s->core, param, p->c_type, p->sql_type, param_buf(s, p), ind);
     if (st != SEER_OK)
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
   }
@@ -409,9 +442,9 @@ static SQLRETURN exec_core(OdbcStmt *s, const char *sql)
     for (int i = 0; i < s->num_params; i++) {
       OdbcParam *p = &s->params[i];
       dae_reset(p);
-      if (i < nmarkers && p->bound && p->indicator != NULL &&
+      if (i < nmarkers && p->bound && param_ind(s, p) != NULL &&
           (p->io_type == SQL_PARAM_INPUT || p->io_type == SQL_PARAM_INPUT_OUTPUT) &&
-          is_data_at_exec(*p->indicator)) {
+          is_data_at_exec(*param_ind(s, p))) {
         p->dae = 1;
         has_dae = 1;
       }
@@ -435,6 +468,14 @@ static SQLRETURN exec_finish(OdbcStmt *s)
   if (pr != SQL_SUCCESS)
     return pr;
 
+  if (s->n_param_rows == 0) { /* every set marked SQL_PARAM_IGNORE: nothing runs */
+    SQLULEN n = s->paramset_size ? s->paramset_size : 1;
+    if (s->params_processed != NULL)
+      *s->params_processed = 0;
+    for (SQLULEN r = 0; s->param_status != NULL && r < n; r++)
+      s->param_status[r] = SQL_PARAM_UNUSED;
+    return SQL_SUCCESS;
+  }
   seer_odbc_arm_timeout(s);
   seer_stmt_set_max_rows(s->core, (size_t)s->max_rows);
   SeerStatus st = seer_stmt_execute(s->core);
@@ -453,31 +494,40 @@ static SQLRETURN exec_finish(OdbcStmt *s)
                                      : SQL_SUCCESS;
   {
     SQLULEN n = s->paramset_size ? s->paramset_size : 1;
+    SQLULEN run = s->n_param_rows;
     if (s->params_processed != NULL)
-      *s->params_processed = n;
+      *s->params_processed = run;
+    /* An ignored set is SQL_PARAM_UNUSED; the core's set k is the
+     * application's row param_rows[k] (#243). */
     if (s->param_status != NULL)
       for (SQLULEN r = 0; r < n; r++)
-        s->param_status[r] = SQL_PARAM_SUCCESS;
+        s->param_status[r] = SQL_PARAM_UNUSED;
+    if (s->param_status != NULL)
+      for (SQLULEN k = 0; k < run; k++)
+        s->param_status[s->param_rows[k]] = SQL_PARAM_SUCCESS;
 
     size_t nbe = seer_stmt_batch_error_count(s->core);
     for (size_t i = 0; i < nbe; i++) {
       unsigned brow = 0, bcode = 0;
       const char *bmsg = NULL;
       seer_stmt_batch_error(s->core, i, &brow, &bcode, &bmsg);
-      if (s->param_status != NULL && brow < n)
-        s->param_status[brow] = SQL_PARAM_ERROR;
+      SQLULEN row = brow < run ? s->param_rows[brow] : brow;
+      if (s->param_status != NULL && row < n)
+        s->param_status[row] = SQL_PARAM_ERROR;
       seer_odbc_diag_add(s, "HY000", (SQLINTEGER)bcode, bmsg ? bmsg : "array DML row error",
-                         (SQLLEN)brow + 1);
+                         (SQLLEN)row + 1);
     }
     if (nbe > 0)
-      result = (nbe >= (size_t)n) ? SQL_ERROR : SQL_SUCCESS_WITH_INFO;
+      result = (nbe >= (size_t)run) ? SQL_ERROR : SQL_SUCCESS_WITH_INFO;
 
     /* Fill the app's SQL_ATTR_SEER_DML_ROW_COUNTS buffer with the per-
      * iteration affected-row counts (12c+); 0 where none were reported. */
     if (s->dml_row_counts != NULL) {
       size_t nc = seer_stmt_array_dml_rowcount_count(s->core);
       for (SQLULEN r = 0; r < n; r++)
-        s->dml_row_counts[r] = (r < nc) ? (SQLLEN)seer_stmt_array_dml_rowcount(s->core, r) : 0;
+        s->dml_row_counts[r] = 0;
+      for (SQLULEN k = 0; k < run && k < nc; k++)
+        s->dml_row_counts[s->param_rows[k]] = (SQLLEN)seer_stmt_array_dml_rowcount(s->core, k);
     }
   }
 
@@ -493,14 +543,14 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     int is_null = 0, is_binary = 0;
     if (seer_stmt_out_data(s->core, i + 1, &data, &dlen, &is_null, &is_binary) != SEER_OK)
       continue;
-    SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, p->c_type, p->buf,
-                                      p->buflen, p->indicator, NULL);
+    SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, p->c_type,
+                                      param_buf(s, p), p->buflen, param_ind(s, p), NULL);
     /* Truncated either way - by the server to the declared ColumnSize (a
      * RETURNING value), or into the application's buffer - is 01004, with
      * the full length in the indicator where the server told us it. */
     long full = seer_stmt_out_truncated(s->core, i + 1);
-    if (full > 0 && p->indicator != NULL)
-      *p->indicator = (SQLLEN)full;
+    if (full > 0 && param_ind(s, p) != NULL)
+      *param_ind(s, p) = (SQLLEN)full;
     if (full > 0 || crc == SQL_SUCCESS_WITH_INFO)
       result = seer_odbc_diag(s, "01004", 0, "String data, right truncated",
                               result == SQL_SUCCESS ? SQL_SUCCESS_WITH_INFO : result);
@@ -879,17 +929,11 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
       OdbcBind *b = &s->binds[i];
       if (!b->bound || seer_stmt_col_name(s->core, i) == NULL)
         continue;
-      void *vp;
-      SQLLEN ind;
-      if (s->row_bind_type == 0) { /* column-wise */
-        vp =
-            b->buf ? (char *)b->buf + (size_t)elem * ctype_stride(b->target_type, b->buflen) : NULL;
-        ind = b->indicator ? b->indicator[elem] : SQL_NTS;
-      } else { /* row-wise */
-        vp = b->buf ? (char *)b->buf + (size_t)elem * s->row_bind_type : NULL;
-        ind = b->indicator ? *(SQLLEN *)((char *)b->indicator + (size_t)elem * s->row_bind_type)
-                           : SQL_NTS;
-      }
+      void *vp = seer_odbc_bound_at(b->buf, s->row_bind_offset, s->row_bind_type,
+                                    ctype_stride(b->target_type, b->buflen), (SQLULEN)elem);
+      const SQLLEN *indp = seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type,
+                                              sizeof(SQLLEN), (SQLULEN)elem);
+      SQLLEN ind = indp ? *indp : SQL_NTS;
       bind_one_value(dml, ++k, b->target_type, 0, vp, ind);
     }
     seer_stmt_bind_text(dml, nset + 1, s->rowids[r], -1);

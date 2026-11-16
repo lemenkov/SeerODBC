@@ -168,14 +168,19 @@ typedef struct {
   int getdata_col;    /* last SQLGetData column, for fragment tracking */
   SQLLEN getdata_off; /* bytes already returned for getdata_col */
   /* Array (bulk) parameter binding. */
-  SQLULEN paramset_size;      /* SQL_ATTR_PARAMSET_SIZE (rows), default 1 */
-  SQLULEN param_bind_type;    /* SQL_ATTR_PARAM_BIND_TYPE, default by-column */
-  SQLULEN *params_processed;  /* SQL_ATTR_PARAMS_PROCESSED_PTR */
-  SQLUSMALLINT *param_status; /* SQL_ATTR_PARAM_STATUS_PTR */
-  SQLLEN *dml_row_counts;     /* SQL_ATTR_SEER_DML_ROW_COUNTS (app buffer) */
+  SQLULEN paramset_size;         /* SQL_ATTR_PARAMSET_SIZE (rows), default 1 */
+  SQLULEN param_bind_type;       /* SQL_ATTR_PARAM_BIND_TYPE, default by-column */
+  SQLULEN *params_processed;     /* SQL_ATTR_PARAMS_PROCESSED_PTR */
+  SQLUSMALLINT *param_status;    /* SQL_ATTR_PARAM_STATUS_PTR */
+  SQLLEN *param_bind_offset;     /* SQL_ATTR_PARAM_BIND_OFFSET_PTR (#243) */
+  SQLUSMALLINT *param_operation; /* SQL_ATTR_PARAM_OPERATION_PTR: SQL_PARAM_IGNORE rows */
+  SQLULEN *param_rows;           /* the parameter sets executed, by their row (malloc'd) */
+  SQLULEN n_param_rows;
+  SQLLEN *dml_row_counts; /* SQL_ATTR_SEER_DML_ROW_COUNTS (app buffer) */
   /* Row-array (block) fetch. */
   SQLULEN row_array_size;   /* SQL_ATTR_ROW_ARRAY_SIZE, default 1 */
   SQLULEN row_bind_type;    /* SQL_ATTR_ROW_BIND_TYPE (0 = by column) */
+  SQLLEN *row_bind_offset;  /* SQL_ATTR_ROW_BIND_OFFSET_PTR (#243) */
   SQLULEN *rows_fetched;    /* SQL_ATTR_ROWS_FETCHED_PTR */
   SQLUSMALLINT *row_status; /* SQL_ATTR_ROW_STATUS_PTR */
   long rowset_start;        /* 0-based first row of the current rowset, -1 = none */
@@ -218,6 +223,20 @@ void seer_odbc_diag_free(SQLHANDLE handle);
 
 /* Map a core SeerStatus to an ODBC SQLSTATE string. */
 const char *seer_odbc_sqlstate(SeerStatus st);
+
+/* Where row `row` of a bound buffer is (#243): ODBC adds the bind offset
+ * (SQL_ATTR_*_BIND_OFFSET_PTR) to every bound data and indicator pointer,
+ * then steps by the bind type - row-wise, the size of the application's
+ * struct - or, column-wise (bind type 0), by the element's own size. NULL
+ * for an unbound pointer. */
+static inline void *seer_odbc_bound_at(void *base, const SQLLEN *offset, SQLULEN bind_type,
+                                       size_t elem, SQLULEN row)
+{
+  if (base == NULL)
+    return NULL;
+  char *p = (char *)base + (offset != NULL ? *offset : 0);
+  return p + row * (bind_type != 0 ? bind_type : elem);
+}
 /* Apply SQL_ATTR_TXN_ISOLATION's level on the connection (#220). */
 SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level);
 /* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call
