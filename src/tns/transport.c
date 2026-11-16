@@ -136,15 +136,20 @@ static void arm_io_timeout(seer_socket_t fd, int timeout_ms)
 }
 
 /* Non-blocking connect to one resolved address, bounded by timeout_ms.
- * Returns a connected socket or SEER_INVALID_SOCKET. */
-static seer_socket_t connect_one(const struct addrinfo *ai, int timeout_ms)
+ * Returns a connected socket or SEER_INVALID_SOCKET, and then in *why the
+ * socket error, SEER_ETIMEDOUT for a connect that never answered. */
+static seer_socket_t connect_one(const struct addrinfo *ai, int timeout_ms, int *why)
 {
+  *why = 0;
   seer_socket_t fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-  if (fd == SEER_INVALID_SOCKET)
+  if (fd == SEER_INVALID_SOCKET) {
+    *why = seer_sock_errno();
     return SEER_INVALID_SOCKET;
+  }
   seer_sock_nosigpipe(fd);
 
   if (seer_sock_set_nonblocking(fd, 1) != 0) {
+    *why = seer_sock_errno();
     seer_closesocket(fd);
     return SEER_INVALID_SOCKET;
   }
@@ -161,15 +166,18 @@ static seer_socket_t connect_one(const struct addrinfo *ai, int timeout_ms)
     } while (rc < 0 && seer_sock_errno() == SEER_EINTR);
 
     if (rc <= 0) { /* timed out (0) or poll error (<0) */
+      *why = rc == 0 ? SEER_ETIMEDOUT : seer_sock_errno();
       seer_closesocket(fd);
       return SEER_INVALID_SOCKET;
     }
     int err = 0;
     if (seer_sock_so_error(fd, &err) != 0 || err != 0) {
+      *why = err ? err : seer_sock_errno();
       seer_closesocket(fd);
       return SEER_INVALID_SOCKET;
     }
   } else if (rc < 0) {
+    *why = seer_sock_errno();
     seer_closesocket(fd);
     return SEER_INVALID_SOCKET;
   }
@@ -181,6 +189,35 @@ static seer_socket_t connect_one(const struct addrinfo *ai, int timeout_ms)
 SeerStatus seer_transport_connect(const char *host, uint16_t port, int timeout_ms,
                                   SeerTransport **out)
 {
+  return seer_transport_connect_diag(host, port, timeout_ms, out, NULL, 0);
+}
+
+/* A connect failure as the user reads it: the address and the cause. */
+static void connect_error(char *err, size_t errlen, const char *host, uint16_t port, int why,
+                          int timeout_ms)
+{
+  if (err == NULL || errlen == 0)
+    return;
+  const char *fmt = strchr(host, ':') != NULL ? "[%s]:%u" : "%s:%u"; /* IPv6 */
+  char addr[300];
+  snprintf(addr, sizeof addr, fmt, host, (unsigned)port);
+  if (why == SEER_ECONNREFUSED)
+    snprintf(err, errlen, "connection to %s refused", addr);
+  else if (why == SEER_ETIMEDOUT)
+    snprintf(err, errlen, "connection to %s timed out after %d s", addr, timeout_ms / 1000);
+  else
+#ifdef _WIN32
+    snprintf(err, errlen, "connection to %s failed (socket error %d)", addr, why);
+#else
+    snprintf(err, errlen, "connection to %s failed: %s", addr, strerror(why));
+#endif
+}
+
+SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int timeout_ms,
+                                       SeerTransport **out, char *err, size_t errlen)
+{
+  if (err != NULL && errlen > 0)
+    err[0] = '\0';
   if (host == NULL || out == NULL)
     return SEER_EPARAM;
   *out = NULL;
@@ -189,6 +226,8 @@ SeerStatus seer_transport_connect(const char *host, uint16_t port, int timeout_m
 
   if (seer_net_init() != 0) {
     seer_log(SEER_LOG_ERROR, "transport: network stack init failed");
+    if (err != NULL && errlen > 0)
+      snprintf(err, errlen, "the network stack failed to start");
     return SEER_EIO;
   }
 
@@ -204,19 +243,27 @@ SeerStatus seer_transport_connect(const char *host, uint16_t port, int timeout_m
   if (gai != 0) {
     seer_log(SEER_LOG_ERROR, "transport: resolve %s:%u failed: %s", host, (unsigned)port,
              gai_strerror(gai));
+    if (err != NULL && errlen > 0)
+      snprintf(err, errlen, "cannot resolve host '%s': %s", host, gai_strerror(gai));
     return SEER_EIO;
   }
 
+  /* Each address the name resolves to; the error reported is the first's. */
   seer_socket_t fd = SEER_INVALID_SOCKET;
+  int first_why = 0;
   for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-    fd = connect_one(ai, timeout_ms);
+    int why = 0;
+    fd = connect_one(ai, timeout_ms, &why);
     if (fd != SEER_INVALID_SOCKET)
       break;
+    if (first_why == 0)
+      first_why = why;
   }
   freeaddrinfo(res);
 
   if (fd == SEER_INVALID_SOCKET) {
-    seer_log(SEER_LOG_ERROR, "transport: connect to %s:%u failed", host, (unsigned)port);
+    connect_error(err, errlen, host, port, first_why, timeout_ms);
+    seer_log(SEER_LOG_ERROR, "transport: %s", err != NULL && err[0] ? err : "connect failed");
     return SEER_EIO;
   }
 

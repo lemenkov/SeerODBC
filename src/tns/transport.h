@@ -25,6 +25,12 @@ typedef struct SeerTransport SeerTransport;
 SeerStatus seer_transport_connect(const char *host, uint16_t port, int timeout_ms,
                                   SeerTransport **out);
 
+/* As seer_transport_connect; on failure `err` (when non-NULL) says why, with
+ * the address: the name doesn't resolve, the port refuses, the connect timed
+ * out, or the socket error (#203). */
+SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int timeout_ms,
+                                       SeerTransport **out, char *err, size_t errlen);
+
 void seer_transport_close(SeerTransport *t);
 
 /* Re-arm the per-read/write socket timeout: 0 means none (block until the
