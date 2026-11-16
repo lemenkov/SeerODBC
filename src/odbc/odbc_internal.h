@@ -237,6 +237,10 @@ static inline void *seer_odbc_bound_at(void *base, const SQLLEN *offset, SQLULEN
   char *p = (char *)base + (offset != NULL ? *offset : 0);
   return p + row * (bind_type != 0 ? bind_type : elem);
 }
+/* Make room for column bindings 1..n, keeping those made (#244): a column
+ * stays bound until unbound or SQLFreeStmt(SQL_UNBIND), across executes, and
+ * may be bound before the statement has run. 0, or -1 when out of memory. */
+int seer_odbc_ensure_binds(OdbcStmt *s, int n);
 /* Apply SQL_ATTR_TXN_ISOLATION's level on the connection (#220). */
 SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level);
 /* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call

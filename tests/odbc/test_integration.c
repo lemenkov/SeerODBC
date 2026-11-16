@@ -1416,16 +1416,18 @@ static void check_error_native_and_offset(SQLHDBC dbc)
   SQLCHAR state[6] = "";
   SQLINTEGER native = 0, off = -1;
   SQLSMALLINT ml = 0;
+  SQLCHAR msg[200] = "";
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT nonexistent FROM dual", SQL_NTS);
-  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, NULL, 0, &ml);
+  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, msg, sizeof msg, &ml);
   SQLGetDiagField(SQL_HANDLE_STMT, st, 1, SQL_DIAG_SEER_ERROR_OFFSET, &off, 0, NULL);
   SQLFreeHandle(SQL_HANDLE_STMT, st);
   if (rc == SQL_ERROR && native == 904 && off == 7)
     pass(name);
   else {
-    char m[200];
-    snprintf(m, sizeof m, "rc=%d native=%d offset=%d", rc, (int)native, (int)off);
+    char m[400]; /* the text too: once on 9i it lacked the ORA- prefix (#246) */
+    snprintf(m, sizeof m, "rc=%d native=%d offset=%d state '%s' '%s'", rc, (int)native, (int)off,
+             (char *)state, (char *)msg);
     fail(name, m);
   }
 }
@@ -1969,6 +1971,45 @@ static void check_rowwise_binds(SQLHDBC dbc)
                (int)b, sb);
   }
   exec_do(dbc, "DROP TABLE seer_rowwise", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* Column bindings live until unbound (#244): bound before the first
+ * execute, they fill on the fetch; the same statement executed again with a
+ * new parameter fills the same buffer; after SQL_UNBIND a fetch leaves it be. */
+static void check_bindcol_lifetime(SQLHDBC dbc)
+{
+  const char *name = "column bindings made before execute last across executes";
+  char err[256] = "", m[400] = "";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLINTEGER p = 1, out = -1;
+  SQLLEN out_ind = 0;
+  SQLRETURN rc = SQLPrepare(st, (SQLCHAR *)"SELECT ? + 1 FROM dual", SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &p, 0, NULL);
+  SQLRETURN bc = SQLBindCol(st, 1, SQL_C_SLONG, &out, 0, &out_ind); /* before the execute */
+  SQLINTEGER got[3] = {-1, -1, -1};
+  for (int k = 0; k < 3 && SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(bc); k++) {
+    p = k == 0 ? 1 : 5;
+    out = -1;
+    if (k == 2)
+      SQLFreeStmt(st, SQL_UNBIND);
+    rc = SQLExecute(st);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(st);
+    got[k] = out;
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+  if (!SQL_SUCCEEDED(rc) || !SQL_SUCCEEDED(bc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (!SQL_SUCCEEDED(bc) || !SQL_SUCCEEDED(rc) || got[0] != 2 || got[1] != 6 || got[2] != -1)
+    snprintf(m, sizeof m, "bind rc=%d, rc=%d, fetched %d / %d / %d (want 2 / 6 / untouched -1) %s",
+             (int)bc, (int)rc, (int)got[0], (int)got[1], (int)got[2], err);
   if (m[0] == '\0')
     pass(name);
   else
@@ -4336,6 +4377,7 @@ int main(void)
     check_cache_after_block_ddl(dbc);
     check_array_batch(dbc);
     check_rowwise_binds(dbc);
+    check_bindcol_lifetime(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
