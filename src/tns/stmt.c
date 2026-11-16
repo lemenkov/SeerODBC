@@ -11263,6 +11263,108 @@ static SeerStatus plsql_aq_deq(SeerConn *c, const char *queue_name, const SeerAq
   return st;
 }
 
+/* Whether `s` is a plain SQL identifier - letters, digits, _ $ # - safe to
+ * name a type with in a block's text (an object queue's payload type). */
+static bool plsql_ident_ok(const char *s)
+{
+  size_t n = s != NULL ? strlen(s) : 0;
+  if (n == 0 || n > 128)
+    return false;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char ch = (unsigned char)s[i];
+    if (!(isalnum(ch) || ch == '_' || ch == '$' || ch == '#'))
+      return false;
+  }
+  return true;
+}
+
+/* An object payload on 8i and 9i (#172): DBMS_AQ.ENQUEUE / DEQUEUE in a block,
+ * the object bound IN to the enqueue and OUT of the dequeue - the object binds
+ * of #236 - where 10g+ speaks AQ's own calls. */
+static SeerStatus plsql_aq_enq_object(SeerConn *c, const char *queue_name, const char *schema,
+                                      const char *type_name, const char *const *attr_values,
+                                      int n_attrs, uint8_t msgid[16])
+{
+  static const char SQL[] =
+      "DECLARE eo DBMS_AQ.ENQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; "
+      "m RAW(16); BEGIN DBMS_AQ.ENQUEUE(:1, eo, mp, :2, m); :3 := m; END;";
+  SeerStmt *s = NULL;
+  SeerStatus st = plsql_aq_stmt(c, SQL, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(s, 1, queue_name, (int)strlen(queue_name));
+  if (st == SEER_OK)
+    st = seer_stmt_bind_object(s, 2, schema, type_name, attr_values, n_attrs);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 3, ORA_TYPE_RAW, 16);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (st == SEER_OK && msgid != NULL) {
+    const void *d = NULL;
+    size_t n = 0;
+    int isnull = 0, isbin = 0;
+    if (seer_stmt_out_data(s, 3, &d, &n, &isnull, &isbin) == SEER_OK && !isnull && n == 16)
+      memcpy(msgid, d, 16);
+    else
+      st = SEER_EPROTO;
+  }
+  seer_stmt_close(s);
+  return st;
+}
+
+static SeerStatus plsql_aq_deq_object(SeerConn *c, const char *queue_name, const char *schema,
+                                      const char *type_name, uint32_t wait_seconds, char **out_text,
+                                      uint8_t msgid[16])
+{
+  /* The payload's variable needs its type named in the text: refused unless
+   * the names are plain identifiers. */
+  if (!plsql_ident_ok(schema) || !plsql_ident_ok(type_name))
+    return SEER_EPARAM;
+  char sql[512];
+  snprintf(sql, sizeof sql,
+           "DECLARE do DBMS_AQ.DEQUEUE_OPTIONS_T; mp DBMS_AQ.MESSAGE_PROPERTIES_T; m RAW(16); "
+           "p %s.%s; BEGIN do.wait := :1; do.navigation := DBMS_AQ.FIRST_MESSAGE; "
+           "DBMS_AQ.DEQUEUE(:2, do, mp, p, m); :3 := p; :4 := m; END;",
+           schema, type_name);
+  SeerStmt *s = NULL;
+  SeerStatus st = plsql_aq_stmt(c, sql, &s);
+  if (st == SEER_OK) /* 0 is DBMS_AQ.NO_WAIT */
+    st = seer_stmt_bind_int64(s, 1, (int64_t)wait_seconds);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_text(s, 2, queue_name, (int)strlen(queue_name));
+  if (st == SEER_OK)
+    st = seer_stmt_bind_object_out(s, 3, schema, type_name);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, 4, ORA_TYPE_RAW, 16);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  if (st == SEER_EDB) {
+    const char *e = seer_last_error(c);
+    if (e != NULL && (strncmp(e, "ORA-25228", 9) == 0 || strncmp(e, "ORA-25254", 9) == 0))
+      st = SEER_ENODATA; /* empty queue, or the wait ran out */
+  }
+  const void *d = NULL;
+  size_t n = 0;
+  int isnull = 0, isbin = 0;
+  if (st == SEER_OK && out_text != NULL &&
+      seer_stmt_out_data(s, 3, &d, &n, &isnull, &isbin) == SEER_OK && !isnull) {
+    *out_text = malloc(n + 1);
+    if (*out_text == NULL) {
+      st = SEER_ENOMEM;
+    } else {
+      memcpy(*out_text, d, n);
+      (*out_text)[n] = '\0';
+    }
+  }
+  if (st == SEER_OK && msgid != NULL) {
+    if (seer_stmt_out_data(s, 4, &d, &n, &isnull, &isbin) == SEER_OK && !isnull && n == 16)
+      memcpy(msgid, d, 16);
+    else
+      st = SEER_EPROTO;
+  }
+  seer_stmt_close(s);
+  return st;
+}
+
 SeerStatus seer_aq_enq_raw_opt(SeerConn *conn, const char *queue_name, const uint8_t *payload,
                                size_t payload_len, const SeerAqEnqOptions *opt, uint8_t msgid[16])
 {
@@ -11299,8 +11401,9 @@ SeerStatus seer_aq_enq_object(SeerConn *conn, const char *queue_name, const char
   if (conn == NULL || queue_name == NULL || type_schema == NULL || type_name == NULL ||
       (n_attrs > 0 && attr_values == NULL))
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i and 8i: no object binds there (#172) */
+  if (conn->field_version < TTC_FIELD_VERSION_10_2) /* 9i and 8i: a block (#172) */
+    return plsql_aq_enq_object(conn, queue_name, type_schema, type_name, attr_values, n_attrs,
+                               msgid);
 
   uint8_t oid[16];
   SeerWriter img;
@@ -11646,10 +11749,11 @@ SeerStatus seer_aq_deq_object(SeerConn *conn, const char *queue_name, const char
 {
   if (conn == NULL || queue_name == NULL || type_schema == NULL || type_name == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_10_2)
-    return SEER_ENOTIMPL; /* 9i and 8i: no object binds there (#172) */
   if (out_text != NULL)
     *out_text = NULL;
+  if (conn->field_version < TTC_FIELD_VERSION_10_2) /* 9i and 8i: a block (#172) */
+    return plsql_aq_deq_object(conn, queue_name, type_schema, type_name, wait_seconds, out_text,
+                               msgid);
 
   uint8_t oid[16];
   SeerStatus st = obj_lookup_oid(conn, type_schema, type_name, oid);
