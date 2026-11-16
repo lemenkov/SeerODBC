@@ -25,30 +25,41 @@ protocol (TNS/TTC) directly. No vendor client libraries are required.
 
 ## What works
 
-Validated live across six server releases — **9i, 10g, 11g, 18c, 21c and 23ai**
-(TTC field versions 2 through 24) — via `tests/odbc/run-matrix.sh`. The 10g–23ai
-tier runs the full ODBC surface through unixODBC; 9i (the legacy fv2 / `TTI_ALL7`
-dialect) is validated through the core API. 11g/21c/23ai are the public-CI tier;
-9i, 10g and 18c stay local (their images aren't redistributable). 12.1 / 12.2 /
+Validated live across eight server releases — **8i, 9i, 10g, 11g, 18c, 21c,
+23ai and 26ai** — via `tests/odbc/run-matrix.sh`. Every tier runs both suites:
+the ODBC suite through unixODBC and the core-API suite, one set of checks each,
+a check skipped only with its reason (`tests/odbc/gates.h`). 11g/21c/23ai are
+the public-CI tier; 8i, 9i, 10g, 18c and 26ai (the required-native-encryption
+bed) stay local, their images or VMs not being redistributable. 12.1 / 12.2 /
 19c have no live server here but share the down-negotiated 12c wire forms (the
-12.1 level is exercised by capping a 21c session at fv7). 8i (8.1.7) runs
-queries with IN binds, DML (an array execute a row at a time) with RETURNING,
-DDL, COMMIT / ROLLBACK and PL/SQL blocks with IN, OUT and IN OUT parameters
-and CLOB / BLOB / BFILE, ROWID and UROWID columns (validated live through the
-core API and an ODBC Driver Manager connection). What 8i itself lacks -
-TIMESTAMP / INTERVAL, BINARY_FLOAT / DOUBLE, temporary LOBs, object types read
-by thin clients - stays out.
+12.1 level is exercised by capping a 21c session at fv7).
+
+**8i (8.1.7) and 9i (9.2)** each run in their own dialect: 8i's 9.2-era OALL8,
+9i's compact `TTI_ALL7` (field version 2). Both take queries, DML with
+RETURNING (CLOB / BLOB targets included), DDL, transactions and PL/SQL blocks
+with IN, OUT and IN OUT parameters; REF CURSOR results and `CURSOR()` columns;
+CLOB / BLOB / BFILE, ROWID and UROWID columns, and LOB OUT parameters
+(`SQL_SEER_CLOB` / `SQL_SEER_BLOB`); SQL objects and collections, read and
+bound; REF columns and REF binds; Advanced Queuing (RAW and object payloads,
+through DBMS_AQ) and two-phase commit; query timeouts; 9i also XMLType,
+TIMESTAMP / INTERVAL and national-character data. What a release itself lacks
+(on 8i TIMESTAMP / INTERVAL and XMLType; before 10g BINARY_FLOAT / DOUBLE,
+DRCP; JSON, VECTOR, BOOLEAN, implicit results) has nothing to reach. Still
+open: PL/SQL associative arrays on 9i (#254: no client binds one in 9.2's compact
+form; they work on 8i), package-level record and index-by types before 12c
+(#193), and a REF OUT parameter on 8i (#241).
 
 - **Connect & auth** — O5LOGON across the 10g (DES), 11g (AES-192/SHA-1) and
-  12c (AES-256/PBKDF2) verifiers, 23ai fv24 fast-auth, and 9i O3LOGON (legacy
-  DES); full Unicode (`*W`) entry points.
+  12c (AES-256/PBKDF2) verifiers, 23ai fv24 fast-auth, and 8i / 9i O3LOGON
+  (legacy DES); connect-time failover across a `HOST` list; full Unicode (`*W`)
+  entry points.
 - **SQL** — queries, DML, transactions (commit/rollback/autocommit), the full
   scalar type set incl. NUMBER/DATE/TIMESTAMP/BINARY_FLOAT|DOUBLE/RAW, LOBs
   (CLOB/BLOB/BFILE) and LONG/LONG RAW, and the complete `SQL_C_*` conversion matrix
   incl. `SQL_C_WCHAR`.
 - **PL/SQL** — anonymous blocks, stored procedures/functions via `{call}` /
   `{?=call}`, IN/OUT parameters, REF CURSOR result sets, and PL/SQL associative
-  arrays (IN and OUT).
+  arrays (IN and OUT; every release but 9i, #254).
 - **Binding & fetch** — `?` and named (`:name`) markers, array (bulk) binding
   with batch-error row status, data-at-execution (`SQLPutData`), block fetch,
   scrollable + updatable cursors (positioned UPDATE/DELETE, optional `FOR UPDATE`
@@ -63,8 +74,9 @@ by thin clients - stays out.
   is kept open and re-executed without a re-parse when the same SQL is prepared
   again (transparent; the describe travels with the cursor).
 - **Beyond ODBC** (via the core `seer_*` API) — Advanced Queuing (RAW / object /
-  JSON payloads, array + multi-consumer), XA / two-phase commit, proxy
-  authentication + DRCP, and TLS / TCPS transport.
+  JSON payloads, array + multi-consumer; RAW and object from 8i, JSON from 21c),
+  XA / two-phase commit (every release), proxy authentication + DRCP, and TLS /
+  TCPS transport.
 
 ## Goals
 
@@ -79,7 +91,8 @@ by thin clients - stays out.
   feature is left out.
   When a choice has to be made, a fix a user would see wins over protocol
   fidelity.
-- Support the release range **9i through 23ai** (field versions 2–24),
+- Support the release range **8i through 26ai** (8i's own dialect, then field
+  versions 2–24),
   negotiating the wire form down to each server; **11g** remains the reference
   target.
 - Implement the ODBC 3.x functions that cover real consumer usage, driven by
