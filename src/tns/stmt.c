@@ -9896,17 +9896,26 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
  * release's own (seerdb PROTOCOL.md §19.17c and bus 77 / 79), the REF bytes as
  * the value. 10g and 11g have no measured thin form; a NULL REF isn't sent on
  * any release (unfilled, 8.1.7 and 9.2 answer ORA-00600 [kokeermd1]). */
-SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema,
-                              const char *type_name, const uint8_t *ref, size_t len)
+/* A REF OUT (#241, bus 85 / 86) takes the IN REF's descriptor - size 4000
+ * on 9i, as for a NULL - and comes back as the REF's bytes: on 12c+ a value
+ * and its ub4 return code (NULL: an empty value, return code -1); on 9i the
+ * block's OUT cell. A pure OUT sends an empty value on 12c+ (JDBC thin) and
+ * none on 9i, which prompts for INs only. 8i's pure-OUT value isn't measured. */
+static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
+                           const char *type_name, const uint8_t *ref, size_t len, bool out)
 {
-  if (stmt == NULL || type_schema == NULL || type_name == NULL || ref == NULL || len == 0 ||
-      len > 4000)
+  if (stmt == NULL || type_schema == NULL || type_name == NULL ||
+      (!out && (ref == NULL || len == 0)) || len > 4000)
     return SEER_EPARAM;
   SeerConn *c = stmt->conn;
   uint8_t fv = c->field_version;
   bool o8i = c->is_8i, o9i = !o8i && fv < TTC_FIELD_VERSION_10_2;
   if (!o8i && !o9i && fv < TTC_FIELD_VERSION_12_1) {
     seer_log(SEER_LOG_WARNING, "stmt: a REF bind on 10g / 11g is not supported (#241)");
+    return SEER_ENOTIMPL;
+  }
+  if (out && o8i) {
+    seer_log(SEER_LOG_WARNING, "stmt: a REF OUT on 8i is not supported yet (#241)");
     return SEER_ENOTIMPL;
   }
   uint8_t oid[16];
@@ -9942,7 +9951,7 @@ SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema
     seer_writer_u8(&oac, 0x01);
     seer_writer_u8(&oac, 0x00);
     seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, (uint32_t)len);
+    seer_enc_sb4(&oac, out ? 4000u : (uint32_t)len);
     seer_writer_u8(&oac, 0x00);
     seer_writer_u8(&oac, 0x00);
     seer_enc_sb4(&oac, 16);
@@ -9951,7 +9960,9 @@ SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema
     seer_enc_sb4(&oac, 1);  /* version */
     seer_enc_sb4(&oac, 31); /* charset */
     seer_writer_u8(&oac, 0x00);
-    if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
+    if (out)
+      seer_writer_u8(&v, 0x00);
+    else if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   } else { /* 12c+, a JDBC thin capture (seerdb #139) */
     seer_writer_u8(&oac, ORA_TYPE_REF);
@@ -9970,7 +9981,9 @@ SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema
     seer_enc_sb4(&oac, 0); /* LOB prefetch */
     if (fv >= TTC_FIELD_VERSION_12_2)
       seer_enc_sb4(&oac, 0); /* oaccolid; 12.1 refuses it (seerdb #1144) */
-    if (st == SEER_OK && obj_append_chr(&v, ref, len, fv) != SEER_OK)
+    if (out)
+      seer_writer_u8(&v, 0x00); /* an empty value, as JDBC sends */
+    else if (st == SEER_OK && obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   }
   if (st == SEER_OK && (!seer_writer_ok(&oac) || !seer_writer_ok(&v)))
@@ -9980,7 +9993,7 @@ SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema
     seer_writer_free(&v);
     return st;
   }
-  st = store_bind(stmt, param, ORA_TYPE_REF, (uint32_t)len, 0, 0, false, v.buf, v.len);
+  st = store_bind(stmt, param, ORA_TYPE_REF, out ? 4000u : (uint32_t)len, 0, 0, out, v.buf, v.len);
   if (st != SEER_OK) {
     seer_writer_free(&oac);
     return st;
@@ -9990,6 +10003,18 @@ SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema
   b->oac_override = oac.buf;
   b->oac_override_len = oac.len;
   return SEER_OK;
+}
+
+SeerStatus seer_stmt_bind_ref(SeerStmt *stmt, int param, const char *type_schema,
+                              const char *type_name, const uint8_t *ref, size_t len)
+{
+  return ref_bind(stmt, param, type_schema, type_name, ref, len, false);
+}
+
+SeerStatus seer_stmt_bind_ref_out(SeerStmt *stmt, int param, const char *type_schema,
+                                  const char *type_name)
+{
+  return ref_bind(stmt, param, type_schema, type_name, NULL, 0, true);
 }
 
 SeerStatus seer_stmt_bind_object_out(SeerStmt *stmt, int param, const char *schema,
