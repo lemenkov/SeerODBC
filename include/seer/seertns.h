@@ -550,7 +550,13 @@ const char *seer_stmt_col_annotations(SeerStmt *stmt, int col);
 int seer_stmt_col_type(SeerStmt *stmt, int col);     /* Oracle type number, -1 if bad */
 int seer_stmt_col_size(SeerStmt *stmt, int col);     /* max size in bytes, 0 if bad */
 int seer_stmt_col_nullable(SeerStmt *stmt, int col); /* nonzero if NULLs allowed */
-long seer_stmt_row_count(SeerStmt *stmt);            /* rows in the result set */
+/* The describe's precision and scale (#259): NUMBER(p,s)'s p and s - 0 and
+ * -127 for a NUMBER declared without them, -127 for a FLOAT(b) (its binary
+ * precision in p); a TIMESTAMP's scale is its fractional-second digits. 0 for
+ * a bad column. */
+int seer_stmt_col_precision(SeerStmt *stmt, int col);
+int seer_stmt_col_scale(SeerStmt *stmt, int col);
+long seer_stmt_row_count(SeerStmt *stmt); /* rows in the result set */
 
 /* Current row's value for `col` (valid until the next fetch or close). On a SQL
  * NULL, *value is NULL and *is_null is set. */

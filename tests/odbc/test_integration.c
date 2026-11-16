@@ -2301,6 +2301,67 @@ static void check_diag_fields(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Column metadata (#259): a NUMBER(10,2) table column describes as
+ * precision 10, scale 2, display size 12, radix 10 (SQLDescribeCol too); a
+ * VARCHAR2 as case-sensitive, searchable, quoted; a DATE with no fractional
+ * seconds; and every string field is written - empty where Oracle's describe
+ * says nothing. */
+static void check_column_metadata(SQLHDBC dbc)
+{
+  const char *name = "column metadata: NUMBER precision / scale, flags, string fields";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_colmeta", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_colmeta (amt NUMBER(10,2), nm VARCHAR2(20), dt DATE)", err,
+          sizeof err);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT amt, nm, dt FROM seer_colmeta", SQL_NTS);
+  SQLLEN v[3][8];
+  static const SQLUSMALLINT ids[8] = {
+      SQL_DESC_PRECISION,      SQL_DESC_SCALE,      SQL_DESC_DISPLAY_SIZE, SQL_DESC_NUM_PREC_RADIX,
+      SQL_DESC_CASE_SENSITIVE, SQL_DESC_SEARCHABLE, SQL_DESC_UNSIGNED,     SQL_DESC_UPDATABLE};
+  static const SQLLEN want[3][8] = {
+      {10, 2, 12, 10, SQL_FALSE, SQL_PRED_BASIC, SQL_FALSE, SQL_ATTR_READWRITE_UNKNOWN},
+      {20, 0, 20, 0, SQL_TRUE, SQL_PRED_SEARCHABLE, SQL_TRUE, SQL_ATTR_READWRITE_UNKNOWN},
+      {0, 0, 19, 0, SQL_FALSE, SQL_PRED_BASIC, SQL_TRUE, SQL_ATTR_READWRITE_UNKNOWN}};
+  for (int c = 0; SQL_SUCCEEDED(rc) && c < 3 && m[0] == '\0'; c++)
+    for (int k = 0; k < 8 && m[0] == '\0'; k++) {
+      v[c][k] = -999;
+      SQLColAttribute(st, (SQLUSMALLINT)(c + 1), ids[k], NULL, 0, NULL, &v[c][k]);
+      if (v[c][k] != want[c][k])
+        snprintf(m, sizeof m, "column %d field %u: %ld, want %ld", c + 1, ids[k], (long)v[c][k],
+                 (long)want[c][k]);
+    }
+  if (SQL_SUCCEEDED(rc) && m[0] == '\0') { /* SQLDescribeCol agrees */
+    SQLULEN size = 0;
+    SQLSMALLINT digits = -1, type = 0;
+    SQLDescribeCol(st, 1, NULL, 0, NULL, &type, &size, &digits, NULL);
+    if (size != 10 || digits != 2)
+      snprintf(m, sizeof m, "SQLDescribeCol(amt): size %lu digits %d, want 10 / 2",
+               (unsigned long)size, (int)digits);
+  }
+  if (SQL_SUCCEEDED(rc) && m[0] == '\0') { /* strings: written, never left as they were */
+    static const SQLUSMALLINT sids[3] = {SQL_DESC_TABLE_NAME, SQL_DESC_SCHEMA_NAME,
+                                         SQL_DESC_LITERAL_PREFIX};
+    static const char *const swant[3] = {"", "", "'"};
+    for (int k = 0; k < 3 && m[0] == '\0'; k++) {
+      char buf[16] = "sentinel";
+      SQLSMALLINT l = -1;
+      SQLColAttribute(st, 2, sids[k], buf, sizeof buf, &l, NULL);
+      if (strcmp(buf, swant[k]) != 0)
+        snprintf(m, sizeof m, "nm field %u: '%s', want '%s'", sids[k], buf, swant[k]);
+    }
+  }
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_colmeta", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Column bindings live until unbound (#244): bound before the first
  * execute, they fill on the fetch; the same statement executed again with a
  * new parameter fills the same buffer; after SQL_UNBIND a fetch leaves it be. */
@@ -4706,6 +4767,7 @@ int main(void)
     check_attr_getters_rowop(dbc);
     check_ref_params(dbc);
     check_diag_fields(dbc);
+    check_column_metadata(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

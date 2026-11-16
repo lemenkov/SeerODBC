@@ -117,6 +117,81 @@ static SQLLEN display_size_of(int ora_type, int max_size)
   }
 }
 
+/* A result column's ODBC metadata, from its Oracle type and the describe's
+ * size, precision and scale (#259). One place, so SQLDescribeCol and
+ * SQLColAttribute agree. */
+typedef struct {
+  SQLLEN column_size;  /* DescribeCol ColumnSize, DESC_LENGTH */
+  SQLLEN precision;    /* DESC_PRECISION: digits, or fractional-second digits */
+  SQLSMALLINT scale;   /* DecimalDigits, DESC_SCALE */
+  SQLLEN display_size; /* DESC_DISPLAY_SIZE */
+  SQLLEN octet_length; /* DESC_OCTET_LENGTH */
+  int radix;           /* DESC_NUM_PREC_RADIX: 10 for numbers, else 0 */
+  int is_char;         /* character data: case-sensitive, quoted literals */
+  int searchable;      /* SQL_PRED_* */
+} ColMeta;
+
+static ColMeta col_meta(OdbcStmt *s, int col)
+{
+  int t = seer_stmt_col_type(s->core, col), max_size = seer_stmt_col_size(s->core, col);
+  int p = seer_stmt_col_precision(s->core, col), sc = seer_stmt_col_scale(s->core, col);
+  ColMeta m = {0};
+  m.column_size = m.precision = m.display_size = m.octet_length = display_size_of(t, max_size);
+  m.searchable = SQL_PRED_BASIC;
+  switch (t) {
+  case ORA_TYPE_NUMBER:
+    m.radix = 10;
+    if (p > 0 && sc == -127) /* FLOAT(b): b binary digits as decimal ones */
+      p = (int)((p * 30103L + 99999L) / 100000L);
+    else if (p > 0 && sc >= 0)
+      m.scale = (SQLSMALLINT)sc;
+    if (p <= 0)
+      p = 38; /* a NUMBER without a precision, as SQLGetTypeInfo's 38 */
+    m.column_size = m.precision = p;
+    m.display_size = m.octet_length = p + 2; /* sign and decimal point */
+    break;
+  case ORA_TYPE_BFLOAT:
+  case ORA_TYPE_BDOUBLE:
+    m.radix = 10;
+    m.column_size = m.precision = t == ORA_TYPE_BFLOAT ? 7 : 15;
+    m.octet_length = t == ORA_TYPE_BFLOAT ? 4 : 8;
+    break;
+  case ORA_TYPE_DATE:
+  case ORA_TYPE_TIMESTAMP:
+  case ORA_TYPE_TIMESTAMPTZ:
+  case ORA_TYPE_TIMESTAMPLTZ: {
+    /* ODBC's datetime precision is the fractional-second digits: 0 for a
+     * DATE, n for a TIMESTAMP(n); the size the characters of its text. */
+    int fs = t == ORA_TYPE_DATE ? 0 : (sc >= 0 && sc <= 9 ? sc : 6);
+    m.precision = m.scale = (SQLSMALLINT)fs;
+    m.column_size = m.display_size = fs > 0 ? 20 + fs : 19;
+    m.octet_length = (SQLLEN)sizeof(SQL_TIMESTAMP_STRUCT);
+    break;
+  }
+  case ORA_TYPE_VARCHAR:
+  case ORA_TYPE_CHAR:
+    m.is_char = 1;
+    m.searchable = SQL_PRED_SEARCHABLE;
+    break;
+  case ORA_TYPE_CLOB: /* LIKE, not = */
+    m.is_char = 1;
+    m.searchable = SQL_PRED_CHAR;
+    break;
+  case ORA_TYPE_LONG: /* in no WHERE clause */
+    m.is_char = 1;
+    m.searchable = SQL_PRED_NONE;
+    break;
+  case ORA_TYPE_LONGRAW:
+  case ORA_TYPE_BLOB:
+  case ORA_TYPE_BFILE:
+    m.searchable = SQL_PRED_NONE;
+    break;
+  default:
+    break;
+  }
+  return m;
+}
+
 SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT StatementHandle, SQLSMALLINT *ColumnCountPtr)
 {
   OdbcStmt *s = (OdbcStmt *)StatementHandle;
@@ -165,10 +240,12 @@ SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNu
   }
   if (DataTypePtr != NULL)
     *DataTypePtr = sql_type_of(ora_type);
+  ColMeta m = col_meta(s, col);
+  (void)max_size;
   if (ColumnSizePtr != NULL)
-    *ColumnSizePtr = (SQLULEN)display_size_of(ora_type, max_size);
+    *ColumnSizePtr = (SQLULEN)m.column_size;
   if (DecimalDigitsPtr != NULL)
-    *DecimalDigitsPtr = 0;
+    *DecimalDigitsPtr = m.scale;
   if (NullablePtr != NULL)
     *NullablePtr = seer_stmt_col_nullable(s->core, col) ? SQL_NULLABLE : SQL_NO_NULLS;
   return SQL_SUCCESS;
@@ -201,7 +278,7 @@ SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnN
 
   int col = ColumnNumber - 1;
   int ora_type = seer_stmt_col_type(s->core, col);
-  int max_size = seer_stmt_col_size(s->core, col);
+  ColMeta m = col_meta(s, col);
   const char *str = NULL;
 
   switch (FieldIdentifier) {
@@ -229,25 +306,65 @@ SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnN
     if (NumericAttributePtr)
       *NumericAttributePtr = sql_type_of(ora_type);
     return SQL_SUCCESS;
+  /* Sizes from the describe's precision and scale (#259). */
   case SQL_DESC_LENGTH:
-  case SQL_DESC_DISPLAY_SIZE:
-  case SQL_DESC_OCTET_LENGTH:
-  case SQL_DESC_PRECISION:
-  case SQL_COLUMN_PRECISION:
+  case SQL_COLUMN_PRECISION: /* ODBC 2's precision is the column size */
     if (NumericAttributePtr)
-      *NumericAttributePtr = display_size_of(ora_type, max_size);
+      *NumericAttributePtr = m.column_size;
+    return SQL_SUCCESS;
+  case SQL_DESC_PRECISION:
+    if (NumericAttributePtr)
+      *NumericAttributePtr = m.precision;
+    return SQL_SUCCESS;
+  case SQL_DESC_DISPLAY_SIZE:
+    if (NumericAttributePtr)
+      *NumericAttributePtr = m.display_size;
+    return SQL_SUCCESS;
+  case SQL_DESC_OCTET_LENGTH:
+    if (NumericAttributePtr)
+      *NumericAttributePtr = m.octet_length;
     return SQL_SUCCESS;
   case SQL_DESC_SCALE:
+  case SQL_COLUMN_SCALE:
     if (NumericAttributePtr)
-      *NumericAttributePtr = 0;
+      *NumericAttributePtr = m.scale;
     return SQL_SUCCESS;
+  case SQL_DESC_NUM_PREC_RADIX:
+    if (NumericAttributePtr)
+      *NumericAttributePtr = m.radix;
+    return SQL_SUCCESS;
+  case SQL_DESC_CASE_SENSITIVE:
+    if (NumericAttributePtr)
+      *NumericAttributePtr = m.is_char ? SQL_TRUE : SQL_FALSE;
+    return SQL_SUCCESS;
+  case SQL_DESC_SEARCHABLE:
+    if (NumericAttributePtr)
+      *NumericAttributePtr = m.searchable;
+    return SQL_SUCCESS;
+  case SQL_DESC_UPDATABLE: /* which columns a statement can write isn't known */
+    if (NumericAttributePtr)
+      *NumericAttributePtr = SQL_ATTR_READWRITE_UNKNOWN;
+    return SQL_SUCCESS;
+  case SQL_DESC_LITERAL_PREFIX:
+  case SQL_DESC_LITERAL_SUFFIX:
+    str = m.is_char ? "'" : "";
+    break;
+  /* Not in an Oracle describe, or not in Oracle: written empty, as ODBC
+   * has it - left unwritten, the application read its own buffer back. */
+  case SQL_DESC_TABLE_NAME:
+  case SQL_DESC_BASE_TABLE_NAME:
+  case SQL_DESC_SCHEMA_NAME:
+  case SQL_DESC_CATALOG_NAME:
+  case SQL_DESC_LOCAL_TYPE_NAME:
+    str = "";
+    break;
   case SQL_DESC_NULLABLE:
     if (NumericAttributePtr)
       *NumericAttributePtr = seer_stmt_col_nullable(s->core, col) ? SQL_NULLABLE : SQL_NO_NULLS;
     return SQL_SUCCESS;
-  case SQL_DESC_UNSIGNED:
+  case SQL_DESC_UNSIGNED: /* ODBC: TRUE for a column that isn't numeric */
     if (NumericAttributePtr)
-      *NumericAttributePtr = SQL_FALSE;
+      *NumericAttributePtr = m.radix == 10 ? SQL_FALSE : SQL_TRUE;
     return SQL_SUCCESS;
   default:
     if (NumericAttributePtr)
