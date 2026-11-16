@@ -223,8 +223,11 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   if (st != SEER_OK) {
     /* The server's own error, its ORA number the native error, when it gave one. */
     SQLINTEGER native = strncmp(why, "ORA-", 4) == 0 ? (SQLINTEGER)atoi(why + 4) : 0;
-    ret = seer_odbc_diag(c, seer_odbc_sqlstate(st), native, why[0] ? why : seer_strerror(st),
-                         SQL_ERROR);
+    /* No session came up - unreachable, refused by the listener, the handshake
+     * cut short: 08001, the client could not establish the connection. 08S01
+     * is for a link that was up and failed (#205). */
+    const char *state = (st == SEER_EIO || st == SEER_EPROTO) ? "08001" : seer_odbc_sqlstate(st);
+    ret = seer_odbc_diag(c, state, native, why[0] ? why : seer_strerror(st), SQL_ERROR);
     goto out;
   }
 

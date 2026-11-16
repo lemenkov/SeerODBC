@@ -2798,7 +2798,9 @@ static void check_proxy_auth(SQLHDBC dbc, const char *drv, const char *host, con
 
 /* A connect that fails says why, as the server put it: a wrong password is the
  * server's ORA-01017 (its native error 1017), a service the listener doesn't
- * know is its ORA-12514 - not a bare "authentication failed". */
+ * know is its ORA-12514 - not a bare "authentication failed". The SQLSTATE is
+ * 28000 for the login refused, 08001 for the connection never established
+ * (#205). */
 static void check_connect_error(const char *drv, const char *host, const char *port,
                                 const char *svc, const char *user)
 {
@@ -2806,7 +2808,9 @@ static void check_connect_error(const char *drv, const char *host, const char *p
   struct {
     const char *svc, *pwd;
     long code;
-  } cases[2] = {{svc, "not-the-password", 1017}, {"SEER_NO_SUCH_SERVICE", "x", 12514}};
+    const char *state;
+  } cases[2] = {{svc, "not-the-password", 1017, "28000"},
+                {"SEER_NO_SUCH_SERVICE", "x", 12514, "08001"}};
   for (int k = 0; k < 2; k++) {
     SQLHENV e;
     SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
@@ -2829,10 +2833,11 @@ static void check_connect_error(const char *drv, const char *host, const char *p
     SQLFreeHandle(SQL_HANDLE_ENV, e);
     char want[16];
     snprintf(want, sizeof want, "ORA-%05ld", cases[k].code);
-    if (SQL_SUCCEEDED(rc) || native != cases[k].code || strncmp((char *)msg, want, 9) != 0) {
+    if (SQL_SUCCEEDED(rc) || native != cases[k].code || strncmp((char *)msg, want, 9) != 0 ||
+        strcmp((char *)state, cases[k].state) != 0) {
       char m[600];
-      snprintf(m, sizeof m, "want %s: rc=%d native=%ld '%s'", want, (int)rc, (long)native,
-               (char *)msg);
+      snprintf(m, sizeof m, "want %s (%s): rc=%d state '%s' native=%ld '%s'", want, cases[k].state,
+               (int)rc, (char *)state, (long)native, (char *)msg);
       fail(name, m);
       return;
     }
@@ -2841,8 +2846,8 @@ static void check_connect_error(const char *drv, const char *host, const char *p
 }
 
 /* An unreachable address says which and why (#203): a closed port is
- * "connection to 127.0.0.1:1 refused" (a connection-class 08 state), not a bare
- * "I/O error". */
+ * "connection to 127.0.0.1:1 refused", not a bare "I/O error", and with 08001,
+ * a connection not established, not 08S01, a link lost (#205). */
 static void check_unreachable_error(const char *drv, const char *svc, const char *user,
                                     const char *pwd)
 {
@@ -2866,7 +2871,7 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
     SQLDisconnect(d);
   SQLFreeHandle(SQL_HANDLE_DBC, d);
   SQLFreeHandle(SQL_HANDLE_ENV, e);
-  if (!SQL_SUCCEEDED(rc) && strncmp((char *)state, "08", 2) == 0 &&
+  if (!SQL_SUCCEEDED(rc) && strcmp((char *)state, "08001") == 0 &&
       strstr((char *)msg, "127.0.0.1:1 refused") != NULL)
     pass(name);
   else {
