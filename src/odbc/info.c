@@ -9,6 +9,7 @@
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -89,6 +90,13 @@ static const char *dbms_ver(OdbcDbc *c)
   }
   seer_stmt_close(s);
   return c->dbms_ver[0] != '\0' ? c->dbms_ver : "00.00.0000";
+}
+
+/* Whether the connection is to Oracle 8i (whose SQL has no ANSI joins). */
+static bool legacy_8i(OdbcDbc *c)
+{
+  int v[5] = {0};
+  return c != NULL && c->conn != NULL && seer_server_version(c->conn, v) == SEER_OK && v[0] == 8;
 }
 
 SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
@@ -183,7 +191,61 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
   case SQL_CURSOR_ROLLBACK_BEHAVIOR:
     return info_u16(SQL_CB_PRESERVE, InfoValuePtr);
 
+  /* --- the connection (#234) --- */
+  case SQL_DATA_SOURCE_NAME:
+    return info_string(c && c->info_dsn ? c->info_dsn : "", InfoValuePtr, BufferLength,
+                       StringLengthPtr);
+  case SQL_USER_NAME:
+    return info_string(c && c->info_user ? c->info_user : "", InfoValuePtr, BufferLength,
+                       StringLengthPtr);
+  case SQL_SERVER_NAME:
+    return info_string(c && c->info_server ? c->info_server : "", InfoValuePtr, BufferLength,
+                       StringLengthPtr);
+  case SQL_DATABASE_NAME: /* the current catalog: Oracle has none */
+    return info_string("", InfoValuePtr, BufferLength, StringLengthPtr);
+
+  /* --- conformance and SQL support (#234) --- */
+  case SQL_SQL_CONFORMANCE:
+    return info_u32(SQL_SC_SQL92_ENTRY, InfoValuePtr);
+  case SQL_ODBC_INTERFACE_CONFORMANCE:
+    return info_u32(SQL_OIC_CORE, InfoValuePtr);
+  case SQL_MULT_RESULT_SETS: /* implicit results, SQLMoreResults */
+  case SQL_PROCEDURES:       /* {call ...} */
+  case SQL_COLUMN_ALIAS:
+  case SQL_LIKE_ESCAPE_CLAUSE: /* {escape ...} */
+  case SQL_EXPRESSIONS_IN_ORDERBY:
+    return info_string("Y", InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_ORDER_BY_COLUMNS_IN_SELECT:
+  case SQL_ROW_UPDATES:
+  case SQL_DESCRIBE_PARAMETER: /* SQLDescribeParam answers a generic default */
+    return info_string("N", InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_OUTER_JOINS:
+    /* {oj} becomes ANSI join syntax, which 8.1.7 hasn't. */
+    return info_string(legacy_8i(c) ? "N" : "Y", InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_OJ_CAPABILITIES:
+    return info_u32(legacy_8i(c)
+                        ? 0
+                        : SQL_OJ_LEFT | SQL_OJ_RIGHT | SQL_OJ_FULL | SQL_OJ_NESTED |
+                              SQL_OJ_NOT_ORDERED | SQL_OJ_INNER | SQL_OJ_ALL_COMPARISON_OPS,
+                    InfoValuePtr);
+  case SQL_GROUP_BY:
+    return info_u16(SQL_GB_GROUP_BY_CONTAINS_SELECT, InfoValuePtr);
+  case SQL_UNION:
+    return info_u32(SQL_U_UNION | SQL_U_UNION_ALL, InfoValuePtr);
+  case SQL_SUBQUERIES:
+    return info_u32(SQL_SQ_COMPARISON | SQL_SQ_EXISTS | SQL_SQ_IN | SQL_SQ_QUANTIFIED |
+                        SQL_SQ_CORRELATED_SUBQUERIES,
+                    InfoValuePtr);
+  case SQL_PARAM_ARRAY_ROW_COUNTS: /* one count for the whole array */
+    return info_u32(SQL_PARC_NO_BATCH, InfoValuePtr);
+  case SQL_PARAM_ARRAY_SELECTS:
+    return info_u32(SQL_PAS_NO_SELECT, InfoValuePtr);
+
   /* --- cursors --- forward-only plus a buffered static (scrollable) cursor */
+  case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1:
+    return info_u32(SQL_CA1_NEXT, InfoValuePtr);
+  case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2:
+    return info_u32(SQL_CA2_READ_ONLY_CONCURRENCY, InfoValuePtr);
   case SQL_SCROLL_OPTIONS:
     return info_u32(SQL_SO_FORWARD_ONLY | SQL_SO_STATIC, InfoValuePtr);
   case SQL_STATIC_CURSOR_ATTRIBUTES1:

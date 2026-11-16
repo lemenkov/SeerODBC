@@ -108,6 +108,9 @@ SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
     if (c->connected && c->conn != NULL)
       seer_disconnect(c->conn);
     free(c->browse_cs);
+    free(c->info_dsn);
+    free(c->info_user);
+    free(c->info_server);
     seer_odbc_diag_free(c);
     free(c);
     return SQL_SUCCESS;

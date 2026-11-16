@@ -2960,6 +2960,64 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+/* SQLGetInfo answers what the driver does (#234): no empty "neither Y nor N"
+ * strings, no 0 where ODBC defines no 0, the connection's user and service. */
+static void check_getinfo_answers(SQLHDBC dbc, const char *user, const char *svc)
+{
+  const char *name = "SQLGetInfo answers (Y/N strings, cursor and array caps, names)";
+  char m[600] = "";
+  static const struct {
+    SQLUSMALLINT type;
+    const char *want;
+  } strs[] = {
+      {SQL_MULT_RESULT_SETS, "Y"},
+      {SQL_PROCEDURES, "Y"},
+      {SQL_COLUMN_ALIAS, "Y"},
+      {SQL_LIKE_ESCAPE_CLAUSE, "Y"},
+      {SQL_EXPRESSIONS_IN_ORDERBY, "Y"},
+      {SQL_ORDER_BY_COLUMNS_IN_SELECT, "N"},
+      {SQL_ROW_UPDATES, "N"},
+      {SQL_DESCRIBE_PARAMETER, "N"},
+  };
+  for (size_t k = 0; k < sizeof strs / sizeof strs[0]; k++) {
+    char v[16] = "";
+    SQLSMALLINT len = 0;
+    SQLGetInfo(dbc, strs[k].type, v, sizeof v, &len);
+    if (strcmp(v, strs[k].want) != 0) {
+      size_t ml = strlen(m);
+      snprintf(m + ml, sizeof m - ml, "type %u: '%s' (want %s); ", (unsigned)strs[k].type, v,
+               strs[k].want);
+    }
+  }
+  char oj[8] = "", u[128] = "", sv[128] = "";
+  SQLSMALLINT len = 0;
+  SQLGetInfo(dbc, SQL_OUTER_JOINS, oj, sizeof oj, &len);
+  const char *want_oj = g_release == 8 ? "N" : "Y"; /* 8.1.7 has no ANSI joins */
+  if (strcmp(oj, want_oj) != 0) {
+    size_t ml = strlen(m);
+    snprintf(m + ml, sizeof m - ml, "SQL_OUTER_JOINS '%s' (want %s); ", oj, want_oj);
+  }
+  SQLGetInfo(dbc, SQL_USER_NAME, u, sizeof u, &len);
+  SQLGetInfo(dbc, SQL_SERVER_NAME, sv, sizeof sv, &len);
+  if (strcasecmp(u, user) != 0 || strcasecmp(sv, svc) != 0) {
+    size_t ml = strlen(m);
+    snprintf(m + ml, sizeof m - ml, "user '%s' server '%s'; ", u, sv);
+  }
+  SQLUINTEGER fo = 0, parc = 0, pas = 0;
+  SQLGetInfo(dbc, SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1, &fo, sizeof fo, NULL);
+  SQLGetInfo(dbc, SQL_PARAM_ARRAY_ROW_COUNTS, &parc, sizeof parc, NULL);
+  SQLGetInfo(dbc, SQL_PARAM_ARRAY_SELECTS, &pas, sizeof pas, NULL);
+  if (!(fo & SQL_CA1_NEXT) || parc != SQL_PARC_NO_BATCH || pas != SQL_PAS_NO_SELECT) {
+    size_t ml = strlen(m);
+    snprintf(m + ml, sizeof m - ml, "forward-only %#x, PARC %u, PAS %u", (unsigned)fo,
+             (unsigned)parc, (unsigned)pas);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* The first diag record's SQLSTATE of a handle, into st[6]. */
 static void diag_state(SQLSMALLINT type, SQLHANDLE h, char st[6])
 {
@@ -4191,6 +4249,7 @@ int main(void)
   check_txn_isolation(dbc, drv, host, port, svc, user, pwd);
   check_max_rows(dbc);
   check_cursor_attrs(dbc);
+  check_getinfo_answers(dbc, user, svc);
   check_tls(drv, svc, user, pwd);
   check_lob_inline(drv, host, port, svc, user, pwd);
 
