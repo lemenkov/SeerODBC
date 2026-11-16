@@ -6074,11 +6074,33 @@ static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *
       seer_writer_free(&nm);
       r->bad = true;
     }
-    if (o8r_le32(r) > 0)
-      o8r_value(r, NULL); /* type schema */
-    if (o8r_le32(r) > 0)
-      o8r_value(r, NULL); /* type name */
+    /* The type's schema and name: an object or collection column's, which
+     * its image decode reads the layout by (#168). */
+    char *ident[2] = {NULL, NULL};
+    for (int k = 0; k < 2; k++) {
+      if (o8r_le32(r) == 0)
+        continue;
+      SeerWriter v;
+      if (!seer_writer_init(&v, 32)) {
+        r->bad = true;
+        break;
+      }
+      o8r_value(r, &v);
+      seer_writer_u8(&v, 0);
+      if (seer_writer_ok(&v) && col->ora_type == ORA_TYPE_ADT)
+        ident[k] = (char *)v.buf;
+      else
+        seer_writer_free(&v);
+    }
     col->n_obj_attrs = 0;
+    if (ident[0] != NULL && ident[1] != NULL) {
+      col->type_schema = ident[0];
+      col->type_name = ident[1];
+      col->n_obj_attrs = -1; /* layout not yet fetched */
+    } else {
+      free(ident[0]);
+      free(ident[1]);
+    }
   }
   if (o8r_le32(r) > 0)
     o8r_value(r, NULL); /* the describe time */
@@ -6114,6 +6136,33 @@ static void o8i_read_cursor_cell(O8iRd *r, bool row_cell, SeerColumn **cols, int
 static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell, uint32_t *nested)
 {
   uint8_t t = col->ora_type;
+  if (t == ORA_TYPE_ADT) {
+    /* An object or collection: 9.2's object cell at 8i's widths - the type
+     * block (a ub4 length and 36 bytes), the object OID and the snapshot, each
+     * a ub4 length and its bytes, a ub2 version, a ub4 image length (0 for
+     * NULL), ub2 flags, the image; then the trailer every 8i cell has (seerdb
+     * PROTOCOL.md §19.17c, #168). Read as a plain value it came back as raw
+     * framing bytes and the rows after it were lost. The image is kept for
+     * o8i_resolve_lobs to decode by the type's layout. */
+    for (int k = 0; k < 3; k++)
+      if (o8r_le32(r) > 0)
+        o8r_value(r, NULL);
+    (void)o8r_le16(r); /* version */
+    uint32_t imglen = o8r_le32(r);
+    (void)o8r_le16(r); /* flags */
+    SeerWriter img;
+    if (!seer_writer_init(&img, 64))
+      return SEER_ENOMEM;
+    if (imglen > 0)
+      o8r_value(r, &img);
+    bool null = o8r_le16(r) == 0xFFFF;
+    o8r_skip(r, 2); /* return code */
+    SeerStatus st = SEER_OK;
+    if (!r->cut && !r->bad && !null && imglen > 0 && seer_writer_ok(&img))
+      st = cell_set_bytes(cell, img.buf, img.len, true);
+    seer_writer_free(&img);
+    return st;
+  }
   if (t == ORA_TYPE_REFCURSOR) {
     /* A CURSOR() column: ODBC has no nested cursor type, so it reads as NULL,
      * as on 9i; its cursor is named for closing (#166). */
@@ -7026,6 +7075,25 @@ static SeerStatus o8i_resolve_lobs(SeerStmt *stmt)
 {
   for (int col = 0; col < stmt->ncols; col++) {
     uint8_t t = stmt->cols[col].ora_type;
+    if (t == ORA_TYPE_ADT) {
+      /* Objects and collections: each cell's image, decoded by its type's
+       * layout, which dictionary queries read - now that the rows are in
+       * (#168). A cell that won't decode is left NULL and logged. */
+      for (size_t row = 0; row < stmt->nrows; row++) {
+        SeerCell *cell = &stmt->rows[row][col];
+        if (cell->data == NULL)
+          continue;
+        uint8_t *img = (uint8_t *)cell->data;
+        size_t imglen = cell->len;
+        *cell = (SeerCell){0};
+        SeerStatus st = decode_typed_image(stmt->conn, &stmt->cols[col], img, imglen, cell);
+        free(img);
+        if (st != SEER_OK && st != SEER_ENOTIMPL)
+          seer_log(SEER_LOG_WARNING, "o8i: OBJECT/collection decode failed (row %zu col %d)", row,
+                   col);
+      }
+      continue;
+    }
     if (t != ORA_TYPE_CLOB && t != ORA_TYPE_BLOB && t != ORA_TYPE_BFILE)
       continue;
     for (size_t row = 0; row < stmt->nrows; row++) {
