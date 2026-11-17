@@ -6,9 +6,11 @@
  * through the protocol core. The app then reads it like any result set with
  * SQLFetch / SQLGetData.
  *
- * Name/schema arguments are treated as search patterns (the default, with
- * SQL_ATTR_METADATA_ID off) and bound as LIKE parameters; a NULL argument
- * matches everything.
+ * Name/schema arguments are bound as LIKE parameters with ESCAPE '\', the
+ * SQL_SEARCH_PATTERN_ESCAPE SQLGetInfo reports (#273): a pattern argument as
+ * given (SQL_ATTR_METADATA_ID off), an ordinary one - the names
+ * SQLPrimaryKeys, SQLStatistics, SQLForeignKeys and SQLSpecialColumns take -
+ * escaped so it matches only itself. A NULL argument matches everything.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -21,20 +23,47 @@
 #include "compat.h"
 #include "odbc_internal.h"
 
-/* Duplicate a possibly non-NUL-terminated ODBC string; NULL/empty -> "%". */
-static char *pattern_dup(const void *s, SQLSMALLINT len)
+/* A catalog name argument as a LIKE pattern with ESCAPE '\'; NULL/empty ->
+ * "%". A pattern argument keeps its wildcards and its escapes of '_', '%'
+ * and '\'; any other '\' - Oracle refuses one before anything else with
+ * ORA-01424 - is taken literally. An ordinary argument (literal) has every
+ * wildcard and '\' escaped. */
+static char *name_dup(const void *s, SQLSMALLINT len, int literal)
 {
   if (s == NULL)
     return strdup("%");
-  size_t n = (len == SQL_NTS) ? strlen((const char *)s) : (size_t)len;
+  const char *p = s;
+  size_t n = (len == SQL_NTS) ? strlen(p) : (size_t)len;
   if (n == 0)
     return strdup("%");
-  char *d = malloc(n + 1);
+  char *d = malloc(2 * n + 1);
   if (d == NULL)
     return NULL;
-  memcpy(d, s, n);
-  d[n] = '\0';
+  size_t o = 0;
+  for (size_t i = 0; i < n; i++) {
+    char c = p[i];
+    if (!literal && c == '\\' && i + 1 < n && p[i + 1] != '\0' &&
+        strchr("_%\\", p[i + 1]) != NULL) {
+      d[o++] = c;
+      d[o++] = p[++i];
+      continue;
+    }
+    if (c == '\\' || (literal && (c == '_' || c == '%')))
+      d[o++] = '\\';
+    d[o++] = c;
+  }
+  d[o] = '\0';
   return d;
+}
+
+static char *pattern_dup(const void *s, SQLSMALLINT len)
+{
+  return name_dup(s, len, 0);
+}
+
+static char *ident_dup(const void *s, SQLSMALLINT len)
+{
+  return name_dup(s, len, 1);
 }
 
 SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLSMALLINT NameLength1,
@@ -69,10 +98,11 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
   static const char *TABLES_SQL =
       "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, OWNER TABLE_SCHEM,"
       " TABLE_NAME, 'TABLE' TABLE_TYPE, CAST(NULL AS VARCHAR2(1)) REMARKS"
-      " FROM ALL_TABLES WHERE OWNER LIKE :1 AND TABLE_NAME LIKE :2";
-  static const char *VIEWS_SQL = "SELECT CAST(NULL AS VARCHAR2(128)), OWNER, VIEW_NAME, 'VIEW',"
-                                 " CAST(NULL AS VARCHAR2(1)) FROM ALL_VIEWS"
-                                 " WHERE OWNER LIKE :1 AND VIEW_NAME LIKE :2";
+      " FROM ALL_TABLES WHERE OWNER LIKE :1 ESCAPE '\\' AND TABLE_NAME LIKE :2 ESCAPE '\\'";
+  static const char *VIEWS_SQL =
+      "SELECT CAST(NULL AS VARCHAR2(128)), OWNER, VIEW_NAME, 'VIEW',"
+      " CAST(NULL AS VARCHAR2(1)) FROM ALL_VIEWS"
+      " WHERE OWNER LIKE :1 ESCAPE '\\' AND VIEW_NAME LIKE :2 ESCAPE '\\'";
 
   char sql[1024];
   const char *params[4];
@@ -82,7 +112,7 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
     snprintf(sql, sizeof sql, "%s UNION ALL %s ORDER BY 2, 3", TABLES_SQL,
              "SELECT CAST(NULL AS VARCHAR2(128)), OWNER, VIEW_NAME, 'VIEW',"
              " CAST(NULL AS VARCHAR2(1)) FROM ALL_VIEWS"
-             " WHERE OWNER LIKE :3 AND VIEW_NAME LIKE :4");
+             " WHERE OWNER LIKE :3 ESCAPE '\\' AND VIEW_NAME LIKE :4 ESCAPE '\\'");
     params[0] = schema;
     params[1] = table;
     params[2] = schema;
@@ -208,7 +238,8 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
       " COLUMN_ID ORDINAL_POSITION,"
       " DECODE(NULLABLE, 'Y', 'YES', 'NO') IS_NULLABLE"
       " FROM ALL_TAB_COLUMNS"
-      " WHERE OWNER LIKE :1 AND TABLE_NAME LIKE :2 AND COLUMN_NAME LIKE :3"
+      " WHERE OWNER LIKE :1 ESCAPE '\\' AND TABLE_NAME LIKE :2 ESCAPE '\\' AND COLUMN_NAME LIKE :3 "
+      "ESCAPE '\\'"
       " ORDER BY OWNER, TABLE_NAME, COLUMN_ID";
   /* The character length twice: COLUMN_SIZE, and BUFFER_LENGTH's copy of it
    * (unused there, as only numbers take that branch). */
@@ -361,8 +392,8 @@ SQLRETURN SQL_API SQLPrimaryKeys(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *table = pattern_dup(TableName, NameLength3);
+  char *schema = ident_dup(SchemaName, NameLength2);
+  char *table = ident_dup(TableName, NameLength3);
   if (schema == NULL || table == NULL) {
     free(schema);
     free(table);
@@ -374,7 +405,8 @@ SQLRETURN SQL_API SQLPrimaryKeys(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
       " c.TABLE_NAME, cc.COLUMN_NAME, cc.POSITION KEY_SEQ, c.CONSTRAINT_NAME PK_NAME"
       " FROM ALL_CONSTRAINTS c, ALL_CONS_COLUMNS cc" /* 8i: no JOIN ... ON (#272) */
       " WHERE c.OWNER = cc.OWNER AND c.CONSTRAINT_NAME = cc.CONSTRAINT_NAME"
-      "   AND c.CONSTRAINT_TYPE = 'P' AND c.OWNER LIKE :1 AND c.TABLE_NAME = :2"
+      "   AND c.CONSTRAINT_TYPE = 'P' AND c.OWNER LIKE :1 ESCAPE '\\' AND c.TABLE_NAME LIKE :2 "
+      "ESCAPE '\\'"
       " ORDER BY cc.POSITION";
 
   const char *params[2] = {schema, table};
@@ -399,8 +431,8 @@ SQLRETURN SQL_API SQLStatistics(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *table = pattern_dup(TableName, NameLength3);
+  char *schema = ident_dup(SchemaName, NameLength2);
+  char *table = ident_dup(TableName, NameLength3);
   if (schema == NULL || table == NULL) {
     free(schema);
     free(table);
@@ -419,7 +451,7 @@ SQLRETURN SQL_API SQLStatistics(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
            " i.LEAF_BLOCKS PAGES, CAST(NULL AS VARCHAR2(1)) FILTER_CONDITION"
            " FROM ALL_INDEXES i, ALL_IND_COLUMNS ic"
            " WHERE i.OWNER = ic.INDEX_OWNER AND i.INDEX_NAME = ic.INDEX_NAME"
-           "   AND i.TABLE_OWNER LIKE :1 AND i.TABLE_NAME = :2%s"
+           "   AND i.TABLE_OWNER LIKE :1 ESCAPE '\\' AND i.TABLE_NAME LIKE :2 ESCAPE '\\'%s"
            " ORDER BY NON_UNIQUE, i.INDEX_NAME, ic.COLUMN_POSITION",
            Unique == SQL_INDEX_UNIQUE ? " AND i.UNIQUENESS = 'UNIQUE'" : "");
 
@@ -447,10 +479,10 @@ SQLRETURN SQL_API SQLForeignKeys(SQLHSTMT StatementHandle, SQLCHAR *PKCatalogNam
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *pksch = pattern_dup(PKSchemaName, PKL2);
-  char *pktab = pattern_dup(PKTableName, PKL3);
-  char *fksch = pattern_dup(FKSchemaName, FKL2);
-  char *fktab = pattern_dup(FKTableName, FKL3);
+  char *pksch = ident_dup(PKSchemaName, PKL2);
+  char *pktab = ident_dup(PKTableName, PKL3);
+  char *fksch = ident_dup(FKSchemaName, FKL2);
+  char *fktab = ident_dup(FKTableName, FKL3);
   if (!pksch || !pktab || !fksch || !fktab) {
     free(pksch);
     free(pktab);
@@ -478,8 +510,8 @@ SQLRETURN SQL_API SQLForeignKeys(SQLHSTMT StatementHandle, SQLCHAR *PKCatalogNam
       "   AND pk.OWNER = pkc.OWNER AND pk.CONSTRAINT_NAME = pkc.CONSTRAINT_NAME"
       "   AND pkc.POSITION = fkc.POSITION"
       "   AND fk.CONSTRAINT_TYPE = 'R'"
-      "   AND pk.OWNER LIKE :1 AND pk.TABLE_NAME LIKE :2"
-      "   AND fk.OWNER LIKE :3 AND fk.TABLE_NAME LIKE :4"
+      "   AND pk.OWNER LIKE :1 ESCAPE '\\' AND pk.TABLE_NAME LIKE :2 ESCAPE '\\'"
+      "   AND fk.OWNER LIKE :3 ESCAPE '\\' AND fk.TABLE_NAME LIKE :4 ESCAPE '\\'"
       " ORDER BY fk.TABLE_NAME, fkc.POSITION";
 
   const char *params[4] = {pksch, pktab, fksch, fktab};
@@ -521,7 +553,7 @@ SQLRETURN SQL_API SQLProcedures(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
       " DECODE(OBJECT_TYPE, 'FUNCTION', 2, 1) PROCEDURE_TYPE"
       " FROM ALL_OBJECTS"
       " WHERE OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION')"
-      "   AND OWNER LIKE :1 AND OBJECT_NAME LIKE :2"
+      "   AND OWNER LIKE :1 ESCAPE '\\' AND OBJECT_NAME LIKE :2 ESCAPE '\\'"
       " ORDER BY OWNER, OBJECT_NAME";
 
   const char *params[2] = {schema, proc};
@@ -595,8 +627,8 @@ SQLRETURN SQL_API SQLProcedureColumns(SQLHSTMT StatementHandle, SQLCHAR *Catalog
       "   ELSE CAST(NULL AS NUMBER) END CHAR_OCTET_LENGTH,"
       " POSITION ORDINAL_POSITION, 'YES' IS_NULLABLE"
       " FROM ALL_ARGUMENTS"
-      " WHERE OWNER LIKE :1 AND OBJECT_NAME LIKE :2"
-      "   AND (ARGUMENT_NAME LIKE :3 OR ARGUMENT_NAME IS NULL) AND DATA_LEVEL = 0"
+      " WHERE OWNER LIKE :1 ESCAPE '\\' AND OBJECT_NAME LIKE :2 ESCAPE '\\'"
+      "   AND (ARGUMENT_NAME LIKE :3 ESCAPE '\\' OR ARGUMENT_NAME IS NULL) AND DATA_LEVEL = 0"
       " ORDER BY OWNER, OBJECT_NAME, POSITION";
   /* ODBC_SIZE_CASE's character length: an unconstrained argument's limit. */
   char sql[8192];
@@ -648,8 +680,8 @@ SQLRETURN SQL_API SQLSpecialColumns(SQLHSTMT StatementHandle, SQLUSMALLINT Ident
   /* SQL_BEST_ROWID: the best unique row identifier on Oracle is the ROWID
    * pseudo-column. Emit one descriptor row if the table exists (SCOPE =
    * SQL_SCOPE_SESSION, PSEUDO_COLUMN = SQL_PC_PSEUDO, DATA_TYPE = SQL_VARCHAR). */
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *table = pattern_dup(TableName, NameLength3);
+  char *schema = ident_dup(SchemaName, NameLength2);
+  char *table = ident_dup(TableName, NameLength3);
   if (schema == NULL || table == NULL) {
     free(schema);
     free(table);
@@ -659,7 +691,7 @@ SQLRETURN SQL_API SQLSpecialColumns(SQLHSTMT StatementHandle, SQLUSMALLINT Ident
       "SELECT 2 SCOPE, 'ROWID' COLUMN_NAME, 12 DATA_TYPE, 'ROWID' TYPE_NAME,"
       " 18 COLUMN_SIZE, 18 BUFFER_LENGTH, CAST(NULL AS NUMBER) DECIMAL_DIGITS,"
       " 2 PSEUDO_COLUMN"
-      " FROM ALL_TABLES WHERE OWNER LIKE :1 AND TABLE_NAME LIKE :2";
+      " FROM ALL_TABLES WHERE OWNER LIKE :1 ESCAPE '\\' AND TABLE_NAME LIKE :2 ESCAPE '\\'";
 
   const char *params[2] = {schema, table};
   SQLRETURN ret = seer_odbc_run_query(s, ROWID_SQL, params, 2);
