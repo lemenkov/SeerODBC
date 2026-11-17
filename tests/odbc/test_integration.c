@@ -2412,7 +2412,8 @@ static void check_ird_sizes(SQLHDBC dbc)
 /* SQLColumns (#265) describes each column as SQLDescribeCol describes it in a
  * result set: the type, size and digits agree; a DATE is SQL_DATETIME /
  * SQL_CODE_TIMESTAMP with BUFFER_LENGTH 16; a character column has no
- * radix; a RAW(16) is 16 and an NVARCHAR2(10) 10. */
+ * radix; a RAW(16) is 16 and an NVARCHAR2(10) 10; a CLOB and a LONG are
+ * SQLGetTypeInfo's 2147483647 (#268). */
 static void check_columns_sizes(SQLHDBC dbc)
 {
   const char *name = "SQLColumns: sizes and types as the result-set describe";
@@ -2420,14 +2421,15 @@ static void check_columns_sizes(SQLHDBC dbc)
   exec_do(dbc, "DROP TABLE seer_colsz", err, sizeof err);
   exec_do(dbc,
           "CREATE TABLE seer_colsz (n NUMBER(10,2), f FLOAT, v VARCHAR2(20), d DATE, r RAW(16),"
-          " nv NVARCHAR2(10))",
+          " nv NVARCHAR2(10), cl CLOB, lg LONG)",
           err, sizeof err);
-  enum { NCOL = 6 };
+  enum { NCOL = 8 };
   SQLSMALLINT dtype[NCOL], digits[NCOL];
   SQLULEN size[NCOL];
   SQLHSTMT st;
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
-  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT n, f, v, d, r, nv FROM seer_colsz", SQL_NTS);
+  SQLRETURN rc =
+      SQLExecDirect(st, (SQLCHAR *)"SELECT n, f, v, d, r, nv, cl, lg FROM seer_colsz", SQL_NTS);
   for (SQLUSMALLINT c = 0; SQL_SUCCEEDED(rc) && c < NCOL; c++)
     SQLDescribeCol(st, c + 1, NULL, 0, NULL, &dtype[c], &size[c], &digits[c], NULL);
   if (!SQL_SUCCEEDED(rc))
@@ -2464,6 +2466,9 @@ static void check_columns_sizes(SQLHDBC dbc)
       snprintf(m, sizeof m, "VARCHAR2: NUM_PREC_RADIX %d, want NULL", (int)v[4]);
     else if (c == 5 && v[1] != 10)
       snprintf(m, sizeof m, "NVARCHAR2(10): size %d, want 10", (int)v[1]);
+    else if (c >= 6 && (v[1] != 2147483647 || v[2] != 2147483647)) /* #268 */
+      snprintf(m, sizeof m, "%s: size %d buffer %d, want 2147483647", c == 6 ? "CLOB" : "LONG",
+               (int)v[1], (int)v[2]);
   }
   if (m[0] == '\0' && !SQL_SUCCEEDED(rc))
     diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
