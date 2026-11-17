@@ -2484,7 +2484,8 @@ static void check_columns_sizes(SQLHDBC dbc)
 
 /* SQLPrimaryKeys, SQLStatistics and SQLForeignKeys answer on every release
  * (#272: 8i refused their ANSI joins and simple CASE) and describe a
- * parent's primary and unique keys and a child's ON DELETE CASCADE key. */
+ * parent's primary and unique keys, SQLStatistics' SQL_TABLE_STAT row first
+ * (#275), and a child's ON DELETE CASCADE key. */
 static void check_key_catalog(SQLHDBC dbc)
 {
   const char *name = "SQLPrimaryKeys / SQLStatistics / SQLForeignKeys";
@@ -2525,13 +2526,23 @@ static void check_key_catalog(SQLHDBC dbc)
 
   if (m[0] == '\0') {
     rows = 0;
+    int fetched = 0, table_row = 0;
     rc = SQLStatistics(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_KP", SQL_NTS,
                        SQL_INDEX_ALL, SQL_QUICK);
     while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+      fetched++;
       col[0] = '\0';
       SQLGetData(st, 9, SQL_C_CHAR, col, sizeof col, &ind);
-      if (ind == SQL_NULL_DATA) /* a table-statistics row has no column */
+      SQLINTEGER type = -1;
+      SQLLEN tind;
+      SQLGetData(st, 7, SQL_C_SLONG, &type, 0, &tind);
+      if (type == SQL_TABLE_STAT) { /* #275: first, and with no column */
+        table_row++;
+        if (fetched != 1 || ind != SQL_NULL_DATA)
+          snprintf(m, sizeof m, "SQLStatistics: SQL_TABLE_STAT is row %d, column %s", fetched,
+                   ind == SQL_NULL_DATA ? "NULL" : col);
         continue;
+      }
       rows++;
       SQLGetData(st, 4, SQL_C_SLONG, &v, 0, &ind);
       if (v != 0)
@@ -2539,8 +2550,9 @@ static void check_key_catalog(SQLHDBC dbc)
     }
     if (!SQL_SUCCEEDED(rc))
       diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
-    else if (m[0] == '\0' && rows != 2)
-      snprintf(m, sizeof m, "SQLStatistics: %d index columns, want 2 (ID, U)", rows);
+    else if (m[0] == '\0' && (rows != 2 || table_row != 1))
+      snprintf(m, sizeof m, "SQLStatistics: %d index columns, %d SQL_TABLE_STAT, want 2 and 1",
+               rows, table_row);
     SQLFreeStmt(st, SQL_CLOSE);
   }
 
