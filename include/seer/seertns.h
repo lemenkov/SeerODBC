@@ -547,8 +547,13 @@ const char *seer_stmt_col_name(SeerStmt *stmt, int col); /* NULL if out of range
  * annotations have an empty value). NULL if the column has none or the server is
  * pre-23ai. Valid until the next execute or close. */
 const char *seer_stmt_col_annotations(SeerStmt *stmt, int col);
-int seer_stmt_col_type(SeerStmt *stmt, int col);     /* Oracle type number, -1 if bad */
-int seer_stmt_col_size(SeerStmt *stmt, int col);     /* max size in bytes, 0 if bad */
+int seer_stmt_col_type(SeerStmt *stmt, int col); /* Oracle type number, -1 if bad */
+/* The column's declared size: characters for a character column, bytes for
+ * a RAW (#264); 0 where the describe gives none, or for a bad column. */
+int seer_stmt_col_size(SeerStmt *stmt, int col);
+/* The column's largest value in bytes, as the describe states it: a
+ * VARCHAR2(20 CHAR) in AL32UTF8 is 80. 0 where it gives none (#264). */
+int seer_stmt_col_octets(SeerStmt *stmt, int col);
 int seer_stmt_col_nullable(SeerStmt *stmt, int col); /* nonzero if NULLs allowed */
 /* The describe's precision and scale (#259): NUMBER(p,s)'s p and s - 0 and
  * -127 for a NUMBER declared without them, -127 for a FLOAT(b) (its binary

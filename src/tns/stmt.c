@@ -47,7 +47,10 @@ typedef struct {
   uint8_t ora_type;
   uint16_t charset;
   uint8_t null_ok;
-  uint32_t max_size;
+  uint32_t max_size; /* as the describe gives it: the define's size on 8i / 9i */
+  /* The declared size for applications (#264): characters for a character
+   * column, bytes for a RAW; and the largest value in bytes. */
+  uint32_t char_size, byte_size;
   /* Described with a zero data length (a bare NULL / '' / DECODE miss): the
    * row carries no bytes at all for it - not even an empty DALC - and its
    * value is always NULL. Default false = read the value as usual. */
@@ -857,6 +860,10 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     cols[i].charset = (uint16_t)charset;
     cols[i].null_ok = null_ok;
     cols[i].max_size = (uint32_t)(max_size < 0 ? 0 : max_size);
+    /* max_size is the character length, 0 for a column that isn't
+     * character data: a RAW's length is its buffer size. */
+    cols[i].byte_size = (uint32_t)(data_len < 0 ? 0 : data_len);
+    cols[i].char_size = type == ORA_TYPE_RAW ? cols[i].byte_size : cols[i].max_size;
     cols[i].zero_len = data_len == 0 && !has_own_row_encoding(type);
 
     if (!seer_reader_ok(r)) {
@@ -5027,6 +5034,10 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   col->ora_type = data_type;
   col->charset = (uint16_t)charset;
   col->max_size = (uint32_t)(max_len < 0 ? 0 : max_len);
+  /* 9i gives bytes only. A national column is AL16UTF16, two bytes a
+   * character, so its characters are exact (#264). */
+  col->byte_size = col->max_size;
+  col->char_size = charset == ORA_CHARSET_AL16UTF16 ? col->max_size / 2 : col->max_size;
   /* Described with size 0, a column carries no bytes in the row - when it is
    * defined at its described size. fv2_define_entry defines a NUMBER, DATE,
    * TIMESTAMP or rowid at a fixed size instead, and the server sends a cell
@@ -6142,8 +6153,9 @@ static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *
     col->precision = o8r_u8(r);
     col->scale = (int8_t)o8r_u8(r);
     col->max_size = o8r_le32(r);
-    (void)o8r_le32(r); /* max array */
-    (void)o8r_le32(r); /* continuation flags */
+    col->char_size = col->byte_size = col->max_size; /* 8i: byte semantics only */
+    (void)o8r_le32(r);                               /* max array */
+    (void)o8r_le32(r);                               /* continuation flags */
     if (o8r_le32(r) > 0)
       o8r_value(r, NULL); /* the type's OID */
     (void)o8r_le16(r);    /* version */
@@ -9305,7 +9317,14 @@ int seer_stmt_col_size(SeerStmt *stmt, int col)
 {
   if (stmt == NULL || col < 0 || col >= stmt->ncols)
     return 0;
-  return (int)stmt->cols[col].max_size;
+  return (int)stmt->cols[col].char_size;
+}
+
+int seer_stmt_col_octets(SeerStmt *stmt, int col)
+{
+  if (stmt == NULL || col < 0 || col >= stmt->ncols)
+    return 0;
+  return (int)stmt->cols[col].byte_size;
 }
 
 int seer_stmt_col_precision(SeerStmt *stmt, int col)

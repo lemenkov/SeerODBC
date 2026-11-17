@@ -2362,6 +2362,53 @@ static void check_column_metadata(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Result-column sizes through the descriptor API (#264): the IRD gives what
+ * SQLColAttribute gives (a NUMBER(10,2) is 10 / 2, a DATE's precision 0), a
+ * RAW(16) is 16 on every release, an NVARCHAR2(10) 10 characters with at
+ * least as many bytes. */
+static void check_ird_sizes(SQLHDBC dbc)
+{
+  const char *name = "IRD sizes: NUMBER, RAW, NVARCHAR2, DATE as SQLColAttribute";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_irdsz", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_irdsz (n NUMBER(10,2), r RAW(16), nv NVARCHAR2(10), d DATE)", err,
+          sizeof err);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT n, r, nv, d FROM seer_irdsz", SQL_NTS);
+  /* length, precision, scale per column; octet length checked apart */
+  static const long want[4][3] = {{10, 10, 2}, {16, 16, 0}, {10, 10, 0}, {19, 0, 0}};
+  SQLHDESC ird = NULL;
+  if (SQL_SUCCEEDED(rc))
+    SQLGetStmtAttr(st, SQL_ATTR_IMP_ROW_DESC, &ird, 0, NULL);
+  for (SQLSMALLINT c = 1; SQL_SUCCEEDED(rc) && c <= 4 && m[0] == '\0'; c++) {
+    SQLLEN len = -1, oct = -1, ca_oct = -1, rlen = -1;
+    SQLSMALLINT prec = -1, scale = -1, rprec = -1, rscale = -1, type, sub, nul;
+    SQLGetDescField(ird, c, SQL_DESC_LENGTH, &len, 0, NULL);
+    SQLGetDescField(ird, c, SQL_DESC_OCTET_LENGTH, &oct, 0, NULL);
+    SQLGetDescField(ird, c, SQL_DESC_PRECISION, &prec, 0, NULL);
+    SQLGetDescField(ird, c, SQL_DESC_SCALE, &scale, 0, NULL);
+    SQLGetDescRec(ird, c, NULL, 0, NULL, &type, &sub, &rlen, &rprec, &rscale, &nul);
+    SQLColAttribute(st, (SQLUSMALLINT)c, SQL_DESC_OCTET_LENGTH, NULL, 0, NULL, &ca_oct);
+    if (len != want[c - 1][0] || prec != want[c - 1][1] || scale != want[c - 1][2] ||
+        rprec != prec || rscale != scale)
+      snprintf(
+          m, sizeof m, "column %d: length %ld precision %d / %d scale %d / %d, want %ld %ld %ld", c,
+          (long)len, prec, rprec, scale, rscale, want[c - 1][0], want[c - 1][1], want[c - 1][2]);
+    else if (oct != ca_oct || rlen != oct || (c == 3 && oct < len)) /* nv: bytes >= chars */
+      snprintf(m, sizeof m, "column %d: octet length %ld (rec %ld), SQLColAttribute %ld, size %ld",
+               c, (long)oct, (long)rlen, (long)ca_oct, (long)len);
+  }
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_irdsz", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLGetTypeInfo (#262): it answers on every release (8i refused the UNION
  * with ORA-01790), lists the types the release has in ODBC's order, gives
  * the attributes SQLColAttribute gives a column of the type, and an unknown
@@ -4828,6 +4875,7 @@ int main(void)
     check_diag_fields(dbc);
     check_column_metadata(dbc);
     check_type_info(dbc);
+    check_ird_sizes(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

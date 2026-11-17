@@ -169,9 +169,18 @@ static ColMeta col_meta(OdbcStmt *s, int col)
     break;
   }
   case ORA_TYPE_VARCHAR:
-  case ORA_TYPE_CHAR:
+  case ORA_TYPE_CHAR: {
     m.is_char = 1;
     m.searchable = SQL_PRED_SEARCHABLE;
+    /* The size counts characters, the octet length bytes: a VARCHAR2(20
+     * CHAR) in AL32UTF8 holds up to 80 (#264). */
+    int octets = seer_stmt_col_octets(s->core, col);
+    if (octets > 0)
+      m.octet_length = octets;
+    break;
+  }
+  case ORA_TYPE_RAW: /* two hex digits a byte, as SQL_C_CHAR shows it */
+    m.display_size = 2 * m.column_size;
     break;
   case ORA_TYPE_CLOB: /* LIKE, not = */
     m.is_char = 1;
@@ -474,7 +483,6 @@ SQLRETURN SQL_API SQLGetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
 
   if (d->kind == SEER_DESC_IRD && s->core != NULL) {
     int ora = seer_stmt_col_type(s->core, i);
-    int max = seer_stmt_col_size(s->core, i);
     const char *nm = seer_stmt_col_name(s->core, i);
     switch (FieldIdentifier) {
     case SQL_DESC_TYPE:
@@ -490,21 +498,30 @@ SQLRETURN SQL_API SQLGetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
     case SQL_DESC_BASE_COLUMN_NAME:
       desc_str(nm, ValuePtr, BufferLength, StringLengthPtr);
       return SQL_SUCCESS;
+    /* The sizes as SQLColAttribute gives them, from the same col_meta (#264). */
     case SQL_DESC_LENGTH:
       if (ValuePtr)
-        *(SQLULEN *)ValuePtr = (SQLULEN)display_size_of(ora, max);
+        *(SQLULEN *)ValuePtr = (SQLULEN)col_meta(s, i).column_size;
       return SQL_SUCCESS;
     case SQL_DESC_OCTET_LENGTH:
       if (ValuePtr)
-        *(SQLLEN *)ValuePtr = display_size_of(ora, max);
+        *(SQLLEN *)ValuePtr = col_meta(s, i).octet_length;
       return SQL_SUCCESS;
     case SQL_DESC_PRECISION:
       if (ValuePtr)
-        *(SQLSMALLINT *)ValuePtr = (SQLSMALLINT)display_size_of(ora, max);
+        *(SQLSMALLINT *)ValuePtr = (SQLSMALLINT)col_meta(s, i).precision;
       return SQL_SUCCESS;
     case SQL_DESC_SCALE:
       if (ValuePtr)
-        *(SQLSMALLINT *)ValuePtr = 0;
+        *(SQLSMALLINT *)ValuePtr = col_meta(s, i).scale;
+      return SQL_SUCCESS;
+    case SQL_DESC_DISPLAY_SIZE:
+      if (ValuePtr)
+        *(SQLLEN *)ValuePtr = col_meta(s, i).display_size;
+      return SQL_SUCCESS;
+    case SQL_DESC_NUM_PREC_RADIX:
+      if (ValuePtr)
+        *(SQLINTEGER *)ValuePtr = col_meta(s, i).radix;
       return SQL_SUCCESS;
     case SQL_DESC_NULLABLE:
       if (ValuePtr)
@@ -555,7 +572,6 @@ SQLRETURN SQL_API SQLGetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
     *ScalePtr = 0;
   if (d->kind == SEER_DESC_IRD && s->core != NULL) {
     int ora = seer_stmt_col_type(s->core, i);
-    int max = seer_stmt_col_size(s->core, i);
     const char *nm = seer_stmt_col_name(s->core, i);
     if (Name != NULL && BufferLength > 0) {
       size_t n = nm ? strlen(nm) : 0;
@@ -568,10 +584,13 @@ SQLRETURN SQL_API SQLGetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
       *StringLengthPtr = (SQLSMALLINT)(nm ? strlen(nm) : 0);
     if (TypePtr)
       *TypePtr = (SQLSMALLINT)sql_type_of(ora);
+    ColMeta m = col_meta(s, i); /* as SQLColAttribute (#264) */
     if (LengthPtr)
-      *LengthPtr = display_size_of(ora, max);
+      *LengthPtr = m.octet_length;
     if (PrecisionPtr)
-      *PrecisionPtr = (SQLSMALLINT)display_size_of(ora, max);
+      *PrecisionPtr = (SQLSMALLINT)m.precision;
+    if (ScalePtr)
+      *ScalePtr = m.scale;
     if (NullablePtr)
       *NullablePtr = seer_stmt_col_nullable(s->core, i) ? SQL_NULLABLE : SQL_NO_NULLS;
   } else {
