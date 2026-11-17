@@ -2482,6 +2482,62 @@ static void check_columns_sizes(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLProcedureColumns (#269) describes an argument as SQLColumns describes a
+ * column of the type: a FLOAT is an exact decimal of 38 digits, a DATE has
+ * a size and the datetime codes, only numbers have a radix, an unconstrained
+ * VARCHAR2 is PL/SQL's 32767 and a CLOB 2147483647. */
+static void check_proc_columns(SQLHDBC dbc)
+{
+  const char *name = "SQLProcedureColumns: argument types and sizes";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc,
+          "CREATE OR REPLACE PROCEDURE seer_pcol (n IN NUMBER, v IN OUT VARCHAR2, d OUT DATE,"
+          " f IN FLOAT, c IN CLOB) AS BEGIN NULL; END;",
+          err, sizeof err);
+  /* COLUMN_TYPE DATA_TYPE COLUMN_SIZE BUFFER_LENGTH DECIMAL_DIGITS NUM_PREC_RADIX
+   * SQL_DATA_TYPE SQL_DATETIME_SUB CHAR_OCTET_LENGTH; -1 for NULL */
+  static const long want[5][9] = {{1, 3, 38, 40, -1, 10, 3, -1, -1},
+                                  {2, 12, 32767, 32767, -1, -1, 12, -1, 32767},
+                                  {4, 93, 19, 16, 0, -1, 9, 3, -1},
+                                  {1, 3, 38, 40, -1, 10, 3, -1, -1},
+                                  {1, -1, 2147483647, 2147483647, -1, -1, -1, -1, 2147483647}};
+  static const SQLUSMALLINT cols[9] = {5, 6, 8, 9, 10, 11, 15, 16, 17};
+  char owner[64] = "";
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++)
+    owner[k] = (char)toupper((unsigned char)u[k]);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLProcedureColumns(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_PCOL",
+                                     SQL_NTS, NULL, 0);
+  int rows = 0;
+  while (SQL_SUCCEEDED(rc) && m[0] == '\0' && SQL_SUCCEEDED(SQLFetch(st))) {
+    char an[64] = "";
+    SQLLEN ind;
+    SQLGetData(st, 4, SQL_C_CHAR, an, sizeof an, &ind);
+    int r = rows++;
+    if (r >= 5)
+      break;
+    for (int k = 0; k < 9 && m[0] == '\0'; k++) {
+      SQLINTEGER v = 0;
+      SQLGetData(st, cols[k], SQL_C_SLONG, &v, 0, &ind);
+      long got = ind == SQL_NULL_DATA ? -1 : (long)v;
+      if (got != want[r][k])
+        snprintf(m, sizeof m, "%s: column %d is %ld, want %ld", an, (int)cols[k], got, want[r][k]);
+    }
+  }
+  if (m[0] == '\0' && !SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  else if (m[0] == '\0' && rows != 5)
+    snprintf(m, sizeof m, "%d rows, want 5", rows);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP PROCEDURE seer_pcol", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLGetTypeInfo (#262): it answers on every release (8i refused the UNION
  * with ORA-01790), lists the types the release has in ODBC's order, gives
  * the attributes SQLColAttribute gives a column of the type, and an unknown
@@ -4950,6 +5006,7 @@ int main(void)
     check_type_info(dbc);
     check_ird_sizes(dbc);
     check_columns_sizes(dbc);
+    check_proc_columns(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
