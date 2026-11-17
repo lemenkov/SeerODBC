@@ -2585,6 +2585,40 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLNumParams and SQLDescribeParam (#280): the parameters a prepared
+ * statement has are described, and one past the last is 07009. */
+static void check_describe_param(SQLHDBC dbc)
+{
+  const char *name = "SQLDescribeParam: parameter range";
+  char m[600] = "";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLPrepare(st, (SQLCHAR *)"SELECT :a, :b FROM dual", SQL_NTS);
+  SQLSMALLINT n = -1, t, dd, nl;
+  SQLULEN sz;
+  if (!SQL_SUCCEEDED(rc) || !SQL_SUCCEEDED(SQLNumParams(st, &n)))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  else if (n != 2)
+    snprintf(m, sizeof m, "SQLNumParams %d, want 2", n);
+  for (SQLUSMALLINT k = 1; k <= 3 && m[0] == '\0'; k++) {
+    rc = SQLDescribeParam(st, k, &t, &sz, &dd, &nl);
+    SQLCHAR state[6] = "", msg[256];
+    SQLINTEGER nat;
+    SQLSMALLINT ml;
+    if (!SQL_SUCCEEDED(rc))
+      SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &nat, msg, sizeof msg, &ml);
+    if (k <= 2 && !SQL_SUCCEEDED(rc))
+      snprintf(m, sizeof m, "parameter %u: rc %d %s", k, rc, (char *)state);
+    else if (k == 3 && (rc != SQL_ERROR || strcmp((char *)state, "07009") != 0))
+      snprintf(m, sizeof m, "parameter 3 of 2: rc %d %s, want 07009", rc, (char *)state);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQL_ATTR_METADATA_ID (#278), set on the connection and so taken by the
  * statement allocated after: catalog arguments are identifiers, SEER_N_M
  * not matching SEER_NXM, an unquoted lower-case name folded to upper case, a
@@ -5256,6 +5290,7 @@ int main(void)
     check_key_catalog(dbc);
     check_catalog_names(dbc);
     check_metadata_id(dbc);
+    check_describe_param(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
