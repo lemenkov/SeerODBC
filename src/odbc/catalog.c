@@ -180,28 +180,89 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   return ret;
 }
 
-/* One row of the SQLGetTypeInfo result set, built from dual. The columns the
- * driver actually varies are TYPE_NAME / DATA_TYPE / COLUMN_SIZE /
- * CASE_SENSITIVE / NUM_PREC_RADIX; the rest are sensible constants/NULLs. */
+/* One row of the SQLGetTypeInfo result set, built from dual (#262). The values
+ * agree with SQLColAttribute's for a column of the type. The text fields are
+ * SQL expressions; every one of a column is CAST to the same type, so the
+ * UNION ALL's rows agree, which 8i requires (ORA-01790). */
 static const struct {
   const char *name;
-  int sql_type;
+  int sql_type;     /* concise: DATA_TYPE */
+  int verbose_type; /* SQL_DATA_TYPE */
+  const char *sub;  /* SQL_DATETIME_SUB */
   long column_size;
+  const char *quote; /* LITERAL_PREFIX / LITERAL_SUFFIX */
+  const char *create_params;
   int case_sensitive;
-  const char *radix; /* "10" or "NULL" */
+  int searchable;        /* SQL_PRED_* */
+  const char *is_signed; /* UNSIGNED_ATTRIBUTE, AUTO_UNIQUE_VALUE: 0 for numbers */
+  const char *min_scale, *max_scale;
+  const char *radix;
+  int since; /* the first release with the type */
 } TYPEINFO[] = {
-    {"NUMBER", SQL_DECIMAL, 38, 0, "10"},
-    {"CHAR", SQL_CHAR, 2000, 1, "NULL"},
-    {"VARCHAR2", SQL_VARCHAR, 4000, 1, "NULL"},
-    {"DATE", SQL_TYPE_TIMESTAMP, 19, 0, "NULL"},
-    {"RAW", SQL_VARBINARY, 2000, 0, "NULL"},
-    {"BINARY_FLOAT", SQL_REAL, 7, 0, "10"},
-    {"BINARY_DOUBLE", SQL_DOUBLE, 15, 0, "10"},
-    {"CLOB", SQL_LONGVARCHAR, 2147483647, 1, "NULL"},
-    {"BLOB", SQL_LONGVARBINARY, 2147483647, 0, "NULL"},
-    {"LONG", SQL_LONGVARCHAR, 2147483647, 1, "NULL"},
-    {"LONG RAW", SQL_LONGVARBINARY, 2147483647, 0, "NULL"},
+    {"NUMBER", SQL_DECIMAL, SQL_DECIMAL, "NULL", 38, "NULL", "'precision,scale'", 0, SQL_PRED_BASIC,
+     "0", "-84", "127", "10", 8},
+    {"CHAR", SQL_CHAR, SQL_CHAR, "NULL", 2000, "''''", "'length'", 1, SQL_PRED_SEARCHABLE, "NULL",
+     "NULL", "NULL", "NULL", 8},
+    {"VARCHAR2", SQL_VARCHAR, SQL_VARCHAR, "NULL", 4000, "''''", "'length'", 1, SQL_PRED_SEARCHABLE,
+     "NULL", "NULL", "NULL", "NULL", 8},
+    /* A TIMESTAMP has the fractional seconds SQL_TYPE_TIMESTAMP has, so it
+     * maps more closely and comes first. */
+    {"TIMESTAMP", SQL_TYPE_TIMESTAMP, SQL_DATETIME, "3", 29, "NULL", "'precision'", 0,
+     SQL_PRED_BASIC, "NULL", "0", "9", "NULL", 9},
+    {"DATE", SQL_TYPE_TIMESTAMP, SQL_DATETIME, "3", 19, "NULL", "NULL", 0, SQL_PRED_BASIC, "NULL",
+     "0", "0", "NULL", 8},
+    {"RAW", SQL_VARBINARY, SQL_VARBINARY, "NULL", 2000, "NULL", "'length'", 0, SQL_PRED_BASIC,
+     "NULL", "NULL", "NULL", "NULL", 8},
+    {"BINARY_FLOAT", SQL_REAL, SQL_REAL, "NULL", 7, "NULL", "NULL", 0, SQL_PRED_BASIC, "0", "NULL",
+     "NULL", "10", 10},
+    {"BINARY_DOUBLE", SQL_DOUBLE, SQL_DOUBLE, "NULL", 15, "NULL", "NULL", 0, SQL_PRED_BASIC, "0",
+     "NULL", "NULL", "10", 10},
+    {"CLOB", SQL_LONGVARCHAR, SQL_LONGVARCHAR, "NULL", 2147483647, "''''", "NULL", 1, SQL_PRED_CHAR,
+     "NULL", "NULL", "NULL", "NULL", 8},
+    {"BLOB", SQL_LONGVARBINARY, SQL_LONGVARBINARY, "NULL", 2147483647, "NULL", "NULL", 0,
+     SQL_PRED_NONE, "NULL", "NULL", "NULL", "NULL", 8},
+    {"LONG", SQL_LONGVARCHAR, SQL_LONGVARCHAR, "NULL", 2147483647, "''''", "NULL", 1, SQL_PRED_NONE,
+     "NULL", "NULL", "NULL", "NULL", 8},
+    {"LONG RAW", SQL_LONGVARBINARY, SQL_LONGVARBINARY, "NULL", 2147483647, "NULL", "NULL", 0,
+     SQL_PRED_NONE, "NULL", "NULL", "NULL", "NULL", 8},
 };
+
+/* The server's major release. 9i is the one release that sends no version
+ * word at login (seer_server_version's SEER_ENOTIMPL). */
+static int server_major(OdbcStmt *s)
+{
+  int v[5] = {0};
+  return seer_server_version(s->dbc->conn, v) == SEER_OK ? v[0] : 9;
+}
+
+/* Append TYPEINFO[i]'s row to sql at *off. A leading UNION ALL when it isn't
+ * the first; empty adds WHERE 1=0, a row of the layout and nothing else.
+ * snprintf returns the length it WOULD have written, so the bound is checked
+ * before *off moves: an unchecked one could push it past the buffer. */
+static int append_type_row(char *sql, size_t size, size_t *off, size_t i, int first, int empty)
+{
+  int n = snprintf(
+      sql + *off, size - *off,
+      "%sSELECT %d SEER_RANK, CAST('%s' AS VARCHAR2(30)) TYPE_NAME, %d DATA_TYPE,"
+      " %ld COLUMN_SIZE,"
+      " CAST(%s AS VARCHAR2(1)) LITERAL_PREFIX, CAST(%s AS VARCHAR2(1)) LITERAL_SUFFIX,"
+      " CAST(%s AS VARCHAR2(30)) CREATE_PARAMS, 1 NULLABLE, %d CASE_SENSITIVE,"
+      " %d SEARCHABLE, CAST(%s AS NUMBER) UNSIGNED_ATTRIBUTE, 0 FIXED_PREC_SCALE,"
+      " CAST(%s AS NUMBER) AUTO_UNIQUE_VALUE, CAST(NULL AS VARCHAR2(1)) LOCAL_TYPE_NAME,"
+      " CAST(%s AS NUMBER) MINIMUM_SCALE, CAST(%s AS NUMBER) MAXIMUM_SCALE,"
+      " %d SQL_DATA_TYPE, CAST(%s AS NUMBER) SQL_DATETIME_SUB,"
+      " CAST(%s AS NUMBER) NUM_PREC_RADIX, CAST(NULL AS NUMBER) INTERVAL_PRECISION"
+      " FROM dual%s",
+      first ? "" : " UNION ALL ", (int)i, TYPEINFO[i].name, TYPEINFO[i].sql_type,
+      TYPEINFO[i].column_size, TYPEINFO[i].quote, TYPEINFO[i].quote, TYPEINFO[i].create_params,
+      TYPEINFO[i].case_sensitive, TYPEINFO[i].searchable, TYPEINFO[i].is_signed,
+      TYPEINFO[i].is_signed, TYPEINFO[i].min_scale, TYPEINFO[i].max_scale, TYPEINFO[i].verbose_type,
+      TYPEINFO[i].sub, TYPEINFO[i].radix, empty ? " WHERE 1=0" : "");
+  if (n < 0 || (size_t)n >= size - *off)
+    return -1;
+  *off += (size_t)n;
+  return 0;
+}
 
 SQLRETURN SQL_API SQLGetTypeInfo(SQLHSTMT StatementHandle, SQLSMALLINT DataType)
 {
@@ -212,46 +273,34 @@ SQLRETURN SQL_API SQLGetTypeInfo(SQLHSTMT StatementHandle, SQLSMALLINT DataType)
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  /* Build a UNION ALL of one row per supported type, optionally filtered to
-   * the requested SQL type, ordered by DATA_TYPE (per the ODBC spec). */
-  char sql[8192];
+  /* A UNION ALL of one row per type the server has, optionally filtered to
+   * the requested SQL type, inside a query that names the 19 columns and
+   * orders them: by DATA_TYPE, then by how closely the type maps to it, which
+   * is the table's order (ODBC's rule). The rank isn't in the result set. */
+  char sql[16384];
   size_t off = 0;
-  int emitted = 0;
-  /* Every append is guarded: snprintf returns the length it WOULD have
-   * written, so an unchecked "off += snprintf(...)" (or a negative return
-   * cast to size_t) can push off past the buffer and make the next
-   * "sizeof sql - off" underflow into a huge size_t. The TYPEINFO table is
-   * statically bounded so this cannot overflow today, but guard it anyway. */
+  int emitted = 0, major = server_major(s);
+  int n = snprintf(sql, sizeof sql,
+                   "SELECT TYPE_NAME, DATA_TYPE, COLUMN_SIZE, LITERAL_PREFIX, LITERAL_SUFFIX,"
+                   " CREATE_PARAMS, NULLABLE, CASE_SENSITIVE, SEARCHABLE, UNSIGNED_ATTRIBUTE,"
+                   " FIXED_PREC_SCALE, AUTO_UNIQUE_VALUE, LOCAL_TYPE_NAME, MINIMUM_SCALE,"
+                   " MAXIMUM_SCALE, SQL_DATA_TYPE, SQL_DATETIME_SUB, NUM_PREC_RADIX,"
+                   " INTERVAL_PRECISION FROM (");
+  off = (size_t)n;
   for (size_t i = 0; i < sizeof TYPEINFO / sizeof TYPEINFO[0]; i++) {
-    if (DataType != SQL_ALL_TYPES && DataType != TYPEINFO[i].sql_type)
+    if ((DataType != SQL_ALL_TYPES && DataType != TYPEINFO[i].sql_type) ||
+        major < TYPEINFO[i].since)
       continue;
-    int n = snprintf(
-        sql + off, sizeof sql - off,
-        "%sSELECT '%s' TYPE_NAME, %d DATA_TYPE, %ld COLUMN_SIZE,"
-        " CAST(NULL AS VARCHAR2(1)) LITERAL_PREFIX, CAST(NULL AS VARCHAR2(1)) LITERAL_SUFFIX,"
-        " CAST(NULL AS VARCHAR2(1)) CREATE_PARAMS, 1 NULLABLE, %d CASE_SENSITIVE,"
-        " 3 SEARCHABLE, CAST(NULL AS NUMBER) UNSIGNED_ATTRIBUTE, 0 FIXED_PREC_SCALE,"
-        " CAST(NULL AS NUMBER) AUTO_UNIQUE_VALUE, CAST(NULL AS VARCHAR2(1)) LOCAL_TYPE_NAME,"
-        " 0 MINIMUM_SCALE, 0 MAXIMUM_SCALE, %d SQL_DATA_TYPE,"
-        " CAST(NULL AS NUMBER) SQL_DATETIME_SUB, %s NUM_PREC_RADIX,"
-        " CAST(NULL AS NUMBER) INTERVAL_PRECISION FROM dual",
-        emitted ? " UNION ALL " : "", TYPEINFO[i].name, TYPEINFO[i].sql_type,
-        TYPEINFO[i].column_size, TYPEINFO[i].case_sensitive, TYPEINFO[i].sql_type,
-        TYPEINFO[i].radix);
-    if (n < 0 || (size_t)n >= sizeof sql - off)
+    if (append_type_row(sql, sizeof sql, &off, i, !emitted, 0) != 0)
       return seer_odbc_diag(s, "HY000", 0, "Type-info query too long", SQL_ERROR);
-    off += (size_t)n;
     emitted = 1;
   }
-  if (!emitted) /* unknown requested type: an empty result set */
-    snprintf(sql, sizeof sql,
-             "SELECT CAST(NULL AS VARCHAR2(1)) TYPE_NAME, CAST(NULL AS NUMBER) DATA_TYPE"
-             " FROM dual WHERE 1=0");
-  else {
-    int n = snprintf(sql + off, sizeof sql - off, " ORDER BY DATA_TYPE");
-    if (n < 0 || (size_t)n >= sizeof sql - off)
-      return seer_odbc_diag(s, "HY000", 0, "Type-info query too long", SQL_ERROR);
-  }
+  /* No type matched: an empty result set, still with all 19 columns. */
+  if (!emitted && append_type_row(sql, sizeof sql, &off, 0, 1, 1) != 0)
+    return seer_odbc_diag(s, "HY000", 0, "Type-info query too long", SQL_ERROR);
+  n = snprintf(sql + off, sizeof sql - off, ") ORDER BY DATA_TYPE, SEER_RANK");
+  if (n < 0 || (size_t)n >= sizeof sql - off)
+    return seer_odbc_diag(s, "HY000", 0, "Type-info query too long", SQL_ERROR);
 
   return seer_odbc_run_query(s, sql, NULL, 0);
 }

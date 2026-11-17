@@ -47,7 +47,7 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 | [x] | SQLTables / SQLColumns | |
 | [x] | SQLPrimaryKeys / SQLForeignKeys | |
 | [x] | SQLStatistics | ALL_INDEXES / ALL_IND_COLUMNS |
-| [x] | SQLGetTypeInfo | type table |
+| [x] | SQLGetTypeInfo | type table, per release (TIMESTAMP from 9i, BINARY_FLOAT / DOUBLE from 10g); attributes as SQLColAttribute reports them |
 | [x] | SQLProcedures / SQLProcedureColumns | ALL_OBJECTS / ALL_ARGUMENTS |
 | [x] | SQLSpecialColumns | ROWID for SQL_BEST_ROWID |
 
