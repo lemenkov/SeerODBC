@@ -112,6 +112,14 @@ static SQLLEN display_size_of(int ora_type, int max_size)
      * buffer, and a column size of 1 had applications cut it to its first
      * characters (isql showed "AAAAD"). */
     return 18;
+  case ORA_TYPE_LONG:
+  case ORA_TYPE_LONGRAW:
+  case ORA_TYPE_CLOB:
+  case ORA_TYPE_BLOB:
+  case ORA_TYPE_BFILE:
+    /* As SQLGetTypeInfo has them: the largest SQLINTEGER. The describe's
+     * 4000 (9i NCLOB 2000) is a placeholder, not a limit (#268). */
+    return 2147483647;
   default:
     return max_size > 0 ? max_size : 4000;
   }

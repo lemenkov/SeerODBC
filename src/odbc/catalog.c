@@ -127,7 +127,11 @@ static int server_major(OdbcStmt *s)
   "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 7 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 8"                  \
   "   WHEN DATA_TYPE='RAW' THEN -3"                                                                \
   "   WHEN DATA_TYPE IN ('LONG','CLOB','NCLOB') THEN -1"                                           \
-  "   WHEN DATA_TYPE IN ('LONG RAW','BLOB') THEN -4 ELSE 12 END"
+  "   WHEN DATA_TYPE IN ('LONG RAW','BLOB','BFILE') THEN -4 ELSE 12 END"
+
+/* The long types, whose size is SQLGetTypeInfo's largest SQLINTEGER: the
+ * dictionary has 4000 for a LOB, a placeholder, and 0 for a LONG (#268). */
+#define ODBC_LONG_TYPES "('LONG','CLOB','NCLOB','LONG RAW','BLOB','BFILE')"
 
 /* COLUMN_SIZE as SQLColAttribute gives a result column of the type (#265):
  * a NUMBER's digits (38 undeclared), a FLOAT's binary digits as decimal
@@ -141,6 +145,7 @@ static int server_major(OdbcStmt *s)
   "     DECODE(NVL(DATA_SCALE, 6), 0, 19, 20 + NVL(DATA_SCALE, 6))"                                \
   "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 7 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 15"                 \
   "   WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR','CHAR','NCHAR') THEN %s"                 \
+  "   WHEN DATA_TYPE IN " ODBC_LONG_TYPES " THEN 2147483647"                                       \
   "   ELSE DATA_LENGTH END"
 
 SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
@@ -183,6 +188,7 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
       " CASE WHEN DATA_TYPE IN ('NUMBER','FLOAT') THEN " ODBC_SIZE_CASE " + 2"
       "   WHEN DATA_TYPE='DATE' OR DATA_TYPE LIKE 'TIMESTAMP%%' THEN 16"
       "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 4 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 8"
+      "   WHEN DATA_TYPE IN " ODBC_LONG_TYPES " THEN 2147483647"
       "   ELSE DATA_LENGTH END BUFFER_LENGTH,"
       " CASE WHEN DATA_TYPE='NUMBER' THEN DATA_SCALE"
       "   WHEN DATA_TYPE='DATE' THEN 0"
@@ -197,7 +203,8 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
       " CASE WHEN DATA_TYPE='DATE' OR DATA_TYPE LIKE 'TIMESTAMP%%' THEN 3"
       "   ELSE CAST(NULL AS NUMBER) END SQL_DATETIME_SUB,"
       " CASE WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR','CHAR','NCHAR','RAW')"
-      "   THEN DATA_LENGTH ELSE CAST(NULL AS NUMBER) END CHAR_OCTET_LENGTH,"
+      "   THEN DATA_LENGTH WHEN DATA_TYPE IN " ODBC_LONG_TYPES " THEN 2147483647"
+      "   ELSE CAST(NULL AS NUMBER) END CHAR_OCTET_LENGTH,"
       " COLUMN_ID ORDINAL_POSITION,"
       " DECODE(NULLABLE, 'Y', 'YES', 'NO') IS_NULLABLE"
       " FROM ALL_TAB_COLUMNS"
