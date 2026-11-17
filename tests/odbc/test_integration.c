@@ -2573,6 +2573,73 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Catalog name arguments (#273): a pattern argument honours the '\' escape
+ * SQLGetInfo reports, so SEER\_N\_M is only SEER_N_M, and an ordinary one
+ * is matched literally, so SEER_N_M in SQLSpecialColumns and SQLForeignKeys
+ * isn't also SEER_NXM. */
+static void check_catalog_names(SQLHDBC dbc)
+{
+  const char *name = "Catalog names: pattern escape, literal identifiers";
+  char err[256] = "", m[600] = "";
+  static const char *ddl[] = {
+      "DROP TABLE seer_nfk",
+      "DROP TABLE seer_n_m",
+      "DROP TABLE seer_nxm",
+      "CREATE TABLE seer_n_m (id NUMBER PRIMARY KEY)",
+      "CREATE TABLE seer_nxm (id NUMBER PRIMARY KEY)",
+      "CREATE TABLE seer_nfk (id NUMBER, CONSTRAINT seer_nfk_fk FOREIGN KEY (id)"
+      " REFERENCES seer_nxm (id))"};
+  for (size_t k = 0; k < sizeof ddl / sizeof ddl[0]; k++)
+    exec_do(dbc, ddl[k], err, sizeof err);
+  char owner[64] = "";
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++)
+    owner[k] = (char)toupper((unsigned char)u[k]);
+  SQLCHAR *o = (SQLCHAR *)owner, *esc = (SQLCHAR *)"SEER\\_N\\_M", *lit = (SQLCHAR *)"SEER_N_M";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  for (int k = 0; k < 5 && m[0] == '\0'; k++) {
+    static const char *what[5] = {"SQLTables SEER\\_N\\_M", "SQLColumns SEER\\_N\\_M",
+                                  "SQLTables SEER_N_M (a pattern)", "SQLSpecialColumns SEER_N_M",
+                                  "SQLForeignKeys PK SEER_N_M"};
+    static const int want[5] = {1, 1, 2, 1, 0};
+    SQLRETURN rc;
+    switch (k) {
+    case 0:
+      rc = SQLTables(st, NULL, 0, o, SQL_NTS, esc, SQL_NTS, NULL, 0);
+      break;
+    case 1:
+      rc = SQLColumns(st, NULL, 0, o, SQL_NTS, esc, SQL_NTS, NULL, 0);
+      break;
+    case 2:
+      rc = SQLTables(st, NULL, 0, o, SQL_NTS, lit, SQL_NTS, NULL, 0);
+      break;
+    case 3:
+      rc = SQLSpecialColumns(st, SQL_BEST_ROWID, NULL, 0, o, SQL_NTS, lit, SQL_NTS,
+                             SQL_SCOPE_SESSION, SQL_NULLABLE);
+      break;
+    default:
+      rc = SQLForeignKeys(st, NULL, 0, o, SQL_NTS, lit, SQL_NTS, NULL, 0, NULL, 0, NULL, 0);
+      break;
+    }
+    int rows = 0;
+    while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+      rows++;
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+    else if (rows != want[k])
+      snprintf(m, sizeof m, "%s: %d rows, want %d", what[k], rows, want[k]);
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  for (size_t k = 0; k < 3; k++)
+    exec_do(dbc, ddl[k], err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLProcedureColumns (#269) describes an argument as SQLColumns describes a
  * column of the type: a FLOAT is an exact decimal of 38 digits, a DATE has
  * a size and the datetime codes, only numbers have a radix, an unconstrained
@@ -5099,6 +5166,7 @@ int main(void)
     check_columns_sizes(dbc);
     check_proc_columns(dbc);
     check_key_catalog(dbc);
+    check_catalog_names(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
