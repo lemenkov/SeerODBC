@@ -2482,6 +2482,97 @@ static void check_columns_sizes(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLPrimaryKeys, SQLStatistics and SQLForeignKeys answer on every release
+ * (#272: 8i refused their ANSI joins and simple CASE) and describe a
+ * parent's primary and unique keys and a child's ON DELETE CASCADE key. */
+static void check_key_catalog(SQLHDBC dbc)
+{
+  const char *name = "SQLPrimaryKeys / SQLStatistics / SQLForeignKeys";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_kc", err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_kp", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_kp (id NUMBER PRIMARY KEY, u NUMBER UNIQUE)", err, sizeof err);
+  exec_do(dbc,
+          "CREATE TABLE seer_kc (pid NUMBER, CONSTRAINT seer_kc_fk FOREIGN KEY (pid)"
+          " REFERENCES seer_kp (id) ON DELETE CASCADE)",
+          err, sizeof err);
+  char owner[64] = "";
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++)
+    owner[k] = (char)toupper((unsigned char)u[k]);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  char col[64];
+  SQLLEN ind;
+  SQLINTEGER v = 0;
+  int rows = 0;
+
+  SQLRETURN rc =
+      SQLPrimaryKeys(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_KP", SQL_NTS);
+  while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+    rows++;
+    col[0] = '\0';
+    SQLGetData(st, 4, SQL_C_CHAR, col, sizeof col, &ind);
+    SQLGetData(st, 5, SQL_C_SLONG, &v, 0, &ind);
+    if (strcmp(col, "ID") != 0 || v != 1)
+      snprintf(m, sizeof m, "SQLPrimaryKeys: column %s seq %d, want ID 1", col, (int)v);
+  }
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  else if (m[0] == '\0' && rows != 1)
+    snprintf(m, sizeof m, "SQLPrimaryKeys: %d rows, want 1", rows);
+  SQLFreeStmt(st, SQL_CLOSE);
+
+  if (m[0] == '\0') {
+    rows = 0;
+    rc = SQLStatistics(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_KP", SQL_NTS,
+                       SQL_INDEX_ALL, SQL_QUICK);
+    while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+      col[0] = '\0';
+      SQLGetData(st, 9, SQL_C_CHAR, col, sizeof col, &ind);
+      if (ind == SQL_NULL_DATA) /* a table-statistics row has no column */
+        continue;
+      rows++;
+      SQLGetData(st, 4, SQL_C_SLONG, &v, 0, &ind);
+      if (v != 0)
+        snprintf(m, sizeof m, "SQLStatistics: index on %s NON_UNIQUE %d, want 0", col, (int)v);
+    }
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+    else if (m[0] == '\0' && rows != 2)
+      snprintf(m, sizeof m, "SQLStatistics: %d index columns, want 2 (ID, U)", rows);
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+
+  if (m[0] == '\0') {
+    rows = 0;
+    rc = SQLForeignKeys(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_KP", SQL_NTS, NULL,
+                        0, NULL, 0, NULL, 0);
+    while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+      rows++;
+      char fkt[64] = "";
+      col[0] = '\0';
+      SQLGetData(st, 7, SQL_C_CHAR, fkt, sizeof fkt, &ind);
+      SQLGetData(st, 8, SQL_C_CHAR, col, sizeof col, &ind);
+      SQLGetData(st, 11, SQL_C_SLONG, &v, 0, &ind);
+      if (strcmp(fkt, "SEER_KC") != 0 || strcmp(col, "PID") != 0 || v != SQL_CASCADE)
+        snprintf(m, sizeof m, "SQLForeignKeys: %s.%s delete rule %d, want SEER_KC.PID %d", fkt, col,
+                 (int)v, SQL_CASCADE);
+    }
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+    else if (m[0] == '\0' && rows != 1)
+      snprintf(m, sizeof m, "SQLForeignKeys: %d rows, want 1", rows);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_kc", err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_kp", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLProcedureColumns (#269) describes an argument as SQLColumns describes a
  * column of the type: a FLOAT is an exact decimal of 38 digits, a DATE has
  * a size and the datetime codes, only numbers have a radix, an unconstrained
@@ -5007,6 +5098,7 @@ int main(void)
     check_ird_sizes(dbc);
     check_columns_sizes(dbc);
     check_proc_columns(dbc);
+    check_key_catalog(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
