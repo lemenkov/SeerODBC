@@ -11,6 +11,8 @@
  * given (SQL_ATTR_METADATA_ID off), an ordinary one - the names
  * SQLPrimaryKeys, SQLStatistics, SQLForeignKeys and SQLSpecialColumns take -
  * escaped so it matches only itself. A NULL argument matches everything.
+ * With SQL_ATTR_METADATA_ID on (#278) every one is an identifier: quoted
+ * kept as written, unquoted upper-cased, matching only itself; NULL is HY009.
  *
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -56,14 +58,54 @@ static char *name_dup(const void *s, SQLSMALLINT len, int literal)
   return d;
 }
 
-static char *pattern_dup(const void *s, SQLSMALLINT len)
+/* With SQL_ATTR_METADATA_ID (#278) an argument is an identifier: quoted, it
+ * loses its quotes ("" being one ") and keeps its case; unquoted, it loses
+ * its trailing blanks and is upper-cased, as Oracle folds it. Either way it
+ * then matches only itself. */
+static char *identifier_dup(const char *p, SQLSMALLINT len)
 {
-  return name_dup(s, len, 0);
+  size_t n = (len == SQL_NTS) ? strlen(p) : (size_t)len;
+  char *id = malloc(n + 1);
+  if (id == NULL)
+    return NULL;
+  size_t o = 0;
+  if (n >= 2 && p[0] == '"' && p[n - 1] == '"') {
+    for (size_t i = 1; i + 1 < n; i++) {
+      id[o++] = p[i];
+      if (p[i] == '"' && p[i + 1] == '"' && i + 2 < n)
+        i++;
+    }
+  } else {
+    while (n > 0 && p[n - 1] == ' ')
+      n--;
+    for (size_t i = 0; i < n; i++)
+      id[o++] = (p[i] >= 'a' && p[i] <= 'z') ? (char)(p[i] - 'a' + 'A') : p[i];
+  }
+  id[o] = '\0';
+  /* An empty identifier binds as NULL, which no name matches. */
+  char *d = o == 0 ? strdup("") : name_dup(id, SQL_NTS, 1);
+  free(id);
+  return d;
 }
 
-static char *ident_dup(const void *s, SQLSMALLINT len)
+/* A pattern argument (SQLTables, SQLColumns, SQLProcedures,
+ * SQLProcedureColumns) and an ordinary one (the others). */
+static char *pattern_dup(const OdbcStmt *st, const void *s, SQLSMALLINT len)
 {
-  return name_dup(s, len, 1);
+  return st->metadata_id && s != NULL ? identifier_dup(s, len) : name_dup(s, len, 0);
+}
+
+static char *ident_dup(const OdbcStmt *st, const void *s, SQLSMALLINT len)
+{
+  return st->metadata_id && s != NULL ? identifier_dup(s, len) : name_dup(s, len, 1);
+}
+
+/* With SQL_ATTR_METADATA_ID an identifier cannot be absent: HY009. */
+static SQLRETURN null_identifier(OdbcStmt *s)
+{
+  return seer_odbc_diag(s, "HY009", 0,
+                        "SQL_ATTR_METADATA_ID is set and a schema or name argument is NULL",
+                        SQL_ERROR);
 }
 
 SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLSMALLINT NameLength1,
@@ -79,9 +121,11 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *table = pattern_dup(TableName, NameLength3);
-  char *types = (TableType == NULL) ? strdup("") : pattern_dup(TableType, NameLength4);
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL))
+    return null_identifier(s);
+  char *schema = pattern_dup(s, SchemaName, NameLength2);
+  char *table = pattern_dup(s, TableName, NameLength3);
+  char *types = (TableType == NULL) ? strdup("") : name_dup(TableType, NameLength4, 0);
   if (schema == NULL || table == NULL || types == NULL) {
     free(schema);
     free(table);
@@ -192,9 +236,11 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *table = pattern_dup(TableName, NameLength3);
-  char *column = pattern_dup(ColumnName, NameLength4);
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL || ColumnName == NULL))
+    return null_identifier(s);
+  char *schema = pattern_dup(s, SchemaName, NameLength2);
+  char *table = pattern_dup(s, TableName, NameLength3);
+  char *column = pattern_dup(s, ColumnName, NameLength4);
   if (schema == NULL || table == NULL || column == NULL) {
     free(schema);
     free(table);
@@ -392,8 +438,10 @@ SQLRETURN SQL_API SQLPrimaryKeys(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = ident_dup(SchemaName, NameLength2);
-  char *table = ident_dup(TableName, NameLength3);
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL))
+    return null_identifier(s);
+  char *schema = ident_dup(s, SchemaName, NameLength2);
+  char *table = ident_dup(s, TableName, NameLength3);
   if (schema == NULL || table == NULL) {
     free(schema);
     free(table);
@@ -431,8 +479,10 @@ SQLRETURN SQL_API SQLStatistics(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = ident_dup(SchemaName, NameLength2);
-  char *table = ident_dup(TableName, NameLength3);
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL))
+    return null_identifier(s);
+  char *schema = ident_dup(s, SchemaName, NameLength2);
+  char *table = ident_dup(s, TableName, NameLength3);
   if (schema == NULL || table == NULL) {
     free(schema);
     free(table);
@@ -496,10 +546,13 @@ SQLRETURN SQL_API SQLForeignKeys(SQLHSTMT StatementHandle, SQLCHAR *PKCatalogNam
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *pksch = ident_dup(PKSchemaName, PKL2);
-  char *pktab = ident_dup(PKTableName, PKL3);
-  char *fksch = ident_dup(FKSchemaName, FKL2);
-  char *fktab = ident_dup(FKTableName, FKL3);
+  if (s->metadata_id &&
+      (PKSchemaName == NULL || PKTableName == NULL || FKSchemaName == NULL || FKTableName == NULL))
+    return null_identifier(s);
+  char *pksch = ident_dup(s, PKSchemaName, PKL2);
+  char *pktab = ident_dup(s, PKTableName, PKL3);
+  char *fksch = ident_dup(s, FKSchemaName, FKL2);
+  char *fktab = ident_dup(s, FKTableName, FKL3);
   if (!pksch || !pktab || !fksch || !fktab) {
     free(pksch);
     free(pktab);
@@ -553,8 +606,10 @@ SQLRETURN SQL_API SQLProcedures(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *proc = pattern_dup(ProcName, NameLength3);
+  if (s->metadata_id && (SchemaName == NULL || ProcName == NULL))
+    return null_identifier(s);
+  char *schema = pattern_dup(s, SchemaName, NameLength2);
+  char *proc = pattern_dup(s, ProcName, NameLength3);
   if (schema == NULL || proc == NULL) {
     free(schema);
     free(proc);
@@ -595,9 +650,11 @@ SQLRETURN SQL_API SQLProcedureColumns(SQLHSTMT StatementHandle, SQLCHAR *Catalog
   if (s->dbc == NULL || !s->dbc->connected)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
 
-  char *schema = pattern_dup(SchemaName, NameLength2);
-  char *proc = pattern_dup(ProcName, NameLength3);
-  char *column = pattern_dup(ColumnName, NameLength4);
+  if (s->metadata_id && (SchemaName == NULL || ProcName == NULL || ColumnName == NULL))
+    return null_identifier(s);
+  char *schema = pattern_dup(s, SchemaName, NameLength2);
+  char *proc = pattern_dup(s, ProcName, NameLength3);
+  char *column = pattern_dup(s, ColumnName, NameLength4);
   if (schema == NULL || proc == NULL || column == NULL) {
     free(schema);
     free(proc);
@@ -697,8 +754,10 @@ SQLRETURN SQL_API SQLSpecialColumns(SQLHSTMT StatementHandle, SQLUSMALLINT Ident
   /* SQL_BEST_ROWID: the best unique row identifier on Oracle is the ROWID
    * pseudo-column. Emit one descriptor row if the table exists (SCOPE =
    * SQL_SCOPE_SESSION, PSEUDO_COLUMN = SQL_PC_PSEUDO, DATA_TYPE = SQL_VARCHAR). */
-  char *schema = ident_dup(SchemaName, NameLength2);
-  char *table = ident_dup(TableName, NameLength3);
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL))
+    return null_identifier(s);
+  char *schema = ident_dup(s, SchemaName, NameLength2);
+  char *table = ident_dup(s, TableName, NameLength3);
   if (schema == NULL || table == NULL) {
     free(schema);
     free(table);

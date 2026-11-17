@@ -114,6 +114,7 @@ typedef struct {
   long login_timeout;        /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
   SQLUINTEGER txn_isolation; /* SQL_ATTR_TXN_ISOLATION, 0 = the server's default (#220) */
   SQLUINTEGER conn_timeout;  /* SQL_ATTR_CONNECTION_TIMEOUT, seconds; 0 = none (#228) */
+  SQLUINTEGER metadata_id;   /* SQL_ATTR_METADATA_ID: the default for new statements (#278) */
   char *browse_cs;
   /* For SQLGetInfo (#234): the DSN connected through ("" without one), the
    * user and the service or SID, kept from the connect. */
@@ -206,6 +207,7 @@ typedef struct {
   SQLULEN max_length;    /* SQL_ATTR_MAX_LENGTH: bytes of a char / binary value, 0 = all (#248) */
   SQLULEN noscan;        /* SQL_ATTR_NOSCAN: SQL_NOSCAN_ON sends the text unscanned (#248) */
   SQLULEN max_rows;      /* SQL_ATTR_MAX_ROWS; 0 = no limit (#221) */
+  SQLULEN metadata_id;   /* SQL_ATTR_METADATA_ID: catalog arguments are identifiers (#278) */
   SQLULEN cursor_type;   /* SQL_ATTR_CURSOR_TYPE: FORWARD_ONLY (0) or STATIC (#226) */
   SQLULEN sensitivity;   /* SQL_ATTR_CURSOR_SENSITIVITY: UNSPECIFIED (0) or INSENSITIVE */
   int updatable;         /* this result set supports positioned DML */

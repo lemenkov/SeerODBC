@@ -104,6 +104,8 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     c->login_timeout = (long)(SQLULEN)ValuePtr;
   if (Attribute == SQL_ATTR_CONNECTION_TIMEOUT) /* seconds any call may wait (#228) */
     c->conn_timeout = (SQLUINTEGER)(SQLULEN)ValuePtr;
+  if (Attribute == SQL_ATTR_METADATA_ID) /* the statements allocated after take it (#278) */
+    c->metadata_id = (SQLULEN)ValuePtr == SQL_TRUE ? SQL_TRUE : SQL_FALSE;
   if (Attribute == SQL_ATTR_TXN_ISOLATION)
     return seer_odbc_apply_isolation(c, (SQLUINTEGER)(SQLULEN)ValuePtr);
   /* Connection timeout, tracing, etc.: accept as no-ops. */
@@ -184,7 +186,10 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   case SQL_ATTR_QUIET_MODE:
     *(SQLPOINTER *)ValuePtr = NULL;
     return SQL_SUCCESS;
-  default: /* the 32-bit ones: ACCESS_MODE read-write, AUTO_IPD and METADATA_ID false, ... */
+  case SQL_ATTR_METADATA_ID:
+    *(SQLUINTEGER *)ValuePtr = c->metadata_id;
+    return SQL_SUCCESS;
+  default: /* the 32-bit ones: ACCESS_MODE read-write, AUTO_IPD false, ... */
     *(SQLUINTEGER *)ValuePtr = 0;
     return SQL_SUCCESS;
   }
@@ -255,11 +260,8 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_FETCH_BOOKMARK_PTR:
     s->fetch_bookmark = (SQLLEN *)ValuePtr;
     return SQL_SUCCESS;
-  case SQL_ATTR_METADATA_ID: /* catalog arguments as identifiers: not yet */
-    if ((SQLULEN)(uintptr_t)ValuePtr != SQL_FALSE)
-      return seer_odbc_diag(s, "HYC00", 0,
-                            "SQL_ATTR_METADATA_ID is not supported: catalog arguments are patterns",
-                            SQL_ERROR);
+  case SQL_ATTR_METADATA_ID: /* catalog arguments as identifiers (#278) */
+    s->metadata_id = (SQLULEN)(uintptr_t)ValuePtr == SQL_TRUE ? SQL_TRUE : SQL_FALSE;
     return SQL_SUCCESS;
   case SQL_ATTR_MAX_LENGTH: /* bytes of a char / binary value returned (#248) */
     s->max_length = (SQLULEN)(uintptr_t)ValuePtr;
@@ -384,8 +386,10 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_KEYSET_SIZE:
   case SQL_ATTR_USE_BOOKMARKS: /* SQL_UB_OFF */
   case SQL_ATTR_ENABLE_AUTO_IPD:
-  case SQL_ATTR_METADATA_ID:
     *(SQLULEN *)ValuePtr = 0;
+    return SQL_SUCCESS;
+  case SQL_ATTR_METADATA_ID:
+    *(SQLULEN *)ValuePtr = s->metadata_id;
     return SQL_SUCCESS;
   case SQL_ATTR_SIMULATE_CURSOR: /* positioned DML by ROWID: one row each */
     *(SQLULEN *)ValuePtr = SQL_SC_UNIQUE;
