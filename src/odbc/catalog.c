@@ -441,22 +441,39 @@ SQLRETURN SQL_API SQLStatistics(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
 
   /* SQL_INDEX_OTHER = 3, ASC_OR_DESC is the leading char of DESCEND. Comma
    * joins and DECODE: 8i has neither JOIN ... ON nor a simple CASE (#272). */
-  char sql[1400];
+  /* First the SQL_TABLE_STAT (0) row (#275): the table's rows and blocks as
+   * of its last statistics gathering, NULL if none - what SQL_QUICK asks
+   * for. Every column CAST, as 8i's UNION ALL wants the types to agree
+   * (ORA-01790); the outer ORDER BY puts that row before the indexes, whose
+   * NULL NON_UNIQUE would otherwise sort it last. */
+  char sql[3072];
   snprintf(sql, sizeof sql,
-           "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, i.TABLE_OWNER TABLE_SCHEM,"
-           " i.TABLE_NAME, DECODE(i.UNIQUENESS, 'UNIQUE', 0, 1) NON_UNIQUE,"
-           " CAST(NULL AS VARCHAR2(128)) INDEX_QUALIFIER, i.INDEX_NAME, 3 TYPE,"
-           " ic.COLUMN_POSITION ORDINAL_POSITION, ic.COLUMN_NAME,"
-           " SUBSTR(ic.DESCEND, 1, 1) ASC_OR_DESC, i.DISTINCT_KEYS CARDINALITY,"
-           " i.LEAF_BLOCKS PAGES, CAST(NULL AS VARCHAR2(1)) FILTER_CONDITION"
+           "SELECT TABLE_CAT, TABLE_SCHEM, TABLE_NAME, NON_UNIQUE, INDEX_QUALIFIER, INDEX_NAME,"
+           " TYPE, ORDINAL_POSITION, COLUMN_NAME, ASC_OR_DESC, CARDINALITY, PAGES,"
+           " FILTER_CONDITION FROM ("
+           "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, CAST(OWNER AS VARCHAR2(128)) TABLE_SCHEM,"
+           " CAST(TABLE_NAME AS VARCHAR2(128)) TABLE_NAME, CAST(NULL AS NUMBER) NON_UNIQUE,"
+           " CAST(NULL AS VARCHAR2(128)) INDEX_QUALIFIER, CAST(NULL AS VARCHAR2(128)) INDEX_NAME,"
+           " 0 TYPE, CAST(NULL AS NUMBER) ORDINAL_POSITION,"
+           " CAST(NULL AS VARCHAR2(4000)) COLUMN_NAME, CAST(NULL AS VARCHAR2(1)) ASC_OR_DESC,"
+           " CAST(NUM_ROWS AS NUMBER) CARDINALITY, CAST(BLOCKS AS NUMBER) PAGES,"
+           " CAST(NULL AS VARCHAR2(1)) FILTER_CONDITION"
+           " FROM ALL_TABLES WHERE OWNER LIKE :1 ESCAPE '\\' AND TABLE_NAME LIKE :2 ESCAPE '\\'"
+           " UNION ALL "
+           "SELECT CAST(NULL AS VARCHAR2(128)), CAST(i.TABLE_OWNER AS VARCHAR2(128)),"
+           " CAST(i.TABLE_NAME AS VARCHAR2(128)), DECODE(i.UNIQUENESS, 'UNIQUE', 0, 1),"
+           " CAST(NULL AS VARCHAR2(128)), CAST(i.INDEX_NAME AS VARCHAR2(128)), 3,"
+           " CAST(ic.COLUMN_POSITION AS NUMBER), CAST(ic.COLUMN_NAME AS VARCHAR2(4000)),"
+           " CAST(SUBSTR(ic.DESCEND, 1, 1) AS VARCHAR2(1)), CAST(i.DISTINCT_KEYS AS NUMBER),"
+           " CAST(i.LEAF_BLOCKS AS NUMBER), CAST(NULL AS VARCHAR2(1))"
            " FROM ALL_INDEXES i, ALL_IND_COLUMNS ic"
            " WHERE i.OWNER = ic.INDEX_OWNER AND i.INDEX_NAME = ic.INDEX_NAME"
-           "   AND i.TABLE_OWNER LIKE :1 ESCAPE '\\' AND i.TABLE_NAME LIKE :2 ESCAPE '\\'%s"
-           " ORDER BY NON_UNIQUE, i.INDEX_NAME, ic.COLUMN_POSITION",
+           "   AND i.TABLE_OWNER LIKE :3 ESCAPE '\\' AND i.TABLE_NAME LIKE :4 ESCAPE '\\'%s"
+           ") ORDER BY TYPE, NON_UNIQUE, INDEX_NAME, ORDINAL_POSITION",
            Unique == SQL_INDEX_UNIQUE ? " AND i.UNIQUENESS = 'UNIQUE'" : "");
 
-  const char *params[2] = {schema, table};
-  SQLRETURN ret = seer_odbc_run_query(s, sql, params, 2);
+  const char *params[4] = {schema, table, schema, table};
+  SQLRETURN ret = seer_odbc_run_query(s, sql, params, 4);
   free(schema);
   free(table);
   return ret;
