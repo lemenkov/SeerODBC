@@ -2362,6 +2362,65 @@ static void check_column_metadata(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLGetTypeInfo (#262): it answers on every release (8i refused the UNION
+ * with ORA-01790), lists the types the release has in ODBC's order, gives
+ * the attributes SQLColAttribute gives a column of the type, and an unknown
+ * type is an empty set of the 19 columns. */
+static void check_type_info(SQLHDBC dbc)
+{
+  const char *name = "SQLGetTypeInfo: per-release types and attributes";
+  char m[600] = "", got[400] = "";
+  const char *want = g_release <= 8   ? "BLOB,LONG RAW,RAW,CLOB,LONG,CHAR,NUMBER,VARCHAR2,DATE"
+                     : g_release == 9 ? "BLOB,LONG RAW,RAW,CLOB,LONG,CHAR,NUMBER,VARCHAR2,"
+                                        "TIMESTAMP,DATE"
+                                      : "BLOB,LONG RAW,RAW,CLOB,LONG,CHAR,NUMBER,BINARY_FLOAT,"
+                                        "BINARY_DOUBLE,VARCHAR2,TIMESTAMP,DATE";
+  /* name, then prefix, SEARCHABLE, MINIMUM_SCALE, MAXIMUM_SCALE, SQL_DATA_TYPE,
+   * SQL_DATETIME_SUB as text ("-" for NULL) */
+  static const char *const rows[][7] = {{"VARCHAR2", "'", "3", "-", "-", "12", "-"},
+                                        {"NUMBER", "-", "2", "-84", "127", "3", "-"},
+                                        {"CLOB", "'", "1", "-", "-", "-1", "-"},
+                                        {"BLOB", "-", "0", "-", "-", "-4", "-"},
+                                        {"DATE", "-", "2", "0", "0", "9", "3"}};
+  static const SQLUSMALLINT cols[6] = {4, 9, 14, 15, 16, 17};
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLGetTypeInfo(st, SQL_ALL_TYPES);
+  while (SQL_SUCCEEDED(rc) && m[0] == '\0' && SQL_SUCCEEDED(SQLFetch(st))) {
+    char tn[40] = "", v[6][40];
+    SQLLEN ind;
+    SQLGetData(st, 1, SQL_C_CHAR, tn, sizeof tn, &ind);
+    snprintf(got + strlen(got), sizeof got - strlen(got), "%s%s", got[0] ? "," : "", tn);
+    for (int k = 0; k < 6; k++) {
+      v[k][0] = '\0';
+      SQLGetData(st, cols[k], SQL_C_CHAR, v[k], sizeof v[k], &ind);
+      if (ind == SQL_NULL_DATA)
+        strcpy(v[k], "-");
+    }
+    for (size_t r = 0; r < sizeof rows / sizeof rows[0]; r++)
+      for (int k = 0; strcmp(tn, rows[r][0]) == 0 && k < 6 && m[0] == '\0'; k++)
+        if (strcmp(v[k], rows[r][k + 1]) != 0)
+          snprintf(m, sizeof m, "%s column %u: '%s', want '%s'", tn, cols[k], v[k], rows[r][k + 1]);
+  }
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  else if (m[0] == '\0' && strcmp(got, want) != 0)
+    snprintf(m, sizeof m, "types %s, want %s", got, want);
+  SQLFreeStmt(st, SQL_CLOSE);
+  if (m[0] == '\0') { /* SQL_GUID: no such type */
+    SQLSMALLINT nc = 0;
+    rc = SQLGetTypeInfo(st, SQL_GUID);
+    SQLNumResultCols(st, &nc);
+    if (!SQL_SUCCEEDED(rc) || nc != 19 || SQLFetch(st) != SQL_NO_DATA)
+      snprintf(m, sizeof m, "SQL_GUID: rc %d, %d columns, want an empty set of 19", rc, nc);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Column bindings live until unbound (#244): bound before the first
  * execute, they fill on the fetch; the same statement executed again with a
  * new parameter fills the same buffer; after SQL_UNBIND a fetch leaves it be. */
@@ -4768,6 +4827,7 @@ int main(void)
     check_ref_params(dbc);
     check_diag_fields(dbc);
     check_column_metadata(dbc);
+    check_type_info(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
