@@ -2409,6 +2409,74 @@ static void check_ird_sizes(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLColumns (#265) describes each column as SQLDescribeCol describes it in a
+ * result set: the type, size and digits agree; a DATE is SQL_DATETIME /
+ * SQL_CODE_TIMESTAMP with BUFFER_LENGTH 16; a character column has no
+ * radix; a RAW(16) is 16 and an NVARCHAR2(10) 10. */
+static void check_columns_sizes(SQLHDBC dbc)
+{
+  const char *name = "SQLColumns: sizes and types as the result-set describe";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_colsz", err, sizeof err);
+  exec_do(dbc,
+          "CREATE TABLE seer_colsz (n NUMBER(10,2), f FLOAT, v VARCHAR2(20), d DATE, r RAW(16),"
+          " nv NVARCHAR2(10))",
+          err, sizeof err);
+  enum { NCOL = 6 };
+  SQLSMALLINT dtype[NCOL], digits[NCOL];
+  SQLULEN size[NCOL];
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT n, f, v, d, r, nv FROM seer_colsz", SQL_NTS);
+  for (SQLUSMALLINT c = 0; SQL_SUCCEEDED(rc) && c < NCOL; c++)
+    SQLDescribeCol(st, c + 1, NULL, 0, NULL, &dtype[c], &size[c], &digits[c], NULL);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  SQLFreeStmt(st, SQL_CLOSE);
+  int rows = 0;
+  char owner[64] = ""; /* the test user's schema: the beds are shared */
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++)
+    owner[k] = (char)toupper((unsigned char)u[k]);
+  if (m[0] == '\0')
+    rc = SQLColumns(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_COLSZ", SQL_NTS, NULL,
+                    0);
+  while (m[0] == '\0' && SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+    SQLINTEGER
+    v[7]; /* DATA_TYPE COLUMN_SIZE BUFFER_LENGTH DECIMAL_DIGITS RADIX SQL_DATA_TYPE SUB */
+    SQLLEN ind[7];
+    static const SQLUSMALLINT cols[7] = {5, 7, 8, 9, 10, 14, 15};
+    for (int k = 0; k < 7; k++)
+      SQLGetData(st, cols[k], SQL_C_SLONG, &v[k], 0, &ind[k]);
+    int c = rows++;
+    if (c >= NCOL)
+      break;
+    long want_size = c == 4 ? 16 : (long)size[c]; /* RAW: its declared length */
+    if (v[0] != dtype[c] || v[1] != want_size || (ind[3] != SQL_NULL_DATA && v[3] != digits[c]))
+      snprintf(m, sizeof m, "column %d: type %d size %d digits %d, describe %d / %ld / %d", c + 1,
+               (int)v[0], (int)v[1], ind[3] == SQL_NULL_DATA ? -1 : (int)v[3], (int)dtype[c],
+               want_size, (int)digits[c]);
+    else if (c == 3 &&
+             (v[2] != 16 || v[5] != SQL_DATETIME || v[6] != SQL_CODE_TIMESTAMP || v[3] != 0))
+      snprintf(m, sizeof m, "DATE: buffer %d digits %d SQL_DATA_TYPE %d SUB %d, want 16 0 9 3",
+               (int)v[2], (int)v[3], (int)v[5], (int)v[6]);
+    else if (c == 2 && ind[4] != SQL_NULL_DATA)
+      snprintf(m, sizeof m, "VARCHAR2: NUM_PREC_RADIX %d, want NULL", (int)v[4]);
+    else if (c == 5 && v[1] != 10)
+      snprintf(m, sizeof m, "NVARCHAR2(10): size %d, want 10", (int)v[1]);
+  }
+  if (m[0] == '\0' && !SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+  else if (m[0] == '\0' && rows != NCOL)
+    snprintf(m, sizeof m, "%d rows, want %d", rows, NCOL);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_colsz", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLGetTypeInfo (#262): it answers on every release (8i refused the UNION
  * with ORA-01790), lists the types the release has in ODBC's order, gives
  * the attributes SQLColAttribute gives a column of the type, and an unknown
@@ -4876,6 +4944,7 @@ int main(void)
     check_column_metadata(dbc);
     check_type_info(dbc);
     check_ird_sizes(dbc);
+    check_columns_sizes(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

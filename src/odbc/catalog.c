@@ -107,6 +107,42 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
   return ret;
 }
 
+/* The server's major release. 9i is the one release that sends no version
+ * word at login (seer_server_version's SEER_ENOTIMPL). */
+static int server_major(OdbcStmt *s)
+{
+  int v[5] = {0};
+  return seer_server_version(s->dbc->conn, v) == SEER_OK ? v[0] : 9;
+}
+
+/* A dictionary DATA_TYPE as its ODBC concise type, the one a result column
+ * of the type describes as (results.c sql_type_of): a FLOAT is a NUMBER with
+ * a binary precision, fetched as an exact decimal. */
+#define ODBC_TYPE_CASE                                                                             \
+  " CASE"                                                                                          \
+  "   WHEN DATA_TYPE IN ('NUMBER','FLOAT') THEN 3"                                                 \
+  "   WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR') THEN 12"                                \
+  "   WHEN DATA_TYPE IN ('CHAR','NCHAR') THEN 1"                                                   \
+  "   WHEN DATA_TYPE='DATE' THEN 93 WHEN DATA_TYPE LIKE 'TIMESTAMP%%' THEN 93"                     \
+  "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 7 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 8"                  \
+  "   WHEN DATA_TYPE='RAW' THEN -3"                                                                \
+  "   WHEN DATA_TYPE IN ('LONG','CLOB','NCLOB') THEN -1"                                           \
+  "   WHEN DATA_TYPE IN ('LONG RAW','BLOB') THEN -4 ELSE 12 END"
+
+/* COLUMN_SIZE as SQLColAttribute gives a result column of the type (#265):
+ * a NUMBER's digits (38 undeclared), a FLOAT's binary digits as decimal
+ * ones, a datetime's characters, a character column's characters. %s is the
+ * dictionary's character length: CHAR_LENGTH from 9i, 8i's declared length. */
+#define ODBC_SIZE_CASE                                                                             \
+  " CASE WHEN DATA_TYPE='NUMBER' THEN NVL(DATA_PRECISION, 38)"                                     \
+  "   WHEN DATA_TYPE='FLOAT' THEN CEIL(NVL(DATA_PRECISION, 126) * 0.30103)"                        \
+  "   WHEN DATA_TYPE='DATE' THEN 19"                                                               \
+  "   WHEN DATA_TYPE LIKE 'TIMESTAMP%%' THEN"                                                      \
+  "     DECODE(NVL(DATA_SCALE, 6), 0, 19, 20 + NVL(DATA_SCALE, 6))"                                \
+  "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 7 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 15"                 \
+  "   WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR','CHAR','NCHAR') THEN %s"                 \
+  "   ELSE DATA_LENGTH END"
+
 SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
                              SQLSMALLINT NameLength1, SQLCHAR *SchemaName, SQLSMALLINT NameLength2,
                              SQLCHAR *TableName, SQLSMALLINT NameLength3, SQLCHAR *ColumnName,
@@ -131,39 +167,35 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   }
 
-  /* The 18-column SQLColumns result set. DATA_TYPE / SQL_DATA_TYPE carry the
-   * ODBC type code (CASE over Oracle's textual DATA_TYPE). COLUMN_DEF is
-   * forced NULL - ALL_TAB_COLUMNS.DATA_DEFAULT is a LONG and not needed.
-   * Searched CASE and DECODE only: a simple CASE (CASE x WHEN ...) is 9i
-   * SQL, and 8i refuses the query with ORA-00923. */
+  /* The 18-column SQLColumns result set, each column described as
+   * SQLColAttribute describes it in a result set (#265). DATA_TYPE carries
+   * the concise ODBC type, SQL_DATA_TYPE the verbose one (SQL_DATETIME for
+   * a datetime, with SQL_CODE_TIMESTAMP in SQL_DATETIME_SUB). BUFFER_LENGTH
+   * is the bytes of the default C type: a NUMBER's text, the
+   * SQL_TIMESTAMP_STRUCT, a binary float's 4 or 8, else the dictionary's
+   * bytes. COLUMN_DEF is forced NULL - ALL_TAB_COLUMNS.DATA_DEFAULT is a LONG
+   * and not needed. Searched CASE and DECODE only: a simple CASE (CASE x
+   * WHEN ...) is 9i SQL, and 8i refuses the query with ORA-00923. */
   static const char *COLUMNS_SQL =
       "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, OWNER TABLE_SCHEM,"
-      " TABLE_NAME, COLUMN_NAME,"
-      " CASE"
-      "   WHEN DATA_TYPE='NUMBER' THEN 3 WHEN DATA_TYPE='FLOAT' THEN 6"
-      "   WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR') THEN 12"
-      "   WHEN DATA_TYPE IN ('CHAR','NCHAR') THEN 1"
-      "   WHEN DATA_TYPE='DATE' THEN 93 WHEN DATA_TYPE LIKE 'TIMESTAMP%' THEN 93"
-      "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 7 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 8"
-      "   WHEN DATA_TYPE='RAW' THEN -3"
-      "   WHEN DATA_TYPE IN ('LONG','CLOB','NCLOB') THEN -1"
-      "   WHEN DATA_TYPE IN ('LONG RAW','BLOB') THEN -4 ELSE 12 END DATA_TYPE,"
-      " DATA_TYPE TYPE_NAME,"
-      " CASE WHEN DATA_TYPE='NUMBER' THEN NVL(DATA_PRECISION, 38) ELSE DATA_LENGTH END COLUMN_SIZE,"
-      " DATA_LENGTH BUFFER_LENGTH, DATA_SCALE DECIMAL_DIGITS,"
-      " 10 NUM_PREC_RADIX,"
+      " TABLE_NAME, COLUMN_NAME," ODBC_TYPE_CASE " DATA_TYPE,"
+      " DATA_TYPE TYPE_NAME," ODBC_SIZE_CASE " COLUMN_SIZE,"
+      " CASE WHEN DATA_TYPE IN ('NUMBER','FLOAT') THEN " ODBC_SIZE_CASE " + 2"
+      "   WHEN DATA_TYPE='DATE' OR DATA_TYPE LIKE 'TIMESTAMP%%' THEN 16"
+      "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 4 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 8"
+      "   ELSE DATA_LENGTH END BUFFER_LENGTH,"
+      " CASE WHEN DATA_TYPE='NUMBER' THEN DATA_SCALE"
+      "   WHEN DATA_TYPE='DATE' THEN 0"
+      "   WHEN DATA_TYPE LIKE 'TIMESTAMP%%' THEN NVL(DATA_SCALE, 6)"
+      "   ELSE CAST(NULL AS NUMBER) END DECIMAL_DIGITS,"
+      " CASE WHEN DATA_TYPE IN ('NUMBER','FLOAT','BINARY_FLOAT','BINARY_DOUBLE') THEN 10"
+      "   ELSE CAST(NULL AS NUMBER) END NUM_PREC_RADIX,"
       " DECODE(NULLABLE, 'Y', 1, 0) NULLABLE,"
       " CAST(NULL AS VARCHAR2(1)) REMARKS, CAST(NULL AS VARCHAR2(1)) COLUMN_DEF,"
-      " CASE"
-      "   WHEN DATA_TYPE='NUMBER' THEN 3 WHEN DATA_TYPE='FLOAT' THEN 6"
-      "   WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR') THEN 12"
-      "   WHEN DATA_TYPE IN ('CHAR','NCHAR') THEN 1"
-      "   WHEN DATA_TYPE='DATE' THEN 93 WHEN DATA_TYPE LIKE 'TIMESTAMP%' THEN 93"
-      "   WHEN DATA_TYPE='BINARY_FLOAT' THEN 7 WHEN DATA_TYPE='BINARY_DOUBLE' THEN 8"
-      "   WHEN DATA_TYPE='RAW' THEN -3"
-      "   WHEN DATA_TYPE IN ('LONG','CLOB','NCLOB') THEN -1"
-      "   WHEN DATA_TYPE IN ('LONG RAW','BLOB') THEN -4 ELSE 12 END SQL_DATA_TYPE,"
-      " CAST(NULL AS NUMBER) SQL_DATETIME_SUB,"
+      " CASE WHEN DATA_TYPE='DATE' OR DATA_TYPE LIKE 'TIMESTAMP%%' THEN 9"
+      "   ELSE" ODBC_TYPE_CASE " END SQL_DATA_TYPE,"
+      " CASE WHEN DATA_TYPE='DATE' OR DATA_TYPE LIKE 'TIMESTAMP%%' THEN 3"
+      "   ELSE CAST(NULL AS NUMBER) END SQL_DATETIME_SUB,"
       " CASE WHEN DATA_TYPE IN ('VARCHAR2','NVARCHAR2','VARCHAR','CHAR','NCHAR','RAW')"
       "   THEN DATA_LENGTH ELSE CAST(NULL AS NUMBER) END CHAR_OCTET_LENGTH,"
       " COLUMN_ID ORDINAL_POSITION,"
@@ -171,9 +203,20 @@ SQLRETURN SQL_API SQLColumns(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
       " FROM ALL_TAB_COLUMNS"
       " WHERE OWNER LIKE :1 AND TABLE_NAME LIKE :2 AND COLUMN_NAME LIKE :3"
       " ORDER BY OWNER, TABLE_NAME, COLUMN_ID";
+  /* The character length twice: COLUMN_SIZE, and BUFFER_LENGTH's copy of it
+   * (unused there, as only numbers take that branch). */
+  const char *chars = server_major(s) >= 9 ? "CHAR_LENGTH" : "CHAR_COL_DECL_LENGTH";
+  char sql[8192];
+  int n = snprintf(sql, sizeof sql, COLUMNS_SQL, chars, chars);
+  if (n < 0 || (size_t)n >= sizeof sql) {
+    free(schema);
+    free(table);
+    free(column);
+    return seer_odbc_diag(s, "HY000", 0, "SQLColumns query too long", SQL_ERROR);
+  }
 
   const char *params[3] = {schema, table, column};
-  SQLRETURN ret = seer_odbc_run_query(s, COLUMNS_SQL, params, 3);
+  SQLRETURN ret = seer_odbc_run_query(s, sql, params, 3);
   free(schema);
   free(table);
   free(column);
@@ -226,14 +269,6 @@ static const struct {
     {"LONG RAW", SQL_LONGVARBINARY, SQL_LONGVARBINARY, "NULL", 2147483647, "NULL", "NULL", 0,
      SQL_PRED_NONE, "NULL", "NULL", "NULL", "NULL", 8},
 };
-
-/* The server's major release. 9i is the one release that sends no version
- * word at login (seer_server_version's SEER_ENOTIMPL). */
-static int server_major(OdbcStmt *s)
-{
-  int v[5] = {0};
-  return seer_server_version(s->dbc->conn, v) == SEER_OK ? v[0] : 9;
-}
 
 /* Append TYPEINFO[i]'s row to sql at *off. A leading UNION ALL when it isn't
  * the first; empty adds WHERE 1=0, a row of the layout and nothing else.
