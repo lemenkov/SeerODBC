@@ -853,11 +853,16 @@ SQLRETURN SQL_API SQLDescribeParam(SQLHSTMT StatementHandle, SQLUSMALLINT Parame
                                    SQLSMALLINT *DataTypePtr, SQLULEN *ParameterSizePtr,
                                    SQLSMALLINT *DecimalDigitsPtr, SQLSMALLINT *NullablePtr)
 {
-  (void)ParameterNumber;
   OdbcStmt *s = (OdbcStmt *)StatementHandle;
   if (s == NULL)
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(s);
+  /* A parameter the statement has: 1 to what SQLNumParams counts (#280). */
+  int n = seer_sql_count_params(s->sql);
+  if (n <= 0)
+    n = (int)s->num_params;
+  if (ParameterNumber < 1 || ParameterNumber > n)
+    return seer_odbc_diag(s, "07009", 0, "Invalid descriptor index: no such parameter", SQL_ERROR);
   /* The driver does not introspect parameter types (Oracle does not describe
    * placeholders before execute), so report the universal default: a
    * character type the app can bind anything to. */
