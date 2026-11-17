@@ -108,12 +108,47 @@ static SQLRETURN null_identifier(OdbcStmt *s)
                         SQL_ERROR);
 }
 
+/* Whether a non-NULL argument is exactly v. */
+static int arg_is(const SQLCHAR *p, SQLSMALLINT len, const char *v)
+{
+  if (p == NULL)
+    return 0;
+  size_t n = (len == SQL_NTS) ? strlen((const char *)p) : (size_t)len;
+  return n == strlen(v) && memcmp(p, v, n) == 0;
+}
+
+/* SQLTables' TableType (#282): a comma-separated list of names, each
+ * possibly in single quotes, compared whole and in any case. NULL, empty or
+ * "%" is every type. */
+static void table_types(const SQLCHAR *p, SQLSMALLINT len, int *want_table, int *want_view)
+{
+  size_t n = p == NULL ? 0 : (len == SQL_NTS) ? strlen((const char *)p) : (size_t)len;
+  if (n == 0 || arg_is(p, len, "%")) {
+    *want_table = *want_view = 1;
+    return;
+  }
+  const char *s = (const char *)p, *end = s + n;
+  while (s < end) {
+    const char *e = memchr(s, ',', (size_t)(end - s));
+    if (e == NULL)
+      e = end;
+    const char *a = s, *b = e;
+    while (a < b && (*a == ' ' || *a == '\''))
+      a++;
+    while (b > a && (b[-1] == ' ' || b[-1] == '\''))
+      b--;
+    if (b - a == 5 && strncasecmp(a, "TABLE", 5) == 0)
+      *want_table = 1;
+    else if (b - a == 4 && strncasecmp(a, "VIEW", 4) == 0)
+      *want_view = 1;
+    s = e + 1;
+  }
+}
+
 SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLSMALLINT NameLength1,
                             SQLCHAR *SchemaName, SQLSMALLINT NameLength2, SQLCHAR *TableName,
                             SQLSMALLINT NameLength3, SQLCHAR *TableType, SQLSMALLINT NameLength4)
 {
-  (void)CatalogName;
-  (void)NameLength1; /* Oracle has no catalogs */
   OdbcStmt *s = (OdbcStmt *)StatementHandle;
   if (s == NULL)
     return SQL_INVALID_HANDLE;
@@ -123,21 +158,51 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
 
   if (s->metadata_id && (SchemaName == NULL || TableName == NULL))
     return null_identifier(s);
-  char *schema = pattern_dup(s, SchemaName, NameLength2);
-  char *table = pattern_dup(s, TableName, NameLength3);
-  char *types = (TableType == NULL) ? strdup("") : name_dup(TableType, NameLength4, 0);
-  if (schema == NULL || table == NULL || types == NULL) {
-    free(schema);
-    free(table);
-    free(types);
-    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+
+  /* The enumerations (#282), patterns only: SQL_ALL_CATALOGS (none in
+   * Oracle), SQL_ALL_SCHEMAS (the users) and SQL_ALL_TABLE_TYPES (those
+   * this function returns). The catalog may be NULL as well as "". */
+  static const char *NO_ROWS_SQL =
+      "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, CAST(NULL AS VARCHAR2(128)) TABLE_SCHEM,"
+      " CAST(NULL AS VARCHAR2(128)) TABLE_NAME, CAST(NULL AS VARCHAR2(128)) TABLE_TYPE,"
+      " CAST(NULL AS VARCHAR2(1)) REMARKS FROM DUAL WHERE 1 = 0";
+  if (!s->metadata_id) {
+    int cat_empty = CatalogName == NULL || arg_is(CatalogName, NameLength1, "");
+    int sch_empty = arg_is(SchemaName, NameLength2, "");
+    int tab_empty = arg_is(TableName, NameLength3, "");
+    if (arg_is(CatalogName, NameLength1, "%") && sch_empty && tab_empty)
+      return seer_odbc_run_query(s, NO_ROWS_SQL, NULL, 0);
+    if (cat_empty && arg_is(SchemaName, NameLength2, "%") && tab_empty)
+      return seer_odbc_run_query(
+          s,
+          "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, USERNAME TABLE_SCHEM,"
+          " CAST(NULL AS VARCHAR2(128)) TABLE_NAME, CAST(NULL AS VARCHAR2(128)) TABLE_TYPE,"
+          " CAST(NULL AS VARCHAR2(1)) REMARKS FROM ALL_USERS ORDER BY 2",
+          NULL, 0);
+    if (cat_empty && sch_empty && tab_empty && arg_is(TableType, NameLength4, "%"))
+      return seer_odbc_run_query(
+          s,
+          "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, CAST(NULL AS VARCHAR2(128)) TABLE_SCHEM,"
+          " CAST(NULL AS VARCHAR2(128)) TABLE_NAME, CAST('TABLE' AS VARCHAR2(128)) TABLE_TYPE,"
+          " CAST(NULL AS VARCHAR2(1)) REMARKS FROM DUAL UNION ALL"
+          " SELECT CAST(NULL AS VARCHAR2(128)), CAST(NULL AS VARCHAR2(128)),"
+          " CAST(NULL AS VARCHAR2(128)), CAST('VIEW' AS VARCHAR2(128)),"
+          " CAST(NULL AS VARCHAR2(1)) FROM DUAL",
+          NULL, 0);
   }
 
-  int all = (types[0] == '\0' || strcmp(types, "%") == 0);
-  int want_table = all || seer_strcasestr(types, "TABLE") != NULL;
-  int want_view = all || seer_strcasestr(types, "VIEW") != NULL;
-  if (!want_table && !want_view) /* a specific, unknown type list */
-    want_table = want_view = 0;
+  int want_table = 0, want_view = 0;
+  table_types(TableType, NameLength4, &want_table, &want_view);
+  if (!want_table && !want_view) /* only types this function doesn't return */
+    return seer_odbc_run_query(s, NO_ROWS_SQL, NULL, 0);
+
+  char *schema = pattern_dup(s, SchemaName, NameLength2);
+  char *table = pattern_dup(s, TableName, NameLength3);
+  if (schema == NULL || table == NULL) {
+    free(schema);
+    free(table);
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  }
 
   static const char *TABLES_SQL =
       "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, OWNER TABLE_SCHEM,"
@@ -177,7 +242,6 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
   SQLRETURN ret = seer_odbc_run_query(s, sql, params, nparams);
   free(schema);
   free(table);
-  free(types);
   return ret;
 }
 
