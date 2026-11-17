@@ -2585,6 +2585,82 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQL_ATTR_METADATA_ID (#278), set on the connection and so taken by the
+ * statement allocated after: catalog arguments are identifiers, SEER_N_M
+ * not matching SEER_NXM, an unquoted lower-case name folded to upper case, a
+ * quoted one kept as written, and a NULL one HY009. */
+static void check_metadata_id(SQLHDBC dbc)
+{
+  const char *name = "SQL_ATTR_METADATA_ID: catalog arguments as identifiers";
+  char err[256] = "", m[600] = "";
+  static const char *ddl[] = {"DROP TABLE seer_n_m",
+                              "DROP TABLE seer_nxm",
+                              "DROP TABLE \"seer_Nq\"",
+                              "CREATE TABLE seer_n_m (id NUMBER PRIMARY KEY)",
+                              "CREATE TABLE seer_nxm (id NUMBER PRIMARY KEY)",
+                              "CREATE TABLE \"seer_Nq\" (id NUMBER)"};
+  for (size_t k = 0; k < sizeof ddl / sizeof ddl[0]; k++)
+    exec_do(dbc, ddl[k], err, sizeof err);
+  char owner[64] = "", lower[64] = "";
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++) {
+    owner[k] = (char)toupper((unsigned char)u[k]);
+    lower[k] = (char)tolower((unsigned char)u[k]);
+  }
+  SQLRETURN rc = SQLSetConnectAttr(dbc, SQL_ATTR_METADATA_ID, (SQLPOINTER)SQL_TRUE, 0);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_DBC, dbc, m, sizeof m);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLULEN v = 0;
+  SQLGetStmtAttr(st, SQL_ATTR_METADATA_ID, &v, 0, NULL);
+  if (m[0] == '\0' && v != SQL_TRUE)
+    snprintf(m, sizeof m, "a new statement has METADATA_ID %lu, want 1", (unsigned long)v);
+  for (int k = 0; k < 4 && m[0] == '\0'; k++) {
+    static const char *what[4] = {"SQLTables SEER_N_M", "SQLTables seer_n_m (folded)",
+                                  "SQLTables \"seer_Nq\" (quoted)", "SQLColumns column NULL"};
+    static const int want[4] = {1, 1, 1, -1};
+    if (k == 0)
+      rc = SQLTables(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_N_M", SQL_NTS, NULL,
+                     0);
+    else if (k == 1)
+      rc = SQLTables(st, NULL, 0, (SQLCHAR *)lower, SQL_NTS, (SQLCHAR *)"seer_n_m", SQL_NTS, NULL,
+                     0);
+    else if (k == 2)
+      rc = SQLTables(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"\"seer_Nq\"", SQL_NTS,
+                     NULL, 0);
+    else
+      rc = SQLColumns(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_N_M", SQL_NTS, NULL,
+                      0);
+    if (want[k] < 0) {
+      SQLCHAR state[6] = "";
+      SQLINTEGER nat;
+      SQLSMALLINT ml;
+      SQLCHAR msg[256];
+      SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &nat, msg, sizeof msg, &ml);
+      if (rc != SQL_ERROR || strcmp((char *)state, "HY009") != 0)
+        snprintf(m, sizeof m, "%s: rc %d state %s, want HY009", what[k], rc, (char *)state);
+    } else {
+      int rows = 0;
+      while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
+        rows++;
+      if (!SQL_SUCCEEDED(rc))
+        diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+      else if (rows != want[k])
+        snprintf(m, sizeof m, "%s: %d rows, want %d", what[k], rows, want[k]);
+    }
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  SQLSetConnectAttr(dbc, SQL_ATTR_METADATA_ID, (SQLPOINTER)SQL_FALSE, 0);
+  for (size_t k = 0; k < 3; k++)
+    exec_do(dbc, ddl[k], err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Catalog name arguments (#273): a pattern argument honours the '\' escape
  * SQLGetInfo reports, so SEER\_N\_M is only SEER_N_M, and an ordinary one
  * is matched literally, so SEER_N_M in SQLSpecialColumns and SQLForeignKeys
@@ -5179,6 +5255,7 @@ int main(void)
     check_proc_columns(dbc);
     check_key_catalog(dbc);
     check_catalog_names(dbc);
+    check_metadata_id(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
