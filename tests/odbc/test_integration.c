@@ -2585,6 +2585,75 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLTables' enumerations and type list (#282): SQL_ALL_CATALOGS is empty,
+ * SQL_ALL_SCHEMAS one row per user (the test user among them, no table
+ * names), SQL_ALL_TABLE_TYPES TABLE and VIEW; a type list is compared by
+ * whole names, so 'SYNONYM' finds none of seer_te's rows. */
+static void check_tables_enum(SQLHDBC dbc)
+{
+  const char *name = "SQLTables: catalog, schema and table-type enumerations";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_te", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_te (id NUMBER)", err, sizeof err);
+  char owner[64] = "";
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++)
+    owner[k] = (char)toupper((unsigned char)u[k]);
+  SQLCHAR *E = (SQLCHAR *)"", *A = (SQLCHAR *)"%", *T = (SQLCHAR *)"SEER_TE";
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  for (int k = 0; k < 5 && m[0] == '\0'; k++) {
+    static const char *what[5] = {"SQL_ALL_CATALOGS", "SQL_ALL_SCHEMAS", "SQL_ALL_TABLE_TYPES",
+                                  "types 'SYNONYM'", "types 'VIEW', 'TABLE'"};
+    SQLRETURN rc;
+    if (k == 0)
+      rc = SQLTables(st, A, SQL_NTS, E, SQL_NTS, E, SQL_NTS, NULL, 0);
+    else if (k == 1)
+      rc = SQLTables(st, E, SQL_NTS, A, SQL_NTS, E, SQL_NTS, NULL, 0);
+    else if (k == 2)
+      rc = SQLTables(st, E, SQL_NTS, E, SQL_NTS, E, SQL_NTS, A, SQL_NTS);
+    else
+      rc = SQLTables(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, T, SQL_NTS,
+                     (SQLCHAR *)(k == 3 ? "'SYNONYM'" : "'VIEW', 'TABLE'"), SQL_NTS);
+    int rows = 0, mine = 0, named = 0;
+    char types[64] = "";
+    while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+      char sch[130] = "", tab[130] = "", typ[130] = "";
+      SQLLEN ind;
+      rows++;
+      SQLGetData(st, 2, SQL_C_CHAR, sch, sizeof sch, &ind);
+      SQLGetData(st, 3, SQL_C_CHAR, tab, sizeof tab, &ind);
+      if (ind != SQL_NULL_DATA)
+        named++;
+      SQLGetData(st, 4, SQL_C_CHAR, typ, sizeof typ, &ind);
+      if (strcmp(sch, owner) == 0)
+        mine++;
+      if (k == 2 && strlen(types) + strlen(typ) + 2 < sizeof types) {
+        strcat(types, typ);
+        strcat(types, " ");
+      }
+    }
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+    else if (k == 0 && rows != 0)
+      snprintf(m, sizeof m, "%s: %d rows, want 0", what[k], rows);
+    else if (k == 1 && (mine != 1 || named != 0))
+      snprintf(m, sizeof m, "%s: %d rows for %s, %d with a table name; want 1 and 0", what[k], mine,
+               owner, named);
+    else if (k == 2 && strcmp(types, "TABLE VIEW ") != 0)
+      snprintf(m, sizeof m, "%s: %s, want TABLE VIEW", what[k], types);
+    else if (k >= 3 && rows != (k == 3 ? 0 : 1))
+      snprintf(m, sizeof m, "%s: %d rows, want %d", what[k], rows, k == 3 ? 0 : 1);
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_te", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLNumParams and SQLDescribeParam (#280): the parameters a prepared
  * statement has are described, and one past the last is 07009. */
 static void check_describe_param(SQLHDBC dbc)
@@ -5291,6 +5360,7 @@ int main(void)
     check_catalog_names(dbc);
     check_metadata_id(dbc);
     check_describe_param(dbc);
+    check_tables_enum(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);
