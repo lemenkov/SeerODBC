@@ -2585,6 +2585,91 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLCopyDesc (#289), the classic row copy: a SELECT's ARD becomes an
+ * INSERT's APD and its IRD the INSERT's IPD, so each fetched row inserts as
+ * it is. A target IRD is HY016; an unprepared statement's IRD is HY007. */
+static void check_copy_desc(SQLHDBC dbc)
+{
+  const char *name = "SQLCopyDesc: ARD to APD and IRD to IPD copy rows";
+  char err[256] = "", m[600] = "";
+  static const char *ddl[] = {"DROP TABLE seer_cd_src",
+                              "DROP TABLE seer_cd_dst",
+                              "CREATE TABLE seer_cd_src (id NUMBER, nm VARCHAR2(20))",
+                              "CREATE TABLE seer_cd_dst (id NUMBER, nm VARCHAR2(20))",
+                              "INSERT INTO seer_cd_src VALUES (1, 'one')",
+                              "INSERT INTO seer_cd_src VALUES (2, NULL)",
+                              "INSERT INTO seer_cd_src VALUES (3, 'three')"};
+  for (size_t k = 0; k < sizeof ddl / sizeof ddl[0]; k++)
+    exec_do(dbc, ddl[k], err, sizeof err);
+  SQLHSTMT sel, ins, idle;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &sel);
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &ins);
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &idle);
+  SQLINTEGER id = 0;
+  char nm[21] = "";
+  SQLLEN id_ind = 0, nm_ind = 0;
+  SQLBindCol(sel, 1, SQL_C_SLONG, &id, 0, &id_ind);
+  SQLBindCol(sel, 2, SQL_C_CHAR, nm, sizeof nm, &nm_ind);
+  SQLHDESC ard, ird, apd, ipd, idle_ird;
+  SQLGetStmtAttr(sel, SQL_ATTR_APP_ROW_DESC, &ard, 0, NULL);
+  SQLGetStmtAttr(sel, SQL_ATTR_IMP_ROW_DESC, &ird, 0, NULL);
+  SQLGetStmtAttr(ins, SQL_ATTR_APP_PARAM_DESC, &apd, 0, NULL);
+  SQLGetStmtAttr(ins, SQL_ATTR_IMP_PARAM_DESC, &ipd, 0, NULL);
+  SQLGetStmtAttr(idle, SQL_ATTR_IMP_ROW_DESC, &idle_ird, 0, NULL);
+  if (!SQL_SUCCEEDED(
+          SQLExecDirect(sel, (SQLCHAR *)"SELECT id, nm FROM seer_cd_src ORDER BY id", SQL_NTS)))
+    diag_text(SQL_HANDLE_STMT, sel, m, sizeof m);
+  if (m[0] == '\0' &&
+      !SQL_SUCCEEDED(SQLPrepare(ins, (SQLCHAR *)"INSERT INTO seer_cd_dst VALUES (?, ?)", SQL_NTS)))
+    diag_text(SQL_HANDLE_STMT, ins, m, sizeof m);
+  if (m[0] == '\0' && !SQL_SUCCEEDED(SQLCopyDesc(ard, apd)))
+    diag_text(SQL_HANDLE_DESC, apd, m, sizeof m);
+  if (m[0] == '\0' && !SQL_SUCCEEDED(SQLCopyDesc(ird, ipd)))
+    diag_text(SQL_HANDLE_DESC, ipd, m, sizeof m);
+  int rows = 0;
+  while (m[0] == '\0' && SQL_SUCCEEDED(SQLFetch(sel))) {
+    rows++;
+    if (!SQL_SUCCEEDED(SQLExecute(ins)))
+      diag_text(SQL_HANDLE_STMT, ins, m, sizeof m);
+  }
+  SQLCHAR state[6] = "", msg[200];
+  SQLINTEGER nat;
+  SQLSMALLINT ml;
+  if (m[0] == '\0') {
+    SQLRETURN rc = SQLCopyDesc(ard, ird);
+    SQLGetDiagRec(SQL_HANDLE_DESC, ird, 1, state, &nat, msg, sizeof msg, &ml);
+    if (rc != SQL_ERROR || strcmp((char *)state, "HY016") != 0)
+      snprintf(m, sizeof m, "copy to an IRD: rc %d %s, want HY016", rc, (char *)state);
+  }
+  if (m[0] == '\0') {
+    state[0] = '\0';
+    SQLRETURN rc = SQLCopyDesc(idle_ird, apd);
+    SQLGetDiagRec(SQL_HANDLE_DESC, apd, 1, state, &nat, msg, sizeof msg, &ml);
+    if (rc != SQL_ERROR || strcmp((char *)state, "HY007") != 0)
+      snprintf(m, sizeof m, "copy from an unprepared IRD: rc %d %s, want HY007", rc, (char *)state);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, idle);
+  SQLFreeHandle(SQL_HANDLE_STMT, ins);
+  SQLFreeHandle(SQL_HANDLE_STMT, sel);
+  if (m[0] == '\0') {
+    char got[128] = "";
+    exec_scalar(dbc,
+                "SELECT COUNT(*) || ':' || SUM(id) || ':' || MAX(DECODE(id, 1, nm)) || ':' || "
+                "NVL(MAX(DECODE(id, 2, nm)), 'null') || ':' || MAX(DECODE(id, 3, nm)) FROM "
+                "seer_cd_dst",
+                got, sizeof got, err, sizeof err);
+    if (rows != 3 || strcmp(got, "3:6:one:null:three") != 0)
+      snprintf(m, sizeof m, "%d rows copied, target '%s'; want 3, '3:6:one:null:three' %s", rows,
+               got, err);
+  }
+  exec_do(dbc, "DROP TABLE seer_cd_dst", err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_cd_src", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static const char *stmt_state(SQLHSTMT st, SQLRETURN rc, char *state)
 {
   SQLINTEGER nat;
@@ -5526,6 +5611,7 @@ int main(void)
     check_tables_enum(dbc);
     check_privileges(dbc);
     check_cursor_names(dbc);
+    check_copy_desc(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

@@ -804,6 +804,154 @@ SQLRETURN SQL_API SQLSetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
   return SQL_SUCCESS;
 }
 
+/* One descriptor record, whichever kind it comes from (#289): an application
+ * descriptor's (ARD / APD) C type, buffer, length and indicator, an
+ * implementation descriptor's (IRD / IPD) SQL type, size, direction and REF
+ * type. */
+typedef struct {
+  SQLSMALLINT type;
+  SQLPOINTER buf;
+  SQLLEN buflen;
+  SQLLEN *indicator;
+  int bound;
+  SQLULEN size;
+  SQLSMALLINT io_type;
+  const char *ref_type;
+} DescRec;
+
+static int app_desc(SeerDescKind k)
+{
+  return k == SEER_DESC_ARD || k == SEER_DESC_APD;
+}
+
+static DescRec desc_rec_get(OdbcStmt *s, SeerDescKind k, int i)
+{
+  DescRec r = {0};
+  r.io_type = SQL_PARAM_INPUT;
+  if (k == SEER_DESC_ARD) {
+    const OdbcBind *b = &s->binds[i];
+    r = (DescRec){b->target_type, b->buf, b->buflen,       b->indicator,
+                  b->bound,       0,      SQL_PARAM_INPUT, NULL};
+  } else if (k == SEER_DESC_APD) {
+    const OdbcParam *p = &s->params[i];
+    r = (DescRec){p->c_type, p->buf, p->buflen, p->indicator, p->bound, 0, SQL_PARAM_INPUT, NULL};
+  } else if (k == SEER_DESC_IPD) {
+    const OdbcParam *p = &s->params[i];
+    r.type = p->sql_type;
+    r.size = p->column_size;
+    r.io_type = p->io_type ? p->io_type : SQL_PARAM_INPUT;
+    r.ref_type = p->ref_type;
+  } else { /* IRD: the result column as described */
+    r.type = (SQLSMALLINT)sql_type_of(seer_stmt_col_type(s->core, i));
+    r.size = (SQLULEN)col_meta(s, i).column_size;
+  }
+  return r;
+}
+
+/* Write a record. Between the two classes only the type carries over; the
+ * other half of a parameter record (APD vs IPD, one array) is kept. */
+static SQLRETURN desc_rec_put(OdbcStmt *s, SeerDescKind k, int i, const DescRec *r, int same)
+{
+  if (k == SEER_DESC_ARD) {
+    OdbcBind *b = &s->binds[i];
+    *b = same ? (OdbcBind){r->type, r->buf, r->buflen, r->indicator, r->bound}
+              : (OdbcBind){r->type, NULL, 0, NULL, 0};
+    return SQL_SUCCESS;
+  }
+  OdbcParam *p = &s->params[i];
+  if (k == SEER_DESC_APD) {
+    p->c_type = r->type;
+    p->buf = same ? r->buf : NULL;
+    p->buflen = same ? r->buflen : 0;
+    p->indicator = same ? r->indicator : NULL;
+    p->bound = same ? r->bound : 0;
+    return SQL_SUCCESS;
+  }
+  p->sql_type = r->type; /* IPD */
+  if (!same)
+    return SQL_SUCCESS;
+  p->column_size = r->size;
+  p->io_type = r->io_type;
+  char *ref = r->ref_type != NULL ? strdup(r->ref_type) : NULL;
+  if (r->ref_type != NULL && ref == NULL)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  free(p->ref_type);
+  p->ref_type = ref;
+  return SQL_SUCCESS;
+}
+
+/* SQLCopyDesc (#289): every record and, between descriptors of one class,
+ * the header fields the statement keeps for them (array size, bind type and
+ * offset, status and rows-processed pointers). A target IRD is read-only
+ * (HY016); a source IRD needs a prepared or executed statement (HY007). */
+SQLRETURN SQL_API SQLCopyDesc(SQLHDESC SourceDescHandle, SQLHDESC TargetDescHandle)
+{
+  OdbcDesc *sd = (OdbcDesc *)SourceDescHandle, *td = (OdbcDesc *)TargetDescHandle;
+  if (sd == NULL || td == NULL)
+    return SQL_INVALID_HANDLE;
+  seer_odbc_diag_clear(td);
+  if (td->kind == SEER_DESC_IRD)
+    return seer_odbc_diag(td, "HY016", 0, "Cannot modify an implementation row descriptor",
+                          SQL_ERROR);
+  if (sd == td)
+    return SQL_SUCCESS;
+  OdbcStmt *ss = (OdbcStmt *)sd->stmt, *ts = (OdbcStmt *)td->stmt;
+  if (sd->kind == SEER_DESC_IRD && ss->core == NULL &&
+      (ss->sql == NULL || seer_odbc_describe_prepared(ss) != SQL_SUCCESS || ss->core == NULL))
+    return seer_odbc_diag(td, "HY007", 0, "Associated statement is not prepared", SQL_ERROR);
+
+  int n = desc_count(ss, sd->kind);
+  int same = app_desc(sd->kind) == app_desc(td->kind);
+  DescRec *recs = n > 0 ? calloc((size_t)n, sizeof *recs) : NULL;
+  if (n > 0 && recs == NULL)
+    return seer_odbc_diag(td, "HY001", 0, "Out of memory", SQL_ERROR);
+  for (int i = 0; i < n; i++) /* read all first: source and target may share arrays */
+    recs[i] = desc_rec_get(ss, sd->kind, i);
+  char **refs = n > 0 ? calloc((size_t)n, sizeof *refs) : NULL;
+  for (int i = 0; refs != NULL && i < n; i++)
+    if (recs[i].ref_type != NULL && (refs[i] = strdup(recs[i].ref_type)) != NULL)
+      recs[i].ref_type = refs[i];
+
+  SQLRETURN rc = SQL_SUCCESS;
+  if (td->kind == SEER_DESC_ARD) {
+    if (seer_odbc_ensure_binds(ts, n) != 0)
+      rc = seer_odbc_diag(td, "HY001", 0, "Out of memory", SQL_ERROR);
+  } else {
+    rc = desc_ensure_params(ts, n);
+  }
+  for (int i = 0; rc == SQL_SUCCESS && i < n; i++)
+    rc = desc_rec_put(ts, td->kind, i, &recs[i], same);
+  if (rc == SQL_SUCCESS) { /* the count: records past it unbound */
+    if (td->kind == SEER_DESC_ARD) {
+      for (int i = n; i < ts->num_binds; i++)
+        ts->binds[i] = (OdbcBind){0};
+      ts->num_binds = n;
+    } else if (td->kind == SEER_DESC_APD) {
+      for (int i = n; i < ts->num_params; i++)
+        ts->params[i].bound = 0, ts->params[i].buf = NULL, ts->params[i].indicator = NULL;
+    }
+  }
+  if (rc == SQL_SUCCESS && same && app_desc(sd->kind)) {
+    int sr = sd->kind == SEER_DESC_ARD, tr = td->kind == SEER_DESC_ARD;
+    SQLULEN size = sr ? ss->row_array_size : ss->paramset_size;
+    SQLULEN bind = sr ? ss->row_bind_type : ss->param_bind_type;
+    SQLLEN *off = sr ? ss->row_bind_offset : ss->param_bind_offset;
+    SQLUSMALLINT *op = sr ? ss->row_operation : ss->param_operation;
+    *(tr ? &ts->row_array_size : &ts->paramset_size) = size;
+    *(tr ? &ts->row_bind_type : &ts->param_bind_type) = bind;
+    *(tr ? &ts->row_bind_offset : &ts->param_bind_offset) = off;
+    *(tr ? &ts->row_operation : &ts->param_operation) = op;
+  } else if (rc == SQL_SUCCESS && same) { /* IRD / IPD -> IPD */
+    ts->param_status = sd->kind == SEER_DESC_IRD ? ss->row_status : ss->param_status;
+    ts->params_processed = sd->kind == SEER_DESC_IRD ? ss->rows_fetched : ss->params_processed;
+  }
+  for (int i = 0; refs != NULL && i < n; i++)
+    free(refs[i]);
+  free(refs);
+  free(recs);
+  return rc;
+}
+
 int seer_odbc_ensure_binds(OdbcStmt *s, int n)
 {
   if (n <= s->num_binds)

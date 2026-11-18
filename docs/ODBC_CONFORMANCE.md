@@ -72,6 +72,9 @@ descriptor API (`SQLGetDescField` / `SQLGetDescRec` read path; `SQLSetDescField`
 `SQLGetStmtAttr`. Writing a descriptor field updates the same bind/parameter array
 that execute and fetch consume, so it is equivalent to `SQLBindCol` (ARD) or the
 value/type halves of `SQLBindParameter` (APD/IPD); the IRD is read-only (`HY016`).
+`SQLCopyDesc` copies records (and, within one class, the header fields) between
+any two of them, e.g. a SELECT's ARD and IRD to an INSERT's APD and IPD to copy
+rows. Explicitly allocated descriptors are not supported yet (#291).
 
 ## SeerODBC-specific identifiers
 
