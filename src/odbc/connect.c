@@ -477,10 +477,12 @@ SQLRETURN SQL_API SQLNativeSql(SQLHDBC ConnectionHandle, SQLCHAR *InStatementTex
     return seer_odbc_diag(c, "HY001", 0, "Out of memory", SQL_ERROR);
   memcpy(in, InStatementText, n);
   in[n] = '\0';
-  char *native = seer_sql_prepare(in);
+  const char *err = NULL;
+  char *native = seer_sql_prepare_for(in, 1, seer_odbc_server_major(c), &err);
   free(in);
   if (native == NULL)
-    return seer_odbc_diag(c, "HY001", 0, "Out of memory", SQL_ERROR);
+    return err != NULL ? seer_odbc_diag(c, "HYC00", 0, err, SQL_ERROR)
+                       : seer_odbc_diag(c, "HY001", 0, "Out of memory", SQL_ERROR);
 
   size_t len = strlen(native);
   if (TextLength2Ptr != NULL)

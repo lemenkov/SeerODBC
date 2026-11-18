@@ -22,6 +22,13 @@ char *seer_sql_prepare(const char *raw);
  * (SQL_ATTR_NOSCAN, #248); the '?' markers are rewritten either way. */
 char *seer_sql_prepare_scan(const char *raw, int scan);
 
+/* As seer_sql_prepare_scan, for a server of major release `major` (0: not
+ * known, read as the newest), which some {fn} translations depend on (#301).
+ * NULL with *err set (a static string) when an escape can't be translated
+ * without binding a parameter to the wrong argument; NULL with *err NULL when
+ * out of memory. `err` may be NULL. */
+char *seer_sql_prepare_for(const char *raw, int scan, int major, const char **err);
+
 /* Count the distinct bind placeholders in a prepared statement: positional
  * :1, :2, ... and named :name / :"Quoted", de-duplicated case-insensitively,
  * ignoring placeholders in string/identifier literals, line/block comments,

@@ -198,6 +198,9 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] SQLCancel — abort a SQL_NEED_DATA sequence; in-band INTERRUPT break for a
       call blocked on the connection (cross-thread interrupt → ORA-01013)
 - [x] SQLNativeSql — returns the native SQL (escape expansion + '?' -> :1)
+- [x] {fn} scalar functions — Appendix E translated per release, advertised in
+      the SQLGetInfo function / interval / CONVERT masks (#301); DIFFERENCE,
+      DATABASE and seeded RAND have no Oracle form
 - [x] SQLBrowseConnect — iterative connect (NEED_DATA browse string -> connect)
 - [x] SQLGetDescField, SQLGetDescRec — read the implicit descriptors (ARD/APD/
       IRD/IPD via SQLGetStmtAttr handles; IRD = result-column metadata)

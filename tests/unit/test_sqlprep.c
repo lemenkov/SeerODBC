@@ -26,6 +26,22 @@ static void check_prepare(const char *in, const char *want)
   free(out);
 }
 
+/* {fn} on a server of release `major`; want NULL: refused with a reason. */
+static void check_fn(const char *in, int major, const char *want)
+{
+  const char *err = NULL;
+  char *out = seer_sql_prepare_for(in, 1, major, &err);
+  if (want == NULL) {
+    if (out != NULL || err == NULL) {
+      fprintf(stderr, "FAIL %s: want a refusal, got %s\n", in, out ? out : "(null, no reason)");
+      exit(1);
+    }
+    return;
+  }
+  eq(in, out, want);
+  free(out);
+}
+
 static void check_count(const char *in, int want)
 {
   int n = seer_sql_count_params(in);
@@ -122,6 +138,46 @@ int main(void)
   check_prepare("SELECT {fn IFNULL(a,b)} FROM t", "SELECT NVL(a,b) FROM t");
   /* a {ts} literal is left alone inside a string */
   check_prepare("SELECT '{ts x}' FROM dual", "SELECT '{ts x}' FROM dual");
+
+  /* --- {fn} scalar functions (#301) --- */
+  check_fn("{fn LEFT(s, 2)}", 0, "SUBSTR(s, 1, 2)");
+  check_fn("{fn locate('c', s)}", 0, "INSTR(s, 'c')"); /* any case */
+  check_fn("{fn LOCATE('c', s, 4)}", 0, "INSTR(s, 'c', 4)");
+  check_fn("{fn POSITION('a,b' IN s)}", 0, "INSTR(s, 'a,b')");
+  check_fn("{fn LOCATE(f(a, b), s)}", 0, "INSTR(s, f(a, b))"); /* nested commas */
+  check_fn("{fn CHAR(65)}", 0, "CHR(65)");
+  check_fn("{fn USER()}", 0, "USER");
+  check_fn("{fn USER}", 0, "USER");
+  check_fn("{fn PI()}", 0, "ACOS(-1)");
+  check_fn("{fn LOG(x)}", 0, "LN(x)");
+  check_fn("{fn ABS(x)}", 0, "ABS(x)");                     /* Oracle's own: as written */
+  check_fn("{fn DIFFERENCE(a, b)}", 0, "DIFFERENCE(a, b)"); /* no form: as written */
+  check_fn("{fn scott.f(x)}", 0, "scott.f(x)");
+  check_fn("{fn LEFT({fn UCASE(s)}, 1)}", 0, "SUBSTR(UPPER(s), 1, 1)");
+  /* the release decides: 8i has no LOCALTIMESTAMP, INTERVAL or TIMESTAMP */
+  check_fn("{fn NOW()}", 23, "LOCALTIMESTAMP");
+  check_fn("{fn NOW()}", 9, "LOCALTIMESTAMP");
+  check_fn("{fn NOW()}", 8, "SYSDATE");
+  check_fn("{fn CURRENT_TIMESTAMP(3)}", 0, "LOCALTIMESTAMP(3)");
+  check_fn("{fn TIMESTAMPADD(SQL_TSI_DAY, 1, d)}", 11, "(NUMTODSINTERVAL(1, 'DAY') + d)");
+  check_fn("{fn TIMESTAMPADD(SQL_TSI_DAY, 1, d)}", 8, "((1) + d)");
+  check_fn("{fn TIMESTAMPADD(DAY, 1, d)}", 8, "((1) + d)"); /* SQL_TSI_ optional */
+  check_fn("{fn TIMESTAMPADD(SQL_TSI_MONTH, n, d)}", 0, "ADD_MONTHS(d, n)");
+  check_fn("{fn TIMESTAMPADD(SQL_TSI_FRAC_SECOND, 1, d)}", 8,
+           "TIMESTAMPADD(SQL_TSI_FRAC_SECOND, 1, d)"); /* none on 8i */
+  check_fn("{fn TIMESTAMPDIFF(SQL_TSI_MONTH, a, b)}", 0, "TRUNC(-MONTHS_BETWEEN(a, b))");
+  check_fn("{fn CONVERT(x, SQL_INTEGER)}", 0, "TRUNC(CAST(x AS NUMBER))");
+  check_fn("{fn CONVERT(x, SQL_DOUBLE)}", 10, "CAST(x AS BINARY_DOUBLE)");
+  check_fn("{fn CONVERT(x, SQL_DOUBLE)}", 9, "CAST(x AS NUMBER)");
+  check_fn("{fn CONVERT(x, SQL_TIMESTAMP)}", 8, "CAST(x AS DATE)");
+  check_fn("{fn CONVERT(x, SQL_GUID)}", 0, "CONVERT(x, SQL_GUID)");
+  /* markers: kept in order, one occurrence each, or refused */
+  check_fn("SELECT {fn LOCATE(?, s)} FROM t", 0, "SELECT INSTR(s, :1) FROM t");
+  check_fn("SELECT {fn LEFT(?, ?)}, ? FROM t", 0, "SELECT SUBSTR(:1, 1, :2), :3 FROM t");
+  check_fn("SELECT {fn LOCATE(?, ?)} FROM t", 0, NULL); /* would swap */
+  check_fn("SELECT {fn REPEAT(?, 2)} FROM t", 0, NULL); /* repeats one (#302) */
+  check_fn("SELECT {fn REPEAT(s, ?)} FROM t", 0, "SELECT RPAD(s, LENGTH(s) * (:1), s) FROM t");
+  check_fn("{? = call f({fn LEFT(?, 1)})}", 0, "BEGIN :1 := f(SUBSTR(:2, 1, 1)); END;");
 
   /* --- parameter counting (operates on prepared :n / :name SQL) --- */
   check_count("SELECT :1+:2 FROM dual", 2);

@@ -81,6 +81,40 @@ the values at execute; their records are their own, the header fields (array siz
 bind type and offset) stay the statement's. Freed while in use, the statements go
 back to their implicit descriptors.
 
+## Scalar functions (`{fn ...}`)
+
+The preprocessor translates the ODBC scalar functions (Appendix E) into Oracle
+SQL, and `SQL_STRING_FUNCTIONS`, `SQL_NUMERIC_FUNCTIONS`,
+`SQL_TIMEDATE_FUNCTIONS`, `SQL_SYSTEM_FUNCTIONS`, `SQL_CONVERT_FUNCTIONS`, the
+`SQL_TIMEDATE_*_INTERVALS` and the `SQL_CONVERT_<type>` masks report what it
+translates on the connected release (#301). The names Oracle shares (ABS, MOD,
+ROUND, CONCAT, REPLACE, SOUNDEX, EXTRACT and so on) go through unchanged. The
+others become Oracle forms, for example LOCATE → INSTR, LEFT → SUBSTR,
+LOG → LN, `USER()` → USER, and CONVERT(v, SQL_INTEGER) → TRUNC(CAST(v AS NUMBER)).
+How each family behaves:
+
+- **Date and time:**
+  - DAYOFWEEK counts from Sunday whatever NLS_TERRITORY says. WEEK starts weeks
+    on Sunday, and week 1 holds January 1.
+  - DAYNAME and MONTHNAME are in the session's language.
+  - Oracle has no TIME type, so CURTIME and CURRENT_TIME return the current
+    DATE with its time of day.
+  - TIMESTAMPDIFF counts whole intervals from the first value to the second,
+    rounded toward zero; it has no FRAC_SECOND.
+  - From 9i, NOW, CURRENT_TIMESTAMP and TIMESTAMPADD keep TIMESTAMP's type and
+    fraction (LOCALTIMESTAMP, INTERVAL arithmetic). 8i has neither, so it uses
+    SYSDATE and day arithmetic, with no FRAC_SECOND and no EXTRACT.
+- **CONVERT** goes between text, numbers, DATE and TIMESTAMP. Text in a date
+  form is parsed by the session's NLS_DATE_FORMAT. SQL_DOUBLE / SQL_REAL become
+  BINARY_DOUBLE / BINARY_FLOAT from 10g, and NUMBER before.
+- **Not available:** DIFFERENCE and DATABASE are neither translated nor
+  advertised: Oracle has no equivalent and no catalogs. `RAND()` becomes
+  DBMS_RANDOM.VALUE, but SQL can't seed it, so RAND is not advertised either.
+- **Parameter markers:** a translation keeps the arguments that hold markers in
+  their order. When it would swap two of them (`{fn LOCATE(?, ?)}`), or repeat
+  one (`{fn REPEAT(?, 2)}`, until #302), the statement is refused with HYC00
+  rather than binding values to the wrong arguments.
+
 ## SeerODBC-specific identifiers
 
 Server features with no standard ODBC surface are exposed through
