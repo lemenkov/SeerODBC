@@ -204,6 +204,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] SQLSetDescField, SQLSetDescRec — write path: writing a field updates the
       same bind/param array execute/fetch consume (ARD = SQLBindCol, APD/IPD =
       SQLBindParameter halves); the IRD is read-only (HY016)
+- [x] SQLCopyDesc — records between any two implicit descriptors, header
+      fields within one class (#289); explicit descriptors still todo (#291)
 - [x] SQLBulkOperations — deliberately unsupported (no bookmarks): reported false
       by SQLGetFunctions; returns HYC00. Use SQLSetPos for positioned DML.
 

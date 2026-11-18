@@ -33,6 +33,7 @@ EXPORTS
     SQLColumnsW
     SQLConnect
     SQLConnectW
+    SQLCopyDesc
     SQLDescribeCol
     SQLDescribeColW
     SQLDescribeParam

@@ -332,6 +332,7 @@ static int func_supported(SQLUSMALLINT id)
   case SQL_API_SQLCOLUMNPRIVILEGES:
   case SQL_API_SQLGETCURSORNAME: /* #288 */
   case SQL_API_SQLSETCURSORNAME:
+  case SQL_API_SQLCOPYDESC: /* #289 */
     return 1;
   default:
     return 0;
