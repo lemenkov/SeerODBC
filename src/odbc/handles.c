@@ -7,7 +7,9 @@
  * SPDX-FileCopyrightText: © 2026 Peter Lemenkov and the SeerODBC contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "odbc_internal.h"
 
@@ -59,6 +61,18 @@ SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
     s->retrieve_data = SQL_RD_ON; /* SQL_RD_OFF is 0: calloc would turn retrieval off */
     s->rowid_col = -1;
     s->metadata_id = c->metadata_id; /* the connection's default (#278) */
+    /* A cursor name of its own, SQL_CURn, until the application sets one;
+     * the connection lists its statements to find one by name (#288). */
+    char name[32];
+    snprintf(name, sizeof name, "SQL_CUR%lu", ++c->cursor_seq);
+    s->cursor_name = strdup(name);
+    if (s->cursor_name == NULL) {
+      free(s);
+      return SQL_ERROR;
+    }
+    s->cur_row = -1;
+    s->next_stmt = c->stmts;
+    c->stmts = s;
     /* The implicit descriptors share the statement's lifetime. */
     s->ard.h.type = s->apd.h.type = s->ird.h.type = s->ipd.h.type = SQL_HANDLE_DESC;
     s->ard.stmt = s->apd.stmt = s->ird.stmt = s->ipd.stmt = s;
@@ -96,6 +110,12 @@ SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
     free(s->params);
     free(s->param_rows);
     free(s->sql);
+    for (void **pp = &s->dbc->stmts; *pp != NULL; pp = &((OdbcStmt *)*pp)->next_stmt)
+      if (*pp == s) {
+        *pp = s->next_stmt;
+        break;
+      }
+    free(s->cursor_name);
     free(s);
     return SQL_SUCCESS;
   }

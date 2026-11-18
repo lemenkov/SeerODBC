@@ -10,6 +10,8 @@
 #ifndef SEERODBC_SQLPREP_H
 #define SEERODBC_SQLPREP_H
 
+#include <stddef.h>
+
 /* Prepare statement text for the core: expand the ODBC {call}/{?=call} and
  * inline ({ts}/{d}/{t}/{fn}/{oj}/{escape}) escapes, then rewrite '?' parameter
  * markers to Oracle positional binds :1, :2, ... Returns a malloc'd string
@@ -35,5 +37,13 @@ int seer_sql_count_params(const char *sql);
  * rewrite also appends `FOR UPDATE` so the fetched rows are row-locked until
  * the transaction ends, unless the statement already carries one. */
 char *seer_sql_make_updatable(const char *sql, char **table, int lock);
+
+/* A positioned UPDATE or DELETE (#288): `... WHERE CURRENT OF name` ending
+ * the statement (a ';' and blanks may follow), outside literals and
+ * comments. On a match, return 1 with *start the offset of CURRENT, *end the
+ * offset just past the name, and the name - an identifier, or a "quoted" one
+ * without its quotes - copied into `name` (truncated to namelen-1).
+ * Otherwise return 0. */
+int seer_sql_current_of(const char *sql, size_t *start, size_t *end, char *name, size_t namelen);
 
 #endif /* SEERODBC_SQLPREP_H */

@@ -313,6 +313,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] Column annotations (23ai, `SQL_DESC_SEER_ANNOTATIONS`)
 - [x] Transactions: commit / rollback / autocommit
 - [x] Positioned UPDATE / DELETE via SQLSetPos (ROWID-based)
+- [x] Cursor names (SQLSetCursorName / SQLGetCursorName) and positioned
+      UPDATE / DELETE ... WHERE CURRENT OF, rewritten to the ROWID
 - [x] FOR UPDATE locking (`SQL_CONCUR_LOCK`)
 - [x] Data-at-execution (SQLPutData streaming)
 - [x] Client-side scrollable fetch (buffered result set)

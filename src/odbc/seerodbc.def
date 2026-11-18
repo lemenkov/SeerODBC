@@ -51,6 +51,8 @@ EXPORTS
     SQLFreeStmt
     SQLGetConnectAttr
     SQLGetConnectAttrW
+    SQLGetCursorName
+    SQLGetCursorNameW
     SQLGetData
     SQLGetDescField
     SQLGetDescFieldW
@@ -86,6 +88,8 @@ EXPORTS
     SQLRowCount
     SQLSetConnectAttr
     SQLSetConnectAttrW
+    SQLSetCursorName
+    SQLSetCursorNameW
     SQLSetDescField
     SQLSetDescFieldW
     SQLSetDescRec

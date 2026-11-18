@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static void eq(const char *what, const char *got, const char *want)
 {
@@ -63,6 +64,28 @@ static void check_updatable_lock(const char *in, int lock, const char *want_tabl
 static void check_updatable(const char *in, const char *want_table, const char *contains)
 {
   check_updatable_lock(in, 0, want_table, contains);
+}
+
+/* seer_sql_current_of: `name` NULL wants no match; else that name, with the
+ * text before CURRENT equal to `head` and nothing but the name between. */
+static void check_current_of(const char *in, const char *name, const char *head)
+{
+  size_t a = 0, b = 0;
+  char got[64] = "";
+  int m = seer_sql_current_of(in, &a, &b, got, sizeof got);
+  if (name == NULL) {
+    if (m) {
+      fprintf(stderr, "FAIL current_of(%s): matched '%s', want no match\n", in, got);
+      exit(1);
+    }
+    return;
+  }
+  if (!m || strcmp(got, name) != 0 || a != strlen(head) || strncmp(in, head, a) != 0 ||
+      strncasecmp(in + a, "CURRENT", 7) != 0 || b > strlen(in) || b <= a) {
+    fprintf(stderr, "FAIL current_of(%s): m=%d name '%s' (want '%s') start %zu end %zu\n", in, m,
+            got, name, a, b);
+    exit(1);
+  }
 }
 
 int main(void)
@@ -130,6 +153,21 @@ int main(void)
   check_updatable_lock("SELECT a FROM emp FOR UPDATE", 1, "emp", "FOR UPDATE");
   /* lock not requested -> no FOR UPDATE appended */
   check_updatable_lock("SELECT a FROM emp", 0, "emp", "ROWIDTOCHAR");
+
+  /* --- positioned UPDATE / DELETE: WHERE CURRENT OF (#288) --- */
+  check_current_of("UPDATE t SET v = 1 WHERE CURRENT OF SQL_CUR1", "SQL_CUR1",
+                   "UPDATE t SET v = 1 WHERE ");
+  check_current_of("delete from t where current of c1 ;  ", "c1", "delete from t where ");
+  check_current_of("UPDATE t SET v = 'WHERE CURRENT OF x' WHERE CURRENT OF \"My Cur\"", "My Cur",
+                   "UPDATE t SET v = 'WHERE CURRENT OF x' WHERE ");
+  check_current_of("UPDATE t SET v = 1\nWHERE\tCURRENT  OF\nc", "c", "UPDATE t SET v = 1\nWHERE\t");
+  check_current_of("SELECT * FROM t WHERE CURRENT OF c", NULL, NULL); /* not UPDATE/DELETE */
+  check_current_of("UPDATE t SET v = 1 WHERE CURRENT OF c AND x = 1", NULL, NULL); /* not last */
+  check_current_of("UPDATE t SET v = 1 WHERE x = 1", NULL, NULL);
+  check_current_of("UPDATE t SET v = 1 -- WHERE CURRENT OF c", NULL, NULL); /* in a comment */
+  check_current_of("UPDATE t SET v = 'x' WHERE CURRENT OF", NULL, NULL);    /* no name */
+  check_current_of("UPDATE t SET nowhere = 1 WHERE CURRENT OF c", "c",
+                   "UPDATE t SET nowhere = 1 WHERE ");
 
   printf("test_sqlprep: all assertions passed\n");
   return 0;

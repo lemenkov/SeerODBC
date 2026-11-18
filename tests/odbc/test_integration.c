@@ -2585,6 +2585,109 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+static const char *stmt_state(SQLHSTMT st, SQLRETURN rc, char *state)
+{
+  SQLINTEGER nat;
+  SQLSMALLINT ml;
+  SQLCHAR msg[256];
+  state[0] = '\0';
+  if (rc != SQL_SUCCESS)
+    SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, (SQLCHAR *)state, &nat, msg, sizeof msg, &ml);
+  return state;
+}
+
+/* Cursor names and positioned DML (#288): a statement has a generated
+ * SQL_CURn name, takes the application's, refuses a duplicate (3C000) and
+ * one in the driver's namespace (34000); UPDATE / DELETE ... WHERE CURRENT
+ * OF act on the named cursor's current row only; an unknown name is 34000
+ * and a closed cursor 24000. */
+static void check_cursor_names(SQLHDBC dbc)
+{
+  const char *name = "cursor names: SQLSetCursorName / WHERE CURRENT OF";
+  char err[256] = "", m[600] = "", state[6];
+  static const char *ddl[] = {"DROP TABLE seer_woc", "CREATE TABLE seer_woc (id NUMBER, v NUMBER)",
+                              "INSERT INTO seer_woc VALUES (1, 10)",
+                              "INSERT INTO seer_woc VALUES (2, 20)",
+                              "INSERT INTO seer_woc VALUES (3, 30)"};
+  for (size_t k = 0; k < sizeof ddl / sizeof ddl[0]; k++)
+    exec_do(dbc, ddl[k], err, sizeof err);
+  SQLHSTMT cur, pos;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &cur);
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &pos);
+  SQLCHAR cn[64] = "";
+  SQLSMALLINT cl = 0;
+  SQLRETURN rc = SQLGetCursorName(cur, cn, sizeof cn, &cl);
+  if (rc != SQL_SUCCESS || strncmp((char *)cn, "SQL_CUR", 7) != 0 ||
+      cl != (SQLSMALLINT)strlen((char *)cn))
+    snprintf(m, sizeof m, "generated name: rc %d '%s' len %d", rc, (char *)cn, cl);
+  if (m[0] == '\0' && SQLSetCursorName(cur, (SQLCHAR *)"SEERCUR", SQL_NTS) != SQL_SUCCESS)
+    diag_text(SQL_HANDLE_STMT, cur, m, sizeof m);
+  if (m[0] == '\0') {
+    SQLGetCursorName(cur, cn, sizeof cn, &cl);
+    if (strcmp((char *)cn, "SEERCUR") != 0)
+      snprintf(m, sizeof m, "SQLGetCursorName after setting: '%s'", (char *)cn);
+  }
+  if (m[0] == '\0') {
+    rc = SQLSetCursorName(pos, (SQLCHAR *)"seercur", SQL_NTS);
+    if (strcmp(stmt_state(pos, rc, state), "3C000") != 0)
+      snprintf(m, sizeof m, "duplicate name: rc %d %s, want 3C000", rc, state);
+  }
+  if (m[0] == '\0') {
+    rc = SQLSetCursorName(pos, (SQLCHAR *)"SQL_CUR99", SQL_NTS);
+    if (strcmp(stmt_state(pos, rc, state), "34000") != 0)
+      snprintf(m, sizeof m, "SQL_CUR99: rc %d %s, want 34000", rc, state);
+  }
+  /* Positioned UPDATE then DELETE through SEERCUR, on rows 1 and 2. */
+  SQLSetStmtAttr(cur, SQL_ATTR_CONCURRENCY, (SQLPOINTER)SQL_CONCUR_LOCK, 0);
+  if (m[0] == '\0' && !SQL_SUCCEEDED(SQLExecDirect(
+                          cur, (SQLCHAR *)"SELECT id, v FROM seer_woc ORDER BY id", SQL_NTS)))
+    diag_text(SQL_HANDLE_STMT, cur, m, sizeof m);
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    SQLLEN n = -1;
+    if (!SQL_SUCCEEDED(SQLFetch(cur))) {
+      diag_text(SQL_HANDLE_STMT, cur, m, sizeof m);
+      break;
+    }
+    const char *dml = k == 0 ? "UPDATE seer_woc SET v = 99 WHERE CURRENT OF SEERCUR"
+                             : "DELETE FROM seer_woc WHERE CURRENT OF seercur";
+    rc = SQLExecDirect(pos, (SQLCHAR *)dml, SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, pos, m, sizeof m);
+    else if (SQLRowCount(pos, &n), n != 1)
+      snprintf(m, sizeof m, "%s: %ld rows, want 1", dml, (long)n);
+    SQLFreeStmt(pos, SQL_CLOSE);
+  }
+  if (m[0] == '\0') {
+    rc = SQLExecDirect(pos, (SQLCHAR *)"UPDATE seer_woc SET v = 0 WHERE CURRENT OF NOPE", SQL_NTS);
+    if (strcmp(stmt_state(pos, rc, state), "34000") != 0)
+      snprintf(m, sizeof m, "unknown cursor: rc %d %s, want 34000", rc, state);
+  }
+  SQLCloseCursor(cur);
+  if (m[0] == '\0') {
+    rc = SQLExecDirect(pos, (SQLCHAR *)"UPDATE seer_woc SET v = 0 WHERE CURRENT OF SEERCUR",
+                       SQL_NTS);
+    if (strcmp(stmt_state(pos, rc, state), "24000") != 0)
+      snprintf(m, sizeof m, "closed cursor: rc %d %s, want 24000", rc, state);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, pos);
+  SQLFreeHandle(SQL_HANDLE_STMT, cur);
+  if (m[0] == '\0') {
+    char got[64] = "";
+    exec_scalar(dbc,
+                "SELECT LISTAGG_ID FROM (SELECT MAX(DECODE(id, 1, v)) || ',' || COUNT(*) || ',' "
+                "|| MAX(DECODE(id, 3, v)) LISTAGG_ID FROM seer_woc)",
+                got, sizeof got, err, sizeof err);
+    if (strcmp(got, "99,2,30") != 0)
+      snprintf(m, sizeof m, "table after: '%s' (row 1 v, rows, row 3 v), want '99,2,30' %s", got,
+               err);
+  }
+  exec_do(dbc, "DROP TABLE seer_woc", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLTablePrivileges and SQLColumnPrivileges (#286): a table granted SELECT,
  * and one column UPDATE, to PUBLIC lists those grants, in ODBC's columns. */
 static void check_privileges(SQLHDBC dbc)
@@ -5422,6 +5525,7 @@ int main(void)
     check_describe_param(dbc);
     check_tables_enum(dbc);
     check_privileges(dbc);
+    check_cursor_names(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

@@ -511,6 +511,35 @@ SQLRETURN SQL_API SQLPrimaryKeysW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lca
   return r;
 }
 
+/* Cursor names (#288): lengths in characters. */
+SQLRETURN SQL_API SQLSetCursorNameW(SQLHSTMT hstmt, SQLWCHAR *name, SQLSMALLINT lname)
+{
+  if (name == NULL)
+    return SQLSetCursorName(hstmt, NULL, 0); /* reports HY009 */
+  char *n = w_to_utf8(name, lname);
+  if (n == NULL)
+    return seer_odbc_diag(hstmt, "HY001", 0, "Out of memory", SQL_ERROR);
+  SQLRETURN r = SQLSetCursorName(hstmt, (SQLCHAR *)n, SQL_NTS);
+  free(n);
+  return r;
+}
+
+SQLRETURN SQL_API SQLGetCursorNameW(SQLHSTMT hstmt, SQLWCHAR *name, SQLSMALLINT cap,
+                                    SQLSMALLINT *lname)
+{
+  char n[4 * SEER_MAX_CURSOR_NAME_LEN + 1];
+  SQLRETURN r = SQLGetCursorName(hstmt, (SQLCHAR *)n, (SQLSMALLINT)sizeof n, NULL);
+  if (cap < 0 || !SQL_SUCCEEDED(r))
+    return cap < 0 ? SQLGetCursorName(hstmt, NULL, cap, NULL) : r;
+  SQLLEN oc = 0;
+  SQLRETURN r2 = emit_w(n, name, cap, &oc);
+  if (lname != NULL)
+    *lname = (SQLSMALLINT)oc;
+  if (r2 == SQL_SUCCESS_WITH_INFO)
+    return seer_odbc_diag(hstmt, "01004", 0, "String data, right truncated", SQL_SUCCESS_WITH_INFO);
+  return r2;
+}
+
 SQLRETURN SQL_API SQLTablePrivilegesW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat,
                                       SQLWCHAR *sch, SQLSMALLINT lsch, SQLWCHAR *tab,
                                       SQLSMALLINT ltab)

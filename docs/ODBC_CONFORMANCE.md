@@ -37,6 +37,7 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 | [x] | SQLBindCol / SQLFetch / SQLGetData | block fetch (ROW_ARRAY_SIZE), SQLGetData fragmentation |
 | [x] | SQLFetchScroll | static scrollable cursor (NEXT/PRIOR/FIRST/LAST/ABSOLUTE/RELATIVE) |
 | [x] | SQLSetPos | POSITION / REFRESH / positioned UPDATE / DELETE |
+| [x] | SQLSetCursorName / SQLGetCursorName | generated `SQL_CURn` names; `UPDATE` / `DELETE ... WHERE CURRENT OF name` rewritten to the named cursor's current ROWID (Oracle has `CURRENT OF` only in PL/SQL) |
 | [x] | SQLRowCount / SQLCloseCursor / SQLFreeStmt | |
 | [x] | SQLSetStmtAttr / SQLGetStmtAttr | paramset/row-array size, bind type, concurrency (SQL_CONCUR_LOCK → FOR UPDATE), status ptrs |
 
@@ -95,7 +96,6 @@ errors returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01000`, native 24344.
 | Function | Why |
 |----------|-----|
 | SQLBulkOperations | Bookmark-based bulk ops; SeerODBC exposes no bookmarks. Reported unsupported by `SQLGetFunctions`; returns `HYC00`. `SQLSetPos` covers positioned UPDATE/DELETE. |
-| Positioned UPDATE via `WHERE CURRENT OF` | `SQLSetPos` covers positioned DML via ROWID. |
 
 ## Free from the Driver Manager (not implemented on purpose)
 
