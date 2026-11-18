@@ -105,13 +105,20 @@ static void check_param(SQLHDBC dbc)
   SQLFreeHandle(SQL_HANDLE_STMT, st);
 }
 
-/* The wide API, as Windows applications call it: UTF-16 SQL in, UTF-16 out. */
-static void check_wide(SQLHDBC dbc)
+/* The wide API, as Windows applications call it: UTF-16 SQL in, UTF-16 out.
+ * UNISTR arrived in 9i, and an 8i database's charset (WE8ISO8859P1 on the
+ * lab bed) has no U+4E2D, so before 9i it reads CHR(196), U+00C4, alone
+ * (#297). */
+static void check_wide(SQLHDBC dbc, int major)
 {
-  static const SQLWCHAR sql[] = {'S',  'E', 'L', 'E', 'C',  'T',  ' ', 'U', 'N', 'I',
-                                 'S',  'T', 'R', '(', '\'', '\\', '0', '0', 'C', '4',
-                                 '\\', '4', 'E', '2', 'D',  '\'', ')', ' ', 'F', 'R',
-                                 'O',  'M', ' ', 'd', 'u',  'a',  'l', 0};
+  static const SQLWCHAR unistr[] = {'S',  'E', 'L', 'E', 'C',  'T',  ' ', 'U', 'N', 'I',
+                                    'S',  'T', 'R', '(', '\'', '\\', '0', '0', 'C', '4',
+                                    '\\', '4', 'E', '2', 'D',  '\'', ')', ' ', 'F', 'R',
+                                    'O',  'M', ' ', 'd', 'u',  'a',  'l', 0};
+  static const SQLWCHAR chr[] = {'S', 'E', 'L', 'E', 'C', 'T', ' ', 'C', 'H', 'R', '(', '1', '9',
+                                 '6', ')', ' ', 'F', 'R', 'O', 'M', ' ', 'd', 'u', 'a', 'l', 0};
+  int legacy = major > 0 && major < 9;
+  const SQLWCHAR *sql = legacy ? chr : unistr;
   SQLHSTMT st;
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLWCHAR out[16] = {0};
@@ -123,7 +130,7 @@ static void check_wide(SQLHDBC dbc)
   if (!ok)
     diag(SQL_HANDLE_STMT, st, err, sizeof err, NULL);
   /* U+00C4 LATIN CAPITAL LETTER A WITH DIAERESIS, U+4E2D CJK "middle" */
-  int right = ok && out[0] == 0x00C4 && out[1] == 0x4E2D && out[2] == 0;
+  int right = ok && out[0] == 0x00C4 && (legacy ? out[1] == 0 : out[1] == 0x4E2D && out[2] == 0);
   char m[700];
   if (ok && !right)
     snprintf(m, sizeof m, "got U+%04X U+%04X (%ld bytes)", (unsigned)out[0], (unsigned)out[1],
@@ -186,7 +193,7 @@ int main(int argc, char **argv)
   report(ok && strcmp(one, "1") == 0, "SELECT 1 FROM dual", ok ? "" : err);
   check_types(dbc);
   check_param(dbc);
-  check_wide(dbc);
+  check_wide(dbc, atoi(dbms)); /* SQL_DBMS_VER "08.01.0700": the major release */
   check_error(dbc);
 
   SQLDisconnect(dbc);
