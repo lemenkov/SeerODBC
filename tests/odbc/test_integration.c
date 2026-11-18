@@ -2585,6 +2585,66 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQLTablePrivileges and SQLColumnPrivileges (#286): a table granted SELECT,
+ * and one column UPDATE, to PUBLIC lists those grants, in ODBC's columns. */
+static void check_privileges(SQLHDBC dbc)
+{
+  const char *name = "SQLTablePrivileges / SQLColumnPrivileges";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_priv", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_priv (id NUMBER, v NUMBER)", err, sizeof err);
+  exec_do(dbc, "GRANT SELECT ON seer_priv TO PUBLIC", err, sizeof err);
+  exec_do(dbc, "GRANT UPDATE (v) ON seer_priv TO PUBLIC", err, sizeof err);
+  char owner[64] = "";
+  const char *u = getenv("SEER_TEST_USER");
+  for (size_t k = 0; u != NULL && u[k] != '\0' && k + 1 < sizeof owner; k++)
+    owner[k] = (char)toupper((unsigned char)u[k]);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    SQLRETURN rc =
+        k == 0 ? SQLTablePrivileges(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_PRIV",
+                                    SQL_NTS)
+               : SQLColumnPrivileges(st, NULL, 0, (SQLCHAR *)owner, SQL_NTS, (SQLCHAR *)"SEER_PRIV",
+                                     SQL_NTS, (SQLCHAR *)"%", SQL_NTS);
+    const char *fn = k == 0 ? "SQLTablePrivileges" : "SQLColumnPrivileges";
+    SQLSMALLINT nc = 0, gcol = (SQLSMALLINT)(k == 0 ? 5 : 6);
+    char label[32] = "";
+    if (SQL_SUCCEEDED(rc)) {
+      SQLNumResultCols(st, &nc);
+      SQLColAttribute(st, (SQLUSMALLINT)gcol, SQL_DESC_NAME, label, sizeof label, NULL, NULL);
+    }
+    int rows = 0;
+    char got[160] = "";
+    while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st))) {
+      char col[64] = "", grantee[64] = "", priv[64] = "", gr[8] = "";
+      SQLLEN ind;
+      rows++;
+      if (k == 1)
+        SQLGetData(st, 4, SQL_C_CHAR, col, sizeof col, &ind);
+      SQLGetData(st, (SQLUSMALLINT)gcol, SQL_C_CHAR, grantee, sizeof grantee, &ind);
+      SQLGetData(st, (SQLUSMALLINT)(gcol + 1), SQL_C_CHAR, priv, sizeof priv, &ind);
+      SQLGetData(st, (SQLUSMALLINT)(gcol + 2), SQL_C_CHAR, gr, sizeof gr, &ind);
+      snprintf(got, sizeof got, "%s%s%s %s %s", col, col[0] ? " " : "", grantee, priv, gr);
+    }
+    const char *want = k == 0 ? "PUBLIC SELECT NO" : "V PUBLIC UPDATE NO";
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+    else if (nc != (k == 0 ? 7 : 8) || strcmp(label, "GRANTEE") != 0)
+      snprintf(m, sizeof m, "%s: %d columns, column %d '%s'; want %d, GRANTEE", fn, nc, gcol, label,
+               k == 0 ? 7 : 8);
+    else if (rows != 1 || strcmp(got, want) != 0)
+      snprintf(m, sizeof m, "%s: %d rows, '%s'; want 1, '%s'", fn, rows, got, want);
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  exec_do(dbc, "DROP TABLE seer_priv", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLTables' enumerations and type list (#282): SQL_ALL_CATALOGS is empty,
  * SQL_ALL_SCHEMAS one row per user (the test user among them, no table
  * names), SQL_ALL_TABLE_TYPES TABLE and VIEW; a type list is compared by
@@ -5361,6 +5421,7 @@ int main(void)
     check_metadata_id(dbc);
     check_describe_param(dbc);
     check_tables_enum(dbc);
+    check_privileges(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

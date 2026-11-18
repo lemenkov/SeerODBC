@@ -50,6 +50,7 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 | [x] | SQLGetTypeInfo | type table, per release (TIMESTAMP from 9i, BINARY_FLOAT / DOUBLE from 10g); attributes as SQLColAttribute reports them |
 | [x] | SQLProcedures / SQLProcedureColumns | ALL_OBJECTS / ALL_ARGUMENTS |
 | [x] | SQLSpecialColumns | ROWID for SQL_BEST_ROWID |
+| [x] | SQLTablePrivileges / SQLColumnPrivileges | ALL_TAB_PRIVS / ALL_COL_PRIVS: granted rights, not an owner's own |
 
 ## Unicode (`*W`)
 
