@@ -435,15 +435,42 @@ SQLRETURN SQL_API SQLMoreResults(SQLHSTMT StatementHandle)
 
 /* ----------------------------------------------------------- descriptors */
 
-/* Number of records in a descriptor: result columns (IRD), bound result columns
- * (ARD), or parameters (APD/IPD). */
-static int desc_count(OdbcStmt *s, SeerDescKind kind)
+/* The records of a descriptor that keeps them as column bindings: an
+ * explicit descriptor's own, or an implicit ARD's - the statement's own
+ * bindings, even while an explicit ARD is in use (#291). NULL otherwise. */
+static OdbcBindSet *desc_binds(OdbcDesc *d)
 {
-  switch (kind) {
+  if (d->is_explicit)
+    return &d->recs;
+  return d->kind == SEER_DESC_ARD ? &((OdbcStmt *)d->stmt)->own_binds : NULL;
+}
+
+/* Grow a set of bindings to `n` records, the new ones unbound. */
+int seer_odbc_bindset_ensure(OdbcBindSet *b, int n)
+{
+  if (n <= b->num_binds)
+    return 0;
+  OdbcBind *nb = realloc(b->binds, (size_t)n * sizeof *nb);
+  if (nb == NULL)
+    return -1;
+  memset(nb + b->num_binds, 0, (size_t)(n - b->num_binds) * sizeof *nb);
+  b->binds = nb;
+  b->num_binds = n;
+  return 0;
+}
+
+/* Number of records in a descriptor: result columns (IRD), bound result columns
+ * (ARD, explicit), or parameters (APD/IPD). */
+static int desc_count(OdbcDesc *d)
+{
+  OdbcStmt *s = (OdbcStmt *)d->stmt;
+  if (desc_binds(d) != NULL)
+    return desc_binds(d)->num_binds;
+  switch (d->kind) {
   case SEER_DESC_IRD:
     return s->core != NULL ? odbc_visible_cols(s) : 0;
   case SEER_DESC_ARD:
-    return s->num_binds;
+    return 0;
   case SEER_DESC_APD:
   case SEER_DESC_IPD:
     return s->num_params;
@@ -479,11 +506,16 @@ SQLRETURN SQL_API SQLGetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(d);
   OdbcStmt *s = (OdbcStmt *)d->stmt;
-  int count = desc_count(s, d->kind);
+  int count = desc_count(d);
 
   if (FieldIdentifier == SQL_DESC_COUNT) {
     if (ValuePtr != NULL)
       *(SQLSMALLINT *)ValuePtr = (SQLSMALLINT)count;
+    return SQL_SUCCESS;
+  }
+  if (FieldIdentifier == SQL_DESC_ALLOC_TYPE) { /* #291 */
+    if (ValuePtr != NULL)
+      *(SQLSMALLINT *)ValuePtr = d->is_explicit ? SQL_DESC_ALLOC_USER : SQL_DESC_ALLOC_AUTO;
     return SQL_SUCCESS;
   }
   if (RecNumber < 1 || RecNumber > count)
@@ -543,10 +575,24 @@ SQLRETURN SQL_API SQLGetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
     default:
       break;
     }
+  } else if (desc_binds(d) != NULL &&
+             (FieldIdentifier == SQL_DESC_DATA_PTR || FieldIdentifier == SQL_DESC_INDICATOR_PTR ||
+              FieldIdentifier == SQL_DESC_OCTET_LENGTH_PTR ||
+              FieldIdentifier == SQL_DESC_OCTET_LENGTH)) {
+    const OdbcBind *b = &desc_binds(d)->binds[i]; /* as SQLSetDescField wrote them (#291) */
+    if (ValuePtr == NULL)
+      return SQL_SUCCESS;
+    if (FieldIdentifier == SQL_DESC_OCTET_LENGTH)
+      *(SQLLEN *)ValuePtr = b->buflen;
+    else if (FieldIdentifier == SQL_DESC_DATA_PTR)
+      *(SQLPOINTER *)ValuePtr = b->bound ? b->buf : NULL;
+    else
+      *(SQLLEN **)ValuePtr = b->indicator;
+    return SQL_SUCCESS;
   } else if (FieldIdentifier == SQL_DESC_TYPE || FieldIdentifier == SQL_DESC_CONCISE_TYPE) {
     SQLSMALLINT t = 0;
-    if (d->kind == SEER_DESC_ARD && s->binds != NULL)
-      t = s->binds[i].target_type;
+    if (desc_binds(d) != NULL)
+      t = desc_binds(d)->binds[i].target_type;
     else if (d->kind == SEER_DESC_APD && s->params != NULL)
       t = s->params[i].c_type;
     else if (d->kind == SEER_DESC_IPD && s->params != NULL)
@@ -571,7 +617,7 @@ SQLRETURN SQL_API SQLGetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(d);
   OdbcStmt *s = (OdbcStmt *)d->stmt;
-  if (RecNumber < 1 || RecNumber > desc_count(s, d->kind))
+  if (RecNumber < 1 || RecNumber > desc_count(d))
     return SQL_NO_DATA;
   int i = RecNumber - 1;
 
@@ -608,7 +654,7 @@ SQLRETURN SQL_API SQLGetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
     if (StringLengthPtr)
       *StringLengthPtr = 0;
     if (TypePtr)
-      *TypePtr = (d->kind == SEER_DESC_ARD && s->binds)    ? s->binds[i].target_type
+      *TypePtr = desc_binds(d) != NULL                     ? desc_binds(d)->binds[i].target_type
                  : (d->kind == SEER_DESC_APD && s->params) ? s->params[i].c_type
                  : (d->kind == SEER_DESC_IPD && s->params) ? s->params[i].sql_type
                                                            : 0;
@@ -660,9 +706,10 @@ SQLRETURN SQL_API SQLSetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
   SQLINTEGER ival = (SQLINTEGER)(intptr_t)ValuePtr;
 
   if (FieldIdentifier == SQL_DESC_COUNT) { /* header: record count */
-    if (d->kind == SEER_DESC_ARD) {        /* ARD count tracks result cols */
-      if (ival >= 0 && ival < s->num_binds)
-        s->num_binds = ival;
+    OdbcBindSet *bs = desc_binds(d);
+    if (bs != NULL) { /* ARD count tracks result cols */
+      if (ival >= 0 && ival < bs->num_binds)
+        bs->num_binds = ival;
       return SQL_SUCCESS;
     }
     return desc_ensure_params(s, ival > 0 ? ival : 0);
@@ -672,10 +719,10 @@ SQLRETURN SQL_API SQLSetDescField(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumb
     return seer_odbc_diag(d, "07009", 0, "Invalid descriptor index", SQL_ERROR);
   int i = RecNumber - 1;
 
-  if (d->kind == SEER_DESC_ARD) {
-    if (seer_odbc_ensure_binds(s, RecNumber) != 0) /* as SQLBindCol (#244) */
+  if (desc_binds(d) != NULL) {
+    if (seer_odbc_bindset_ensure(desc_binds(d), RecNumber) != 0) /* as SQLBindCol (#244) */
       return seer_odbc_diag(d, "HY001", 0, "Out of memory", SQL_ERROR);
-    OdbcBind *b = &s->binds[i];
+    OdbcBind *b = &desc_binds(d)->binds[i];
     switch (FieldIdentifier) {
     case SQL_DESC_TYPE:
     case SQL_DESC_CONCISE_TYPE:
@@ -776,10 +823,10 @@ SQLRETURN SQL_API SQLSetDescRec(SQLHDESC DescriptorHandle, SQLSMALLINT RecNumber
   int i = RecNumber - 1;
   SQLLEN *ind = IndicatorPtr ? IndicatorPtr : StringLengthPtr;
 
-  if (d->kind == SEER_DESC_ARD) {
-    if (seer_odbc_ensure_binds(s, RecNumber) != 0) /* as SQLBindCol (#244) */
+  if (desc_binds(d) != NULL) {
+    if (seer_odbc_bindset_ensure(desc_binds(d), RecNumber) != 0) /* as SQLBindCol (#244) */
       return seer_odbc_diag(d, "HY001", 0, "Out of memory", SQL_ERROR);
-    OdbcBind *b = &s->binds[i];
+    OdbcBind *b = &desc_binds(d)->binds[i];
     b->target_type = Type;
     b->buf = DataPtr;
     b->buflen = Length;
@@ -824,12 +871,14 @@ static int app_desc(SeerDescKind k)
   return k == SEER_DESC_ARD || k == SEER_DESC_APD;
 }
 
-static DescRec desc_rec_get(OdbcStmt *s, SeerDescKind k, int i)
+static DescRec desc_rec_get(OdbcDesc *d, int i)
 {
+  OdbcStmt *s = (OdbcStmt *)d->stmt;
+  SeerDescKind k = d->kind;
   DescRec r = {0};
   r.io_type = SQL_PARAM_INPUT;
-  if (k == SEER_DESC_ARD) {
-    const OdbcBind *b = &s->binds[i];
+  if (desc_binds(d) != NULL) { /* an ARD, or an explicit descriptor (#291) */
+    const OdbcBind *b = &desc_binds(d)->binds[i];
     r = (DescRec){b->target_type, b->buf, b->buflen,       b->indicator,
                   b->bound,       0,      SQL_PARAM_INPUT, NULL};
   } else if (k == SEER_DESC_APD) {
@@ -850,10 +899,12 @@ static DescRec desc_rec_get(OdbcStmt *s, SeerDescKind k, int i)
 
 /* Write a record. Between the two classes only the type carries over; the
  * other half of a parameter record (APD vs IPD, one array) is kept. */
-static SQLRETURN desc_rec_put(OdbcStmt *s, SeerDescKind k, int i, const DescRec *r, int same)
+static SQLRETURN desc_rec_put(OdbcDesc *d, int i, const DescRec *r, int same)
 {
-  if (k == SEER_DESC_ARD) {
-    OdbcBind *b = &s->binds[i];
+  OdbcStmt *s = (OdbcStmt *)d->stmt;
+  SeerDescKind k = d->kind;
+  if (desc_binds(d) != NULL) {
+    OdbcBind *b = &desc_binds(d)->binds[i];
     *b = same ? (OdbcBind){r->type, r->buf, r->buflen, r->indicator, r->bound}
               : (OdbcBind){r->type, NULL, 0, NULL, 0};
     return SQL_SUCCESS;
@@ -874,7 +925,7 @@ static SQLRETURN desc_rec_put(OdbcStmt *s, SeerDescKind k, int i, const DescRec 
   p->io_type = r->io_type;
   char *ref = r->ref_type != NULL ? strdup(r->ref_type) : NULL;
   if (r->ref_type != NULL && ref == NULL)
-    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    return seer_odbc_diag(d, "HY001", 0, "Out of memory", SQL_ERROR);
   free(p->ref_type);
   p->ref_type = ref;
   return SQL_SUCCESS;
@@ -900,38 +951,42 @@ SQLRETURN SQL_API SQLCopyDesc(SQLHDESC SourceDescHandle, SQLHDESC TargetDescHand
       (ss->sql == NULL || seer_odbc_describe_prepared(ss) != SQL_SUCCESS || ss->core == NULL))
     return seer_odbc_diag(td, "HY007", 0, "Associated statement is not prepared", SQL_ERROR);
 
-  int n = desc_count(ss, sd->kind);
+  int n = desc_count(sd);
   int same = app_desc(sd->kind) == app_desc(td->kind);
   DescRec *recs = n > 0 ? calloc((size_t)n, sizeof *recs) : NULL;
   if (n > 0 && recs == NULL)
     return seer_odbc_diag(td, "HY001", 0, "Out of memory", SQL_ERROR);
   for (int i = 0; i < n; i++) /* read all first: source and target may share arrays */
-    recs[i] = desc_rec_get(ss, sd->kind, i);
+    recs[i] = desc_rec_get(sd, i);
   char **refs = n > 0 ? calloc((size_t)n, sizeof *refs) : NULL;
   for (int i = 0; refs != NULL && i < n; i++)
     if (recs[i].ref_type != NULL && (refs[i] = strdup(recs[i].ref_type)) != NULL)
       recs[i].ref_type = refs[i];
 
   SQLRETURN rc = SQL_SUCCESS;
-  if (td->kind == SEER_DESC_ARD) {
-    if (seer_odbc_ensure_binds(ts, n) != 0)
+  OdbcBindSet *tb = desc_binds(td); /* an ARD's or an explicit descriptor's records */
+  if (tb != NULL) {
+    if (seer_odbc_bindset_ensure(tb, n) != 0)
       rc = seer_odbc_diag(td, "HY001", 0, "Out of memory", SQL_ERROR);
   } else {
     rc = desc_ensure_params(ts, n);
   }
   for (int i = 0; rc == SQL_SUCCESS && i < n; i++)
-    rc = desc_rec_put(ts, td->kind, i, &recs[i], same);
+    rc = desc_rec_put(td, i, &recs[i], same);
   if (rc == SQL_SUCCESS) { /* the count: records past it unbound */
-    if (td->kind == SEER_DESC_ARD) {
-      for (int i = n; i < ts->num_binds; i++)
-        ts->binds[i] = (OdbcBind){0};
-      ts->num_binds = n;
+    if (tb != NULL) {
+      for (int i = n; i < tb->num_binds; i++)
+        tb->binds[i] = (OdbcBind){0};
+      tb->num_binds = n;
     } else if (td->kind == SEER_DESC_APD) {
       for (int i = n; i < ts->num_params; i++)
         ts->params[i].bound = 0, ts->params[i].buf = NULL, ts->params[i].indicator = NULL;
     }
   }
-  if (rc == SQL_SUCCESS && same && app_desc(sd->kind)) {
+  /* The header fields are the statement's; an explicit descriptor has its
+   * records only (#291). */
+  if (sd->is_explicit || td->is_explicit) {
+  } else if (rc == SQL_SUCCESS && same && app_desc(sd->kind)) {
     int sr = sd->kind == SEER_DESC_ARD, tr = td->kind == SEER_DESC_ARD;
     SQLULEN size = sr ? ss->row_array_size : ss->paramset_size;
     SQLULEN bind = sr ? ss->row_bind_type : ss->param_bind_type;
@@ -952,17 +1007,9 @@ SQLRETURN SQL_API SQLCopyDesc(SQLHDESC SourceDescHandle, SQLHDESC TargetDescHand
   return rc;
 }
 
-int seer_odbc_ensure_binds(OdbcStmt *s, int n)
+int seer_odbc_ensure_binds(OdbcStmt *s, int n) /* the current ARD: own, or explicit (#291) */
 {
-  if (n <= s->num_binds)
-    return 0;
-  OdbcBind *nb = realloc(s->binds, (size_t)n * sizeof *nb);
-  if (nb == NULL)
-    return -1;
-  memset(nb + s->num_binds, 0, (size_t)(n - s->num_binds) * sizeof *nb);
-  s->binds = nb;
-  s->num_binds = n;
-  return 0;
+  return seer_odbc_bindset_ensure(s->ab, n);
 }
 
 SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber,
@@ -977,13 +1024,13 @@ SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
     return seer_odbc_diag(s, "07009", 0, "Invalid column number", SQL_ERROR);
   /* Any column, before or after the execute: a number past the result's
    * columns is reported when a fetch would fill it (#244). */
-  if (ColumnNumber > s->num_binds && (TargetValuePtr != NULL || StrLen_or_IndPtr != NULL) &&
+  if (ColumnNumber > s->ab->num_binds && (TargetValuePtr != NULL || StrLen_or_IndPtr != NULL) &&
       seer_odbc_ensure_binds(s, ColumnNumber) != 0)
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
-  if (ColumnNumber > s->num_binds)
+  if (ColumnNumber > s->ab->num_binds)
     return SQL_SUCCESS; /* unbinding a column never bound */
 
-  OdbcBind *b = &s->binds[ColumnNumber - 1];
+  OdbcBind *b = &s->ab->binds[ColumnNumber - 1];
   if (TargetValuePtr == NULL && StrLen_or_IndPtr == NULL) {
     b->bound = 0; /* unbind */
     return SQL_SUCCESS;
@@ -1073,8 +1120,8 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
   if (s->retrieve_data == SQL_RD_OFF) /* positioned, nothing filled (#250) */
     return SQL_SUCCESS;
   int ncols = odbc_visible_cols(s);
-  for (int i = 0; i < s->num_binds; i++) {
-    OdbcBind *b = &s->binds[i];
+  for (int i = 0; i < s->ab->num_binds; i++) {
+    OdbcBind *b = &s->ab->binds[i];
     if (!b->bound)
       continue;
     if (i >= ncols) /* bound, but the result has no such column */
@@ -1347,10 +1394,12 @@ SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option)
     s->cur_row = -1; /* closed: no current row for WHERE CURRENT OF (#288) */
     return SQL_SUCCESS;
   case SQL_UNBIND:
-    for (int i = 0; i < s->num_binds; i++)
-      s->binds[i].bound = 0;
+    for (int i = 0; i < s->ab->num_binds; i++)
+      s->ab->binds[i].bound = 0;
     return SQL_SUCCESS;
   case SQL_RESET_PARAMS:
+    if (s->apd_ext != NULL) /* the APD in use has no records left (#291) */
+      s->apd_ext->recs.num_binds = 0;
     for (int i = 0; i < s->num_params; i++)
       free(s->params[i].dae_buf), free(s->params[i].ref_type);
     free(s->params);

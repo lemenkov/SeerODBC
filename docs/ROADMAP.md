@@ -205,7 +205,9 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       same bind/param array execute/fetch consume (ARD = SQLBindCol, APD/IPD =
       SQLBindParameter halves); the IRD is read-only (HY016)
 - [x] SQLCopyDesc — records between any two implicit descriptors, header
-      fields within one class (#289); explicit descriptors still todo (#291)
+      fields within one class (#289)
+- [x] Explicit descriptors (SQLAllocHandle SQL_HANDLE_DESC) as a statement's ARD
+      (shared in place) or APD (loaded at execute); records only (#291)
 - [x] SQLBulkOperations — deliberately unsupported (no bookmarks): reported false
       by SQLGetFunctions; returns HYC00. Use SQLSetPos for positioned DML.
 

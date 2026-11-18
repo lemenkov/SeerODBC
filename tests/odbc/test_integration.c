@@ -2585,6 +2585,127 @@ static void check_key_catalog(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Explicit descriptors (#291): one allocated on the connection and filled
+ * with SQLSetDescField is the ARD of two statements, which both fetch into
+ * its buffers, then an INSERT's APD; SQLGetStmtAttr returns it; freed while
+ * in use, the statements go back to their own; another statement's
+ * implicit descriptor, or an implementation one, can't be set (HY017). */
+static void check_explicit_desc(SQLHDBC dbc)
+{
+  const char *name = "explicit descriptors: shared ARD, APD, free while in use";
+  char err[256] = "", m[600] = "";
+  exec_do(dbc, "DROP TABLE seer_xd", err, sizeof err);
+  exec_do(dbc, "CREATE TABLE seer_xd (id NUMBER, nm VARCHAR2(20))", err, sizeof err);
+  SQLHDESC d = SQL_NULL_HDESC;
+  SQLHSTMT s1, s2, s3;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s1);
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s2);
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s3);
+  SQLINTEGER id = 0;
+  char nm[21] = "";
+  SQLLEN id_ind = 0, nm_ind = 0;
+  if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_DESC, dbc, &d))) {
+    diag_text(SQL_HANDLE_DBC, dbc, m, sizeof m);
+    if (m[0] == '\0')
+      snprintf(m, sizeof m, "SQLAllocHandle(SQL_HANDLE_DESC) failed with no diagnostic");
+  }
+  SQLSMALLINT alloc = 0;
+  if (m[0] == '\0') {
+    SQLGetDescField(d, 0, SQL_DESC_ALLOC_TYPE, &alloc, 0, NULL);
+    if (alloc != SQL_DESC_ALLOC_USER)
+      snprintf(m, sizeof m, "SQL_DESC_ALLOC_TYPE %d, want SQL_DESC_ALLOC_USER", alloc);
+  }
+  if (m[0] == '\0') {
+    SQLSetDescField(d, 1, SQL_DESC_CONCISE_TYPE, (SQLPOINTER)SQL_C_SLONG, 0);
+    SQLSetDescField(d, 1, SQL_DESC_INDICATOR_PTR, &id_ind, 0);
+    SQLSetDescField(d, 1, SQL_DESC_DATA_PTR, &id, 0);
+    SQLSetDescField(d, 2, SQL_DESC_CONCISE_TYPE, (SQLPOINTER)SQL_C_CHAR, 0);
+    SQLSetDescField(d, 2, SQL_DESC_OCTET_LENGTH, (SQLPOINTER)(SQLLEN)sizeof nm, 0);
+    SQLSetDescField(d, 2, SQL_DESC_INDICATOR_PTR, &nm_ind, 0);
+    SQLSetDescField(d, 2, SQL_DESC_DATA_PTR, nm, 0);
+    SQLSMALLINT cnt = 0;
+    SQLGetDescField(d, 0, SQL_DESC_COUNT, &cnt, 0, NULL);
+    if (cnt != 2)
+      snprintf(m, sizeof m, "SQL_DESC_COUNT %d after two records, want 2", cnt);
+  }
+  /* The ARD of two statements. */
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    SQLHSTMT st = k == 0 ? s1 : s2;
+    if (!SQL_SUCCEEDED(SQLSetStmtAttr(st, SQL_ATTR_APP_ROW_DESC, d, 0))) {
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+      break;
+    }
+    SQLHDESC got = SQL_NULL_HDESC;
+    SQLGetStmtAttr(st, SQL_ATTR_APP_ROW_DESC, &got, 0, NULL);
+    const char *sql = k == 0 ? "SELECT 1, 'one' FROM dual" : "SELECT 2, 'two' FROM dual";
+    id = 0;
+    nm[0] = '\0';
+    if (got != d)
+      snprintf(m, sizeof m, "statement %d: SQLGetStmtAttr(APP_ROW_DESC) is not the descriptor",
+               k + 1);
+    else if (!SQL_SUCCEEDED(SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS)) ||
+             !SQL_SUCCEEDED(SQLFetch(st)))
+      diag_text(SQL_HANDLE_STMT, st, m, sizeof m);
+    else if (id != k + 1 || strcmp(nm, k == 0 ? "one" : "two") != 0)
+      snprintf(m, sizeof m, "statement %d fetched %d '%s'", k + 1, (int)id, nm);
+    SQLFreeStmt(st, SQL_CLOSE);
+  }
+  /* The APD of an INSERT: its values from the descriptor's buffers. */
+  if (m[0] == '\0') {
+    SQLINTEGER dummy = 0;
+    SQLLEN dind = 0;
+    SQLBindParameter(s3, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &dummy, 0, &dind);
+    SQLBindParameter(s3, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 20, 0, NULL, 0, &dind);
+    id = 7;
+    strcpy(nm, "seven");
+    id_ind = 0;
+    nm_ind = SQL_NTS;
+    if (!SQL_SUCCEEDED(SQLSetStmtAttr(s3, SQL_ATTR_APP_PARAM_DESC, d, 0)) ||
+        !SQL_SUCCEEDED(SQLExecDirect(s3, (SQLCHAR *)"INSERT INTO seer_xd VALUES (?, ?)", SQL_NTS)))
+      diag_text(SQL_HANDLE_STMT, s3, m, sizeof m);
+  }
+  /* Freed while in use: s1 is back on its own ARD. */
+  if (m[0] == '\0') {
+    SQLFreeHandle(SQL_HANDLE_DESC, d);
+    d = SQL_NULL_HDESC;
+    SQLINTEGER v = 0;
+    SQLLEN vind = 0;
+    SQLBindCol(s1, 1, SQL_C_SLONG, &v, 0, &vind);
+    if (!SQL_SUCCEEDED(
+            SQLExecDirect(s1, (SQLCHAR *)"SELECT id FROM seer_xd WHERE nm = 'seven'", SQL_NTS)) ||
+        !SQL_SUCCEEDED(SQLFetch(s1)))
+      diag_text(SQL_HANDLE_STMT, s1, m, sizeof m);
+    else if (v != 7)
+      snprintf(m, sizeof m, "after the free, s1 fetched %d (want the inserted 7)", (int)v);
+    SQLFreeStmt(s1, SQL_CLOSE);
+  }
+  /* Another statement's implicit descriptor, and an IRD: HY017. */
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    SQLHDESC other = SQL_NULL_HDESC;
+    SQLGetStmtAttr(s2, SQL_ATTR_APP_ROW_DESC, &other, 0, NULL);
+    SQLRETURN rc =
+        SQLSetStmtAttr(s1, k == 0 ? SQL_ATTR_APP_ROW_DESC : SQL_ATTR_IMP_ROW_DESC, other, 0);
+    SQLCHAR state[6] = "", msg[200];
+    SQLINTEGER nat;
+    SQLSMALLINT ml;
+    SQLGetDiagRec(SQL_HANDLE_STMT, s1, 1, state, &nat, msg, sizeof msg, &ml);
+    if (rc != SQL_ERROR || strcmp((char *)state, "HY017") != 0)
+      snprintf(m, sizeof m, "%s: rc %d %s, want HY017",
+               k == 0 ? "another statement's ARD as APP_ROW_DESC" : "setting IMP_ROW_DESC", rc,
+               (char *)state);
+  }
+  if (d != SQL_NULL_HDESC)
+    SQLFreeHandle(SQL_HANDLE_DESC, d);
+  SQLFreeHandle(SQL_HANDLE_STMT, s3);
+  SQLFreeHandle(SQL_HANDLE_STMT, s2);
+  SQLFreeHandle(SQL_HANDLE_STMT, s1);
+  exec_do(dbc, "DROP TABLE seer_xd", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* SQLCopyDesc (#289), the classic row copy: a SELECT's ARD becomes an
  * INSERT's APD and its IRD the INSERT's IPD, so each fetched row inserts as
  * it is. A target IRD is HY016; an unprepared statement's IRD is HY007. */
@@ -5612,6 +5733,7 @@ int main(void)
     check_privileges(dbc);
     check_cursor_names(dbc);
     check_copy_desc(dbc);
+    check_explicit_desc(dbc);
     check_catalog(dbc);
     check_lock(dbc);
     check_data_at_exec(dbc);

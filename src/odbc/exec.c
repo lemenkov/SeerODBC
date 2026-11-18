@@ -701,8 +701,15 @@ static SQLRETURN current_of(OdbcStmt *s, const char *sql, char **out)
 
 /* Execute statement text: a positioned one rewritten first. The core keeps
  * its own copy of the text, so the rewrite is freed straight after. */
+static SQLRETURN load_explicit_apd(OdbcStmt *s);
+
 static SQLRETURN exec_text(OdbcStmt *s, const char *sql)
 {
+  if (s->apd_ext != NULL) {
+    SQLRETURN lr = load_explicit_apd(s);
+    if (lr != SQL_SUCCESS)
+      return lr;
+  }
   char *pos = NULL;
   SQLRETURN r = current_of(s, sql, &pos);
   if (r != SQL_SUCCESS)
@@ -969,6 +976,41 @@ SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT Parame
   p->buflen = BufferLength;
   p->indicator = StrLen_or_IndPtr;
   p->bound = 1;
+  /* With an explicit APD in use, the value half is that descriptor's (#291). */
+  if (s->apd_ext != NULL) {
+    if (seer_odbc_bindset_ensure(&s->apd_ext->recs, ParameterNumber) != 0)
+      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    s->apd_ext->recs.binds[ParameterNumber - 1] =
+        (OdbcBind){p->c_type, p->buf, p->buflen, p->indicator, 1};
+  }
+  return SQL_SUCCESS;
+}
+
+/* With an explicit APD in use (#291), its records are the parameters' value
+ * halves for this execute; the IPD halves stay the statement's. */
+static SQLRETURN load_explicit_apd(OdbcStmt *s)
+{
+  const OdbcBindSet *a = &s->apd_ext->recs;
+  if (a->num_binds > s->num_params) {
+    OdbcParam *np = realloc(s->params, (size_t)a->num_binds * sizeof *np);
+    if (np == NULL)
+      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    for (int i = s->num_params; i < a->num_binds; i++)
+      np[i] = (OdbcParam){0};
+    s->params = np;
+    s->num_params = a->num_binds;
+  }
+  for (int i = 0; i < s->num_params; i++) {
+    OdbcParam *p = &s->params[i];
+    const OdbcBind *b = i < a->num_binds ? &a->binds[i] : NULL;
+    p->c_type = b != NULL ? b->target_type : 0;
+    p->buf = b != NULL ? b->buf : NULL;
+    p->buflen = b != NULL ? b->buflen : 0;
+    p->indicator = b != NULL ? b->indicator : NULL;
+    p->bound = b != NULL && b->bound;
+    if (p->bound && p->io_type == 0)
+      p->io_type = SQL_PARAM_INPUT;
+  }
   return SQL_SUCCESS;
 }
 
@@ -1098,8 +1140,8 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
     if (o < 0 || (size_t)o >= sizeof sql)
       return seer_odbc_diag(s, "HY000", 0, "Updatable cursor statement too long", SQL_ERROR);
     int nset = 0;
-    for (int i = 0; i < s->num_binds && i < odbc_visible_cols(s); i++) {
-      if (!s->binds[i].bound)
+    for (int i = 0; i < s->ab->num_binds && i < odbc_visible_cols(s); i++) {
+      if (!s->ab->binds[i].bound)
         continue;
       const char *name = seer_stmt_col_name(s->core, i);
       if (name == NULL)
@@ -1122,8 +1164,8 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
       return seer_odbc_diag(s, "HY000", 0, "prepare failed", SQL_ERROR);
 
     int k = 0;
-    for (int i = 0; i < s->num_binds && i < odbc_visible_cols(s); i++) {
-      OdbcBind *b = &s->binds[i];
+    for (int i = 0; i < s->ab->num_binds && i < odbc_visible_cols(s); i++) {
+      OdbcBind *b = &s->ab->binds[i];
       if (!b->bound || seer_stmt_col_name(s->core, i) == NULL)
         continue;
       void *vp = seer_odbc_bound_at(b->buf, s->row_bind_offset, s->row_bind_type,
