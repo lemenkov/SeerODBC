@@ -121,6 +121,9 @@ SeerStatus seer_test_build_fetch_only(uint8_t fv, uint32_t release, uint8_t seq,
  * and ORA code (defined in stmt.c). Backs the fv2 status regression test. */
 void seer_test_fv2_decode_dml(const uint8_t *buf, size_t len, int64_t *rowcount, int64_t *code);
 
+/* Test-only: the error text a 9i error reply sets on c->last_error (#246). */
+void seer_test_fv2_set_error(SeerConn *c, const uint8_t *buf, size_t len);
+
 /* Oracle 8i login (defined in ttc.c): build an OSESSKEY / OAUTH call at 8i's
  * fixed little-endian widths, and read one value of its reply. */
 /* The operating-system account running the client (getpwuid, else $USER /
