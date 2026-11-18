@@ -258,8 +258,17 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
     return info_u32(SQL_SC_SQL92_ENTRY, InfoValuePtr);
   case SQL_ODBC_INTERFACE_CONFORMANCE:
     return info_u32(SQL_OIC_CORE, InfoValuePtr);
-  case SQL_MULT_RESULT_SETS: /* implicit results, SQLMoreResults */
-  case SQL_PROCEDURES:       /* {call ...} */
+  case SQL_MULT_RESULT_SETS:
+    /* The only second result set is an implicit result (DBMS_SQL.RETURN_RESULT,
+     * via SQLMoreResults), which 12c brought (#312). */
+    return info_string(seer_odbc_server_major(c) >= 12 ? "Y" : "N", InfoValuePtr, BufferLength,
+                       StringLengthPtr);
+  case SQL_BATCH_SUPPORT:
+    /* From 12c a procedure ({call}) returns its implicit results. No explicit
+     * batches (Oracle runs one statement at a time), and a procedure's DML
+     * gives no separate row counts, so SQL_BATCH_ROW_COUNT stays 0. */
+    return info_u32(seer_odbc_server_major(c) >= 12 ? SQL_BS_SELECT_PROC : 0, InfoValuePtr);
+  case SQL_PROCEDURES: /* {call ...} */
   case SQL_COLUMN_ALIAS:
   case SQL_LIKE_ESCAPE_CLAUSE: /* {escape ...} */
   case SQL_EXPRESSIONS_IN_ORDERBY:

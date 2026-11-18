@@ -3966,6 +3966,73 @@ static void check_refcursor_nested_cursor(SQLHDBC dbc)
   }
 }
 
+/* Run `sql` and count the result sets it gives through SQLMoreResults: -1 when
+ * it fails to run, with the error in `err`. */
+static int count_result_sets(SQLHDBC dbc, const char *sql, char *err, size_t errn)
+{
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS);
+  int sets = -1;
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, (int)errn);
+  else
+    for (sets = 0; SQL_SUCCEEDED(rc); rc = SQLMoreResults(st)) {
+      SQLSMALLINT nc = 0;
+      SQLNumResultCols(st, &nc);
+      if (nc > 0) {
+        sets++;
+        while (SQL_SUCCEEDED(SQLFetch(st)))
+          ;
+      }
+    }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  return sets;
+}
+
+/* SQL_MULT_RESULT_SETS and SQL_BATCH_SUPPORT (#312) match what the server
+ * does on every release: "Y" and SQL_BS_SELECT_PROC exactly where a block,
+ * and a procedure called through {call}, really give two result sets. */
+static void check_mult_result_sets(SQLHDBC dbc)
+{
+  const char *name = "SQL_MULT_RESULT_SETS / SQL_BATCH_SUPPORT match the server";
+  const char *body = "a SYS_REFCURSOR; b SYS_REFCURSOR; BEGIN "
+                     "OPEN a FOR SELECT 1 FROM dual; DBMS_SQL.RETURN_RESULT(a); "
+                     "OPEN b FOR SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual; "
+                     "DBMS_SQL.RETURN_RESULT(b); END;";
+  char sql[512], err[256] = "", m[400] = "", mrs[8] = "";
+  SQLUINTEGER bs = 0, brc = 0;
+  SQLGetInfo(dbc, SQL_MULT_RESULT_SETS, mrs, sizeof mrs, NULL);
+  SQLGetInfo(dbc, SQL_BATCH_SUPPORT, &bs, sizeof bs, NULL);
+  SQLGetInfo(dbc, SQL_BATCH_ROW_COUNT, &brc, sizeof brc, NULL);
+
+  snprintf(sql, sizeof sql, "DECLARE %s", body);
+  int block = count_result_sets(dbc, sql, err, sizeof err);
+  /* A procedure that won't compile (no RETURN_RESULT) still creates, with
+   * errors; calling it then fails like the block. */
+  snprintf(sql, sizeof sql, "CREATE OR REPLACE PROCEDURE seer_mrs AS %s", body);
+  exec_do(dbc, sql, err, sizeof err);
+  char cerr[256] = "";
+  int call = count_result_sets(dbc, "{call seer_mrs}", cerr, sizeof cerr);
+  exec_do(dbc, "DROP PROCEDURE seer_mrs", err, sizeof err);
+
+  if (block >= 0 && block != 2)
+    snprintf(m, sizeof m, "the two-result block gave %d sets", block);
+  else if (call >= 0 && call != 2)
+    snprintf(m, sizeof m, "{call} of the two-result procedure gave %d sets", call);
+  else if ((strcmp(mrs, "Y") == 0) != (block == 2))
+    snprintf(m, sizeof m, "SQL_MULT_RESULT_SETS '%s', block gave %d sets", mrs, block);
+  else if (bs != (call == 2 ? (SQLUINTEGER)SQL_BS_SELECT_PROC : 0))
+    snprintf(m, sizeof m, "SQL_BATCH_SUPPORT 0x%x, {call} gave %d sets (%s)", (unsigned)bs, call,
+             cerr);
+  else if (brc != 0)
+    snprintf(m, sizeof m, "SQL_BATCH_ROW_COUNT 0x%x, want 0", (unsigned)brc);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_implicit_results(SQLHDBC dbc)
 {
   const char *name = "implicit results";
@@ -4853,7 +4920,7 @@ static void check_getinfo_answers(SQLHDBC dbc, const char *user, const char *svc
     SQLUSMALLINT type;
     const char *want;
   } strs[] = {
-      {SQL_MULT_RESULT_SETS, "Y"},
+      /* SQL_MULT_RESULT_SETS follows the release: check_mult_result_sets. */
       {SQL_PROCEDURES, "Y"},
       {SQL_COLUMN_ALIAS, "Y"},
       {SQL_LIKE_ESCAPE_CLAUSE, "Y"},
@@ -6169,6 +6236,7 @@ int main(void)
   check_bulk_unsupported(dbc);
   check_annotations(dbc);
   check_implicit_results(dbc);
+  check_mult_result_sets(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);
