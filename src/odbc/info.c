@@ -31,6 +31,13 @@ static SQLRETURN info_string(const char *val, SQLPOINTER buf, SQLSMALLINT buflen
   return SQL_SUCCESS;
 }
 
+/* What both cursors do with a rowset (#294): SQLSetPos's operations, any
+ * LockType as NO_CHANGE, and positioned UPDATE / DELETE (#288). */
+#define CURSOR_CA1                                                                                 \
+  (SQL_CA1_NEXT | SQL_CA1_LOCK_NO_CHANGE | SQL_CA1_POS_POSITION | SQL_CA1_POS_UPDATE |             \
+   SQL_CA1_POS_DELETE | SQL_CA1_POS_REFRESH | SQL_CA1_POSITIONED_UPDATE |                          \
+   SQL_CA1_POSITIONED_DELETE)
+
 static SQLRETURN info_u16(SQLUSMALLINT val, SQLPOINTER buf)
 {
   if (buf != NULL)
@@ -245,20 +252,28 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
   case SQL_PARAM_ARRAY_SELECTS:
     return info_u32(SQL_PAS_NO_SELECT, InfoValuePtr);
 
-  /* --- cursors --- forward-only plus a buffered static (scrollable) cursor */
+  /* --- cursors --- forward-only plus a buffered static (scrollable) cursor.
+   * Both take SQLSetPos (POSITION / REFRESH / UPDATE / DELETE, any LockType
+   * as NO_CHANGE), positioned DML by ROWID (unique), read-only or locking
+   * concurrency (FOR UPDATE), and SQL_ATTR_MAX_ROWS on a SELECT (#294). */
   case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1:
-    return info_u32(SQL_CA1_NEXT | SQL_CA1_POSITIONED_UPDATE | SQL_CA1_POSITIONED_DELETE,
-                    InfoValuePtr);
+    return info_u32(CURSOR_CA1, InfoValuePtr);
+  case SQL_STATIC_CURSOR_ATTRIBUTES1:
+    return info_u32(CURSOR_CA1 | SQL_CA1_ABSOLUTE | SQL_CA1_RELATIVE, InfoValuePtr);
   case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2:
-    return info_u32(SQL_CA2_READ_ONLY_CONCURRENCY, InfoValuePtr);
+  case SQL_STATIC_CURSOR_ATTRIBUTES2:
+    return info_u32(SQL_CA2_READ_ONLY_CONCURRENCY | SQL_CA2_LOCK_CONCURRENCY |
+                        SQL_CA2_MAX_ROWS_SELECT | SQL_CA2_SIMULATE_UNIQUE,
+                    InfoValuePtr);
   case SQL_SCROLL_OPTIONS:
     return info_u32(SQL_SO_FORWARD_ONLY | SQL_SO_STATIC, InfoValuePtr);
-  case SQL_STATIC_CURSOR_ATTRIBUTES1:
-    return info_u32(SQL_CA1_NEXT | SQL_CA1_ABSOLUTE | SQL_CA1_RELATIVE | SQL_CA1_POSITIONED_UPDATE |
-                        SQL_CA1_POSITIONED_DELETE,
+  case SQL_POS_OPERATIONS: /* the 2.x forms of the same */
+    return info_u32(SQL_POS_POSITION | SQL_POS_REFRESH | SQL_POS_UPDATE | SQL_POS_DELETE,
                     InfoValuePtr);
-  case SQL_STATIC_CURSOR_ATTRIBUTES2:
-    return info_u32(SQL_CA2_READ_ONLY_CONCURRENCY, InfoValuePtr);
+  case SQL_SCROLL_CONCURRENCY:
+    return info_u32(SQL_SCCO_READ_ONLY | SQL_SCCO_LOCK, InfoValuePtr);
+  case SQL_LOCK_TYPES:
+    return info_u32(SQL_LCK_NO_CHANGE, InfoValuePtr);
 
   default:
     /* Unknown InfoType: a benign empty/zero answer keeps the DM happy. */

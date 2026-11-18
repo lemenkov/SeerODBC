@@ -4495,6 +4495,8 @@ static void check_unreachable_error(const char *drv, const char *svc, const char
   }
 }
 
+static void diag_state(SQLSMALLINT type, SQLHANDLE h, char st[6]);
+
 /* SQLGetInfo answers what the driver does (#234): no empty "neither Y nor N"
  * strings, no 0 where ODBC defines no 0, the connection's user and service. */
 static void check_getinfo_answers(SQLHDBC dbc, const char *user, const char *svc)
@@ -4546,6 +4548,35 @@ static void check_getinfo_answers(SQLHDBC dbc, const char *user, const char *svc
     size_t ml = strlen(m);
     snprintf(m + ml, sizeof m - ml, "forward-only %#x, PARC %u, PAS %u", (unsigned)fo,
              (unsigned)parc, (unsigned)pas);
+  }
+  /* What SQLSetPos and locking cursors do, said (#294); optimistic
+   * concurrency, which the driver can't keep, becomes LOCK with 01S02. */
+  SQLUINTEGER st1 = 0, st2 = 0, posops = 0, scco = 0;
+  SQLGetInfo(dbc, SQL_STATIC_CURSOR_ATTRIBUTES1, &st1, sizeof st1, NULL);
+  SQLGetInfo(dbc, SQL_STATIC_CURSOR_ATTRIBUTES2, &st2, sizeof st2, NULL);
+  SQLGetInfo(dbc, SQL_POS_OPERATIONS, &posops, sizeof posops, NULL);
+  SQLGetInfo(dbc, SQL_SCROLL_CONCURRENCY, &scco, sizeof scco, NULL);
+  const SQLUINTEGER want1 = SQL_CA1_POS_POSITION | SQL_CA1_POS_UPDATE | SQL_CA1_POS_DELETE |
+                            SQL_CA1_POS_REFRESH | SQL_CA1_LOCK_NO_CHANGE;
+  if ((fo & want1) != want1 || (st1 & want1) != want1 || !(st2 & SQL_CA2_LOCK_CONCURRENCY) ||
+      posops != (SQL_POS_POSITION | SQL_POS_REFRESH | SQL_POS_UPDATE | SQL_POS_DELETE) ||
+      scco != (SQL_SCCO_READ_ONLY | SQL_SCCO_LOCK)) {
+    size_t ml = strlen(m);
+    snprintf(m + ml, sizeof m - ml, "CA1 fo %#x st %#x, CA2 %#x, POS_OPERATIONS %#x, SCCO %#x; ",
+             (unsigned)fo, (unsigned)st1, (unsigned)st2, (unsigned)posops, (unsigned)scco);
+  }
+  SQLHSTMT cst;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &cst);
+  SQLRETURN crc = SQLSetStmtAttr(cst, SQL_ATTR_CONCURRENCY, (SQLPOINTER)SQL_CONCUR_ROWVER, 0);
+  char cstate[6] = "";
+  diag_state(SQL_HANDLE_STMT, cst, cstate);
+  SQLULEN conc = 0;
+  SQLGetStmtAttr(cst, SQL_ATTR_CONCURRENCY, &conc, 0, NULL);
+  SQLFreeHandle(SQL_HANDLE_STMT, cst);
+  if (crc != SQL_SUCCESS_WITH_INFO || strcmp(cstate, "01S02") != 0 || conc != SQL_CONCUR_LOCK) {
+    size_t ml = strlen(m);
+    snprintf(m + ml, sizeof m - ml, "CONCUR_ROWVER: rc %d %s, reads back %lu (want 01S02, LOCK)",
+             crc, cstate, (unsigned long)conc);
   }
   if (m[0] == '\0')
     pass(name);
