@@ -162,8 +162,12 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
 #else
     return info_string("libseerodbc.so", InfoValuePtr, BufferLength, StringLengthPtr);
 #endif
-  case SQL_DRIVER_VER:
-    return info_string("00.00.0000", InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_DRIVER_VER: { /* "##.##.####": 0.4.0 is 00.04.0000 */
+    char ver[24];
+    snprintf(ver, sizeof ver, "%02d.%02d.%04d", SEERTNS_VERSION_MAJOR, SEERTNS_VERSION_MINOR,
+             SEERTNS_VERSION_PATCH);
+    return info_string(ver, InfoValuePtr, BufferLength, StringLengthPtr);
+  }
   case SQL_DRIVER_ODBC_VER:
     return info_string("03.80", InfoValuePtr, BufferLength, StringLengthPtr);
   case SQL_DBMS_NAME:

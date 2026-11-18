@@ -244,7 +244,8 @@ if build_driver
     test_integration = executable('test_integration',
       'odbc/test_integration.c',
       dependencies : [test_dep, odbc_dm_dep],
-      c_args : ['-DSEER_DRIVER_PATH="' + seerodbc_lib.full_path() + '"'],
+      c_args : ['-DSEER_DRIVER_PATH="' + seerodbc_lib.full_path() + '"',
+                '-DSEER_PROJECT_VERSION="' + meson.project_version() + '"'],
     )
     # `depends` (not link_with) so the .so is built first but loaded only by the
     # Driver Manager at run time - linking it in would clash with the DM's
