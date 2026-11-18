@@ -111,9 +111,9 @@ How each family behaves:
   advertised: Oracle has no equivalent and no catalogs. `RAND()` becomes
   DBMS_RANDOM.VALUE, but SQL can't seed it, so RAND is not advertised either.
 - **Parameter markers:** a translation keeps the arguments that hold markers in
-  their order. When it would swap two of them (`{fn LOCATE(?, ?)}`), or repeat
-  one (`{fn REPEAT(?, 2)}`, until #302), the statement is refused with HYC00
-  rather than binding values to the wrong arguments.
+  their order, and may repeat one (`{fn REPEAT(?, 2)}` is still one parameter).
+  When it would swap two of them (`{fn LOCATE(?, ?)}`), the statement is refused
+  with HYC00 rather than binding values to the wrong arguments.
 
 ## SeerODBC-specific identifiers
 

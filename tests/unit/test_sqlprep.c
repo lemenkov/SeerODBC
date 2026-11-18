@@ -175,7 +175,8 @@ int main(void)
   check_fn("SELECT {fn LOCATE(?, s)} FROM t", 0, "SELECT INSTR(s, :1) FROM t");
   check_fn("SELECT {fn LEFT(?, ?)}, ? FROM t", 0, "SELECT SUBSTR(:1, 1, :2), :3 FROM t");
   check_fn("SELECT {fn LOCATE(?, ?)} FROM t", 0, NULL); /* would swap */
-  check_fn("SELECT {fn REPEAT(?, 2)} FROM t", 0, NULL); /* repeats one (#302) */
+  check_fn("SELECT {fn REPEAT(?, 2)}, ? FROM t", 0,     /* one parameter, repeated (#302) */
+           "SELECT RPAD(:1, LENGTH(:1) * (2), :1), :2 FROM t");
   check_fn("SELECT {fn REPEAT(s, ?)} FROM t", 0, "SELECT RPAD(s, LENGTH(s) * (:1), s) FROM t");
   check_fn("{? = call f({fn LEFT(?, 1)})}", 0, "BEGIN :1 := f(SUBSTR(:2, 1, 1)); END;");
 

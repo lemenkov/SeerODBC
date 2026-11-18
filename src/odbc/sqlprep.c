@@ -281,25 +281,18 @@ static int split_args(const char *p, size_t n, bool at_in, Span *out)
   return k;
 }
 
-/* Expand template `t` with `args`. Binds pair with placeholders in the order
- * they appear, so the arguments holding one must appear in their own order,
- * each once: reordered, the values would land in the wrong places, and the
- * form is refused. A repeated ":1" would be one bind by the API's rule, but
- * in SQL the server pairs values with occurrences, so a repeat followed by a
- * new placeholder leaves that one unbound until the core sends a value per
- * occurrence (#302): refused too. */
+/* Expand template `t` with `args`. Bind N is the N-th distinct placeholder
+ * by first appearance, so an argument holding one may repeat (":1" twice is
+ * one bind; the core sends it for each occurrence, #302), but those arguments
+ * must first appear in their own order, and none may be dropped: otherwise
+ * the values would land in the wrong places, and the form is refused. */
 static int expand(Buf *out, const char *t, const Span *args, int nargs, Ctx *ctx)
 {
   int seen[FN_MAX_ARGS] = {0}, last = 0;
   for (const char *q = t; *q != '\0'; q++)
     if (q[0] == '$' && q[1] >= '1' && q[1] <= '9') {
       int a = q[1] - '1';
-      if (a < nargs && has_marker(args[a].p, args[a].n)) {
-        if (seen[a]) {
-          ctx->err = "this {fn} escape repeats an argument that holds a parameter marker, which "
-                     "the driver can't bind yet";
-          return -1;
-        }
+      if (a < nargs && !seen[a] && has_marker(args[a].p, args[a].n)) {
         if (a + 1 < last) {
           ctx->err = "this {fn} escape reorders arguments that hold parameter markers, so their "
                      "values would bind to the wrong arguments";
