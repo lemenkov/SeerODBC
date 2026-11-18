@@ -262,9 +262,22 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   case SQL_ATTR_ROW_STATUS_PTR:
     s->row_status = (SQLUSMALLINT *)ValuePtr;
     return SQL_SUCCESS;
-  case SQL_ATTR_CONCURRENCY: /* updatable cursor opt-in */
-    s->concurrency = (SQLULEN)(uintptr_t)ValuePtr;
-    return SQL_SUCCESS;
+  case SQL_ATTR_CONCURRENCY: { /* updatable cursor opt-in */
+    SQLULEN v = (SQLULEN)(uintptr_t)ValuePtr;
+    if (v == SQL_CONCUR_READ_ONLY || v == SQL_CONCUR_LOCK) {
+      s->concurrency = v;
+      return SQL_SUCCESS;
+    }
+    if (v != SQL_CONCUR_ROWVER && v != SQL_CONCUR_VALUES)
+      return seer_odbc_diag(s, "HY024", 0, "Invalid attribute value", SQL_ERROR);
+    /* Optimistic concurrency (#294): SQLSetPos would have to refuse a row
+     * changed since the fetch, and updates by ROWID unchecked. The one it has
+     * that keeps the promise is locking the rows, as ODBC has a driver
+     * substitute what it lacks. */
+    s->concurrency = SQL_CONCUR_LOCK;
+    return seer_odbc_diag(s, "01S02", 0, "Concurrency changed to SQL_CONCUR_LOCK",
+                          SQL_SUCCESS_WITH_INFO);
+  }
   case SQL_ATTR_QUERY_TIMEOUT: /* seconds a call may wait for the server */
     s->query_timeout = (SQLULEN)(uintptr_t)ValuePtr;
     return SQL_SUCCESS;
