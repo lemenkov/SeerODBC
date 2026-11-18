@@ -433,18 +433,25 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
 }
 
 /* Prepare the statement text: NUL-terminate, then run the SQL preprocessor
- * (escape expansion + '?' marker rewrite, see sqlprep.c). */
-static char *dup_sql(const OdbcStmt *s, SQLCHAR *text, SQLINTEGER len)
+ * (escape expansion + '?' marker rewrite, see sqlprep.c). NULL with the
+ * diagnostic posted, `*rc` its return. */
+static char *dup_sql(OdbcStmt *s, SQLCHAR *text, SQLINTEGER len, SQLRETURN *rc)
 {
   size_t n = (len == SQL_NTS) ? strlen((const char *)text) : (size_t)len;
   char *raw = malloc(n + 1);
-  if (raw == NULL)
-    return NULL;
-  memcpy(raw, text, n);
-  raw[n] = '\0';
-  /* With SQL_ATTR_NOSCAN on, the escapes go as written (#248). */
-  char *out = seer_sql_prepare_scan(raw, s->noscan != SQL_NOSCAN_ON);
-  free(raw);
+  const char *err = NULL;
+  char *out = NULL;
+  if (raw != NULL) {
+    memcpy(raw, text, n);
+    raw[n] = '\0';
+    /* With SQL_ATTR_NOSCAN on, the escapes go as written (#248). */
+    out =
+        seer_sql_prepare_for(raw, s->noscan != SQL_NOSCAN_ON, seer_odbc_server_major(s->dbc), &err);
+    free(raw);
+  }
+  if (out == NULL)
+    *rc = err != NULL ? seer_odbc_diag(s, "HYC00", 0, err, SQL_ERROR)
+                      : seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   return out;
 }
 
@@ -814,9 +821,10 @@ SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR *StatementText,
   if (StatementText == NULL)
     return seer_odbc_diag(s, "HY009", 0, "NULL statement text", SQL_ERROR);
 
-  char *sql = dup_sql(s, StatementText, TextLength);
+  SQLRETURN rc = SQL_ERROR;
+  char *sql = dup_sql(s, StatementText, TextLength, &rc);
   if (sql == NULL)
-    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    return rc;
   free(s->sql);
   s->sql = sql;
   /* A new statement: drop the previous one's result set, so metadata calls
@@ -853,9 +861,10 @@ SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR *StatementText
   if (StatementText == NULL)
     return seer_odbc_diag(s, "HY009", 0, "NULL statement text", SQL_ERROR);
 
-  char *sql = dup_sql(s, StatementText, TextLength);
+  SQLRETURN rc = SQL_ERROR;
+  char *sql = dup_sql(s, StatementText, TextLength, &rc);
   if (sql == NULL)
-    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    return rc;
   free(s->sql);
   s->sql = sql;
   return exec_text(s, s->sql);

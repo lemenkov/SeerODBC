@@ -249,8 +249,7 @@ SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR *CatalogName, SQLS
  * word at login (seer_server_version's SEER_ENOTIMPL). */
 static int server_major(OdbcStmt *s)
 {
-  int v[5] = {0};
-  return seer_server_version(s->dbc->conn, v) == SEER_OK ? v[0] : 9;
+  return seer_odbc_server_major(s->dbc);
 }
 
 /* A dictionary DATA_TYPE as its ODBC concise type, the one a result column

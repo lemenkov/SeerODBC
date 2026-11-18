@@ -3025,6 +3025,201 @@ static void check_tables_enum(SQLHDBC dbc)
 
 /* SQLNumParams and SQLDescribeParam (#280): the parameters a prepared
  * statement has are described, and one past the last is 07009. */
+/* Run `sql` with text parameters `p` (NULL-terminated), column 1 into `out`.
+ * The SQLSTATE of a failure goes into `state`. */
+static SQLRETURN exec_params(SQLHDBC dbc, const char *sql, const char *const *p, char *out,
+                             int outn, char state[6])
+{
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLLEN ind[4] = {SQL_NTS, SQL_NTS, SQL_NTS, SQL_NTS}, oi = 0;
+  out[0] = state[0] = '\0';
+  SQLRETURN rc = SQLPrepare(st, (SQLCHAR *)sql, SQL_NTS);
+  for (int i = 0; i < 4 && p[i] != NULL && SQL_SUCCEEDED(rc); i++)
+    rc = SQLBindParameter(st, (SQLUSMALLINT)(i + 1), SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 30,
+                          0, (SQLPOINTER)p[i], 0, &ind[i]);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLExecute(st);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLFetch(st);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLGetData(st, 1, SQL_C_CHAR, out, outn, &oi);
+  if (!SQL_SUCCEEDED(rc)) {
+    SQLINTEGER nat;
+    SQLCHAR msg[300];
+    SQLSMALLINT ml;
+    SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, (SQLCHAR *)state, &nat, msg, sizeof msg, &ml);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  return rc;
+}
+
+/* The {fn} scalar functions (#301): each translation's value, on every
+ * release (8i's own forms where it lacks LOCALTIMESTAMP, INTERVAL and
+ * TIMESTAMP), the SQLGetInfo masks that advertise them, and parameter markers
+ * in their arguments: kept in order where the Oracle form repeats or reorders
+ * them, and refused (HYC00) where two of them would swap. */
+static void check_scalar_functions(SQLHDBC dbc)
+{
+  const char *name = "{fn} scalar functions: values, masks, markers";
+  static const struct {
+    const char *expr, *want;
+    int from; /* the first release it applies to */
+  } T[] = {
+      {"{fn CHAR(65)}", "A", 0},
+      {"{fn BIT_LENGTH('abc')}", "24", 0},
+      {"{fn CHAR_LENGTH('abc')}", "3", 0},
+      {"{fn OCTET_LENGTH('abc')}", "3", 0},
+      {"{fn INSERT('abcdef',2,3,'XY')}", "aXYef", 0},
+      {"{fn INSERT('abcdef',1,2,'XY')}", "XYcdef", 0},
+      {"{fn LEFT('abcdef',2)}", "ab", 0},
+      {"{fn LEFT('ab',5)}", "ab", 0},
+      {"{fn RIGHT('abcdef',2)}", "ef", 0},
+      {"{fn RIGHT('ab',5)}", "ab", 0},
+      {"{fn LENGTH('abc  ')}", "3", 0},
+      {"{fn LOCATE('c','abcabc')}", "3", 0},
+      {"{fn LOCATE('c','abcabc',4)}", "6", 0},
+      {"{fn POSITION('c' IN 'abc')}", "3", 0},
+      {"{fn REPEAT('ab',3)}", "ababab", 0},
+      {"{fn CONCAT('[',{fn CONCAT({fn SPACE(3)},']')})}", "[   ]", 0},
+      {"{fn ROUND({fn COT(1)},4)}", "0.6421", 0},
+      {"{fn ROUND({fn DEGREES({fn PI()})},4)}", "180", 0},
+      {"{fn ROUND({fn RADIANS(180)},4)}", "3.1416", 0},
+      {"{fn ROUND({fn LOG(10)},4)}", "2.3026", 0},
+      {"{fn LOG10(1000)}", "3", 0},
+      {"{fn TRUNCATE(2.567,1)}", "2.5", 0},
+      {"{fn DAYNAME({d '2026-11-18'})}", "Wednesday", 0},
+      {"{fn MONTHNAME({d '2026-11-18'})}", "November", 0},
+      {"{fn DAYOFMONTH({d '2026-11-18'})}", "18", 0},
+      {"{fn DAYOFWEEK({d '2026-11-15'})}", "1", 0}, /* a Sunday */
+      {"{fn DAYOFWEEK({d '2026-11-21'})}", "7", 0}, /* a Saturday */
+      {"{fn DAYOFYEAR({d '2026-11-18'})}", "322", 0},
+      {"{fn QUARTER({d '2026-11-18'})}", "4", 0},
+      {"{fn WEEK({d '2026-01-01'})}", "1", 0},
+      {"{fn WEEK({d '2026-01-03'})}", "1", 0}, /* the Saturday */
+      {"{fn WEEK({d '2026-01-04'})}", "2", 0}, /* the Sunday after */
+      {"{fn WEEK({d '2026-11-18'})}", "47", 0},
+      {"{fn HOUR({ts '2026-11-18 13:45:56'})}", "13", 0},
+      {"{fn MINUTE({ts '2026-11-18 13:45:56'})}", "45", 0},
+      {"{fn SECOND({ts '2026-11-18 13:45:56'})}", "56", 0},
+      {"{fn YEAR({d '2026-11-18'})}", "2026", 0},
+      {"{fn MONTH({d '2026-11-18'})}", "11", 0},
+      {"TO_CHAR({fn CURDATE()}, 'HH24:MI:SS')", "00:00:00", 0},
+      {"TO_CHAR({fn CURRENT_DATE()}, 'YYYY') - TO_CHAR(SYSDATE, 'YYYY')", "0", 0},
+      {"SIGN(CAST({fn NOW()} AS DATE) - SYSDATE + 1)", "1", 0},
+      {"SIGN(CAST({fn CURRENT_TIMESTAMP()} AS DATE) - SYSDATE + 1)", "1", 0},
+      {"SIGN(CAST({fn CURTIME()} AS DATE) - SYSDATE + 1)", "1", 0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_SECOND,90,{ts '2026-11-18 10:00:00'})},"
+       " 'YYYY-MM-DD HH24:MI:SS')",
+       "2026-11-18 10:01:30", 0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_HOUR,-3,{ts '2026-11-18 01:00:00'})},"
+       " 'YYYY-MM-DD HH24:MI:SS')",
+       "2026-11-17 22:00:00", 0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_DAY,1,{d '2026-11-18'})}, 'YYYY-MM-DD')", "2026-11-19", 0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_WEEK,2,{d '2026-11-18'})}, 'YYYY-MM-DD')", "2026-12-02",
+       0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_MONTH,1,{d '2026-01-31'})}, 'YYYY-MM-DD')", "2026-02-28",
+       0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_QUARTER,1,{d '2026-11-18'})}, 'YYYY-MM-DD')", "2027-02-18",
+       0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_YEAR,1,{d '2026-11-18'})}, 'YYYY-MM-DD')", "2027-11-18",
+       0},
+      {"TO_CHAR({fn TIMESTAMPADD(SQL_TSI_FRAC_SECOND,500000000,{ts '2026-11-18 10:00:00'})},"
+       " 'HH24:MI:SS.FF3')",
+       "10:00:00.500", 9},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_SECOND,{ts '2026-11-18 10:00:00'},{ts '2026-11-18 12:59:59'})}",
+       "10799", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_MINUTE,{ts '2026-11-18 10:00:00'},{ts '2026-11-18 12:59:59'})}",
+       "179", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_HOUR,{ts '2026-11-18 10:00:00'},{ts '2026-11-18 12:59:59'})}",
+       "2", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_DAY,{d '2026-11-20'},{d '2026-11-18'})}", "-2", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_WEEK,{d '2026-11-01'},{d '2026-11-18'})}", "2", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_MONTH,{d '2026-01-31'},{d '2026-03-30'})}", "1", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_QUARTER,{d '2026-01-15'},{d '2026-11-18'})}", "3", 0},
+      {"{fn TIMESTAMPDIFF(SQL_TSI_YEAR,{d '2020-11-19'},{d '2026-11-18'})}", "5", 0},
+      {"{fn TIMESTAMPDIFF(DAY,{d '2026-11-18'},{d '2026-11-19'})}", "1", 0}, /* no SQL_TSI_ */
+      {"{fn USER()}", "", 0}, /* the name: any non-empty answer */
+      {"{fn IFNULL(NULL,5)}", "5", 0},
+      {"{fn CONVERT('42',SQL_INTEGER)}", "42", 0},
+      {"{fn CONVERT('2.9',SQL_INTEGER)}", "2", 0},
+      {"{fn CONVERT(42,SQL_VARCHAR)} || 'x'", "42x", 0},
+      {"{fn CONVERT('2.5',SQL_DOUBLE)} * 2", "5", 0},
+      {"{fn CONVERT('2.5',SQL_DECIMAL)} * 2", "5", 0},
+      {"TO_CHAR({fn CONVERT({ts '2026-11-18 10:11:12'},SQL_DATE)}, 'YYYY-MM-DD HH24:MI:SS')",
+       "2026-11-18 00:00:00", 0},
+      {"TO_CHAR({fn CONVERT({d '2026-11-18'},SQL_TIMESTAMP)}, 'YYYY-MM-DD')", "2026-11-18", 0},
+  };
+  char m[700] = "", out[256], err[256];
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && m[0] == '\0'; i++) {
+    if (g_release < T[i].from)
+      continue;
+    char sql[512];
+    snprintf(sql, sizeof sql, "SELECT %s FROM dual", T[i].expr);
+    if (!SQL_SUCCEEDED(exec_scalar(dbc, sql, out, sizeof out, err, sizeof err)))
+      snprintf(m, sizeof m, "%s: %s", T[i].expr, err);
+    else if (T[i].want[0] == '\0' ? out[0] == '\0' : strcmp(out, T[i].want) != 0)
+      snprintf(m, sizeof m, "%s: got '%s', want '%s'", T[i].expr, out, T[i].want);
+  }
+
+  /* Markers: LOCATE reorders its two arguments, which is fine while one holds
+   * a marker; two markers that would swap are refused (HYC00), and so is a
+   * marker in an argument REPEAT or RIGHT repeats, until #302. */
+  static const struct {
+    const char *sql, *p[4], *want;
+  } P[] = {
+      {"SELECT {fn LOCATE(?, 'abcabc')} FROM dual", {"c", NULL}, "3"},
+      {"SELECT {fn LOCATE('c', ?)} FROM dual", {"xxc", NULL}, "3"},
+      {"SELECT {fn RIGHT('abcdef', ?)} || ? FROM dual", {"2", "!", NULL}, "ef!"},
+      {"SELECT ? || {fn LEFT(?, 2)} || ? FROM dual", {"[", "abc", "]"}, "[ab]"},
+      {"SELECT {fn LOCATE(?, ?)} FROM dual", {"c", "abc", NULL}, NULL},
+      {"SELECT {fn REPEAT(?, 2)} || ? FROM dual", {"ab", "!", NULL}, NULL},
+  };
+  for (size_t i = 0; i < sizeof P / sizeof P[0] && m[0] == '\0'; i++) {
+    char state[6];
+    SQLRETURN rc = exec_params(dbc, P[i].sql, P[i].p, out, sizeof out, state);
+    if (P[i].want == NULL) {
+      if (rc != SQL_ERROR || strcmp(state, "HYC00") != 0)
+        snprintf(m, sizeof m, "%s: rc %d %s, want HYC00", P[i].sql, rc, state);
+    } else if (!SQL_SUCCEEDED(rc)) {
+      snprintf(m, sizeof m, "%s: rc %d %s", P[i].sql, rc, state);
+    } else if (strcmp(out, P[i].want) != 0) {
+      snprintf(m, sizeof m, "%s: got '%s', want '%s'", P[i].sql, out, P[i].want);
+    }
+  }
+
+  /* The masks advertise what translates, release by release. */
+  SQLUINTEGER v = 0;
+  if (m[0] == '\0') {
+    SQLGetInfo(dbc, SQL_STRING_FUNCTIONS, &v, sizeof v, NULL);
+    if (!(v & SQL_FN_STR_LOCATE) || !(v & SQL_FN_STR_LEFT) || (v & SQL_FN_STR_DIFFERENCE))
+      snprintf(m, sizeof m, "SQL_STRING_FUNCTIONS 0x%x", (unsigned)v);
+  }
+  if (m[0] == '\0') {
+    SQLGetInfo(dbc, SQL_TIMEDATE_FUNCTIONS, &v, sizeof v, NULL);
+    if (!(v & SQL_FN_TD_TIMESTAMPDIFF) || !(v & SQL_FN_TD_EXTRACT) != (g_release == 8))
+      snprintf(m, sizeof m, "SQL_TIMEDATE_FUNCTIONS 0x%x", (unsigned)v);
+  }
+  if (m[0] == '\0') {
+    SQLGetInfo(dbc, SQL_TIMEDATE_ADD_INTERVALS, &v, sizeof v, NULL);
+    if (!(v & SQL_FN_TSI_MONTH) || !(v & SQL_FN_TSI_FRAC_SECOND) != (g_release == 8))
+      snprintf(m, sizeof m, "SQL_TIMEDATE_ADD_INTERVALS 0x%x", (unsigned)v);
+  }
+  if (m[0] == '\0') {
+    SQLGetInfo(dbc, SQL_CONVERT_VARCHAR, &v, sizeof v, NULL);
+    SQLUINTEGER d = 0;
+    SQLGetInfo(dbc, SQL_CONVERT_DATE, &d, sizeof d, NULL);
+    if (!(v & SQL_CVT_INTEGER) || !(v & SQL_CVT_DATE) || (d & SQL_CVT_INTEGER) ||
+        !(d & SQL_CVT_CHAR))
+      snprintf(m, sizeof m, "SQL_CONVERT_VARCHAR 0x%x, SQL_CONVERT_DATE 0x%x", (unsigned)v,
+               (unsigned)d);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_describe_param(SQLHDBC dbc)
 {
   const char *name = "SQLDescribeParam: parameter range";
@@ -5760,6 +5955,7 @@ int main(void)
     check_catalog_names(dbc);
     check_metadata_id(dbc);
     check_describe_param(dbc);
+    check_scalar_functions(dbc);
     check_tables_enum(dbc);
     check_privileges(dbc);
     check_cursor_names(dbc);

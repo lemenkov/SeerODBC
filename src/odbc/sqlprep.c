@@ -56,27 +56,369 @@ static int buf_put(Buf *x, const char *s, size_t n)
   return 0;
 }
 
-/* Map a few ODBC {fn} scalar-function names to their Oracle spellings; others
- * pass through unchanged (most match). */
-static const char *fn_alias(const char *name, size_t n)
+/* What a translation needs to know: the server's major release (0 when it is
+ * not known, read as the newest) and, on a refusal, why. */
+typedef struct {
+  int major;
+  const char *err;
+} Ctx;
+
+/* The ODBC scalar functions (Appendix E) and their Oracle forms (#301). A form
+ * starting with '=' renames the function and keeps its argument list as
+ * written; any other is a template whose $1..$9 are the arguments. `kw` is the
+ * keyword argument of TIMESTAMPADD / TIMESTAMPDIFF (the first; SQL_TSI_
+ * dropped) or CONVERT (the last), which is not counted in `nargs` nor numbered.
+ * `lo` / `hi` bound the releases a form is for (0: unbounded). A function, or an
+ * argument count, the table lacks goes to the server as written: most of
+ * Oracle's own names match (ABS, MOD, ROUND, CONCAT, REPLACE, EXTRACT...). */
+static const struct {
+  const char *name, *kw;
+  int nargs, lo, hi;
+  const char *form;
+} FN[] = {
+    /* string */
+    {"BIT_LENGTH", NULL, 1, 0, 0, "(LENGTHB($1) * 8)"},
+    {"CHAR", NULL, 1, 0, 0, "=CHR"},
+    {"CHAR_LENGTH", NULL, 1, 0, 0, "=LENGTH"},
+    {"CHARACTER_LENGTH", NULL, 1, 0, 0, "=LENGTH"},
+    {"INSERT", NULL, 4, 0, 0, "(SUBSTR($1, 1, ($2) - 1) || $4 || SUBSTR($1, ($2) + ($3)))"},
+    {"LCASE", NULL, 1, 0, 0, "=LOWER"},
+    {"LEFT", NULL, 2, 0, 0, "SUBSTR($1, 1, $2)"},
+    {"LENGTH", NULL, 1, 0, 0, "LENGTH(RTRIM($1))"}, /* ODBC's drops trailing blanks */
+    {"LOCATE", NULL, 2, 0, 0, "INSTR($2, $1)"},
+    {"LOCATE", NULL, 3, 0, 0, "INSTR($2, $1, $3)"},
+    {"OCTET_LENGTH", NULL, 1, 0, 0, "=LENGTHB"},
+    {"POSITION", NULL, 2, 0, 0, "INSTR($2, $1)"}, /* POSITION(a IN b), split at IN */
+    {"REPEAT", NULL, 2, 0, 0, "RPAD($1, LENGTH($1) * ($2), $1)"},
+    {"RIGHT", NULL, 2, 0, 0, "SUBSTR($1, GREATEST(LENGTH($1) - ($2) + 1, 1))"},
+    {"SPACE", NULL, 1, 0, 0, "RPAD(' ', $1)"},
+    {"SUBSTRING", NULL, -1, 0, 0, "=SUBSTR"},
+    {"UCASE", NULL, 1, 0, 0, "=UPPER"},
+    /* numeric */
+    {"CEILING", NULL, 1, 0, 0, "=CEIL"},
+    {"COT", NULL, 1, 0, 0, "(1 / TAN($1))"},
+    {"DEGREES", NULL, 1, 0, 0, "(($1) * 180 / ACOS(-1))"},
+    {"LOG", NULL, 1, 0, 0, "=LN"},
+    {"LOG10", NULL, 1, 0, 0, "LOG(10, $1)"},
+    {"PI", NULL, 0, 0, 0, "ACOS(-1)"},
+    {"RADIANS", NULL, 1, 0, 0, "(($1) * ACOS(-1) / 180)"},
+    {"RAND", NULL, 0, 0, 0, "DBMS_RANDOM.VALUE"}, /* no seeded form in SQL */
+    {"TRUNCATE", NULL, -1, 0, 0, "=TRUNC"},
+    /* date and time: 8i has no LOCALTIMESTAMP or CURRENT_DATE, and no time
+     * type anywhere, so a time is a DATE */
+    {"CURDATE", NULL, 0, 9, 0, "TRUNC(CURRENT_DATE)"},
+    {"CURDATE", NULL, 0, 0, 8, "TRUNC(SYSDATE)"},
+    {"CURRENT_DATE", NULL, 0, 9, 0, "TRUNC(CURRENT_DATE)"},
+    {"CURRENT_DATE", NULL, 0, 0, 8, "TRUNC(SYSDATE)"},
+    {"CURTIME", NULL, 0, 9, 0, "CURRENT_DATE"},
+    {"CURTIME", NULL, 0, 0, 8, "SYSDATE"},
+    {"CURRENT_TIME", NULL, 0, 9, 0, "CURRENT_DATE"},
+    {"CURRENT_TIME", NULL, 1, 9, 0, "LOCALTIMESTAMP($1)"},
+    {"CURRENT_TIME", NULL, 0, 0, 8, "SYSDATE"},
+    {"CURRENT_TIMESTAMP", NULL, 0, 9, 0, "LOCALTIMESTAMP"},
+    {"CURRENT_TIMESTAMP", NULL, 1, 9, 0, "LOCALTIMESTAMP($1)"},
+    {"CURRENT_TIMESTAMP", NULL, 0, 0, 8, "SYSDATE"},
+    {"NOW", NULL, 0, 9, 0, "LOCALTIMESTAMP"},
+    {"NOW", NULL, 0, 0, 8, "SYSDATE"},
+    {"DAYNAME", NULL, 1, 0, 0, "RTRIM(TO_CHAR($1, 'Day'))"},
+    {"DAYOFMONTH", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'DD'))"},
+    /* 1 = Sunday whatever NLS_TERRITORY says: Julian day 0 was a Monday */
+    {"DAYOFWEEK", NULL, 1, 0, 0, "(MOD(TO_NUMBER(TO_CHAR($1, 'J')) + 1, 7) + 1)"},
+    {"DAYOFYEAR", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'DDD'))"},
+    {"HOUR", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'HH24'))"},
+    {"MINUTE", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'MI'))"},
+    {"MONTH", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'MM'))"},
+    {"MONTHNAME", NULL, 1, 0, 0, "RTRIM(TO_CHAR($1, 'Month'))"},
+    {"QUARTER", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'Q'))"},
+    {"SECOND", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'SS'))"},
+    /* weeks start on Sunday, and week 1 holds January 1 */
+    {"WEEK", NULL, 1, 0, 0,
+     "(TRUNC((TO_NUMBER(TO_CHAR($1, 'DDD')) + MOD(TO_NUMBER(TO_CHAR(TRUNC($1, 'YYYY'), 'J')) + 1, "
+     "7) - 1) / 7) + 1)"},
+    {"YEAR", NULL, 1, 0, 0, "TO_NUMBER(TO_CHAR($1, 'YYYY'))"},
+    /* TIMESTAMPADD(interval, n, ts): from 9i an INTERVAL keeps a TIMESTAMP's
+     * type and fraction; 8i adds days to a DATE */
+    {"TIMESTAMPADD", "FRAC_SECOND", 2, 9, 0, "(NUMTODSINTERVAL(($1) / 1000000000, 'SECOND') + $2)"},
+    {"TIMESTAMPADD", "SECOND", 2, 9, 0, "(NUMTODSINTERVAL($1, 'SECOND') + $2)"},
+    {"TIMESTAMPADD", "MINUTE", 2, 9, 0, "(NUMTODSINTERVAL($1, 'MINUTE') + $2)"},
+    {"TIMESTAMPADD", "HOUR", 2, 9, 0, "(NUMTODSINTERVAL($1, 'HOUR') + $2)"},
+    {"TIMESTAMPADD", "DAY", 2, 9, 0, "(NUMTODSINTERVAL($1, 'DAY') + $2)"},
+    {"TIMESTAMPADD", "WEEK", 2, 9, 0, "(NUMTODSINTERVAL(($1) * 7, 'DAY') + $2)"},
+    {"TIMESTAMPADD", "SECOND", 2, 0, 8, "(($1) / 86400 + $2)"},
+    {"TIMESTAMPADD", "MINUTE", 2, 0, 8, "(($1) / 1440 + $2)"},
+    {"TIMESTAMPADD", "HOUR", 2, 0, 8, "(($1) / 24 + $2)"},
+    {"TIMESTAMPADD", "DAY", 2, 0, 8, "(($1) + $2)"},
+    {"TIMESTAMPADD", "WEEK", 2, 0, 8, "(($1) * 7 + $2)"},
+    {"TIMESTAMPADD", "MONTH", 2, 0, 0, "ADD_MONTHS($2, $1)"},
+    {"TIMESTAMPADD", "QUARTER", 2, 0, 0, "ADD_MONTHS($2, ($1) * 3)"},
+    {"TIMESTAMPADD", "YEAR", 2, 0, 0, "ADD_MONTHS($2, ($1) * 12)"},
+    /* TIMESTAMPDIFF(interval, t1, t2): whole intervals from t1 to t2, toward
+     * zero. Whole seconds first, as a day's fraction is not exact */
+    {"TIMESTAMPDIFF", "SECOND", 2, 0, 0, "ROUND((CAST($1 AS DATE) - CAST($2 AS DATE)) * -86400)"},
+    {"TIMESTAMPDIFF", "MINUTE", 2, 0, 0,
+     "TRUNC(ROUND((CAST($1 AS DATE) - CAST($2 AS DATE)) * -86400) / 60)"},
+    {"TIMESTAMPDIFF", "HOUR", 2, 0, 0,
+     "TRUNC(ROUND((CAST($1 AS DATE) - CAST($2 AS DATE)) * -86400) / 3600)"},
+    {"TIMESTAMPDIFF", "DAY", 2, 0, 0,
+     "TRUNC(ROUND((CAST($1 AS DATE) - CAST($2 AS DATE)) * -86400) / 86400)"},
+    {"TIMESTAMPDIFF", "WEEK", 2, 0, 0,
+     "TRUNC(ROUND((CAST($1 AS DATE) - CAST($2 AS DATE)) * -86400) / 604800)"},
+    {"TIMESTAMPDIFF", "MONTH", 2, 0, 0, "TRUNC(-MONTHS_BETWEEN($1, $2))"},
+    {"TIMESTAMPDIFF", "QUARTER", 2, 0, 0, "TRUNC(-MONTHS_BETWEEN($1, $2) / 3)"},
+    {"TIMESTAMPDIFF", "YEAR", 2, 0, 0, "TRUNC(-MONTHS_BETWEEN($1, $2) / 12)"},
+    /* system */
+    {"IFNULL", NULL, 2, 0, 0, "=NVL"},
+    {"USER", NULL, 0, 0, 0, "USER"},
+    /* CONVERT(value, SQL_type) */
+    {"CONVERT", "SQL_CHAR", 1, 0, 0, "TO_CHAR($1)"},
+    {"CONVERT", "SQL_VARCHAR", 1, 0, 0, "TO_CHAR($1)"},
+    {"CONVERT", "SQL_WCHAR", 1, 0, 0, "TO_NCHAR($1)"},
+    {"CONVERT", "SQL_WVARCHAR", 1, 0, 0, "TO_NCHAR($1)"},
+    {"CONVERT", "SQL_LONGVARCHAR", 1, 9, 0, "TO_CLOB($1)"},
+    {"CONVERT", "SQL_WLONGVARCHAR", 1, 9, 0, "TO_NCLOB($1)"},
+    {"CONVERT", "SQL_NUMERIC", 1, 0, 0, "CAST($1 AS NUMBER)"},
+    {"CONVERT", "SQL_DECIMAL", 1, 0, 0, "CAST($1 AS NUMBER)"},
+    {"CONVERT", "SQL_TINYINT", 1, 0, 0, "TRUNC(CAST($1 AS NUMBER))"},
+    {"CONVERT", "SQL_SMALLINT", 1, 0, 0, "TRUNC(CAST($1 AS NUMBER))"},
+    {"CONVERT", "SQL_INTEGER", 1, 0, 0, "TRUNC(CAST($1 AS NUMBER))"},
+    {"CONVERT", "SQL_BIGINT", 1, 0, 0, "TRUNC(CAST($1 AS NUMBER))"},
+    {"CONVERT", "SQL_REAL", 1, 10, 0, "CAST($1 AS BINARY_FLOAT)"},
+    {"CONVERT", "SQL_FLOAT", 1, 10, 0, "CAST($1 AS BINARY_DOUBLE)"},
+    {"CONVERT", "SQL_DOUBLE", 1, 10, 0, "CAST($1 AS BINARY_DOUBLE)"},
+    {"CONVERT", "SQL_REAL", 1, 0, 9, "CAST($1 AS NUMBER)"},
+    {"CONVERT", "SQL_FLOAT", 1, 0, 9, "CAST($1 AS NUMBER)"},
+    {"CONVERT", "SQL_DOUBLE", 1, 0, 9, "CAST($1 AS NUMBER)"},
+    {"CONVERT", "SQL_DATE", 1, 0, 0, "TRUNC(CAST($1 AS DATE))"},
+    {"CONVERT", "SQL_TYPE_DATE", 1, 0, 0, "TRUNC(CAST($1 AS DATE))"},
+    {"CONVERT", "SQL_TIMESTAMP", 1, 9, 0, "CAST($1 AS TIMESTAMP)"},
+    {"CONVERT", "SQL_TYPE_TIMESTAMP", 1, 9, 0, "CAST($1 AS TIMESTAMP)"},
+    {"CONVERT", "SQL_TIMESTAMP", 1, 0, 8, "CAST($1 AS DATE)"},
+    {"CONVERT", "SQL_TYPE_TIMESTAMP", 1, 0, 8, "CAST($1 AS DATE)"},
+};
+
+/* Whether `s` holds a bind placeholder (":1", ":name") outside quotes. */
+static bool has_marker(const char *s, size_t n)
 {
-  static const struct {
-    const char *odbc, *ora;
-  } map[] = {
-      {"UCASE", "UPPER"}, {"LCASE", "LOWER"},  {"SUBSTRING", "SUBSTR"},
-      {"IFNULL", "NVL"},  {"CEILING", "CEIL"}, {"TRUNCATE", "TRUNC"},
-  };
-  for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
-    if (strlen(map[i].odbc) == n && strncasecmp(name, map[i].odbc, n) == 0)
-      return map[i].ora;
-  return NULL;
+  char quote = 0;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (quote) {
+      if (c == quote)
+        quote = 0;
+    } else if (c == '\'' || c == '"') {
+      quote = c;
+    } else if (c == ':' && i + 1 < n &&
+               (isalnum((unsigned char)s[i + 1]) || s[i + 1] == '_' || s[i + 1] == '"')) {
+      return true;
+    }
+  }
+  return false;
 }
 
-static char *inline_escapes(const char *in); /* recursion */
+#define FN_MAX_ARGS 9
+
+typedef struct {
+  const char *p;
+  size_t n;
+} Span;
+
+static Span trim_span(const char *p, size_t n)
+{
+  while (n > 0 && isspace((unsigned char)*p)) {
+    p++;
+    n--;
+  }
+  while (n > 0 && isspace((unsigned char)p[n - 1]))
+    n--;
+  return (Span){p, n};
+}
+
+/* Split an argument list (the text between the parentheses) at its top-level
+ * commas; POSITION's "a IN b" splits at the IN. Returns the count, or -1 when
+ * there are more than FN_MAX_ARGS. */
+static int split_args(const char *p, size_t n, bool at_in, Span *out)
+{
+  Span all = trim_span(p, n);
+  if (all.n == 0)
+    return 0;
+  int k = 0, depth = 0;
+  char quote = 0;
+  size_t start = 0;
+  for (size_t i = 0; i < all.n; i++) {
+    char c = all.p[i];
+    if (quote) {
+      if (c == quote)
+        quote = 0;
+      continue;
+    }
+    if (c == '\'' || c == '"') {
+      quote = c;
+      continue;
+    }
+    if (c == '(' || c == ')') {
+      depth += c == '(' ? 1 : -1;
+      continue;
+    }
+    size_t cut = 0; /* the separator's length */
+    if (depth == 0 && !at_in && c == ',')
+      cut = 1;
+    else if (depth == 0 && at_in && i > 0 && i + 2 < all.n &&
+             isspace((unsigned char)all.p[i - 1]) && strncasecmp(all.p + i, "IN", 2) == 0 &&
+             isspace((unsigned char)all.p[i + 2]))
+      cut = 2;
+    if (cut == 0)
+      continue;
+    if (k == FN_MAX_ARGS)
+      return -1;
+    out[k++] = trim_span(all.p + start, i - start);
+    start = i + cut;
+    i += cut - 1;
+    at_in = false; /* POSITION has one IN */
+  }
+  if (k == FN_MAX_ARGS)
+    return -1;
+  out[k++] = trim_span(all.p + start, all.n - start);
+  return k;
+}
+
+/* Expand template `t` with `args`. Binds pair with placeholders in the order
+ * they appear, so the arguments holding one must appear in their own order,
+ * each once: reordered, the values would land in the wrong places, and the
+ * form is refused. A repeated ":1" would be one bind by the API's rule, but
+ * in SQL the server pairs values with occurrences, so a repeat followed by a
+ * new placeholder leaves that one unbound until the core sends a value per
+ * occurrence (#302): refused too. */
+static int expand(Buf *out, const char *t, const Span *args, int nargs, Ctx *ctx)
+{
+  int seen[FN_MAX_ARGS] = {0}, last = 0;
+  for (const char *q = t; *q != '\0'; q++)
+    if (q[0] == '$' && q[1] >= '1' && q[1] <= '9') {
+      int a = q[1] - '1';
+      if (a < nargs && has_marker(args[a].p, args[a].n)) {
+        if (seen[a]) {
+          ctx->err = "this {fn} escape repeats an argument that holds a parameter marker, which "
+                     "the driver can't bind yet";
+          return -1;
+        }
+        if (a + 1 < last) {
+          ctx->err = "this {fn} escape reorders arguments that hold parameter markers, so their "
+                     "values would bind to the wrong arguments";
+          return -1;
+        }
+        last = a + 1;
+      }
+      if (a < nargs)
+        seen[a] = 1;
+    }
+  for (int a = 0; a < nargs; a++)
+    if (!seen[a] && has_marker(args[a].p, args[a].n)) {
+      ctx->err = "this {fn} escape drops an argument that holds a parameter marker";
+      return -1;
+    }
+  for (const char *q = t; *q != '\0'; q++) {
+    if (q[0] == '$' && q[1] >= '1' && q[1] <= '9' && q[1] - '1' < nargs) {
+      const Span *a = &args[q[1] - '1'];
+      if (buf_put(out, a->p, a->n))
+        return -1;
+      q++;
+    } else if (buf_put(out, q, 1)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Translate one {fn ...} body (its inner escapes already expanded). 1 when it
+ * was written to `out`, 0 when the table has no form for it (the caller writes
+ * it as it is), -1 on a refusal (ctx->err) or no memory. */
+static int translate_fn(Buf *out, const char *body, Ctx *ctx)
+{
+  size_t id = 0;
+  while (body[id] && (isalnum((unsigned char)body[id]) || body[id] == '_'))
+    id++;
+  const char *after = body + id;
+  while (isspace((unsigned char)*after))
+    after++;
+  const char *open = NULL, *close = NULL;
+  if (*after == '(') {
+    open = after;
+    int depth = 0;
+    char quote = 0;
+    for (const char *q = open; *q != '\0'; q++) {
+      if (quote) {
+        if (*q == quote)
+          quote = 0;
+      } else if (*q == '\'' || *q == '"') {
+        quote = *q;
+      } else if (*q == '(') {
+        depth++;
+      } else if (*q == ')' && --depth == 0) {
+        close = q;
+        break;
+      }
+    }
+    if (close == NULL)
+      return 0;
+    for (const char *q = close + 1; *q != '\0'; q++)
+      if (!isspace((unsigned char)*q))
+        return 0; /* something after the call: not ours to rewrite */
+  } else if (*after != '\0') {
+    return 0; /* schema.function, or anything else */
+  }
+  if (id == 0)
+    return 0;
+
+  Span args[FN_MAX_ARGS];
+  int nargs = 0;
+  bool at_in = id == 8 && strncasecmp(body, "POSITION", 8) == 0;
+  if (open != NULL) {
+    nargs = split_args(open + 1, (size_t)(close - open - 1), at_in, args);
+    if (nargs < 0)
+      return 0;
+  }
+  int major = ctx->major > 0 ? ctx->major : 99;
+  for (size_t i = 0; i < sizeof FN / sizeof FN[0]; i++) {
+    if (strlen(FN[i].name) != id || strncasecmp(body, FN[i].name, id) != 0)
+      continue;
+    if ((FN[i].lo && major < FN[i].lo) || (FN[i].hi && major > FN[i].hi))
+      continue;
+    const Span *a = args;
+    int n = nargs;
+    if (FN[i].kw != NULL) { /* the keyword argument, matched and set aside */
+      if (n < 1)
+        continue;
+      bool first = strcasecmp(FN[i].name, "CONVERT") != 0;
+      Span k = first ? args[0] : args[n - 1];
+      if (first && k.n > 8 && strncasecmp(k.p, "SQL_TSI_", 8) == 0) {
+        k.p += 8;
+        k.n -= 8;
+      }
+      if (strlen(FN[i].kw) != k.n || strncasecmp(k.p, FN[i].kw, k.n) != 0)
+        continue;
+      if (first)
+        a++;
+      n--;
+    }
+    if (FN[i].nargs >= 0 && FN[i].nargs != n)
+      continue;
+    if (FN[i].form[0] == '=') { /* a rename: the argument list as written */
+      const char *rest = open != NULL ? open : "()";
+      return buf_put(out, FN[i].form + 1, strlen(FN[i].form + 1)) ||
+                     buf_put(out, rest, strlen(rest))
+                 ? -1
+                 : 1;
+    }
+    return expand(out, FN[i].form, a, n, ctx) ? -1 : 1;
+  }
+  return 0;
+}
+
+static char *inline_escapes(const char *in, Ctx *ctx); /* recursion */
 
 /* Append the translation of one escape body (content between { and }, with the
  * leading keyword already identified) to `out`. */
-static int emit_escape(Buf *out, const char *kw, size_t kwlen, const char *rest, size_t restlen)
+static int emit_escape(Buf *out, const char *kw, size_t kwlen, const char *rest, size_t restlen,
+                       Ctx *ctx)
 {
   /* Trim surrounding whitespace of the remainder. */
   while (restlen > 0 && isspace((unsigned char)*rest)) {
@@ -100,20 +442,14 @@ static int emit_escape(Buf *out, const char *kw, size_t kwlen, const char *rest,
     char *tmp = seer_strndup(rest, restlen);
     if (tmp == NULL)
       return -1;
-    char *inner = inline_escapes(tmp); /* recurse (nested escapes) */
+    char *inner = inline_escapes(tmp, ctx); /* recurse (nested escapes) */
     free(tmp);
     if (inner == NULL)
       return -1;
     int rc = 0;
     if (kwlen == 2 && strncasecmp(kw, "fn", 2) == 0) {
-      size_t id = 0; /* leading function identifier */
-      while (inner[id] && (isalnum((unsigned char)inner[id]) || inner[id] == '_'))
-        id++;
-      const char *alias = fn_alias(inner, id);
-      if (alias != NULL)
-        rc = buf_put(out, alias, strlen(alias)) || buf_put(out, inner + id, strlen(inner + id));
-      else
-        rc = buf_put(out, inner, strlen(inner));
+      rc = translate_fn(out, inner, ctx);
+      rc = rc == 0 ? buf_put(out, inner, strlen(inner)) : rc < 0 ? -1 : 0;
     } else {
       rc = buf_put(out, inner, strlen(inner));
     }
@@ -127,8 +463,9 @@ static int emit_escape(Buf *out, const char *kw, size_t kwlen, const char *rest,
 }
 
 /* Translate inline ODBC escapes ({ts}/{d}/{t}/{fn}/{oj}/{escape}) anywhere in
- * the text, quote- and nesting-aware. */
-static char *inline_escapes(const char *in)
+ * the text, quote- and nesting-aware. NULL on a refusal (ctx->err) or no
+ * memory. */
+static char *inline_escapes(const char *in, Ctx *ctx)
 {
   Buf out = {0};
   char quote = 0;
@@ -157,10 +494,15 @@ static char *inline_escapes(const char *in)
       while (kend < close && (isalpha((unsigned char)*kend)))
         kend++;
       size_t kwlen = (size_t)(kend - k);
+      int rc;
       if (kwlen > 0 && strncasecmp(k, "call", 4) != 0)
-        emit_escape(&out, k, kwlen, kend, (size_t)(close - kend));
+        rc = emit_escape(&out, k, kwlen, kend, (size_t)(close - kend), ctx);
       else
-        buf_put(&out, p, (size_t)(close - p + 1)); /* leave {call}/unknown */
+        rc = buf_put(&out, p, (size_t)(close - p + 1)); /* leave {call}/unknown */
+      if (rc) {
+        free(out.b);
+        return NULL;
+      }
       p = close + 1;
     } else {
       buf_put(&out, p, 1);
@@ -175,25 +517,29 @@ static char *inline_escapes(const char *in)
 /* Translate the ODBC {call ...} / {?=call ...} statement escape into an Oracle
  * PL/SQL block, then any inline escapes. Non-call text just gets inline
  * translation. */
-static char *translate_escapes(const char *in)
+static char *translate_escapes(const char *in, Ctx *ctx)
 {
   const char *p = in;
   while (*p != '\0' && isspace((unsigned char)*p))
     p++;
   if (*p != '{')
-    return inline_escapes(in);
+    return inline_escapes(in, ctx);
 
   const char *close = find_close_brace(p);
   if (close == NULL)
-    return inline_escapes(in);
+    return inline_escapes(in, ctx);
 
   const char *q = p + 1;
   while (isspace((unsigned char)*q))
     q++;
-  bool has_return = false;
-  if (*q == '?') { /* {? = call func(...)} */
-    has_return = true;
-    q++;
+  /* {? = call func(...)}: the markers are already :1, :2... */
+  const char *ret = NULL;
+  size_t retlen = 0;
+  if (*q == ':' && isdigit((unsigned char)q[1])) {
+    ret = q++;
+    while (isdigit((unsigned char)*q))
+      q++;
+    retlen = (size_t)(q - ret);
     while (isspace((unsigned char)*q))
       q++;
     if (*q == '=')
@@ -203,7 +549,7 @@ static char *translate_escapes(const char *in)
   }
   if (strncasecmp(q, "call", 4) != 0 ||
       !(q[4] == '\0' || isspace((unsigned char)q[4]) || q[4] == '('))
-    return inline_escapes(in); /* not a call escape */
+    return inline_escapes(in, ctx); /* not a call escape */
 
   q += 4;
   while (isspace((unsigned char)*q))
@@ -212,15 +558,20 @@ static char *translate_escapes(const char *in)
   while (blen > 0 && isspace((unsigned char)q[blen - 1]))
     blen--;
 
-  char *res = malloc(blen + 32);
+  char *res = malloc(blen + retlen + 32);
   if (res == NULL)
     return NULL;
-  int o = sprintf(res, "BEGIN %s", has_return ? "? := " : "");
+  int o = sprintf(res, "BEGIN ");
+  if (ret != NULL) {
+    memcpy(res + o, ret, retlen);
+    o += (int)retlen;
+    o += sprintf(res + o, " := ");
+  }
   memcpy(res + o, q, blen);
   o += (int)blen;
   sprintf(res + o, "; END;");
 
-  char *full = inline_escapes(res); /* handle {ts}/{d}/... inside the call */
+  char *full = inline_escapes(res, ctx); /* handle {ts}/{d}/... inside the call */
   free(res);
   return full;
 }
@@ -263,13 +614,22 @@ char *seer_sql_prepare(const char *raw)
 
 char *seer_sql_prepare_scan(const char *raw, int scan)
 {
-  if (!scan)
-    return rewrite_params(raw);
-  char *esc = translate_escapes(raw);
-  if (esc == NULL)
-    return NULL;
-  char *out = rewrite_params(esc);
-  free(esc);
+  return seer_sql_prepare_for(raw, scan, 0, NULL);
+}
+
+/* The markers first, so the {fn} translations see which arguments hold one. */
+char *seer_sql_prepare_for(const char *raw, int scan, int major, const char **err)
+{
+  if (err != NULL)
+    *err = NULL;
+  char *marked = rewrite_params(raw);
+  if (!scan || marked == NULL)
+    return marked;
+  Ctx ctx = {major, NULL};
+  char *out = translate_escapes(marked, &ctx);
+  free(marked);
+  if (out == NULL && err != NULL)
+    *err = ctx.err;
   return out;
 }
 

@@ -290,6 +290,9 @@ static inline void *seer_odbc_bound_at(void *base, const SQLLEN *offset, SQLULEN
 int seer_odbc_ensure_binds(OdbcStmt *s, int n);
 /* Grow a set of bindings (an ARD's or an explicit descriptor's) to n records. */
 int seer_odbc_bindset_ensure(OdbcBindSet *b, int n);
+/* The connected server's major release: 9 for 9i, which sends no version at
+ * login; 0 when not connected. */
+int seer_odbc_server_major(OdbcDbc *c);
 /* Apply SQL_ATTR_TXN_ISOLATION's level on the connection (#220). */
 SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level);
 /* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call

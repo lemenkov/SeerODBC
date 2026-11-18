@@ -99,11 +99,49 @@ static const char *dbms_ver(OdbcDbc *c)
   return c->dbms_ver[0] != '\0' ? c->dbms_ver : "00.00.0000";
 }
 
+int seer_odbc_server_major(OdbcDbc *c)
+{
+  if (c == NULL || c->conn == NULL)
+    return 0;
+  int v[5] = {0};
+  return seer_server_version(c->conn, v) == SEER_OK ? v[0] : 9;
+}
+
 /* Whether the connection is to Oracle 8i (whose SQL has no ANSI joins). */
 static bool legacy_8i(OdbcDbc *c)
 {
   int v[5] = {0};
   return c != NULL && c->conn != NULL && seer_server_version(c->conn, v) == SEER_OK && v[0] == 8;
+}
+
+/* The SQL_CONVERT_<source> answer: the types {fn CONVERT} takes a value of
+ * that source type to (#301). Text goes anywhere; numbers to text and
+ * numbers; dates and timestamps to text and each other; a long text (a CLOB)
+ * only to text. Oracle has no TIME, BIT or interval types to convert, and
+ * binary values have no CONVERT form; 8i no CLOB conversion. */
+static SQLUINTEGER convert_targets(SQLUSMALLINT source, bool v8i)
+{
+  const SQLUINTEGER text = SQL_CVT_CHAR | SQL_CVT_VARCHAR | SQL_CVT_WCHAR | SQL_CVT_WVARCHAR |
+                           (v8i ? 0 : SQL_CVT_LONGVARCHAR | SQL_CVT_WLONGVARCHAR);
+  const SQLUINTEGER num = SQL_CVT_NUMERIC | SQL_CVT_DECIMAL | SQL_CVT_TINYINT | SQL_CVT_SMALLINT |
+                          SQL_CVT_INTEGER | SQL_CVT_BIGINT | SQL_CVT_REAL | SQL_CVT_FLOAT |
+                          SQL_CVT_DOUBLE;
+  const SQLUINTEGER dt = SQL_CVT_DATE | SQL_CVT_TIMESTAMP;
+  switch (source) {
+  case SQL_CONVERT_CHAR:
+  case SQL_CONVERT_VARCHAR:
+  case SQL_CONVERT_WCHAR:
+  case SQL_CONVERT_WVARCHAR:
+    return text | num | dt;
+  case SQL_CONVERT_LONGVARCHAR:
+  case SQL_CONVERT_WLONGVARCHAR:
+    return text;
+  case SQL_CONVERT_DATE:
+  case SQL_CONVERT_TIMESTAMP:
+    return text | dt;
+  default: /* the numeric types */
+    return text | num;
+  }
 }
 
 SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
@@ -239,6 +277,65 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
                         : SQL_OJ_LEFT | SQL_OJ_RIGHT | SQL_OJ_FULL | SQL_OJ_NESTED |
                               SQL_OJ_NOT_ORDERED | SQL_OJ_INNER | SQL_OJ_ALL_COMPARISON_OPS,
                     InfoValuePtr);
+  /* --- the {fn} scalar functions the preprocessor translates (#301) --- */
+  case SQL_STRING_FUNCTIONS: /* no DIFFERENCE */
+    return info_u32(
+        SQL_FN_STR_ASCII | SQL_FN_STR_BIT_LENGTH | SQL_FN_STR_CHAR | SQL_FN_STR_CHAR_LENGTH |
+            SQL_FN_STR_CHARACTER_LENGTH | SQL_FN_STR_CONCAT | SQL_FN_STR_INSERT | SQL_FN_STR_LCASE |
+            SQL_FN_STR_LEFT | SQL_FN_STR_LENGTH | SQL_FN_STR_LOCATE | SQL_FN_STR_LOCATE_2 |
+            SQL_FN_STR_LTRIM | SQL_FN_STR_OCTET_LENGTH | SQL_FN_STR_POSITION | SQL_FN_STR_REPEAT |
+            SQL_FN_STR_REPLACE | SQL_FN_STR_RIGHT | SQL_FN_STR_RTRIM | SQL_FN_STR_SOUNDEX |
+            SQL_FN_STR_SPACE | SQL_FN_STR_SUBSTRING | SQL_FN_STR_UCASE,
+        InfoValuePtr);
+  case SQL_NUMERIC_FUNCTIONS: /* no RAND: SQL can't seed it */
+    return info_u32(SQL_FN_NUM_ABS | SQL_FN_NUM_ACOS | SQL_FN_NUM_ASIN | SQL_FN_NUM_ATAN |
+                        SQL_FN_NUM_ATAN2 | SQL_FN_NUM_CEILING | SQL_FN_NUM_COS | SQL_FN_NUM_COT |
+                        SQL_FN_NUM_DEGREES | SQL_FN_NUM_EXP | SQL_FN_NUM_FLOOR | SQL_FN_NUM_LOG |
+                        SQL_FN_NUM_LOG10 | SQL_FN_NUM_MOD | SQL_FN_NUM_PI | SQL_FN_NUM_POWER |
+                        SQL_FN_NUM_RADIANS | SQL_FN_NUM_ROUND | SQL_FN_NUM_SIGN | SQL_FN_NUM_SIN |
+                        SQL_FN_NUM_SQRT | SQL_FN_NUM_TAN | SQL_FN_NUM_TRUNCATE,
+                    InfoValuePtr);
+  case SQL_TIMEDATE_FUNCTIONS: /* EXTRACT is Oracle's own, from 9i */
+    return info_u32(SQL_FN_TD_CURRENT_DATE | SQL_FN_TD_CURRENT_TIME | SQL_FN_TD_CURRENT_TIMESTAMP |
+                        SQL_FN_TD_CURDATE | SQL_FN_TD_CURTIME | SQL_FN_TD_DAYNAME |
+                        SQL_FN_TD_DAYOFMONTH | SQL_FN_TD_DAYOFWEEK | SQL_FN_TD_DAYOFYEAR |
+                        SQL_FN_TD_HOUR | SQL_FN_TD_MINUTE | SQL_FN_TD_MONTH | SQL_FN_TD_MONTHNAME |
+                        SQL_FN_TD_NOW | SQL_FN_TD_QUARTER | SQL_FN_TD_SECOND |
+                        SQL_FN_TD_TIMESTAMPADD | SQL_FN_TD_TIMESTAMPDIFF | SQL_FN_TD_WEEK |
+                        SQL_FN_TD_YEAR | (legacy_8i(c) ? 0 : SQL_FN_TD_EXTRACT),
+                    InfoValuePtr);
+  case SQL_SYSTEM_FUNCTIONS: /* no DATABASE: Oracle has no catalogs */
+    return info_u32(SQL_FN_SYS_IFNULL | SQL_FN_SYS_USERNAME, InfoValuePtr);
+  case SQL_TIMEDATE_ADD_INTERVALS: /* 8i has no fractional seconds */
+    return info_u32((legacy_8i(c) ? 0 : SQL_FN_TSI_FRAC_SECOND) | SQL_FN_TSI_SECOND |
+                        SQL_FN_TSI_MINUTE | SQL_FN_TSI_HOUR | SQL_FN_TSI_DAY | SQL_FN_TSI_WEEK |
+                        SQL_FN_TSI_MONTH | SQL_FN_TSI_QUARTER | SQL_FN_TSI_YEAR,
+                    InfoValuePtr);
+  case SQL_TIMEDATE_DIFF_INTERVALS:
+    return info_u32(SQL_FN_TSI_SECOND | SQL_FN_TSI_MINUTE | SQL_FN_TSI_HOUR | SQL_FN_TSI_DAY |
+                        SQL_FN_TSI_WEEK | SQL_FN_TSI_MONTH | SQL_FN_TSI_QUARTER | SQL_FN_TSI_YEAR,
+                    InfoValuePtr);
+  case SQL_CONVERT_FUNCTIONS:
+    return info_u32(SQL_FN_CVT_CONVERT | SQL_FN_CVT_CAST, InfoValuePtr);
+  case SQL_CONVERT_CHAR:
+  case SQL_CONVERT_VARCHAR:
+  case SQL_CONVERT_WCHAR:
+  case SQL_CONVERT_WVARCHAR:
+  case SQL_CONVERT_LONGVARCHAR:
+  case SQL_CONVERT_WLONGVARCHAR:
+  case SQL_CONVERT_NUMERIC:
+  case SQL_CONVERT_DECIMAL:
+  case SQL_CONVERT_TINYINT:
+  case SQL_CONVERT_SMALLINT:
+  case SQL_CONVERT_INTEGER:
+  case SQL_CONVERT_BIGINT:
+  case SQL_CONVERT_REAL:
+  case SQL_CONVERT_FLOAT:
+  case SQL_CONVERT_DOUBLE:
+  case SQL_CONVERT_DATE:
+  case SQL_CONVERT_TIMESTAMP:
+    return info_u32(convert_targets(InfoType, legacy_8i(c)), InfoValuePtr);
+
   case SQL_GROUP_BY:
     return info_u16(SQL_GB_GROUP_BY_CONTAINS_SELECT, InfoValuePtr);
   case SQL_UNION:
