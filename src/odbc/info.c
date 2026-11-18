@@ -295,15 +295,126 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
                         SQL_FN_NUM_RADIANS | SQL_FN_NUM_ROUND | SQL_FN_NUM_SIGN | SQL_FN_NUM_SIN |
                         SQL_FN_NUM_SQRT | SQL_FN_NUM_TAN | SQL_FN_NUM_TRUNCATE,
                     InfoValuePtr);
-  case SQL_TIMEDATE_FUNCTIONS: /* EXTRACT is Oracle's own, from 9i */
+  case SQL_TIMEDATE_FUNCTIONS: /* EXTRACT is Oracle's own, 8i too (#308) */
     return info_u32(SQL_FN_TD_CURRENT_DATE | SQL_FN_TD_CURRENT_TIME | SQL_FN_TD_CURRENT_TIMESTAMP |
                         SQL_FN_TD_CURDATE | SQL_FN_TD_CURTIME | SQL_FN_TD_DAYNAME |
                         SQL_FN_TD_DAYOFMONTH | SQL_FN_TD_DAYOFWEEK | SQL_FN_TD_DAYOFYEAR |
                         SQL_FN_TD_HOUR | SQL_FN_TD_MINUTE | SQL_FN_TD_MONTH | SQL_FN_TD_MONTHNAME |
                         SQL_FN_TD_NOW | SQL_FN_TD_QUARTER | SQL_FN_TD_SECOND |
                         SQL_FN_TD_TIMESTAMPADD | SQL_FN_TD_TIMESTAMPDIFF | SQL_FN_TD_WEEK |
-                        SQL_FN_TD_YEAR | (legacy_8i(c) ? 0 : SQL_FN_TD_EXTRACT),
+                        SQL_FN_TD_YEAR | SQL_FN_TD_EXTRACT,
                     InfoValuePtr);
+
+  /* The SQL-92 description masks (#306). Each bit is a statement form that
+   * runs on the release (tests/odbc: check_sql92_info); forms Oracle spells
+   * differently (DROP ... CASCADE CONSTRAINTS, ALTER TABLE ... MODIFY, ON
+   * DELETE NO ACTION as the unwritten default) are left out. */
+  case SQL_SCHEMA_USAGE:
+    return info_u32(SQL_SU_DML_STATEMENTS | SQL_SU_PROCEDURE_INVOCATION | SQL_SU_TABLE_DEFINITION |
+                        SQL_SU_INDEX_DEFINITION | SQL_SU_PRIVILEGE_DEFINITION,
+                    InfoValuePtr);
+  case SQL_CREATE_TABLE:
+    return info_u32(SQL_CT_CREATE_TABLE | SQL_CT_GLOBAL_TEMPORARY | SQL_CT_COMMIT_PRESERVE |
+                        SQL_CT_COMMIT_DELETE | SQL_CT_COLUMN_CONSTRAINT | SQL_CT_COLUMN_DEFAULT |
+                        SQL_CT_TABLE_CONSTRAINT | SQL_CT_CONSTRAINT_NAME_DEFINITION |
+                        SQL_CT_CONSTRAINT_INITIALLY_DEFERRED |
+                        SQL_CT_CONSTRAINT_INITIALLY_IMMEDIATE | SQL_CT_CONSTRAINT_DEFERRABLE |
+                        SQL_CT_CONSTRAINT_NON_DEFERRABLE,
+                    InfoValuePtr);
+  case SQL_ALTER_TABLE: /* ADD [no COLUMN keyword], DROP COLUMN, DROP CONSTRAINT .. CASCADE */
+    return info_u32(SQL_AT_ADD_COLUMN | SQL_AT_DROP_COLUMN | SQL_AT_ADD_COLUMN_SINGLE |
+                        SQL_AT_ADD_COLUMN_DEFAULT | SQL_AT_ADD_CONSTRAINT |
+                        SQL_AT_ADD_TABLE_CONSTRAINT | SQL_AT_DROP_COLUMN_DEFAULT |
+                        SQL_AT_DROP_TABLE_CONSTRAINT_CASCADE | SQL_AT_CONSTRAINT_NAME_DEFINITION |
+                        SQL_AT_CONSTRAINT_INITIALLY_DEFERRED |
+                        SQL_AT_CONSTRAINT_INITIALLY_IMMEDIATE | SQL_AT_CONSTRAINT_DEFERRABLE |
+                        SQL_AT_CONSTRAINT_NON_DEFERRABLE,
+                    InfoValuePtr);
+  case SQL_CREATE_VIEW: /* WITH CHECK OPTION, but no CASCADED / LOCAL */
+    return info_u32(SQL_CV_CREATE_VIEW | SQL_CV_CHECK_OPTION, InfoValuePtr);
+  case SQL_CREATE_SCHEMA: /* CREATE SCHEMA AUTHORIZATION <own user> ... */
+    return info_u32(SQL_CS_CREATE_SCHEMA | SQL_CS_AUTHORIZATION, InfoValuePtr);
+  case SQL_DROP_TABLE:
+    return info_u32(SQL_DT_DROP_TABLE, InfoValuePtr);
+  case SQL_DROP_VIEW:
+    return info_u32(SQL_DV_DROP_VIEW, InfoValuePtr);
+  case SQL_DDL_INDEX:
+    return info_u32(SQL_DI_CREATE_INDEX | SQL_DI_DROP_INDEX, InfoValuePtr);
+  case SQL_INDEX_KEYWORDS:
+    return info_u32(SQL_IK_ASC | SQL_IK_DESC, InfoValuePtr);
+  case SQL_INSERT_STATEMENT: /* no SELECT ... INTO <table> */
+    return info_u32(SQL_IS_INSERT_LITERALS | SQL_IS_INSERT_SEARCHED, InfoValuePtr);
+  case SQL_AGGREGATE_FUNCTIONS:
+    return info_u32(SQL_AF_ALL | SQL_AF_AVG | SQL_AF_COUNT | SQL_AF_DISTINCT | SQL_AF_MAX |
+                        SQL_AF_MIN | SQL_AF_SUM,
+                    InfoValuePtr);
+  case SQL_SQL92_DATETIME_FUNCTIONS: /* no CURRENT_TIME; 8i has neither */
+    return info_u32(legacy_8i(c) ? 0 : SQL_SDF_CURRENT_DATE | SQL_SDF_CURRENT_TIMESTAMP,
+                    InfoValuePtr);
+  case SQL_SQL92_NUMERIC_VALUE_FUNCTIONS: /* the rest are {fn} only */
+    return info_u32(SQL_SNVF_EXTRACT, InfoValuePtr);
+  case SQL_SQL92_STRING_FUNCTIONS: /* TRANSLATE ... USING CHAR_CS / NCHAR_CS */
+    return info_u32(SQL_SSF_LOWER | SQL_SSF_UPPER | SQL_SSF_TRANSLATE | SQL_SSF_TRIM_BOTH |
+                        SQL_SSF_TRIM_LEADING | SQL_SSF_TRIM_TRAILING,
+                    InfoValuePtr);
+  case SQL_SQL92_PREDICATES:
+    return info_u32(SQL_SP_BETWEEN | SQL_SP_COMPARISON | SQL_SP_EXISTS | SQL_SP_IN |
+                        SQL_SP_ISNOTNULL | SQL_SP_ISNULL | SQL_SP_LIKE | SQL_SP_OVERLAPS |
+                        SQL_SP_QUANTIFIED_COMPARISON,
+                    InfoValuePtr);
+  case SQL_SQL92_RELATIONAL_JOIN_OPERATORS: { /* ANSI joins from 9i, EXCEPT from 21c */
+    int major = seer_odbc_server_major(c);
+    return info_u32(SQL_SRJO_INTERSECT_JOIN |
+                        (legacy_8i(c) ? 0
+                                      : SQL_SRJO_CROSS_JOIN | SQL_SRJO_INNER_JOIN |
+                                            SQL_SRJO_LEFT_OUTER_JOIN | SQL_SRJO_RIGHT_OUTER_JOIN |
+                                            SQL_SRJO_FULL_OUTER_JOIN | SQL_SRJO_NATURAL_JOIN) |
+                        (major >= 21 ? SQL_SRJO_EXCEPT_JOIN : 0),
+                    InfoValuePtr);
+  }
+  case SQL_SQL92_VALUE_EXPRESSIONS: /* 8i: no simple CASE, COALESCE or NULLIF */
+    return info_u32(SQL_SVE_CAST |
+                        (legacy_8i(c) ? 0 : SQL_SVE_CASE | SQL_SVE_COALESCE | SQL_SVE_NULLIF),
+                    InfoValuePtr);
+  case SQL_SQL92_ROW_VALUE_CONSTRUCTOR: /* 8i: no DEFAULT in VALUES / SET */
+    return info_u32(SQL_SRVC_VALUE_EXPRESSION | SQL_SRVC_NULL | SQL_SRVC_ROW_SUBQUERY |
+                        (legacy_8i(c) ? 0 : SQL_SRVC_DEFAULT),
+                    InfoValuePtr);
+  case SQL_SQL92_GRANT:
+    return info_u32(SQL_SG_DELETE_TABLE | SQL_SG_INSERT_TABLE | SQL_SG_INSERT_COLUMN |
+                        SQL_SG_REFERENCES_TABLE | SQL_SG_REFERENCES_COLUMN | SQL_SG_SELECT_TABLE |
+                        SQL_SG_UPDATE_TABLE | SQL_SG_UPDATE_COLUMN | SQL_SG_WITH_GRANT_OPTION,
+                    InfoValuePtr);
+  case SQL_SQL92_REVOKE: /* table privileges only; no column REVOKE, CASCADE or RESTRICT */
+    return info_u32(SQL_SR_DELETE_TABLE | SQL_SR_INSERT_TABLE | SQL_SR_REFERENCES_TABLE |
+                        SQL_SR_SELECT_TABLE | SQL_SR_UPDATE_TABLE,
+                    InfoValuePtr);
+  case SQL_SQL92_FOREIGN_KEY_DELETE_RULE:
+    return info_u32(SQL_SFKD_CASCADE | SQL_SFKD_SET_NULL, InfoValuePtr);
+  case SQL_SQL92_FOREIGN_KEY_UPDATE_RULE: /* Oracle has no ON UPDATE */
+    return info_u32(0, InfoValuePtr);
+  case SQL_CURSOR_SENSITIVITY: /* what SQL_ATTR_CURSOR_SENSITIVITY settles on */
+    return info_u32(SQL_INSENSITIVE, InfoValuePtr);
+  case SQL_INTEGRITY: /* primary, foreign key, check and unique constraints */
+    return info_string("Y", InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_MAX_ROW_SIZE_INCLUDES_LONG: /* SQL_MAX_ROW_SIZE is 0: no limit */
+    return info_string("Y", InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_KEYWORDS: /* reserved on every release, and not ODBC keywords */
+    return info_string("ACCESS,AUDIT,CLUSTER,COMMENT,COMPRESS,EXCLUSIVE,FILE,IDENTIFIED,"
+                       "INCREMENT,INITIAL,LEVEL,LOCK,LONG,MAXEXTENTS,MINUS,MLSLABEL,MODE,MODIFY,"
+                       "NOAUDIT,NOCOMPRESS,NOWAIT,NUMBER,OFFLINE,ONLINE,PCTFREE,PRIOR,RAW,"
+                       "RENAME,RESOURCE,ROW,ROWID,ROWNUM,ROWS,SHARE,SIZE,START,SUCCESSFUL,"
+                       "SYNONYM,SYSDATE,TRIGGER,UID,VALIDATE,VARCHAR2,WHENEVER",
+                       InfoValuePtr, BufferLength, StringLengthPtr);
+  case SQL_MAX_COLUMNS_IN_TABLE: /* ORA-01792 past it */
+    return info_u16(1000, InfoValuePtr);
+  case SQL_MAX_COLUMNS_IN_INDEX: /* ORA-01793 past it */
+    return info_u16(32, InfoValuePtr);
+  case SQL_MAX_CHAR_LITERAL_LEN: /* ORA-01704 past it */
+    return info_u32(4000, InfoValuePtr);
+  case SQL_MAX_PROCEDURE_NAME_LEN:
+  case SQL_MAX_USER_NAME_LEN:
+    return info_u16(max_identifier_len(c), InfoValuePtr);
   case SQL_SYSTEM_FUNCTIONS: /* no DATABASE: Oracle has no catalogs */
     return info_u32(SQL_FN_SYS_IFNULL | SQL_FN_SYS_USERNAME, InfoValuePtr);
   case SQL_DATETIME_LITERALS: /* {d} {t} {ts} everywhere; {INTERVAL} from 9i */

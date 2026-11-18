@@ -3198,7 +3198,7 @@ static void check_scalar_functions(SQLHDBC dbc)
   }
   if (m[0] == '\0') {
     SQLGetInfo(dbc, SQL_TIMEDATE_FUNCTIONS, &v, sizeof v, NULL);
-    if (!(v & SQL_FN_TD_TIMESTAMPDIFF) || !(v & SQL_FN_TD_EXTRACT) != (g_release == 8))
+    if (!(v & SQL_FN_TD_TIMESTAMPDIFF) || !(v & SQL_FN_TD_EXTRACT))
       snprintf(m, sizeof m, "SQL_TIMEDATE_FUNCTIONS 0x%x", (unsigned)v);
   }
   if (m[0] == '\0') {
@@ -3215,6 +3215,367 @@ static void check_scalar_functions(SQLHDBC dbc)
       snprintf(m, sizeof m, "SQL_CONVERT_VARCHAR 0x%x, SQL_CONVERT_DATE 0x%x", (unsigned)v,
                (unsigned)d);
   }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* Build a statement of `n` repeated items: head item0, item1 ... tail. Each
+ * item is `fmt` printed with its index. NULL on no memory. */
+static char *repeat_items(const char *head, const char *fmt, int n, const char *tail)
+{
+  size_t cap = strlen(head) + strlen(tail) + (size_t)n * (strlen(fmt) + 12) + 1;
+  char *s = malloc(cap);
+  if (s == NULL)
+    return NULL;
+  /* Each piece fits by the sizing above; stop at the first that doesn't, so
+   * `len` never passes `cap`. */
+  int w = snprintf(s, cap, "%s", head);
+  size_t len = w < 0 ? cap : (size_t)w;
+  for (int i = 0; i < n && len < cap; i++) {
+    if (i > 0) {
+      w = snprintf(s + len, cap - len, ", ");
+      len = w < 0 || (size_t)w >= cap - len ? cap : len + (size_t)w;
+      if (len >= cap)
+        break;
+    }
+    w = snprintf(s + len, cap - len, fmt, i);
+    len = w < 0 || (size_t)w >= cap - len ? cap : len + (size_t)w;
+  }
+  if (len >= cap) {
+    free(s);
+    return NULL;
+  }
+  snprintf(s + len, cap - len, "%s", tail);
+  return s;
+}
+
+/* The SQL-92 description masks of SQLGetInfo (#306): each bit is set exactly
+ * when its statement runs on the release, so a bit both claims a form that
+ * works and is missing for one that doesn't. Then the reserved words
+ * (SQL_KEYWORDS) and the limits, each right at and one past it. */
+static void check_sql92_info(SQLHDBC dbc)
+{
+  const char *name = "SQL-92 info masks, keywords and limits match the server";
+  enum { SETUP = 0 };
+  static const struct {
+    SQLUSMALLINT type; /* SETUP: run, result ignored */
+    SQLUINTEGER bits;
+    SQLUSMALLINT type2;
+    SQLUINTEGER bits2;
+    const char *sql; /* %1$s: the schema; a literal percent is %% */
+  } T[] = {
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92b'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92s'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92g'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92m'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92k'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP VIEW seer_s92v'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92t'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      {SETUP, 0, 0, 0,
+       "BEGIN EXECUTE IMMEDIATE 'DROP TABLE seer_s92a'; EXCEPTION WHEN OTHERS THEN NULL; END;"},
+      /* CREATE TABLE, with the schema */
+      {SQL_CREATE_TABLE,
+       SQL_CT_CREATE_TABLE | SQL_CT_COLUMN_CONSTRAINT | SQL_CT_COLUMN_DEFAULT |
+           SQL_CT_CONSTRAINT_NAME_DEFINITION,
+       SQL_SCHEMA_USAGE, SQL_SU_TABLE_DEFINITION,
+       "CREATE TABLE %1$s.seer_s92a (id NUMBER CONSTRAINT seer_s92a_pk PRIMARY KEY,"
+       " v VARCHAR2(10) DEFAULT 'x', n NUMBER CHECK (n > 0))"},
+      {SQL_CREATE_TABLE,
+       SQL_CT_TABLE_CONSTRAINT | SQL_CT_CONSTRAINT_DEFERRABLE |
+           SQL_CT_CONSTRAINT_INITIALLY_DEFERRED,
+       0, 0,
+       "CREATE TABLE seer_s92t (id NUMBER, CONSTRAINT seer_s92t_u UNIQUE (id) DEFERRABLE"
+       " INITIALLY DEFERRED)"},
+      {SQL_CREATE_TABLE, SQL_CT_CONSTRAINT_NON_DEFERRABLE | SQL_CT_CONSTRAINT_INITIALLY_IMMEDIATE,
+       0, 0,
+       "CREATE TABLE seer_s92g (id NUMBER CHECK (id > 0) NOT DEFERRABLE INITIALLY IMMEDIATE)"},
+      {SETUP, 0, 0, 0, "DROP TABLE seer_s92g"},
+      {SQL_CREATE_TABLE, SQL_CT_GLOBAL_TEMPORARY | SQL_CT_COMMIT_PRESERVE, 0, 0,
+       "CREATE GLOBAL TEMPORARY TABLE seer_s92g (id NUMBER) ON COMMIT PRESERVE ROWS"},
+      {SETUP, 0, 0, 0, "DROP TABLE seer_s92g"},
+      {SQL_CREATE_TABLE, SQL_CT_GLOBAL_TEMPORARY | SQL_CT_COMMIT_DELETE, 0, 0,
+       "CREATE GLOBAL TEMPORARY TABLE seer_s92g (id NUMBER) ON COMMIT DELETE ROWS"},
+      {SETUP, 0, 0, 0, "DROP TABLE seer_s92g"},
+      /* ALTER TABLE */
+      {SQL_ALTER_TABLE,
+       SQL_AT_ADD_TABLE_CONSTRAINT | SQL_AT_CONSTRAINT_NAME_DEFINITION |
+           SQL_AT_CONSTRAINT_NON_DEFERRABLE | SQL_AT_CONSTRAINT_INITIALLY_IMMEDIATE,
+       0, 0,
+       "ALTER TABLE seer_s92t ADD CONSTRAINT seer_s92t_c CHECK (id > 0) NOT DEFERRABLE INITIALLY"
+       " IMMEDIATE"},
+      {SQL_ALTER_TABLE, SQL_AT_CONSTRAINT_DEFERRABLE | SQL_AT_CONSTRAINT_INITIALLY_DEFERRED, 0, 0,
+       "ALTER TABLE seer_s92t ADD CONSTRAINT seer_s92t_d CHECK (id < 100) DEFERRABLE INITIALLY"
+       " DEFERRED"},
+      {SQL_ALTER_TABLE, SQL_AT_ADD_COLUMN | SQL_AT_ADD_COLUMN_SINGLE | SQL_AT_ADD_COLUMN_DEFAULT, 0,
+       0, "ALTER TABLE seer_s92t ADD x NUMBER DEFAULT 5"},
+      {SQL_ALTER_TABLE, SQL_AT_ADD_CONSTRAINT, 0, 0,
+       "ALTER TABLE seer_s92t ADD w NUMBER CONSTRAINT seer_s92t_w CHECK (w > 0)"},
+      {SQL_ALTER_TABLE, SQL_AT_DROP_COLUMN | SQL_AT_DROP_COLUMN_DEFAULT, 0, 0,
+       "ALTER TABLE seer_s92t DROP COLUMN x"},
+      {SQL_ALTER_TABLE, SQL_AT_DROP_COLUMN_CASCADE, 0, 0,
+       "ALTER TABLE seer_s92t DROP COLUMN w CASCADE"},
+      {SQL_ALTER_TABLE, SQL_AT_DROP_COLUMN_RESTRICT, 0, 0,
+       "ALTER TABLE seer_s92t DROP COLUMN w RESTRICT"},
+      {SQL_ALTER_TABLE, SQL_AT_DROP_TABLE_CONSTRAINT_CASCADE, 0, 0,
+       "ALTER TABLE seer_s92t DROP CONSTRAINT seer_s92t_c CASCADE"},
+      {SQL_ALTER_TABLE, SQL_AT_DROP_TABLE_CONSTRAINT_RESTRICT, 0, 0,
+       "ALTER TABLE seer_s92t DROP CONSTRAINT seer_s92t_w RESTRICT"},
+      {SQL_ALTER_TABLE, SQL_AT_SET_COLUMN_DEFAULT, 0, 0,
+       "ALTER TABLE seer_s92t ALTER COLUMN id SET DEFAULT 6"},
+      /* indexes */
+      {SQL_DDL_INDEX, SQL_DI_CREATE_INDEX, SQL_SCHEMA_USAGE, SQL_SU_INDEX_DEFINITION,
+       "CREATE INDEX %1$s.seer_s92i ON %1$s.seer_s92a (v, n)"},
+      {SQL_DDL_INDEX, SQL_DI_DROP_INDEX, 0, 0, "DROP INDEX %1$s.seer_s92i"},
+      {SQL_INDEX_KEYWORDS, SQL_IK_ASC | SQL_IK_DESC, 0, 0,
+       "CREATE INDEX seer_s92i ON seer_s92a (v DESC, n ASC)"},
+      {SETUP, 0, 0, 0, "DROP INDEX seer_s92i"},
+      /* views */
+      {SQL_CREATE_VIEW, SQL_CV_CREATE_VIEW | SQL_CV_CHECK_OPTION, 0, 0,
+       "CREATE VIEW seer_s92v AS SELECT id, n FROM seer_s92a WHERE n > 0 WITH CHECK OPTION"},
+      {SQL_CREATE_VIEW, SQL_CV_CASCADED, 0, 0,
+       "CREATE VIEW seer_s92w AS SELECT id FROM seer_s92a WITH CASCADED CHECK OPTION"},
+      {SQL_CREATE_VIEW, SQL_CV_LOCAL, 0, 0,
+       "CREATE VIEW seer_s92w AS SELECT id FROM seer_s92a WITH LOCAL CHECK OPTION"},
+      {SQL_DROP_VIEW, SQL_DV_CASCADE, 0, 0, "DROP VIEW seer_s92v CASCADE"},
+      {SQL_DROP_VIEW, SQL_DV_RESTRICT, 0, 0, "DROP VIEW seer_s92v RESTRICT"},
+      {SQL_DROP_VIEW, SQL_DV_DROP_VIEW, 0, 0, "DROP VIEW seer_s92v"},
+      /* CREATE SCHEMA, DROP TABLE */
+      {SQL_CREATE_SCHEMA, SQL_CS_CREATE_SCHEMA | SQL_CS_AUTHORIZATION, 0, 0,
+       "CREATE SCHEMA AUTHORIZATION %1$s CREATE TABLE seer_s92s (a NUMBER)"},
+      {SQL_DROP_TABLE, SQL_DT_CASCADE, 0, 0, "DROP TABLE seer_s92s CASCADE"},
+      {SQL_DROP_TABLE, SQL_DT_RESTRICT, 0, 0, "DROP TABLE seer_s92s RESTRICT"},
+      {SQL_DROP_TABLE, SQL_DT_DROP_TABLE, 0, 0, "DROP TABLE seer_s92s"},
+      /* foreign-key rules */
+      {SQL_SQL92_FOREIGN_KEY_DELETE_RULE, SQL_SFKD_CASCADE, 0, 0,
+       "CREATE TABLE seer_s92b (a NUMBER REFERENCES seer_s92a (id) ON DELETE CASCADE)"},
+      {SETUP, 0, 0, 0, "DROP TABLE seer_s92b"},
+      {SQL_SQL92_FOREIGN_KEY_DELETE_RULE, SQL_SFKD_SET_NULL, 0, 0,
+       "CREATE TABLE seer_s92b (a NUMBER REFERENCES seer_s92a (id) ON DELETE SET NULL)"},
+      {SETUP, 0, 0, 0, "DROP TABLE seer_s92b"},
+      {SQL_SQL92_FOREIGN_KEY_DELETE_RULE, SQL_SFKD_NO_ACTION, 0, 0,
+       "CREATE TABLE seer_s92b (a NUMBER REFERENCES seer_s92a (id) ON DELETE NO ACTION)"},
+      {SQL_SQL92_FOREIGN_KEY_DELETE_RULE, SQL_SFKD_SET_DEFAULT, 0, 0,
+       "CREATE TABLE seer_s92b (a NUMBER REFERENCES seer_s92a (id) ON DELETE SET DEFAULT)"},
+      {SQL_SQL92_FOREIGN_KEY_UPDATE_RULE, SQL_SFKU_CASCADE, 0, 0,
+       "CREATE TABLE seer_s92b (a NUMBER REFERENCES seer_s92a (id) ON UPDATE CASCADE)"},
+      /* INSERT and row value constructors */
+      {SQL_INSERT_STATEMENT, SQL_IS_INSERT_LITERALS, SQL_SCHEMA_USAGE, SQL_SU_DML_STATEMENTS,
+       "INSERT INTO %1$s.seer_s92a (id, n) VALUES (1, 1)"},
+      {SQL_INSERT_STATEMENT, SQL_IS_INSERT_SEARCHED, 0, 0,
+       "INSERT INTO seer_s92a (id, n) SELECT 3, 3 FROM dual"},
+      {SQL_INSERT_STATEMENT, SQL_IS_SELECT_INTO, 0, 0, "SELECT id INTO seer_s92s FROM seer_s92a"},
+      {SQL_SQL92_ROW_VALUE_CONSTRUCTOR, SQL_SRVC_DEFAULT, 0, 0,
+       "INSERT INTO seer_s92a (id, v, n) VALUES (2, DEFAULT, 2)"},
+      {SQL_SQL92_ROW_VALUE_CONSTRUCTOR, SQL_SRVC_NULL | SQL_SRVC_VALUE_EXPRESSION, 0, 0,
+       "INSERT INTO seer_s92a (id, v, n) VALUES (4, NULL, 1 + 3)"},
+      {SQL_SQL92_ROW_VALUE_CONSTRUCTOR, SQL_SRVC_ROW_SUBQUERY, 0, 0,
+       "SELECT 1 FROM dual WHERE (1, 2) IN (SELECT 1, 2 FROM dual)"},
+      /* GRANT and REVOKE */
+      {SQL_SQL92_GRANT,
+       SQL_SG_SELECT_TABLE | SQL_SG_INSERT_TABLE | SQL_SG_UPDATE_TABLE | SQL_SG_DELETE_TABLE |
+           SQL_SG_REFERENCES_TABLE,
+       SQL_SCHEMA_USAGE, SQL_SU_PRIVILEGE_DEFINITION,
+       "GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES ON %1$s.seer_s92a TO PUBLIC"},
+      {SQL_SQL92_GRANT, SQL_SG_INSERT_COLUMN | SQL_SG_UPDATE_COLUMN | SQL_SG_REFERENCES_COLUMN, 0,
+       0, "GRANT INSERT (v), UPDATE (v), REFERENCES (id) ON seer_s92a TO PUBLIC"},
+      {SQL_SQL92_GRANT, SQL_SG_WITH_GRANT_OPTION, 0, 0,
+       "GRANT SELECT ON seer_s92a TO PUBLIC WITH GRANT OPTION"},
+      {SQL_SQL92_REVOKE, SQL_SR_INSERT_COLUMN, 0, 0, "REVOKE INSERT (v) ON seer_s92a FROM PUBLIC"},
+      {SQL_SQL92_REVOKE, SQL_SR_CASCADE, 0, 0,
+       "REVOKE REFERENCES ON seer_s92a FROM PUBLIC CASCADE"},
+      {SQL_SQL92_REVOKE, SQL_SR_GRANT_OPTION_FOR, 0, 0,
+       "REVOKE GRANT OPTION FOR SELECT ON seer_s92a FROM PUBLIC"},
+      {SQL_SQL92_REVOKE, SQL_SR_RESTRICT, 0, 0, "REVOKE SELECT ON seer_s92a FROM PUBLIC RESTRICT"},
+      {SQL_SQL92_REVOKE,
+       SQL_SR_SELECT_TABLE | SQL_SR_INSERT_TABLE | SQL_SR_UPDATE_TABLE | SQL_SR_DELETE_TABLE |
+           SQL_SR_REFERENCES_TABLE,
+       0, 0, "REVOKE SELECT, INSERT, UPDATE, DELETE, REFERENCES ON seer_s92a FROM PUBLIC"},
+      /* a procedure call with the schema */
+      {SETUP, 0, 0, 0, "CREATE OR REPLACE PROCEDURE seer_s92p IS BEGIN NULL; END;"},
+      {SQL_SCHEMA_USAGE, SQL_SU_PROCEDURE_INVOCATION, 0, 0, "BEGIN %1$s.seer_s92p; END;"},
+      {SETUP, 0, 0, 0, "DROP PROCEDURE seer_s92p"},
+      /* functions */
+      {SQL_AGGREGATE_FUNCTIONS,
+       SQL_AF_ALL | SQL_AF_AVG | SQL_AF_COUNT | SQL_AF_DISTINCT | SQL_AF_MAX | SQL_AF_MIN |
+           SQL_AF_SUM,
+       0, 0,
+       "SELECT AVG(n), COUNT(*), COUNT(DISTINCT n), MAX(n), MIN(n), SUM(ALL n) FROM seer_s92a"},
+      {SQL_SQL92_DATETIME_FUNCTIONS, SQL_SDF_CURRENT_DATE, 0, 0, "SELECT CURRENT_DATE FROM dual"},
+      {SQL_SQL92_DATETIME_FUNCTIONS, SQL_SDF_CURRENT_TIMESTAMP, 0, 0,
+       "SELECT CURRENT_TIMESTAMP FROM dual"},
+      {SQL_SQL92_DATETIME_FUNCTIONS, SQL_SDF_CURRENT_TIME, 0, 0, "SELECT CURRENT_TIME FROM dual"},
+      {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, SQL_SNVF_EXTRACT, 0, 0,
+       "SELECT EXTRACT(YEAR FROM SYSDATE) FROM dual"},
+      {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, SQL_SNVF_CHAR_LENGTH, 0, 0,
+       "SELECT CHAR_LENGTH('abc') FROM dual"},
+      {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, SQL_SNVF_OCTET_LENGTH, 0, 0,
+       "SELECT OCTET_LENGTH('abc') FROM dual"},
+      {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, SQL_SNVF_BIT_LENGTH, 0, 0,
+       "SELECT BIT_LENGTH('abc') FROM dual"},
+      {SQL_SQL92_NUMERIC_VALUE_FUNCTIONS, SQL_SNVF_POSITION, 0, 0,
+       "SELECT POSITION('b' IN 'abc') FROM dual"},
+      {SQL_SQL92_STRING_FUNCTIONS, SQL_SSF_LOWER | SQL_SSF_UPPER, 0, 0,
+       "SELECT LOWER('A'), UPPER('a') FROM dual"},
+      {SQL_SQL92_STRING_FUNCTIONS, SQL_SSF_TRIM_BOTH | SQL_SSF_TRIM_LEADING | SQL_SSF_TRIM_TRAILING,
+       0, 0,
+       "SELECT TRIM(BOTH 'x' FROM 'xax'), TRIM(LEADING 'x' FROM 'xa'), TRIM(TRAILING 'x' FROM"
+       " 'ax') FROM dual"},
+      {SQL_SQL92_STRING_FUNCTIONS, SQL_SSF_TRANSLATE, 0, 0,
+       "SELECT TRANSLATE('abc' USING CHAR_CS) FROM dual"},
+      {SQL_SQL92_STRING_FUNCTIONS, SQL_SSF_SUBSTRING, 0, 0,
+       "SELECT SUBSTRING('abc' FROM 2 FOR 1) FROM dual"},
+      {SQL_SQL92_STRING_FUNCTIONS, SQL_SSF_CONVERT, 0, 0,
+       "SELECT CONVERT('abc' USING UTF8) FROM dual"},
+      /* predicates */
+      {SQL_SQL92_PREDICATES,
+       SQL_SP_BETWEEN | SQL_SP_COMPARISON | SQL_SP_IN | SQL_SP_ISNULL | SQL_SP_ISNOTNULL |
+           SQL_SP_LIKE,
+       0, 0,
+       "SELECT 1 FROM dual WHERE 1 BETWEEN 0 AND 2 AND 1 < 2 AND 'a' LIKE 'a%%' AND 1 IN (1, 2)"
+       " AND NULL IS NULL AND 1 IS NOT NULL"},
+      {SQL_SQL92_PREDICATES, SQL_SP_EXISTS | SQL_SP_QUANTIFIED_COMPARISON, 0, 0,
+       "SELECT 1 FROM dual WHERE EXISTS (SELECT 1 FROM dual) AND 1 = ANY (SELECT 1 FROM dual)"
+       " AND 1 >= ALL (SELECT 1 FROM dual)"},
+      {SQL_SQL92_PREDICATES, SQL_SP_OVERLAPS, 0, 0,
+       "SELECT 1 FROM dual WHERE (SYSDATE, SYSDATE + 1) OVERLAPS (SYSDATE, SYSDATE + 2)"},
+      {SQL_SQL92_PREDICATES, SQL_SP_UNIQUE, 0, 0,
+       "SELECT 1 FROM dual WHERE UNIQUE (SELECT 1 FROM dual)"},
+      {SQL_SQL92_PREDICATES, SQL_SP_MATCH_FULL, 0, 0,
+       "SELECT 1 FROM dual WHERE (1) MATCH FULL (SELECT 1 FROM dual)"},
+      /* joins and set operators */
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_CROSS_JOIN, 0, 0,
+       "SELECT 1 FROM dual a CROSS JOIN dual b"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_INNER_JOIN, 0, 0,
+       "SELECT 1 FROM dual a INNER JOIN dual b ON a.dummy = b.dummy"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_LEFT_OUTER_JOIN, 0, 0,
+       "SELECT 1 FROM dual a LEFT OUTER JOIN dual b ON a.dummy = b.dummy"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_RIGHT_OUTER_JOIN, 0, 0,
+       "SELECT 1 FROM dual a RIGHT OUTER JOIN dual b ON a.dummy = b.dummy"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_FULL_OUTER_JOIN, 0, 0,
+       "SELECT 1 FROM dual a FULL OUTER JOIN dual b ON a.dummy = b.dummy"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_NATURAL_JOIN, 0, 0,
+       "SELECT 1 FROM dual a NATURAL JOIN dual b"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_UNION_JOIN, 0, 0,
+       "SELECT 1 FROM dual a UNION JOIN dual b"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_INTERSECT_JOIN, 0, 0,
+       "SELECT 1 FROM dual INTERSECT SELECT 1 FROM dual"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_EXCEPT_JOIN, 0, 0,
+       "SELECT 1 FROM dual EXCEPT SELECT 2 FROM dual"},
+      {SQL_SQL92_RELATIONAL_JOIN_OPERATORS, SQL_SRJO_CORRESPONDING_CLAUSE, 0, 0,
+       "SELECT 1 a FROM dual UNION CORRESPONDING SELECT 1 a FROM dual"},
+      /* value expressions */
+      {SQL_SQL92_VALUE_EXPRESSIONS, SQL_SVE_CASE, 0, 0,
+       "SELECT CASE 1 WHEN 1 THEN 'y' END, CASE WHEN 1 = 1 THEN 'y' END FROM dual"},
+      {SQL_SQL92_VALUE_EXPRESSIONS, SQL_SVE_CAST, 0, 0, "SELECT CAST('1' AS NUMBER) FROM dual"},
+      {SQL_SQL92_VALUE_EXPRESSIONS, SQL_SVE_COALESCE, 0, 0, "SELECT COALESCE(NULL, 1) FROM dual"},
+      {SQL_SQL92_VALUE_EXPRESSIONS, SQL_SVE_NULLIF, 0, 0, "SELECT NULLIF(1, 2) FROM dual"},
+  };
+  /* The schema is the session's own user, from the server, as a plain
+   * identifier. */
+  char u[64] = "", m[700] = "", err[256], sql[1024];
+  exec_scalar(dbc, "SELECT USER FROM dual", u, sizeof u, err, sizeof err);
+  for (const char *c = u; *c; c++)
+    if (!isalnum((unsigned char)*c) && *c != '_' && *c != '$' && *c != '#')
+      u[0] = '\0';
+  if (u[0] == '\0')
+    snprintf(m, sizeof m, "no plain user name from SELECT USER");
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && m[0] == '\0'; i++) {
+    snprintf(sql, sizeof sql, T[i].sql, u);
+    int ran = SQL_SUCCEEDED(exec_do(dbc, sql, err, sizeof err));
+    if (T[i].type == SETUP)
+      continue;
+    for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+      SQLUSMALLINT type = k == 0 ? T[i].type : T[i].type2;
+      SQLUINTEGER bits = k == 0 ? T[i].bits : T[i].bits2, v = 0;
+      if (type == 0)
+        continue;
+      SQLGetInfo(dbc, type, &v, sizeof v, NULL);
+      if (ran && (v & bits) != bits)
+        snprintf(m, sizeof m, "info %u = 0x%x lacks 0x%x, but %s runs", type, (unsigned)v,
+                 (unsigned)bits, sql);
+      else if (!ran && (v & bits) != 0)
+        snprintf(m, sizeof m, "info %u = 0x%x claims 0x%x, but %s: %s", type, (unsigned)v,
+                 (unsigned)bits, sql, err);
+    }
+  }
+
+  /* SQL_KEYWORDS: each word is reserved (it can't name a column). */
+  char kw[1024] = "";
+  SQLSMALLINT kwlen = 0;
+  SQLGetInfo(dbc, SQL_KEYWORDS, kw, sizeof kw, &kwlen);
+  if (m[0] == '\0' && kw[0] == '\0')
+    snprintf(m, sizeof m, "SQL_KEYWORDS is empty");
+  for (char *w = strtok(kw, ","); w != NULL && m[0] == '\0'; w = strtok(NULL, ",")) {
+    snprintf(sql, sizeof sql, "CREATE TABLE seer_s92k (%s NUMBER)", w);
+    if (SQL_SUCCEEDED(exec_do(dbc, sql, err, sizeof err))) {
+      exec_do(dbc, "DROP TABLE seer_s92k", err, sizeof err);
+      snprintf(m, sizeof m, "SQL_KEYWORDS has %s, but it names a column", w);
+    }
+  }
+
+  /* The limits, at and one past each. */
+  SQLUSMALLINT cols = 0, idx = 0;
+  SQLUINTEGER lit = 0;
+  SQLGetInfo(dbc, SQL_MAX_COLUMNS_IN_TABLE, &cols, sizeof cols, NULL);
+  SQLGetInfo(dbc, SQL_MAX_COLUMNS_IN_INDEX, &idx, sizeof idx, NULL);
+  SQLGetInfo(dbc, SQL_MAX_CHAR_LITERAL_LEN, &lit, sizeof lit, NULL);
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    char *s = repeat_items("CREATE TABLE seer_s92m (", "c%d NUMBER(1)", cols + k, ")");
+    if (s == NULL)
+      snprintf(err, sizeof err, "no memory for the statement");
+    int ok = s != NULL && SQL_SUCCEEDED(exec_do(dbc, s, err, sizeof err));
+    free(s);
+    if (ok)
+      exec_do(dbc, "DROP TABLE seer_s92m", err, sizeof err);
+    if (ok != (k == 0))
+      snprintf(m, sizeof m, "SQL_MAX_COLUMNS_IN_TABLE %u: %d columns %s", cols, cols + k,
+               ok ? "work" : err);
+  }
+  if (m[0] == '\0') {
+    char *s = repeat_items("CREATE TABLE seer_s92m (", "c%d NUMBER(1)", idx + 1, ")");
+    if (s == NULL || !SQL_SUCCEEDED(exec_do(dbc, s, err, sizeof err)))
+      snprintf(m, sizeof m, "index table: %s", err);
+    free(s);
+  }
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    char *s = repeat_items("CREATE INDEX seer_s92mi ON seer_s92m (", "c%d", idx + k, ")");
+    if (s == NULL)
+      snprintf(err, sizeof err, "no memory for the statement");
+    int ok = s != NULL && SQL_SUCCEEDED(exec_do(dbc, s, err, sizeof err));
+    free(s);
+    if (ok)
+      exec_do(dbc, "DROP INDEX seer_s92mi", err, sizeof err);
+    if (ok != (k == 0))
+      snprintf(m, sizeof m, "SQL_MAX_COLUMNS_IN_INDEX %u: %d columns %s", idx, idx + k,
+               ok ? "work" : err);
+  }
+  exec_do(dbc, "DROP TABLE seer_s92m", err, sizeof err);
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    size_t n = lit + (size_t)k;
+    char *s = malloc(n + 40);
+    if (s == NULL)
+      break;
+    memcpy(s, "SELECT LENGTH('", 15);
+    memset(s + 15, 'x', n);
+    strcpy(s + 15 + n, "') FROM dual");
+    int ok = SQL_SUCCEEDED(exec_do(dbc, s, err, sizeof err));
+    free(s);
+    if (ok != (k == 0))
+      snprintf(m, sizeof m, "SQL_MAX_CHAR_LITERAL_LEN %u: %zu characters %s", (unsigned)lit, n,
+               ok ? "work" : err);
+  }
+
+  exec_do(dbc, "DROP TABLE seer_s92t", err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_s92a", err, sizeof err);
   if (m[0] == '\0')
     pass(name);
   else
@@ -6109,6 +6470,7 @@ int main(void)
     check_scalar_functions(dbc);
     check_repeated_placeholders(dbc);
     check_datetime_literals(dbc);
+    check_sql92_info(dbc);
     check_tables_enum(dbc);
     check_privileges(dbc);
     check_cursor_names(dbc);

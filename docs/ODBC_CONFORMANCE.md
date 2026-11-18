@@ -103,7 +103,8 @@ How each family behaves:
     rounded toward zero; it has no FRAC_SECOND.
   - From 9i, NOW, CURRENT_TIMESTAMP and TIMESTAMPADD keep TIMESTAMP's type and
     fraction (LOCALTIMESTAMP, INTERVAL arithmetic). 8i has neither, so it uses
-    SYSDATE and day arithmetic, with no FRAC_SECOND and no EXTRACT.
+    SYSDATE and day arithmetic, with no FRAC_SECOND. EXTRACT is Oracle's own on
+    every release (#308).
 - **CONVERT** goes between text, numbers, DATE and TIMESTAMP. Text in a date
   form is parsed by the session's NLS_DATE_FORMAT. SQL_DOUBLE / SQL_REAL become
   BINARY_DOUBLE / BINARY_FLOAT from 10g, and NUMBER before.
@@ -130,6 +131,45 @@ connected release (#305):
   a value that already has one cancels it.
 - **8i** has no INTERVAL type, so there the escape stays as written and isn't
   advertised.
+
+## SQL-92 capabilities in SQLGetInfo
+
+The SQL-92 description masks say which statement forms each release accepts
+as written (#306). `check_sql92_info` runs one statement per bit on every tier
+and requires the bit to be set exactly when its statement runs. Oracle's own
+spellings of a form don't count. `DROP TABLE ... CASCADE CONSTRAINTS`,
+`ALTER TABLE ... MODIFY` and an implicit ON DELETE NO ACTION set no bit,
+because the SQL-92 text (`CASCADE`, `ALTER COLUMN ... SET DEFAULT`, `ON DELETE
+NO ACTION`) is refused.
+
+- **Schema names** qualify tables in DML and DDL, indexes, privileges and
+  procedure calls (`SQL_SCHEMA_USAGE`). There are no catalogs.
+- **DDL:**
+  - CREATE TABLE takes constraints (named, deferrable), defaults and global
+    temporary tables;
+  - ALTER TABLE adds columns (`ADD x ...`, without COLUMN) and constraints,
+    drops columns, and drops a constraint with CASCADE;
+  - CREATE VIEW takes WITH CHECK OPTION, but not CASCADED or LOCAL;
+  - CREATE SCHEMA AUTHORIZATION;
+  - CREATE and DROP INDEX, with ASC and DESC keys.
+- **Foreign keys** take ON DELETE CASCADE and SET NULL. There is no ON UPDATE.
+- **Releases differ:**
+  - 8i has no ANSI joins, no CURRENT_DATE or CURRENT_TIMESTAMP, no simple
+    CASE, COALESCE or NULLIF, and no DEFAULT in VALUES or SET;
+  - EXCEPT is accepted from 21c;
+  - INTERSECT, OVERLAPS, TRIM, `TRANSLATE ... USING` and EXTRACT work
+    everywhere.
+- **`SQL_KEYWORDS`** lists Oracle's reserved words that aren't ODBC keywords.
+  None of them can name a column on any release.
+- **Limits:**
+  - 1000 columns per table (ORA-01792 past it);
+  - 32 columns per index (ORA-01793);
+  - 4000-character literals (ORA-01704);
+  - procedure and user names as long as other identifiers (30, or 128 from
+    12.2).
+
+  Others, such as the select list, the statement length and the number of
+  tables, report 0 because no fixed limit was found.
 
 ## SeerODBC-specific identifiers
 

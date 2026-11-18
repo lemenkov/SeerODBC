@@ -203,6 +203,9 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
       DATABASE and seeded RAND have no Oracle form
 - [x] Datetime and interval literals — {d} {t} {ts} everywhere, {INTERVAL} from
       9i with the sign moved inside the quotes; SQL_DATETIME_LITERALS (#305)
+- [x] SQLGetInfo SQL-92 masks — schema usage, DDL, joins, predicates, value
+      expressions, GRANT/REVOKE, keywords and limits, each bit backed by a
+      statement on every tier (#306); EXTRACT advertised on 8i too (#308)
 - [x] SQLBrowseConnect — iterative connect (NEED_DATA browse string -> connect)
 - [x] SQLGetDescField, SQLGetDescRec — read the implicit descriptors (ARD/APD/
       IRD/IPD via SQLGetStmtAttr handles; IRD = result-column metadata)
