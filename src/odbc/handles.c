@@ -80,12 +80,54 @@ SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
     s->apd.kind = SEER_DESC_APD;
     s->ird.kind = SEER_DESC_IRD;
     s->ipd.kind = SEER_DESC_IPD;
+    s->ab = &s->own_binds; /* the implicit ARD's records, until one is set (#291) */
     *OutputHandle = (SQLHANDLE)s;
+    return SQL_SUCCESS;
+  }
+  case SQL_HANDLE_DESC: { /* explicit: an application descriptor of the connection (#291) */
+    if (InputHandle == NULL)
+      return SQL_INVALID_HANDLE;
+    OdbcDbc *c = (OdbcDbc *)InputHandle;
+    if (!c->connected)
+      return seer_odbc_diag(c, "08003", 0, "Connection not open", SQL_ERROR);
+    OdbcDesc *d = calloc(1, sizeof *d);
+    if (d == NULL)
+      return seer_odbc_diag(c, "HY001", 0, "Out of memory", SQL_ERROR);
+    d->h.type = SQL_HANDLE_DESC;
+    d->kind = SEER_DESC_ARD; /* an application descriptor; ARD or APD as it is used */
+    d->is_explicit = 1;
+    d->dbc = c;
+    d->next_desc = c->descs;
+    c->descs = d;
+    *OutputHandle = (SQLHANDLE)d;
     return SQL_SUCCESS;
   }
   default:
     return SQL_ERROR;
   }
+}
+
+/* Free an explicit descriptor: the statements using it go back to their
+ * implicit ARD / APD (#291). */
+static void free_explicit_desc(OdbcDesc *d)
+{
+  OdbcDbc *c = d->dbc;
+  for (OdbcStmt *s = c->stmts; s != NULL; s = s->next_stmt) {
+    if (s->ard_ext == d) {
+      s->ard_ext = NULL;
+      s->ab = &s->own_binds;
+    }
+    if (s->apd_ext == d)
+      s->apd_ext = NULL;
+  }
+  for (void **pp = &c->descs; *pp != NULL; pp = &((OdbcDesc *)*pp)->next_desc)
+    if (*pp == d) {
+      *pp = d->next_desc;
+      break;
+    }
+  free(d->recs.binds);
+  seer_odbc_diag_free(d);
+  free(d);
 }
 
 SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
@@ -104,7 +146,7 @@ SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
     seer_odbc_diag_free(&s->apd);
     seer_odbc_diag_free(&s->ird);
     seer_odbc_diag_free(&s->ipd);
-    free(s->binds);
+    free(s->own_binds.binds);
     for (int i = 0; i < s->num_params; i++)
       free(s->params[i].dae_buf), free(s->params[i].ref_type);
     free(s->params);
@@ -120,16 +162,20 @@ SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle)
     return SQL_SUCCESS;
   }
   case SQL_HANDLE_DESC:
-    /* Implicit descriptors are owned by their statement; the app cannot
-     * free them (no explicit descriptor allocation is supported). */
-    return seer_odbc_diag(Handle, "HY017", 0,
-                          "Invalid use of an automatically allocated "
-                          "descriptor handle",
-                          SQL_ERROR);
+    /* An implicit descriptor is its statement's, freed with it. */
+    if (!((OdbcDesc *)Handle)->is_explicit)
+      return seer_odbc_diag(Handle, "HY017", 0,
+                            "Invalid use of an automatically allocated "
+                            "descriptor handle",
+                            SQL_ERROR);
+    free_explicit_desc((OdbcDesc *)Handle);
+    return SQL_SUCCESS;
   case SQL_HANDLE_DBC: {
     OdbcDbc *c = (OdbcDbc *)Handle;
     if (c->connected && c->conn != NULL)
       seer_disconnect(c->conn);
+    while (c->descs != NULL) /* explicit descriptors go with their connection */
+      free_explicit_desc(c->descs);
     free(c->browse_cs);
     free(c->info_dsn);
     free(c->info_user);

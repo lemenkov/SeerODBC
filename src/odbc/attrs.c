@@ -205,6 +205,32 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   seer_odbc_diag_clear(s);
 
   switch (Attribute) {
+  case SQL_ATTR_APP_ROW_DESC: /* an explicit descriptor, or back to the implicit one (#291) */
+  case SQL_ATTR_APP_PARAM_DESC: {
+    int row = Attribute == SQL_ATTR_APP_ROW_DESC;
+    OdbcDesc *d = (OdbcDesc *)ValuePtr;
+    if (d == NULL || d == (row ? &s->ard : &s->apd)) {
+      d = NULL;
+    } else if (!d->is_explicit) {
+      return seer_odbc_diag(
+          s, "HY017", 0, "Invalid use of an automatically allocated descriptor handle", SQL_ERROR);
+    } else if (d->dbc != s->dbc) {
+      return seer_odbc_diag(s, "HY024", 0,
+                            "Invalid attribute value: the descriptor is another connection's",
+                            SQL_ERROR);
+    }
+    if (row) {
+      s->ard_ext = d;
+      s->ab = d != NULL ? &d->recs : &s->own_binds;
+    } else {
+      s->apd_ext = d;
+    }
+    return SQL_SUCCESS;
+  }
+  case SQL_ATTR_IMP_ROW_DESC: /* the implementation descriptors are the statement's */
+  case SQL_ATTR_IMP_PARAM_DESC:
+    return seer_odbc_diag(s, "HY017", 0,
+                          "Invalid use of an automatically allocated descriptor handle", SQL_ERROR);
   case SQL_ATTR_PARAMSET_SIZE: /* rows per array-bind execute */
     s->paramset_size = (SQLULEN)(uintptr_t)ValuePtr;
     if (s->paramset_size == 0)
@@ -333,11 +359,11 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
   if (ValuePtr == NULL)
     return SQL_SUCCESS;
   switch (Attribute) {
-  case SQL_ATTR_APP_ROW_DESC:
-    *(SQLHANDLE *)ValuePtr = &s->ard;
+  case SQL_ATTR_APP_ROW_DESC: /* the one in use: an explicit one if set (#291) */
+    *(SQLHANDLE *)ValuePtr = s->ard_ext != NULL ? (SQLHANDLE)s->ard_ext : (SQLHANDLE)&s->ard;
     return SQL_SUCCESS;
   case SQL_ATTR_APP_PARAM_DESC:
-    *(SQLHANDLE *)ValuePtr = &s->apd;
+    *(SQLHANDLE *)ValuePtr = s->apd_ext != NULL ? (SQLHANDLE)s->apd_ext : (SQLHANDLE)&s->apd;
     return SQL_SUCCESS;
   case SQL_ATTR_IMP_ROW_DESC:
     *(SQLHANDLE *)ValuePtr = &s->ird;

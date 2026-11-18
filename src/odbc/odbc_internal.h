@@ -119,6 +119,7 @@ typedef struct {
   SQLUINTEGER conn_timeout;  /* SQL_ATTR_CONNECTION_TIMEOUT, seconds; 0 = none (#228) */
   SQLUINTEGER metadata_id;   /* SQL_ATTR_METADATA_ID: the default for new statements (#278) */
   void *stmts;               /* its statements (OdbcStmt), newest first: cursor names (#288) */
+  void *descs;               /* its explicit descriptors (OdbcDesc), newest first (#291) */
   unsigned long cursor_seq;  /* the last SQL_CURn generated */
   char *browse_cs;
   /* For SQLGetInfo (#234): the DSN connected through ("" without one), the
@@ -135,6 +136,14 @@ typedef struct {
   SQLLEN *indicator;
   int bound;
 } OdbcBind;
+
+/* An application descriptor's records: a statement's column bindings, or an
+ * explicitly allocated descriptor's (#291), which statements share when
+ * they use it as their ARD. */
+typedef struct {
+  OdbcBind *binds; /* [num_binds] */
+  int num_binds;
+} OdbcBindSet;
 
 /* A deferred parameter set by SQLBindParameter (resolved at execute time). */
 typedef struct {
@@ -166,8 +175,16 @@ typedef enum { SEER_DESC_ARD, SEER_DESC_APD, SEER_DESC_IRD, SEER_DESC_IPD } Seer
 
 typedef struct {
   OdbcHeader h;
-  void *stmt; /* owning OdbcStmt */
+  void *stmt; /* owning OdbcStmt; NULL for an explicit descriptor */
   SeerDescKind kind;
+  /* An explicitly allocated descriptor (#291): an application descriptor
+   * of the connection, its records its own, used by any of the
+   * connection's statements as their ARD (shared in place) or APD (copied
+   * into the parameters at execute). */
+  int is_explicit;
+  OdbcDbc *dbc;
+  OdbcBindSet recs;
+  void *next_desc; /* the connection's next explicit descriptor */
 } OdbcDesc;
 
 typedef struct {
@@ -176,8 +193,10 @@ typedef struct {
   char *sql;                   /* prepared statement text (SQLPrepare) */
   SeerStmt *core;              /* core statement, NULL until execute */
   OdbcDesc ard, apd, ird, ipd; /* implicit descriptors */
-  OdbcBind *binds;             /* result columns, [num_binds] */
-  int num_binds;
+  OdbcBindSet own_binds;       /* the implicit ARD's records: result-column bindings */
+  OdbcBindSet *ab;   /* the current ARD's: own_binds, or an explicit descriptor's (#291) */
+  OdbcDesc *ard_ext; /* the explicit ARD in use, NULL = the implicit one (#291) */
+  OdbcDesc *apd_ext; /* the explicit APD in use, NULL = the implicit one */
   OdbcParam *params; /* input parameters, [num_params] */
   int num_params;
   /* Data-at-execution sequence (SQLParamData/SQLPutData) between an execute
@@ -269,6 +288,8 @@ static inline void *seer_odbc_bound_at(void *base, const SQLLEN *offset, SQLULEN
  * stays bound until unbound or SQLFreeStmt(SQL_UNBIND), across executes, and
  * may be bound before the statement has run. 0, or -1 when out of memory. */
 int seer_odbc_ensure_binds(OdbcStmt *s, int n);
+/* Grow a set of bindings (an ARD's or an explicit descriptor's) to n records. */
+int seer_odbc_bindset_ensure(OdbcBindSet *b, int n);
 /* Apply SQL_ATTR_TXN_ISOLATION's level on the connection (#220). */
 SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level);
 /* Arm the statement's SQL_ATTR_QUERY_TIMEOUT on its connection before a call

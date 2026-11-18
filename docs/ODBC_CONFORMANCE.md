@@ -74,7 +74,12 @@ that execute and fetch consume, so it is equivalent to `SQLBindCol` (ARD) or the
 value/type halves of `SQLBindParameter` (APD/IPD); the IRD is read-only (`HY016`).
 `SQLCopyDesc` copies records (and, within one class, the header fields) between
 any two of them, e.g. a SELECT's ARD and IRD to an INSERT's APD and IPD to copy
-rows. Explicitly allocated descriptors are not supported yet (#291).
+rows. Explicitly allocated descriptors (`SQLAllocHandle(SQL_HANDLE_DESC)`) are
+application descriptors of the connection: set as a statement's ARD they are shared
+in place (two statements can fetch into the same buffers), as its APD they supply
+the values at execute; their records are their own, the header fields (array size,
+bind type and offset) stay the statement's. Freed while in use, the statements go
+back to their implicit descriptors.
 
 ## SeerODBC-specific identifiers
 
