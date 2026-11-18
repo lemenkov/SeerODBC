@@ -3163,8 +3163,8 @@ static void check_scalar_functions(SQLHDBC dbc)
   }
 
   /* Markers: LOCATE reorders its two arguments, which is fine while one holds
-   * a marker; two markers that would swap are refused (HYC00), and so is a
-   * marker in an argument REPEAT or RIGHT repeats, until #302. */
+   * a marker; REPEAT and RIGHT repeat theirs, each still one parameter
+   * (#302); two markers that would swap are refused (HYC00). */
   static const struct {
     const char *sql, *p[4], *want;
   } P[] = {
@@ -3172,8 +3172,9 @@ static void check_scalar_functions(SQLHDBC dbc)
       {"SELECT {fn LOCATE('c', ?)} FROM dual", {"xxc", NULL}, "3"},
       {"SELECT {fn RIGHT('abcdef', ?)} || ? FROM dual", {"2", "!", NULL}, "ef!"},
       {"SELECT ? || {fn LEFT(?, 2)} || ? FROM dual", {"[", "abc", "]"}, "[ab]"},
+      {"SELECT {fn REPEAT(?, 2)} || ? FROM dual", {"ab", "!", NULL}, "abab!"},
+      {"SELECT {fn RIGHT(?, ?)} || ? FROM dual", {"abcdef", "2", "!"}, "ef!"},
       {"SELECT {fn LOCATE(?, ?)} FROM dual", {"c", "abc", NULL}, NULL},
-      {"SELECT {fn REPEAT(?, 2)} || ? FROM dual", {"ab", "!", NULL}, NULL},
   };
   for (size_t i = 0; i < sizeof P / sizeof P[0] && m[0] == '\0'; i++) {
     char state[6];
@@ -3213,6 +3214,102 @@ static void check_scalar_functions(SQLHDBC dbc)
         !(d & SQL_CVT_CHAR))
       snprintf(m, sizeof m, "SQL_CONVERT_VARCHAR 0x%x, SQL_CONVERT_DATE 0x%x", (unsigned)v,
                (unsigned)d);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* A placeholder repeated before a new one (#302): bind N is the N-th distinct
+ * placeholder, but a SQL statement takes a value per occurrence, so the
+ * driver sends each repeat its placeholder's value. In a query, past text and
+ * comments, on a re-execute of the cached cursor, and in an array DML. */
+static void check_repeated_placeholders(SQLHDBC dbc)
+{
+  const char *name = "repeated placeholders before a new one";
+  char m[600] = "", out[128], state[6], err[256] = "";
+  static const struct {
+    const char *sql, *p[4], *want;
+    int from;
+  } Q[] = {
+      {"SELECT :1 || :1 || :2 FROM dual", {"ab", "!", NULL}, "abab!", 0},
+      {"SELECT :b || :a || :b || :a || :c FROM dual", {"1", "2", "3", NULL}, "12123", 0},
+      {"SELECT :a || '-- :a' || /* :b */ :a || :b FROM dual", {"x", "y", NULL}, "x-- :axy", 0},
+      {"SELECT q'[:a]' || :a || :a || :b FROM dual", {"x", "y", NULL}, ":axxy", 10},
+      {"SELECT COUNT(*) FROM dual WHERE :1 = :1 AND :2 = 'z'", {"q", "z", NULL}, "1", 0},
+  };
+  for (size_t i = 0; i < sizeof Q / sizeof Q[0] && m[0] == '\0'; i++) {
+    if (g_release < Q[i].from)
+      continue;
+    SQLRETURN rc = exec_params(dbc, Q[i].sql, Q[i].p, out, sizeof out, state);
+    if (!SQL_SUCCEEDED(rc))
+      snprintf(m, sizeof m, "%s: rc %d %s", Q[i].sql, rc, state);
+    else if (strcmp(out, Q[i].want) != 0)
+      snprintf(m, sizeof m, "%s: got '%s', want '%s'", Q[i].sql, out, Q[i].want);
+  }
+
+  /* The same prepared statement twice, new values the second time. */
+  if (m[0] == '\0') {
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    char a[8] = "ab", b[8] = "!";
+    SQLLEN ia = SQL_NTS, ib = SQL_NTS, oi = 0;
+    SQLPrepare(st, (SQLCHAR *)"SELECT :1 || :1 || :2 FROM dual", SQL_NTS);
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0, a, 0, &ia);
+    SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 8, 0, b, 0, &ib);
+    for (int pass_no = 0; pass_no < 2 && m[0] == '\0'; pass_no++) {
+      if (pass_no == 1) {
+        strcpy(a, "cd");
+        strcpy(b, "?");
+      }
+      const char *want = pass_no == 0 ? "abab!" : "cdcd?";
+      SQLRETURN rc = SQLExecute(st);
+      if (SQL_SUCCEEDED(rc))
+        rc = SQLFetch(st);
+      if (SQL_SUCCEEDED(rc))
+        rc = SQLGetData(st, 1, SQL_C_CHAR, out, sizeof out, &oi);
+      if (!SQL_SUCCEEDED(rc)) {
+        diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+        snprintf(m, sizeof m, "re-execute %d: %s", pass_no + 1, err);
+      } else if (strcmp(out, want) != 0) {
+        snprintf(m, sizeof m, "re-execute %d: got '%s', want '%s'", pass_no + 1, out, want);
+      }
+      SQLFreeStmt(st, SQL_CLOSE);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+  }
+
+  /* An array INSERT whose second value repeats the first placeholder. */
+  if (m[0] == '\0') {
+    exec_do(dbc, "DROP TABLE seer_dupph", err, sizeof err);
+    if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_dupph (a VARCHAR2(10), b VARCHAR2(20))", err,
+                               sizeof err))) {
+      skip(name, err);
+      return;
+    }
+    char av[3][4] = {"x", "y", "z"}, bv[3][4] = {"1", "2", "3"};
+    SQLLEN ai[3] = {SQL_NTS, SQL_NTS, SQL_NTS}, bi[3] = {SQL_NTS, SQL_NTS, SQL_NTS};
+    SQLHSTMT st;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+    SQLSetStmtAttr(st, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)3, 0);
+    SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 4, 0, av, 4, ai);
+    SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 4, 0, bv, 4, bi);
+    SQLRETURN rc =
+        SQLExecDirect(st, (SQLCHAR *)"INSERT INTO seer_dupph VALUES (:1, :1 || :1 || :2)", SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+    SQLFreeHandle(SQL_HANDLE_STMT, st);
+    if (!SQL_SUCCEEDED(rc))
+      snprintf(m, sizeof m, "array INSERT: %s", err);
+    else if (!SQL_SUCCEEDED(exec_scalar(dbc,
+                                        "SELECT COUNT(*) || ':' || MIN(b) || ':' || MAX(b) FROM "
+                                        "seer_dupph WHERE b = a || a || SUBSTR(b, 3)",
+                                        out, sizeof out, err, sizeof err)))
+      snprintf(m, sizeof m, "array INSERT read back: %s", err);
+    else if (strcmp(out, "3:xx1:zz3") != 0)
+      snprintf(m, sizeof m, "array INSERT: got '%s', want '3:xx1:zz3'", out);
+    exec_do(dbc, "DROP TABLE seer_dupph", err, sizeof err);
   }
   if (m[0] == '\0')
     pass(name);
@@ -5956,6 +6053,7 @@ int main(void)
     check_metadata_id(dbc);
     check_describe_param(dbc);
     check_scalar_functions(dbc);
+    check_repeated_placeholders(dbc);
     check_tables_enum(dbc);
     check_privileges(dbc);
     check_cursor_names(dbc);

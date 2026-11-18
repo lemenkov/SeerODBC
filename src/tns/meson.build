@@ -11,6 +11,7 @@ tns_sources = files(
   'oson.c',
   'packet.c',
   'pipeline.c',
+  'placeholders.c',
   'reader.c',
   'session.c',
   'stmt.c',

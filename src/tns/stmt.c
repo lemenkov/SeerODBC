@@ -16,6 +16,7 @@
 #include "json.h"
 #include "lob.h"
 #include "oson.h"
+#include "placeholders.h"
 #include "log.h"
 #include "marshal.h"
 #include "reader.h"
@@ -8785,7 +8786,193 @@ int seer_stmt_compile_warning(SeerStmt *stmt)
   return stmt != NULL && stmt->compile_warning;
 }
 
+/* ----------------------------------------- one value per occurrence (#302) */
+
+/* The binds as the API set them, while the expanded set is on the statement. */
+typedef struct {
+  SeerBind *orig; /* NULL: nothing expanded */
+  int norig;
+  int *occ; /* per occurrence, its distinct placeholder */
+  int nocc, ndistinct;
+  int *first; /* per distinct placeholder, its first occurrence */
+} BindExpansion;
+
+/* A repeat of `b` for a later occurrence: the same descriptor, its own copy
+ * of the values (an execute may replace them, as 9i's temporary LOBs do), and
+ * nothing it owns besides. */
+static SeerStatus dup_bind(const SeerStmt *s, const SeerBind *b, SeerBind *d)
+{
+  int iters = s->n_iters > 0 ? s->n_iters : 1;
+  *d = *b;
+  d->rxd = NULL;
+  d->rxd_len = NULL;
+  d->oac_override = NULL;
+  d->out = (SeerCell){0};
+  d->ret_locator = NULL;
+  d->out_arr = NULL;
+  d->out_arr_n = 0;
+  d->out_image = NULL;
+  d->temp_locator = NULL; /* the first occurrence owns the temporary LOB */
+  d->temp_loclen = 0;
+  if (b->rxd != NULL) {
+    d->rxd = calloc((size_t)iters, sizeof *d->rxd);
+    d->rxd_len = calloc((size_t)iters, sizeof *d->rxd_len);
+    if (d->rxd == NULL || d->rxd_len == NULL)
+      return SEER_ENOMEM;
+    for (int k = 0; k < iters; k++) {
+      d->rxd_len[k] = b->rxd_len[k];
+      if (b->rxd[k] == NULL)
+        continue;
+      d->rxd[k] = malloc(b->rxd_len[k] > 0 ? b->rxd_len[k] : 1);
+      if (d->rxd[k] == NULL)
+        return SEER_ENOMEM;
+      memcpy(d->rxd[k], b->rxd[k], b->rxd_len[k]);
+    }
+  }
+  if (b->oac_override != NULL) {
+    d->oac_override = malloc(b->oac_override_len);
+    if (d->oac_override == NULL)
+      return SEER_ENOMEM;
+    memcpy(d->oac_override, b->oac_override, b->oac_override_len);
+  }
+  return SEER_OK;
+}
+
+/* Free what dup_bind made (obj_type is the first occurrence's). */
+static void free_dup_bind(const SeerStmt *s, SeerBind *d)
+{
+  int iters = s->n_iters > 0 ? s->n_iters : 1;
+  if (d->rxd != NULL)
+    for (int k = 0; k < iters; k++)
+      free(d->rxd[k]);
+  free(d->rxd);
+  free(d->rxd_len);
+  free(d->oac_override);
+  memset(d, 0, sizeof *d);
+}
+
+/* For a SQL statement whose placeholders repeat, put on the statement one
+ * bind per occurrence, each a copy of its distinct placeholder's: the server
+ * pairs a SQL statement's values with occurrences, so `:1 || :1 || :2` with
+ * two left :2 unbound (ORA-01008). Not for what runs as a PL/SQL block, which
+ * takes one value per name: a block, a DML with OUT binds (RETURNING, which
+ * 8i / 9i wrap in a block, and where python-oracledb refuses repeated names),
+ * a 9i DML with a long text bind. Nor when fewer binds are set than names,
+ * which the server reports as it is. */
+static SeerStatus expand_binds(SeerStmt *stmt, BindExpansion *x)
+{
+  *x = (BindExpansion){0};
+  if (stmt->npbinds == 0 || stmt->sql == NULL)
+    return SEER_OK;
+  StmtKind kind = classify_sql(stmt->sql);
+  if (kind == STMT_BLOCK)
+    return SEER_OK;
+  for (int i = 0; i < stmt->npbinds; i++)
+    if (stmt->pbinds[i].is_out)
+      return SEER_OK;
+  if (kind == STMT_CHANGE && !stmt->conn->is_8i &&
+      stmt->conn->field_version < TTC_FIELD_VERSION_10_2 && fv2_long_binds(stmt) == FV2_BINDS_BLOCK)
+    return SEER_OK;
+  int *occ = NULL, nocc = 0, nd = 0;
+  if (seer_sql_placeholders(stmt->sql, &occ, &nocc, &nd) != 0)
+    return SEER_ENOMEM;
+  if (nocc == nd || nd > stmt->npbinds) {
+    free(occ);
+    return SEER_OK;
+  }
+  int extra = stmt->npbinds - nd; /* set past the last name: kept, after */
+  SeerBind *e = calloc((size_t)(nocc + extra), sizeof *e);
+  int *first = malloc((size_t)nd * sizeof *first);
+  if (e == NULL || first == NULL) {
+    free(e);
+    free(first);
+    free(occ);
+    return SEER_ENOMEM;
+  }
+  for (int k = 0; k < nd; k++)
+    first[k] = -1;
+  SeerStatus st = SEER_OK;
+  for (int j = 0; j < nocc && st == SEER_OK; j++) {
+    int k = occ[j];
+    if (first[k] < 0) {
+      e[j] = stmt->pbinds[k];
+      first[k] = j;
+    } else {
+      st = dup_bind(stmt, &stmt->pbinds[k], &e[j]);
+    }
+  }
+  if (st != SEER_OK) {
+    for (int j = 0; j < nocc; j++)
+      if (first[occ[j]] != j)
+        free_dup_bind(stmt, &e[j]);
+    free(e);
+    free(first);
+    free(occ);
+    return st;
+  }
+  for (int t = 0; t < extra; t++)
+    e[nocc + t] = stmt->pbinds[nd + t];
+  *x = (BindExpansion){stmt->pbinds, stmt->npbinds, occ, nocc, nd, first};
+  stmt->pbinds = e;
+  stmt->npbinds = nocc + extra;
+  seer_log(SEER_LOG_DEBUG, "stmt: %d placeholders, %d occurrences: one value each", nd, nocc);
+  return SEER_OK;
+}
+
+/* Back to the binds as set: the first occurrences and the extras carry
+ * whatever the call left in them; the repeats go. */
+static void restore_binds(SeerStmt *stmt, BindExpansion *x)
+{
+  if (x->orig == NULL)
+    return;
+  int extra = x->norig - x->ndistinct;
+  for (int k = 0; k < x->ndistinct; k++)
+    x->orig[k] = stmt->pbinds[x->first[k]];
+  for (int t = 0; t < extra; t++)
+    x->orig[x->ndistinct + t] = stmt->pbinds[x->nocc + t];
+  for (int j = 0; j < x->nocc; j++)
+    if (x->first[x->occ[j]] != j)
+      free_dup_bind(stmt, &stmt->pbinds[j]);
+  free(stmt->pbinds);
+  stmt->pbinds = x->orig;
+  stmt->npbinds = x->norig;
+  free(x->occ);
+  free(x->first);
+  *x = (BindExpansion){0};
+}
+
+static SeerStatus describe_now(SeerStmt *stmt);
+static SeerStatus execute_now(SeerStmt *stmt);
+
 SeerStatus seer_stmt_describe(SeerStmt *stmt)
+{
+  if (stmt == NULL)
+    return SEER_EPARAM;
+  BindExpansion x;
+  SeerStatus st = expand_binds(stmt, &x);
+  if (st != SEER_OK)
+    return st;
+  st = describe_now(stmt);
+  restore_binds(stmt, &x);
+  return st;
+}
+
+SeerStatus seer_stmt_execute(SeerStmt *stmt)
+{
+  if (stmt == NULL)
+    return SEER_EPARAM;
+  if (!stmt->conn->authenticated)
+    return SEER_EPROTO;
+  BindExpansion x;
+  SeerStatus st = expand_binds(stmt, &x);
+  if (st != SEER_OK)
+    return st;
+  st = execute_now(stmt);
+  restore_binds(stmt, &x);
+  return st;
+}
+
+static SeerStatus describe_now(SeerStmt *stmt)
 {
   if (stmt == NULL)
     return SEER_EPARAM;
@@ -8836,7 +9023,7 @@ SeerStatus seer_stmt_describe(SeerStmt *stmt)
   return SEER_OK;
 }
 
-SeerStatus seer_stmt_execute(SeerStmt *stmt)
+static SeerStatus execute_now(SeerStmt *stmt)
 {
   if (stmt == NULL)
     return SEER_EPARAM;
@@ -9113,7 +9300,11 @@ SeerStatus seer_stmt_pipeline_burst(SeerConn *c, SeerStmt **stmts, size_t n, lon
   for (size_t i = 0; i < n; i++) {
     stmts[i]->reuse_cursor = 0; /* pipelined ops never cache-reuse */
     c->pipeline_token = (uint32_t)(i + 1);
-    st = build_exec(stmts[i], &msgs[i]);
+    BindExpansion x; /* one value per occurrence, as seer_stmt_execute (#302) */
+    st = expand_binds(stmts[i], &x);
+    if (st == SEER_OK)
+      st = build_exec(stmts[i], &msgs[i]);
+    restore_binds(stmts[i], &x);
     c->pipeline_token = 0;
     if (st != SEER_OK)
       goto cleanup;

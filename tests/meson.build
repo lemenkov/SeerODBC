@@ -113,6 +113,14 @@ test_fv2_error = executable('test_fv2_error',
 )
 test('fv2 error text', test_fv2_error)
 
+# Bind placeholders occurrence by occurrence (#302): a SQL statement takes a
+# value for each, past quoted text and comments.
+test_placeholders = executable('test_placeholders',
+  'unit/test_placeholders.c',
+  dependencies : [test_dep, seertns_dep],
+)
+test('placeholders', test_placeholders)
+
 # 8i login: OSESSKEY / OAUTH at 8i's fixed little-endian widths, byte for
 # byte against seerdb's encoders, and reading the pairs reply.
 test_o8i_login = executable('test_o8i_login',
