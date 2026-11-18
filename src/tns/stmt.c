@@ -4631,7 +4631,9 @@ static int64_t fv2_oer_code(const uint8_t *resp, size_t rlen)
  * chunks (a length byte and that many bytes), then a zero length that is the
  * reply's last byte. The joined text, or NULL when resp[i] starts no such run
  * or the text is not an "ORA-" message. Caller frees. */
-static char *fv2_chunked_message(const uint8_t *resp, size_t rlen, size_t i)
+/* A chunked "ORA-..." run at `i`: ending the reply when `at_end`, else
+ * anywhere its zero terminator falls inside it (#246). */
+static char *fv2_chunked_message(const uint8_t *resp, size_t rlen, size_t i, bool at_end)
 {
   if (resp[i] != 0xFE)
     return NULL;
@@ -4640,7 +4642,7 @@ static char *fv2_chunked_message(const uint8_t *resp, size_t rlen, size_t i)
     total += resp[j];
     j += 1 + (size_t)resp[j];
   }
-  if (j != rlen - 1 || total < 4)
+  if ((at_end ? j != rlen - 1 : j >= rlen) || total < 4)
     return NULL;
   char *msg = malloc(total + 1);
   if (msg == NULL)
@@ -4871,30 +4873,54 @@ static void fv2_decode_dml_response(const uint8_t *data, size_t dlen, int64_t *r
   *code = status.code;
 }
 
+/* A length-prefixed "ORA-..." run at `i`: ending the reply when `at_end`,
+ * else anywhere inside it. */
+static char *fv2_plain_message(const uint8_t *resp, size_t rlen, size_t i, bool at_end)
+{
+  size_t len = resp[i];
+  if (len < 4 || (at_end ? i + 1 + len != rlen : i + 1 + len > rlen) ||
+      memcmp(resp + i + 1, "ORA-", 4) != 0)
+    return NULL;
+  char *msg = malloc(len + 1);
+  if (msg != NULL) {
+    memcpy(msg, resp + i + 1, len);
+    msg[len] = '\0';
+  }
+  return msg;
+}
+
+/* The error's text, the reply's last field. Both forms must read "ORA-":
+ * a bare length match took a stray byte for one, and a 9i error now and then
+ * came back as 2 bytes of the reply's tail, its ORA number and SQLSTATE lost
+ * (#246). Failing that at the end, a run with bytes after it; failing any,
+ * the status's ORA code - never the last call's text, which a reply without
+ * one used to leave in place. */
 static void fv2_set_error(SeerConn *c, const uint8_t *resp, size_t rlen)
 {
   char *msg = NULL;
-  for (size_t i = 3; i + 1 < rlen && msg == NULL; i++)
-    msg = fv2_chunked_message(resp, rlen, i);
-  for (size_t i = 3; i + 1 < rlen && msg == NULL; i++) {
-    size_t len = resp[i];
-    if (len && i + 1 + len == rlen) {
-      msg = malloc(len + 1);
-      if (msg != NULL) {
-        memcpy(msg, resp + i + 1, len);
-        msg[len] = '\0';
-      }
-    }
+  for (int at_end = 1; at_end >= 0 && msg == NULL; at_end--) {
+    for (size_t i = 3; i + 1 < rlen && msg == NULL; i++)
+      msg = fv2_chunked_message(resp, rlen, i, at_end);
+    for (size_t i = 3; i + 1 < rlen && msg == NULL; i++)
+      msg = fv2_plain_message(resp, rlen, i, at_end);
+    if (msg != NULL && !at_end)
+      seer_log(SEER_LOG_DEBUG, "fv2: the error text is not the reply's last field");
+  }
+  /* Where in the statement the error is, as 10g+ reports it (seerdb #2263:
+   * `select nosuch from dual` is ORA-00904 at 7). */
+  Fv2Status status;
+  bool have_status = fv2_read_status(resp, rlen, &status);
+  if (have_status)
+    c->last_error_offset = (long)status.position;
+  if (msg == NULL && have_status && status.code > 0) {
+    msg = malloc(16);
+    if (msg != NULL)
+      snprintf(msg, 16, "ORA-%05lld", (long long)status.code);
   }
   if (msg != NULL) {
     free(c->last_error);
     c->last_error = msg;
   }
-  /* Where in the statement the error is, as 10g+ reports it (seerdb #2263:
-   * `select nosuch from dual` is ORA-00904 at 7). */
-  Fv2Status status;
-  if (fv2_read_status(resp, rlen, &status))
-    c->last_error_offset = (long)status.position;
 }
 
 /* Append one fv2 define entry: the client's requested return type for a column. */
@@ -12520,6 +12546,11 @@ out:
  * field version `fv`, reporting the column count and the trailing OER error
  * code. Used by the RPA-skip regression test (a 26ai/fv27 execute response whose
  * RPA field byte 0x04 collided with the OER token). Not exported from the .so. */
+void seer_test_fv2_set_error(SeerConn *c, const uint8_t *buf, size_t len)
+{
+  fv2_set_error(c, buf, len);
+}
+
 void seer_test_fv2_decode_dml(const uint8_t *buf, size_t len, int64_t *rowcount, int64_t *code)
 {
   fv2_decode_dml_response(buf, len, rowcount, code);

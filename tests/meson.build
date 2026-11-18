@@ -105,6 +105,14 @@ test_fv2_status = executable('test_fv2_status',
 )
 test('fv2 dml status', test_fv2_status)
 
+# 9i (fv2) error text (#246): the "ORA-" run that ends the reply, plain or
+# chunked, never a stray length byte or the reply's tail.
+test_fv2_error = executable('test_fv2_error',
+  'unit/test_fv2_error.c',
+  dependencies : [test_dep, seertns_dep],
+)
+test('fv2 error text', test_fv2_error)
+
 # 8i login: OSESSKEY / OAUTH at 8i's fixed little-endian widths, byte for
 # byte against seerdb's encoders, and reading the pairs reply.
 test_o8i_login = executable('test_o8i_login',
