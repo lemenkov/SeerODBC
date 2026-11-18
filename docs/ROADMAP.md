@@ -193,7 +193,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] Diag: SQLGetDiagRec(W), SQLGetDiagField
 - [x] Info: SQLGetInfo(W), SQLGetFunctions, SQLGetTypeInfo(W)
 - [x] Catalog: SQLTables(W), SQLColumns(W), SQLPrimaryKeys, SQLForeignKeys,
-      SQLStatistics, SQLProcedures, SQLProcedureColumns, SQLSpecialColumns
+      SQLStatistics, SQLProcedures, SQLProcedureColumns, SQLSpecialColumns,
+      SQLTablePrivileges, SQLColumnPrivileges
 - [x] SQLCancel — abort a SQL_NEED_DATA sequence; in-band INTERRUPT break for a
       call blocked on the connection (cross-thread interrupt → ORA-01013)
 - [x] SQLNativeSql — returns the native SQL (escape expansion + '?' -> :1)

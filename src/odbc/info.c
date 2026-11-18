@@ -321,6 +321,8 @@ static int func_supported(SQLUSMALLINT id)
   case SQL_API_SQLPROCEDURES:
   case SQL_API_SQLPROCEDURECOLUMNS:
   case SQL_API_SQLSPECIALCOLUMNS:
+  case SQL_API_SQLTABLEPRIVILEGES: /* #286 */
+  case SQL_API_SQLCOLUMNPRIVILEGES:
     return 1;
   default:
     return 0;

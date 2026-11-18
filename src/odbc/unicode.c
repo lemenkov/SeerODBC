@@ -511,6 +511,32 @@ SQLRETURN SQL_API SQLPrimaryKeysW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lca
   return r;
 }
 
+SQLRETURN SQL_API SQLTablePrivilegesW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat,
+                                      SQLWCHAR *sch, SQLSMALLINT lsch, SQLWCHAR *tab,
+                                      SQLSMALLINT ltab)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch), *t = w_to_utf8(tab, ltab);
+  SQLRETURN r = SQLTablePrivileges(hstmt, U8ARG(c), U8ARG(s), U8ARG(t));
+  free(c);
+  free(s);
+  free(t);
+  return r;
+}
+
+SQLRETURN SQL_API SQLColumnPrivilegesW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat,
+                                       SQLWCHAR *sch, SQLSMALLINT lsch, SQLWCHAR *tab,
+                                       SQLSMALLINT ltab, SQLWCHAR *col, SQLSMALLINT lcol)
+{
+  char *c = w_to_utf8(cat, lcat), *s = w_to_utf8(sch, lsch), *t = w_to_utf8(tab, ltab),
+       *k = w_to_utf8(col, lcol);
+  SQLRETURN r = SQLColumnPrivileges(hstmt, U8ARG(c), U8ARG(s), U8ARG(t), U8ARG(k));
+  free(c);
+  free(s);
+  free(t);
+  free(k);
+  return r;
+}
+
 SQLRETURN SQL_API SQLStatisticsW(SQLHSTMT hstmt, SQLWCHAR *cat, SQLSMALLINT lcat, SQLWCHAR *sch,
                                  SQLSMALLINT lsch, SQLWCHAR *tab, SQLSMALLINT ltab,
                                  SQLUSMALLINT unique, SQLUSMALLINT reserved)

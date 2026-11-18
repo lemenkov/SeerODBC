@@ -27,6 +27,8 @@ EXPORTS
     SQLCloseCursor
     SQLColAttribute
     SQLColAttributeW
+    SQLColumnPrivileges
+    SQLColumnPrivilegesW
     SQLColumns
     SQLColumnsW
     SQLConnect
@@ -95,5 +97,7 @@ EXPORTS
     SQLSpecialColumnsW
     SQLStatistics
     SQLStatisticsW
+    SQLTablePrivileges
+    SQLTablePrivilegesW
     SQLTables
     SQLTablesW

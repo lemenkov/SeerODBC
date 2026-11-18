@@ -528,6 +528,91 @@ SQLRETURN SQL_API SQLPrimaryKeys(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
   return ret;
 }
 
+/* SQLTablePrivileges (#286): the grants on tables matching the schema and
+ * table patterns, as ALL_TAB_PRIVS lists them - those the user made or
+ * received, and PUBLIC's. An owner's own rights are not grants, and are not
+ * listed. */
+SQLRETURN SQL_API SQLTablePrivileges(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
+                                     SQLSMALLINT NameLength1, SQLCHAR *SchemaName,
+                                     SQLSMALLINT NameLength2, SQLCHAR *TableName,
+                                     SQLSMALLINT NameLength3)
+{
+  (void)CatalogName;
+  (void)NameLength1;
+  OdbcStmt *s = (OdbcStmt *)StatementHandle;
+  if (s == NULL)
+    return SQL_INVALID_HANDLE;
+  seer_odbc_diag_clear(s);
+  if (s->dbc == NULL || !s->dbc->connected)
+    return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
+
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL))
+    return null_identifier(s);
+  char *schema = pattern_dup(s, SchemaName, NameLength2);
+  char *table = pattern_dup(s, TableName, NameLength3);
+  if (schema == NULL || table == NULL) {
+    free(schema);
+    free(table);
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  }
+
+  static const char *TABPRIV_SQL =
+      "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, TABLE_SCHEMA TABLE_SCHEM, TABLE_NAME,"
+      " GRANTOR, GRANTEE, PRIVILEGE, GRANTABLE IS_GRANTABLE FROM ALL_TAB_PRIVS"
+      " WHERE TABLE_SCHEMA LIKE :1 ESCAPE '\\' AND TABLE_NAME LIKE :2 ESCAPE '\\'"
+      " ORDER BY 2, 3, 6, 5";
+
+  const char *params[2] = {schema, table};
+  SQLRETURN ret = seer_odbc_run_query(s, TABPRIV_SQL, params, 2);
+  free(schema);
+  free(table);
+  return ret;
+}
+
+/* SQLColumnPrivileges (#286): the column grants, from ALL_COL_PRIVS, on one
+ * table - schema and table ordinary arguments - for the columns matching the
+ * column pattern. */
+SQLRETURN SQL_API SQLColumnPrivileges(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
+                                      SQLSMALLINT NameLength1, SQLCHAR *SchemaName,
+                                      SQLSMALLINT NameLength2, SQLCHAR *TableName,
+                                      SQLSMALLINT NameLength3, SQLCHAR *ColumnName,
+                                      SQLSMALLINT NameLength4)
+{
+  (void)CatalogName;
+  (void)NameLength1;
+  OdbcStmt *s = (OdbcStmt *)StatementHandle;
+  if (s == NULL)
+    return SQL_INVALID_HANDLE;
+  seer_odbc_diag_clear(s);
+  if (s->dbc == NULL || !s->dbc->connected)
+    return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
+
+  if (s->metadata_id && (SchemaName == NULL || TableName == NULL || ColumnName == NULL))
+    return null_identifier(s);
+  char *schema = ident_dup(s, SchemaName, NameLength2);
+  char *table = ident_dup(s, TableName, NameLength3);
+  char *column = pattern_dup(s, ColumnName, NameLength4);
+  if (schema == NULL || table == NULL || column == NULL) {
+    free(schema);
+    free(table);
+    free(column);
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  }
+
+  static const char *COLPRIV_SQL =
+      "SELECT CAST(NULL AS VARCHAR2(128)) TABLE_CAT, TABLE_SCHEMA TABLE_SCHEM, TABLE_NAME,"
+      " COLUMN_NAME, GRANTOR, GRANTEE, PRIVILEGE, GRANTABLE IS_GRANTABLE FROM ALL_COL_PRIVS"
+      " WHERE TABLE_SCHEMA LIKE :1 ESCAPE '\\' AND TABLE_NAME LIKE :2 ESCAPE '\\'"
+      " AND COLUMN_NAME LIKE :3 ESCAPE '\\' ORDER BY 2, 3, 4, 7, 6";
+
+  const char *params[3] = {schema, table, column};
+  SQLRETURN ret = seer_odbc_run_query(s, COLPRIV_SQL, params, 3);
+  free(schema);
+  free(table);
+  free(column);
+  return ret;
+}
+
 SQLRETURN SQL_API SQLStatistics(SQLHSTMT StatementHandle, SQLCHAR *CatalogName,
                                 SQLSMALLINT NameLength1, SQLCHAR *SchemaName,
                                 SQLSMALLINT NameLength2, SQLCHAR *TableName,
