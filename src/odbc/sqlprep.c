@@ -430,6 +430,35 @@ static int emit_escape(Buf *out, const char *kw, size_t kwlen, const char *rest,
            buf_put(out, ",'HH24:MI:SS')", 14);
   if (kwlen == 6 && strncasecmp(kw, "escape", 6) == 0)
     return buf_put(out, "ESCAPE ", 7) || buf_put(out, rest, restlen);
+  /* {INTERVAL [+|-] 'value' qualifier}: Oracle's own INTERVAL literal (9i+)
+   * takes every ODBC qualifier. Oracle has no unary minus for an interval
+   * (ORA-00932), so a sign outside the quotes moves inside them; a minus on a
+   * value that already starts with one cancels it. 8i has no INTERVAL: the
+   * escape stays as written. */
+  if (kwlen == 8 && strncasecmp(kw, "interval", 8) == 0 && (ctx->major <= 0 || ctx->major >= 9)) {
+    char sign = 0;
+    if (restlen > 0 && (*rest == '+' || *rest == '-')) {
+      sign = *rest;
+      rest++;
+      restlen--;
+      while (restlen > 0 && isspace((unsigned char)*rest)) {
+        rest++;
+        restlen--;
+      }
+    }
+    if (sign != '-' || restlen < 2 || *rest != '\'')
+      return buf_put(out, "INTERVAL ", 9) || buf_put(out, rest, restlen);
+    rest++; /* past the opening quote */
+    restlen--;
+    bool neg = true;
+    if (*rest == '-' || *rest == '+') {
+      neg = *rest == '+';
+      rest++;
+      restlen--;
+    }
+    return buf_put(out, neg ? "INTERVAL '-" : "INTERVAL '", neg ? 11 : 10) ||
+           buf_put(out, rest, restlen);
+  }
   if ((kwlen == 2 && strncasecmp(kw, "fn", 2) == 0) ||
       (kwlen == 2 && strncasecmp(kw, "oj", 2) == 0)) {
     char *tmp = seer_strndup(rest, restlen);

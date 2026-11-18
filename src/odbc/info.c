@@ -306,6 +306,19 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
                     InfoValuePtr);
   case SQL_SYSTEM_FUNCTIONS: /* no DATABASE: Oracle has no catalogs */
     return info_u32(SQL_FN_SYS_IFNULL | SQL_FN_SYS_USERNAME, InfoValuePtr);
+  case SQL_DATETIME_LITERALS: /* {d} {t} {ts} everywhere; {INTERVAL} from 9i */
+    return info_u32(
+        SQL_DL_SQL92_DATE | SQL_DL_SQL92_TIME | SQL_DL_SQL92_TIMESTAMP |
+            (legacy_8i(c)
+                 ? 0
+                 : SQL_DL_SQL92_INTERVAL_YEAR | SQL_DL_SQL92_INTERVAL_MONTH |
+                       SQL_DL_SQL92_INTERVAL_DAY | SQL_DL_SQL92_INTERVAL_HOUR |
+                       SQL_DL_SQL92_INTERVAL_MINUTE | SQL_DL_SQL92_INTERVAL_SECOND |
+                       SQL_DL_SQL92_INTERVAL_YEAR_TO_MONTH | SQL_DL_SQL92_INTERVAL_DAY_TO_HOUR |
+                       SQL_DL_SQL92_INTERVAL_DAY_TO_MINUTE | SQL_DL_SQL92_INTERVAL_DAY_TO_SECOND |
+                       SQL_DL_SQL92_INTERVAL_HOUR_TO_MINUTE | SQL_DL_SQL92_INTERVAL_HOUR_TO_SECOND |
+                       SQL_DL_SQL92_INTERVAL_MINUTE_TO_SECOND),
+        InfoValuePtr);
   case SQL_TIMEDATE_ADD_INTERVALS: /* 8i has no fractional seconds */
     return info_u32((legacy_8i(c) ? 0 : SQL_FN_TSI_FRAC_SECOND) | SQL_FN_TSI_SECOND |
                         SQL_FN_TSI_MINUTE | SQL_FN_TSI_HOUR | SQL_FN_TSI_DAY | SQL_FN_TSI_WEEK |
