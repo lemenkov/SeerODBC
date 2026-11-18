@@ -267,12 +267,23 @@ static bool fragment_sized(const SeerConn *c, size_t total)
  * a busy CI runner, whose next fragment came later than that, and the reply
  * failed to decode ("protocol error"). Without that framing, or once the last
  * byte is the token (a real end, or the token value at a fragment's edge), the
- * short wait decides as before. */
+ * short wait decides as before.
+ *
+ * The fill itself is not fixed: 23.26.4 fills a fragment to SDU-257 (#284),
+ * where every earlier release had SDU-37 or SDU-81, and its LOB reads were cut
+ * at the first fragment. So once logged in, where every reply ends with the
+ * token (measured on 23.26.4 and 26ai: the one exception is 3 bytes), an
+ * unfinished reply whose packet is over half the SDU is a fragment, however
+ * full the server chose to make it. Before login some replies carry no token,
+ * and the exact sizes decide. */
 static bool more_fragments(SeerConn *c, size_t total, const SeerWriter *acc)
 {
-  if (c->sdu == 0 || !fragment_sized(c, total))
+  if (c->sdu == 0)
     return false;
   bool open = c->supports_eor && acc->len > 0 && acc->buf[acc->len - 1] != TTI_END_OF_RESPONSE;
+  bool near_full = open && c->authenticated && total * 2 > (size_t)c->sdu;
+  if (!near_full && !fragment_sized(c, total))
+    return false;
   if (seer_transport_wait_readable(c->t, open ? EOR_FRAGMENT_WAIT_MS : FRAGMENT_WAIT_MS) == 0) {
     seer_log(open ? SEER_LOG_ERROR : SEER_LOG_DEBUG,
              open ? "ttc: no continuation of an unfinished %zu-byte reply fragment"
