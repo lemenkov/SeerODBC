@@ -170,6 +170,10 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
   case SQL_MAX_TABLE_NAME_LEN:
   case SQL_MAX_SCHEMA_NAME_LEN:
     return info_u16(max_identifier_len(c), InfoValuePtr);
+  case SQL_MAX_CURSOR_NAME_LEN: /* SQLSetCursorName (#288) */
+    return info_u16(SEER_MAX_CURSOR_NAME_LEN, InfoValuePtr);
+  case SQL_POSITIONED_STATEMENTS: /* WHERE CURRENT OF, rewritten to the ROWID */
+    return info_u32(SQL_PS_POSITIONED_DELETE | SQL_PS_POSITIONED_UPDATE, InfoValuePtr);
   case SQL_CATALOG_LOCATION:
     return info_u16(0, InfoValuePtr);
   case SQL_CONCAT_NULL_BEHAVIOR:
@@ -243,13 +247,16 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType,
 
   /* --- cursors --- forward-only plus a buffered static (scrollable) cursor */
   case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1:
-    return info_u32(SQL_CA1_NEXT, InfoValuePtr);
+    return info_u32(SQL_CA1_NEXT | SQL_CA1_POSITIONED_UPDATE | SQL_CA1_POSITIONED_DELETE,
+                    InfoValuePtr);
   case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2:
     return info_u32(SQL_CA2_READ_ONLY_CONCURRENCY, InfoValuePtr);
   case SQL_SCROLL_OPTIONS:
     return info_u32(SQL_SO_FORWARD_ONLY | SQL_SO_STATIC, InfoValuePtr);
   case SQL_STATIC_CURSOR_ATTRIBUTES1:
-    return info_u32(SQL_CA1_NEXT | SQL_CA1_ABSOLUTE | SQL_CA1_RELATIVE, InfoValuePtr);
+    return info_u32(SQL_CA1_NEXT | SQL_CA1_ABSOLUTE | SQL_CA1_RELATIVE | SQL_CA1_POSITIONED_UPDATE |
+                        SQL_CA1_POSITIONED_DELETE,
+                    InfoValuePtr);
   case SQL_STATIC_CURSOR_ATTRIBUTES2:
     return info_u32(SQL_CA2_READ_ONLY_CONCURRENCY, InfoValuePtr);
 
@@ -323,6 +330,8 @@ static int func_supported(SQLUSMALLINT id)
   case SQL_API_SQLSPECIALCOLUMNS:
   case SQL_API_SQLTABLEPRIVILEGES: /* #286 */
   case SQL_API_SQLCOLUMNPRIVILEGES:
+  case SQL_API_SQLGETCURSORNAME: /* #288 */
+  case SQL_API_SQLSETCURSORNAME:
     return 1;
   default:
     return 0;

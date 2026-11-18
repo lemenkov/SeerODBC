@@ -429,6 +429,7 @@ SQLRETURN SQL_API SQLMoreResults(SQLHSTMT StatementHandle)
   s->getdata_col = -1;
   s->getdata_off = 0;
   s->rowset_start = -1;
+  s->cur_row = -1;
   return SQL_SUCCESS;
 }
 
@@ -986,7 +987,8 @@ static SQLRETURN fetch_rowset(OdbcStmt *s, long start)
   if (s->rows_fetched)
     *s->rows_fetched = got;
   s->rowset_start = (got > 0) ? start : -1;
-  s->getdata_col = -1; /* SQLGetData targets the last fetched row */
+  s->cur_row = s->rowset_start; /* WHERE CURRENT OF: the rowset's first row (#288) */
+  s->getdata_col = -1;          /* SQLGetData targets the last fetched row */
   s->getdata_off = 0;
 
   if (got == 0)
@@ -1102,6 +1104,7 @@ SQLRETURN SQL_API SQLSetPos(SQLHSTMT StatementHandle, SQLSETPOSIROW RowNumber,
     long off = (RowNumber > 0) ? (long)RowNumber - 1 : 0;
     if (seer_stmt_set_row(s->core, s->rowset_start + off) != SEER_OK)
       return seer_odbc_diag(s, "HY107", 0, "Row number out of range", SQL_ERROR);
+    s->cur_row = s->rowset_start + off; /* the row WHERE CURRENT OF means (#288) */
     s->getdata_col = -1;
     s->getdata_off = 0;
     return SQL_SUCCESS;
@@ -1193,6 +1196,7 @@ SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option)
     }
     s->getdata_col = -1;
     s->getdata_off = 0;
+    s->cur_row = -1; /* closed: no current row for WHERE CURRENT OF (#288) */
     return SQL_SUCCESS;
   case SQL_UNBIND:
     for (int i = 0; i < s->num_binds; i++)
@@ -1224,5 +1228,6 @@ SQLRETURN SQL_API SQLCloseCursor(SQLHSTMT StatementHandle)
   s->core = NULL;
   s->getdata_col = -1;
   s->getdata_off = 0;
+  s->cur_row = -1;
   return SQL_SUCCESS;
 }

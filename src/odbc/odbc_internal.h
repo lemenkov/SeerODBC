@@ -105,6 +105,9 @@ typedef struct {
   SQLINTEGER odbc_version;
 } OdbcEnv;
 
+/* SQLSetCursorName's longest name, as SQL_MAX_CURSOR_NAME_LEN reports it (#288). */
+#define SEER_MAX_CURSOR_NAME_LEN 128
+
 typedef struct {
   OdbcHeader h;
   OdbcEnv *env;
@@ -115,6 +118,8 @@ typedef struct {
   SQLUINTEGER txn_isolation; /* SQL_ATTR_TXN_ISOLATION, 0 = the server's default (#220) */
   SQLUINTEGER conn_timeout;  /* SQL_ATTR_CONNECTION_TIMEOUT, seconds; 0 = none (#228) */
   SQLUINTEGER metadata_id;   /* SQL_ATTR_METADATA_ID: the default for new statements (#278) */
+  void *stmts;               /* its statements (OdbcStmt), newest first: cursor names (#288) */
+  unsigned long cursor_seq;  /* the last SQL_CURn generated */
   char *browse_cs;
   /* For SQLGetInfo (#234): the DSN connected through ("" without one), the
    * user and the service or SID, kept from the connect. */
@@ -215,6 +220,9 @@ typedef struct {
   int rowid_col;         /* core column index of the hidden ROWID, -1 = none */
   char **rowids;         /* per-row ROWID strings, [num_rowids] */
   size_t num_rowids;
+  void *next_stmt;   /* the connection's next statement (#288) */
+  char *cursor_name; /* SQLSetCursorName's, or a generated SQL_CURn */
+  long cur_row;      /* the cursor's current row (0-based), -1 = none */
 } OdbcStmt;
 
 /* Result columns visible to the application: the core's column count minus the

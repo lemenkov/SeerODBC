@@ -537,3 +537,101 @@ int seer_sql_count_params(const char *sql)
   }
   return nseen;
 }
+
+static int ident_char(char c)
+{
+  return isalnum((unsigned char)c) || c == '_' || c == '$' || c == '#';
+}
+
+/* Whether `p` begins `WHERE CURRENT OF name` ending the statement; if so,
+ * fill the offsets (from `sql`) and the name. */
+static int current_of_at(const char *sql, const char *p, size_t *start, size_t *end, char *name,
+                         size_t namelen)
+{
+  p += 5; /* WHERE */
+  while (isspace((unsigned char)*p))
+    p++;
+  if (!kw_at(p, "CURRENT"))
+    return 0;
+  const char *cur = p;
+  p += 7;
+  if (!isspace((unsigned char)*p))
+    return 0;
+  while (isspace((unsigned char)*p))
+    p++;
+  if (!kw_at(p, "OF"))
+    return 0;
+  p += 2;
+  if (!isspace((unsigned char)*p))
+    return 0;
+  while (isspace((unsigned char)*p))
+    p++;
+  const char *n0, *n1;
+  if (*p == '"') {
+    n0 = ++p;
+    while (*p != '\0' && *p != '"')
+      p++;
+    if (*p != '"' || p == n0)
+      return 0;
+    n1 = p++;
+  } else {
+    if (!isalpha((unsigned char)*p))
+      return 0;
+    n0 = p;
+    while (ident_char(*p))
+      p++;
+    n1 = p;
+  }
+  const char *after = p;
+  while (isspace((unsigned char)*p))
+    p++;
+  if (*p == ';')
+    p++;
+  while (isspace((unsigned char)*p))
+    p++;
+  if (*p != '\0')
+    return 0;
+  size_t len = (size_t)(n1 - n0);
+  if (namelen == 0)
+    return 0;
+  if (len >= namelen)
+    len = namelen - 1;
+  memcpy(name, n0, len);
+  name[len] = '\0';
+  *start = (size_t)(cur - sql);
+  *end = (size_t)(after - sql);
+  return 1;
+}
+
+int seer_sql_current_of(const char *sql, size_t *start, size_t *end, char *name, size_t namelen)
+{
+  if (sql == NULL)
+    return 0;
+  const char *p = sql;
+  while (isspace((unsigned char)*p))
+    p++;
+  if (!kw_at(p, "UPDATE") && !kw_at(p, "DELETE"))
+    return 0;
+  while (*p != '\0') {
+    if (*p == '\'' || *p == '"') { /* a literal or quoted identifier ('' / "" inside) */
+      char q = *p++;
+      while (*p != '\0' && !(*p == q && p[1] != q))
+        p += (*p == q) ? 2 : 1;
+      if (*p != '\0')
+        p++;
+    } else if (p[0] == '-' && p[1] == '-') {
+      while (*p != '\0' && *p != '\n')
+        p++;
+    } else if (p[0] == '/' && p[1] == '*') {
+      const char *e = strstr(p + 2, "*/");
+      p = e != NULL ? e + 2 : p + strlen(p);
+    } else if ((p == sql || !ident_char(p[-1])) && kw_at(p, "WHERE")) {
+      if (current_of_at(sql, p, start, end, name, namelen))
+        return 1;
+      p += 5;
+    } else {
+      p++;
+    }
+  }
+  return 0;
+}

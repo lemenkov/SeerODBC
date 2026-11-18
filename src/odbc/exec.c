@@ -428,6 +428,7 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
   s->getdata_col = -1;
   s->getdata_off = 0;
   s->rowset_start = -1;
+  s->cur_row = -1;
   return SQL_SUCCESS;
 }
 
@@ -637,12 +638,149 @@ static SQLRETURN exec_finish(OdbcStmt *s)
   s->getdata_col = -1;
   s->getdata_off = 0;
   s->rowset_start = -1;
+  s->cur_row = -1;
   return result;
+}
+
+/* ------------------------------------------------------ cursor names (#288) */
+
+static OdbcStmt *stmt_by_cursor(OdbcDbc *c, const char *name)
+{
+  for (OdbcStmt *t = c->stmts; t != NULL; t = t->next_stmt)
+    if (t->cursor_name != NULL && strcasecmp(t->cursor_name, name) == 0)
+      return t;
+  return NULL;
+}
+
+/* A positioned UPDATE or DELETE, `... WHERE CURRENT OF name`. Oracle has
+ * that only in PL/SQL, for a PL/SQL cursor, so it is rewritten here to the
+ * ROWID of the named cursor's current row, which an updatable cursor keeps
+ * for every row as SQLSetPos uses it. *out is the rewritten text (caller
+ * frees), or NULL when the statement isn't positioned. */
+static SQLRETURN current_of(OdbcStmt *s, const char *sql, char **out)
+{
+  *out = NULL;
+  size_t a = 0, b = 0;
+  char name[136], msg[300];
+  if (!seer_sql_current_of(sql, &a, &b, name, sizeof name))
+    return SQL_SUCCESS;
+  OdbcStmt *c = stmt_by_cursor(s->dbc, name);
+  if (c == NULL) {
+    snprintf(msg, sizeof msg, "Invalid cursor name: no statement has cursor %s", name);
+    return seer_odbc_diag(s, "34000", 0, msg, SQL_ERROR);
+  }
+  if (c == s) {
+    snprintf(msg, sizeof msg,
+             "Invalid cursor state: cursor %s is this statement's own; position it on another "
+             "statement",
+             name);
+    return seer_odbc_diag(s, "24000", 0, msg, SQL_ERROR);
+  }
+  if (!c->updatable) {
+    snprintf(msg, sizeof msg,
+             "Invalid cursor state: cursor %s is read-only (set SQL_ATTR_CONCURRENCY and use a "
+             "single-table SELECT)",
+             name);
+    return seer_odbc_diag(s, "24000", 0, msg, SQL_ERROR);
+  }
+  const char *rid = c->cur_row >= 0 && (size_t)c->cur_row < c->num_rowids && c->rowids != NULL
+                        ? c->rowids[c->cur_row]
+                        : NULL;
+  if (rid == NULL || strchr(rid, '\'') != NULL) {
+    snprintf(msg, sizeof msg, "Invalid cursor state: cursor %s is not positioned on a row", name);
+    return seer_odbc_diag(s, "24000", 0, msg, SQL_ERROR);
+  }
+  size_t n = a + strlen(rid) + strlen(sql + b) + 16;
+  char *r = malloc(n);
+  if (r == NULL)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  snprintf(r, n, "%.*sROWID = '%s'%s", (int)a, sql, rid, sql + b);
+  *out = r;
+  return SQL_SUCCESS;
+}
+
+/* Execute statement text: a positioned one rewritten first. The core keeps
+ * its own copy of the text, so the rewrite is freed straight after. */
+static SQLRETURN exec_text(OdbcStmt *s, const char *sql)
+{
+  char *pos = NULL;
+  SQLRETURN r = current_of(s, sql, &pos);
+  if (r != SQL_SUCCESS)
+    return r;
+  r = exec_core(s, pos != NULL ? pos : sql);
+  free(pos);
+  return r;
+}
+
+SQLRETURN SQL_API SQLSetCursorName(SQLHSTMT StatementHandle, SQLCHAR *CursorName,
+                                   SQLSMALLINT NameLength)
+{
+  OdbcStmt *s = (OdbcStmt *)StatementHandle;
+  if (s == NULL)
+    return SQL_INVALID_HANDLE;
+  seer_odbc_diag_clear(s);
+  if (CursorName == NULL)
+    return seer_odbc_diag(s, "HY009", 0, "Invalid use of null pointer", SQL_ERROR);
+  if (NameLength < 0 && NameLength != SQL_NTS)
+    return seer_odbc_diag(s, "HY090", 0, "Invalid string or buffer length", SQL_ERROR);
+  size_t n = NameLength == SQL_NTS ? strlen((const char *)CursorName) : (size_t)NameLength;
+  if (s->core != NULL && seer_stmt_num_cols(s->core) > 0)
+    return seer_odbc_diag(s, "24000", 0, "Invalid cursor state: the cursor is open", SQL_ERROR);
+  /* An identifier of at most SQL_MAX_CURSOR_NAME_LEN characters, not in the
+   * SQL_CUR / SQLCUR namespace the driver generates names in. */
+  int ok = n > 0 && n <= SEER_MAX_CURSOR_NAME_LEN && isalpha(CursorName[0]) &&
+           strncasecmp((const char *)CursorName, "SQL_CUR", 7) != 0 &&
+           strncasecmp((const char *)CursorName, "SQLCUR", 6) != 0;
+  for (size_t i = 0; ok && i < n; i++)
+    ok = isalnum(CursorName[i]) || CursorName[i] == '_' || CursorName[i] == '$' ||
+         CursorName[i] == '#';
+  if (!ok)
+    return seer_odbc_diag(s, "34000", 0, "Invalid cursor name", SQL_ERROR);
+  char *name = seer_strndup((const char *)CursorName, n);
+  if (name == NULL)
+    return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+  OdbcStmt *other = stmt_by_cursor(s->dbc, name);
+  if (other != NULL && other != s) {
+    free(name);
+    return seer_odbc_diag(s, "3C000", 0, "Duplicate cursor name", SQL_ERROR);
+  }
+  free(s->cursor_name);
+  s->cursor_name = name;
+  return SQL_SUCCESS;
+}
+
+SQLRETURN SQL_API SQLGetCursorName(SQLHSTMT StatementHandle, SQLCHAR *CursorName,
+                                   SQLSMALLINT BufferLength, SQLSMALLINT *NameLengthPtr)
+{
+  OdbcStmt *s = (OdbcStmt *)StatementHandle;
+  if (s == NULL)
+    return SQL_INVALID_HANDLE;
+  seer_odbc_diag_clear(s);
+  if (BufferLength < 0)
+    return seer_odbc_diag(s, "HY090", 0, "Invalid string or buffer length", SQL_ERROR);
+  const char *name = s->cursor_name != NULL ? s->cursor_name : "";
+  size_t n = strlen(name);
+  if (NameLengthPtr != NULL)
+    *NameLengthPtr = (SQLSMALLINT)n;
+  if (CursorName != NULL && BufferLength > 0) {
+    size_t cp = n < (size_t)BufferLength - 1 ? n : (size_t)BufferLength - 1;
+    memcpy(CursorName, name, cp);
+    CursorName[cp] = '\0';
+    if (cp < n)
+      return seer_odbc_diag(s, "01004", 0, "String data, right truncated", SQL_SUCCESS_WITH_INFO);
+  }
+  return SQL_SUCCESS;
 }
 
 SQLRETURN seer_odbc_describe_prepared(OdbcStmt *s)
 {
   if (s == NULL || s->core != NULL || s->sql == NULL || s->dbc == NULL || !s->dbc->connected)
+    return SQL_SUCCESS;
+  /* A positioned UPDATE / DELETE describes nothing, and the server can't
+   * parse it before its CURRENT OF is rewritten (#288). */
+  size_t a, b;
+  char name[8];
+  if (seer_sql_current_of(s->sql, &a, &b, name, sizeof name))
     return SQL_SUCCESS;
   seer_odbc_arm_timeout(s);
   SeerStatus st = seer_stmt_prepare(s->dbc->conn, s->sql, &s->core);
@@ -693,7 +831,7 @@ SQLRETURN SQL_API SQLExecute(SQLHSTMT StatementHandle)
     return seer_odbc_diag(s, "08003", 0, "Connection not open", SQL_ERROR);
   if (s->sql == NULL)
     return seer_odbc_diag(s, "HY010", 0, "Statement not prepared", SQL_ERROR);
-  return exec_core(s, s->sql);
+  return exec_text(s, s->sql);
 }
 
 SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR *StatementText,
@@ -713,7 +851,7 @@ SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR *StatementText
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   free(s->sql);
   s->sql = sql;
-  return exec_core(s, s->sql);
+  return exec_text(s, s->sql);
 }
 
 /* Data-at-execution driver loop. After an execute that returned SQL_NEED_DATA,
