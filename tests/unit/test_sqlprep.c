@@ -139,6 +139,17 @@ int main(void)
   /* a {ts} literal is left alone inside a string */
   check_prepare("SELECT '{ts x}' FROM dual", "SELECT '{ts x}' FROM dual");
 
+  /* --- {INTERVAL} literals (#305): Oracle's own from 9i, as written on 8i --- */
+  check_fn("{INTERVAL '3' DAY}", 9, "INTERVAL '3' DAY");
+  check_fn("{interval '1-2' year to month}", 23, "INTERVAL '1-2' year to month");
+  check_fn("{INTERVAL + '5' HOUR}", 0, "INTERVAL '5' HOUR");
+  check_fn("{INTERVAL -'5' HOUR}", 0, "INTERVAL '-5' HOUR");
+  check_fn("{INTERVAL - '-5' HOUR}", 0, "INTERVAL '5' HOUR");
+  check_fn("{INTERVAL - '+5' HOUR}", 0, "INTERVAL '-5' HOUR");
+  check_fn("d -{INTERVAL - '1 2:03:04.5' DAY(3) TO SECOND(1)}", 0,
+           "d -INTERVAL '-1 2:03:04.5' DAY(3) TO SECOND(1)");
+  check_fn("{INTERVAL '3' DAY}", 8, "{INTERVAL '3' DAY}");
+
   /* --- {fn} scalar functions (#301) --- */
   check_fn("{fn LEFT(s, 2)}", 0, "SUBSTR(s, 1, 2)");
   check_fn("{fn locate('c', s)}", 0, "INSTR(s, 'c')"); /* any case */

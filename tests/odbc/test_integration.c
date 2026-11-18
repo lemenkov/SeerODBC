@@ -3221,6 +3221,60 @@ static void check_scalar_functions(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* The datetime literal escapes (#305): {d} {t} {ts} on every tier, and
+ * {INTERVAL} from 9i, including a sign outside the quotes; SQL_DATETIME_LITERALS
+ * says which. */
+static void check_datetime_literals(SQLHDBC dbc)
+{
+  const char *name = "datetime and interval literal escapes";
+  static const struct {
+    const char *expr, *want;
+    int from;
+  } T[] = {
+      {"TO_CHAR({d '2024-02-29'}, 'YYYY-MM-DD HH24:MI:SS')", "2024-02-29 00:00:00", 0},
+      {"TO_CHAR({t '13:14:15'}, 'HH24:MI:SS')", "13:14:15", 0},
+      {"TO_CHAR({ts '2024-02-29 13:14:15'}, 'YYYY-MM-DD HH24:MI:SS')", "2024-02-29 13:14:15", 0},
+      {"TO_CHAR({d '2024-02-29'} + {INTERVAL '3' DAY}, 'YYYY-MM-DD')", "2024-03-03", 9},
+      {"TO_CHAR({d '2024-02-29'} + {interval '1-2' year to month}, 'YYYY-MM-DD')", "2025-04-29", 9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} + {INTERVAL - '5' HOUR}, 'HH24:MI')", "05:00", 9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} -{INTERVAL -'5' HOUR}, 'HH24:MI')", "15:00", 9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} + {INTERVAL - '-1' MINUTE}, 'HH24:MI')", "10:01", 9},
+      {"TO_CHAR({d '2024-02-29'} + {INTERVAL - '1-1' YEAR TO MONTH}, 'YYYY-MM-DD')", "2023-01-29",
+       9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} + {INTERVAL '123 1:02:03.5' DAY(3) TO SECOND(1)},"
+       " 'YYYY-MM-DD HH24:MI:SS.FF1')",
+       "2024-07-01 11:02:03.5", 9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} + {INTERVAL '7.25' SECOND(2,2)}, 'HH24:MI:SS.FF2')",
+       "10:00:07.25", 9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} + {INTERVAL '10:30' MINUTE TO SECOND}, 'HH24:MI:SS')",
+       "10:10:30", 9},
+      {"TO_CHAR({ts '2024-02-29 10:00:00'} + {INTERVAL '2 3' DAY TO HOUR}, 'DD HH24')", "02 13", 9},
+  };
+  char m[700] = "", out[256], err[256];
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && m[0] == '\0'; i++) {
+    if (g_release < T[i].from)
+      continue;
+    char sql[512];
+    snprintf(sql, sizeof sql, "SELECT %s FROM dual", T[i].expr);
+    if (!SQL_SUCCEEDED(exec_scalar(dbc, sql, out, sizeof out, err, sizeof err)))
+      snprintf(m, sizeof m, "%s: %s", T[i].expr, err);
+    else if (strcmp(out, T[i].want) != 0)
+      snprintf(m, sizeof m, "%s: got '%s', want '%s'", T[i].expr, out, T[i].want);
+  }
+  if (m[0] == '\0') {
+    SQLUINTEGER v = 0;
+    SQLGetInfo(dbc, SQL_DATETIME_LITERALS, &v, sizeof v, NULL);
+    SQLUINTEGER dts = SQL_DL_SQL92_DATE | SQL_DL_SQL92_TIME | SQL_DL_SQL92_TIMESTAMP;
+    int iv = (v & SQL_DL_SQL92_INTERVAL_DAY_TO_SECOND) && (v & SQL_DL_SQL92_INTERVAL_YEAR);
+    if ((v & dts) != dts || iv != (g_release >= 9))
+      snprintf(m, sizeof m, "SQL_DATETIME_LITERALS 0x%x", (unsigned)v);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* A placeholder repeated before a new one (#302): bind N is the N-th distinct
  * placeholder, but a SQL statement takes a value per occurrence, so the
  * driver sends each repeat its placeholder's value. In a query, past text and
@@ -6054,6 +6108,7 @@ int main(void)
     check_describe_param(dbc);
     check_scalar_functions(dbc);
     check_repeated_placeholders(dbc);
+    check_datetime_literals(dbc);
     check_tables_enum(dbc);
     check_privileges(dbc);
     check_cursor_names(dbc);

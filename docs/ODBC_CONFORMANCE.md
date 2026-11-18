@@ -115,6 +115,22 @@ How each family behaves:
   When it would swap two of them (`{fn LOCATE(?, ?)}`), the statement is refused
   with HYC00 rather than binding values to the wrong arguments.
 
+## Datetime and interval literals
+
+`SQL_DATETIME_LITERALS` reports the escapes the preprocessor translates on the
+connected release (#305):
+
+- **`{d '...'}` and `{ts '...'}`** become Oracle's DATE and TIMESTAMP literals.
+- **`{t '...'}`** becomes a DATE whose time of day is the value. Oracle has no
+  TIME type.
+- **`{INTERVAL [+|-] '...' qualifier}`** becomes Oracle's INTERVAL literal,
+  from 9i. Every ODBC qualifier is accepted, with leading and seconds
+  precision (`DAY(3) TO SECOND(1)`, `SECOND(2,2)`). Oracle has no unary minus
+  for an interval, so a sign outside the quotes moves inside them. A minus on
+  a value that already has one cancels it.
+- **8i** has no INTERVAL type, so there the escape stays as written and isn't
+  advertised.
+
 ## SeerODBC-specific identifiers
 
 Server features with no standard ODBC surface are exposed through

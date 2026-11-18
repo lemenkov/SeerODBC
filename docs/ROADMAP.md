@@ -201,6 +201,8 @@ Default cap is `TTC_FIELD_VERSION_23_4` (24); servers negotiate down via
 - [x] {fn} scalar functions — Appendix E translated per release, advertised in
       the SQLGetInfo function / interval / CONVERT masks (#301); DIFFERENCE,
       DATABASE and seeded RAND have no Oracle form
+- [x] Datetime and interval literals — {d} {t} {ts} everywhere, {INTERVAL} from
+      9i with the sign moved inside the quotes; SQL_DATETIME_LITERALS (#305)
 - [x] SQLBrowseConnect — iterative connect (NEED_DATA browse string -> connect)
 - [x] SQLGetDescField, SQLGetDescRec — read the implicit descriptors (ARD/APD/
       IRD/IPD via SQLGetStmtAttr handles; IRD = result-column metadata)
