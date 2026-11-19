@@ -5800,6 +5800,71 @@ static void check_param_c_types(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Integer, bit and float fetch targets (#329) follow Appendix D: past the
+ * type's range is 22003, a dropped fraction 01S07, non-numeric text 22018,
+ * and a bit is 0 or 1. A 23ai BOOLEAN reads as 1 / 0. Two-way: in-range
+ * values still convert with SQL_SUCCESS. */
+static void check_numeric_targets(SQLHDBC dbc)
+{
+  const char *name = "integer / bit fetch targets: range, truncation, text";
+  char m[400] = "";
+  struct {
+    const char *expr;
+    SQLSMALLINT ct;
+    SQLRETURN rc;
+    const char *state;
+    long long want;
+    int from;
+  } T[] = {
+      {"70000", SQL_C_SSHORT, SQL_ERROR, "22003", 0, 8},
+      {"-32768", SQL_C_SSHORT, SQL_SUCCESS, "", -32768, 8},
+      {"3.7", SQL_C_SLONG, SQL_SUCCESS_WITH_INFO, "01S07", 3, 8},
+      {"-1", SQL_C_ULONG, SQL_ERROR, "22003", 0, 8},
+      {"1e20", SQL_C_SBIGINT, SQL_ERROR, "22003", 0, 8},
+      {"'abc'", SQL_C_SLONG, SQL_ERROR, "22018", 0, 8},
+      {"' 42 '", SQL_C_SLONG, SQL_SUCCESS, "", 42, 8},
+      {"5", SQL_C_BIT, SQL_ERROR, "22003", 0, 8},
+      {"1", SQL_C_BIT, SQL_SUCCESS, "", 1, 8},
+      {"TRUE", SQL_C_BIT, SQL_SUCCESS, "", 1, 23},
+      {"FALSE", SQL_C_SLONG, SQL_SUCCESS, "", 0, 23},
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    if (g_release < T[i].from)
+      continue;
+    char sql[96], st[6] = "";
+    snprintf(sql, sizeof sql, "SELECT %s FROM dual", T[i].expr);
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    union {
+      SQLSMALLINT sh;
+      SQLINTEGER l;
+      SQLUINTEGER ul;
+      SQLBIGINT b;
+      unsigned char bit;
+    } v;
+    memset(&v, 0, sizeof v);
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, T[i].ct, &v, sizeof v, &ind);
+    if (rc != SQL_SUCCESS)
+      diag_state(SQL_HANDLE_STMT, s, st);
+    long long got = T[i].ct == SQL_C_SSHORT  ? v.sh
+                    : T[i].ct == SQL_C_SLONG ? v.l
+                    : T[i].ct == SQL_C_ULONG ? (long long)v.ul
+                    : T[i].ct == SQL_C_BIT   ? v.bit
+                                             : (long long)v.b;
+    if (rc != T[i].rc || strcmp(st, T[i].state) != 0 || (SQL_SUCCEEDED(rc) && got != T[i].want))
+      snprintf(m, sizeof m, "%s as C type %d: rc=%d '%s' value %lld (want rc=%d '%s' %lld)",
+               T[i].expr, (int)T[i].ct, (int)rc, st, got, (int)T[i].rc, T[i].state, T[i].want);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7036,6 +7101,7 @@ int main(void)
   check_c_default(dbc);
   check_timestamp_param_date(dbc);
   check_param_c_types(dbc);
+  check_numeric_targets(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);

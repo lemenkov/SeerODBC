@@ -149,6 +149,15 @@ reported as success.
   - a leading field past 32 bits is 22015.
   The leading precision in the ARD isn't enforced.
 - **`SQL_C_GUID`** gets 07006, because Oracle has no GUID type.
+- **Integer, bit and floating-point targets** follow Appendix D (#329):
+  - a value past the C type's range is 22003, and the buffer is left alone;
+  - a dropped fraction is 01S07 (3.7 into `SQL_C_SLONG` is 3);
+  - text that isn't a number is 22018;
+  - a bit is 0 or 1, so 5 is 22003 and 1.5 is 1 with 01S07;
+  - a 23ai BOOLEAN reads as 1 or 0;
+  - binary data into a numeric type is 07006.
+  Before, the value was cast without a word: 70000 into a `SQLSMALLINT` was
+  4464, `'abc'` was 0, and a BOOLEAN TRUE read as 0.
 - **Text that won't parse as the target** (a date, an interval) is 22018.
 - **In a bound rowset**, a column that fails makes its row `SQL_ROW_ERROR`.
   The other rows are delivered with `SQL_SUCCESS_WITH_INFO`. A rowset where

@@ -473,6 +473,180 @@ static SQLRETURN copy_wide(const unsigned char *src, size_t total, SQLPOINTER bu
   return cp < remain ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
 }
 
+/* Case-insensitive equality with an upper-case ASCII word. */
+static bool word_is(const char *s, size_t n, const char *upper)
+{
+  size_t k = strlen(upper);
+  if (n != k)
+    return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (c >= 'a' && c <= 'z')
+      c = (char)(c - 'a' + 'A');
+    if (c != upper[i])
+      return false;
+  }
+  return true;
+}
+
+/* A value's text as a number for the integer and bit targets (#329): its
+ * sign, the magnitude truncated toward zero, and whether a nonzero fraction
+ * was dropped. Takes [+-]digits[.digits][e[+-]digits] with blanks around it,
+ * and 23ai's BOOLEAN text TRUE / FALSE as 1 / 0. Returns 0, -1 if the text is
+ * not a number (22018), -2 if the magnitude is past 64 bits (22003). */
+static int parse_int_text(const char *s, bool *neg, unsigned long long *mag, bool *frac)
+{
+  *neg = false;
+  *mag = 0;
+  *frac = false;
+  while (*s == ' ' || *s == '\t')
+    s++;
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+    n--;
+  if (word_is(s, n, "TRUE")) {
+    *mag = 1;
+    return 0;
+  }
+  if (word_is(s, n, "FALSE"))
+    return 0;
+
+  size_t i = 0;
+  if (i < n && (s[i] == '+' || s[i] == '-'))
+    *neg = s[i++] == '-';
+  size_t digits = 0;
+  bool over = false;
+  for (; i < n && s[i] >= '0' && s[i] <= '9'; i++, digits++) {
+    unsigned d = (unsigned)(s[i] - '0');
+    if (*mag > (~0ULL - d) / 10)
+      over = true;
+    else
+      *mag = *mag * 10 + d;
+  }
+  if (i < n && s[i] == '.')
+    for (i++; i < n && s[i] >= '0' && s[i] <= '9'; i++, digits++)
+      *frac = *frac || s[i] != '0';
+  if (digits == 0)
+    return -1;
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+    /* An exponent: validate it, then let strtod place the point. */
+    size_t j = i + 1;
+    if (j < n && (s[j] == '+' || s[j] == '-'))
+      j++;
+    size_t ed = 0;
+    for (; j < n && s[j] >= '0' && s[j] <= '9'; j++)
+      ed++;
+    if (ed == 0 || j != n)
+      return -1;
+    char buf[128];
+    if (n >= sizeof buf)
+      return -2;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    double v = strtod(buf, NULL);
+    double a = v < 0 ? -v : v;
+    if (!(a < 18446744073709551616.0)) /* also an infinity */
+      return -2;
+    *mag = (unsigned long long)a;
+    *frac = (double)*mag != a;
+    return 0;
+  }
+  if (i != n)
+    return -1;
+  return over ? -2 : 0;
+}
+
+/* Store an integer target of `size` bytes, signed or not, from text: 22018 for
+ * non-numeric text, 22003 past the type's range (buf untouched), 01S07 when a
+ * fraction was truncated (#329). */
+static SQLRETURN put_int(const char *s, bool is_signed, size_t size, SQLPOINTER buf, SQLLEN *ind,
+                         const char **state)
+{
+  bool neg, frac;
+  unsigned long long mag;
+  int rc = parse_int_text(s, &neg, &mag, &frac);
+  if (rc == -1) {
+    *state = "22018";
+    return SQL_ERROR;
+  }
+  unsigned long long umax = size >= 8 ? ~0ULL : (1ULL << (8 * size)) - 1;
+  unsigned long long smax = umax >> 1; /* the signed maximum; its minimum is -(smax + 1) */
+  bool fits = rc == 0 && (is_signed ? (neg ? mag <= smax + 1 : mag <= smax)
+                                    : (!neg || mag == 0) && mag <= umax);
+  if (!fits) {
+    *state = "22003";
+    return SQL_ERROR;
+  }
+  unsigned long long bits = neg ? (unsigned long long)0 - mag : mag;
+  if (buf) {
+    switch (size) {
+    case 1: {
+      unsigned char b = (unsigned char)bits;
+      memcpy(buf, &b, 1);
+      break;
+    }
+    case 2: {
+      unsigned short b = (unsigned short)bits;
+      memcpy(buf, &b, 2);
+      break;
+    }
+    case 4: {
+      unsigned int b = (unsigned int)bits;
+      memcpy(buf, &b, 4);
+      break;
+    }
+    default:
+      memcpy(buf, &bits, 8);
+      break;
+    }
+  }
+  if (ind)
+    *ind = (SQLLEN)size;
+  if (frac) {
+    *state = "01S07";
+    return SQL_SUCCESS_WITH_INFO;
+  }
+  return SQL_SUCCESS;
+}
+
+/* A floating-point target: 22018 for non-numeric text, 22003 past the range
+ * of a double (or of a float, `single`) (#329). */
+static SQLRETURN put_real(const char *s, bool single, SQLPOINTER buf, SQLLEN *ind,
+                          const char **state)
+{
+  bool neg, frac;
+  unsigned long long mag;
+  int rc = parse_int_text(s, &neg, &mag, &frac); /* only to validate the text */
+  if (rc == -1) {
+    *state = "22018";
+    return SQL_ERROR;
+  }
+  while (*s == ' ' || *s == '\t')
+    s++;
+  double v;
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+    n--;
+  if (word_is(s, n, "TRUE") || word_is(s, n, "FALSE"))
+    v = (double)mag;
+  else
+    v = strtod(s, NULL);
+  double a = v < 0 ? -v : v;
+  if (!(a <= (single ? 3.402823466e38 : 1.7976931348623157e308))) {
+    *state = "22003";
+    return SQL_ERROR;
+  }
+  if (buf) {
+    if (single)
+      *(SQLREAL *)buf = (SQLREAL)v;
+    else
+      *(SQLDOUBLE *)buf = v;
+  }
+  if (ind)
+    *ind = (SQLLEN)(single ? sizeof(SQLREAL) : sizeof(SQLDOUBLE));
+  return SQL_SUCCESS;
+}
+
 SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
                             SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
                             SQLLEN *offset, const char **sqlstate)
@@ -492,78 +666,72 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   const char *s = (const char *)val; /* NUL-terminated for numeric/date parse */
 
   switch (target) {
-  /* ---- integer family ---- */
+  /* ---- integer family: range-checked, truncation reported (#329) ---- */
   case SQL_C_STINYINT:
   case SQL_C_TINYINT:
-    if (buf)
-      *(SQLSCHAR *)buf = (SQLSCHAR)strtoll(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLSCHAR);
-    return SQL_SUCCESS;
   case SQL_C_UTINYINT:
-    if (buf)
-      *(SQLCHAR *)buf = (SQLCHAR)strtoull(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLCHAR);
-    return SQL_SUCCESS;
   case SQL_C_SSHORT:
   case SQL_C_SHORT:
-    if (buf)
-      *(SQLSMALLINT *)buf = (SQLSMALLINT)strtoll(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLSMALLINT);
-    return SQL_SUCCESS;
   case SQL_C_USHORT:
-    if (buf)
-      *(SQLUSMALLINT *)buf = (SQLUSMALLINT)strtoull(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLUSMALLINT);
-    return SQL_SUCCESS;
   case SQL_C_SLONG:
   case SQL_C_LONG:
-    if (buf)
-      *(SQLINTEGER *)buf = (SQLINTEGER)strtoll(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLINTEGER);
-    return SQL_SUCCESS;
   case SQL_C_ULONG:
-    if (buf)
-      *(SQLUINTEGER *)buf = (SQLUINTEGER)strtoull(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLUINTEGER);
-    return SQL_SUCCESS;
   case SQL_C_SBIGINT:
-    if (buf)
-      *(SQLBIGINT *)buf = (SQLBIGINT)strtoll(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLBIGINT);
-    return SQL_SUCCESS;
   case SQL_C_UBIGINT:
-    if (buf)
-      *(SQLUBIGINT *)buf = (SQLUBIGINT)strtoull(s, NULL, 10);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLUBIGINT);
-    return SQL_SUCCESS;
   case SQL_C_BIT:
-    if (buf)
-      *(SQLCHAR *)buf = (strtoll(s, NULL, 10) != 0) ? 1 : 0;
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLCHAR);
-    return SQL_SUCCESS;
-
-  /* ---- floating point ---- */
   case SQL_C_FLOAT:
-    if (buf)
-      *(SQLREAL *)buf = (SQLREAL)strtod(s, NULL);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLREAL);
-    return SQL_SUCCESS;
   case SQL_C_DOUBLE:
-    if (buf)
-      *(SQLDOUBLE *)buf = strtod(s, NULL);
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQLDOUBLE);
-    return SQL_SUCCESS;
+    if (is_binary) { /* Appendix D has no binary -> numeric conversion */
+      *state = "07006";
+      return SQL_ERROR;
+    }
+    switch (target) {
+    case SQL_C_STINYINT:
+    case SQL_C_TINYINT:
+      return put_int(s, true, 1, buf, ind, state);
+    case SQL_C_UTINYINT:
+      return put_int(s, false, 1, buf, ind, state);
+    case SQL_C_SSHORT:
+    case SQL_C_SHORT:
+      return put_int(s, true, 2, buf, ind, state);
+    case SQL_C_USHORT:
+      return put_int(s, false, 2, buf, ind, state);
+    case SQL_C_SLONG:
+    case SQL_C_LONG:
+      return put_int(s, true, 4, buf, ind, state);
+    case SQL_C_ULONG:
+      return put_int(s, false, 4, buf, ind, state);
+    case SQL_C_SBIGINT:
+      return put_int(s, true, 8, buf, ind, state);
+    case SQL_C_UBIGINT:
+      return put_int(s, false, 8, buf, ind, state);
+    case SQL_C_FLOAT:
+      return put_real(s, true, buf, ind, state);
+    case SQL_C_DOUBLE:
+      return put_real(s, false, buf, ind, state);
+    default: { /* SQL_C_BIT: 0 or 1; below 0 or from 2 up is 22003 */
+      bool neg, frac;
+      unsigned long long mag;
+      int rc = parse_int_text(s, &neg, &mag, &frac);
+      if (rc == -1) {
+        *state = "22018";
+        return SQL_ERROR;
+      }
+      if (rc != 0 || mag > 1 || (neg && (mag > 0 || frac))) {
+        *state = "22003";
+        return SQL_ERROR;
+      }
+      if (buf)
+        *(SQLCHAR *)buf = (SQLCHAR)mag;
+      if (ind)
+        *ind = (SQLLEN)sizeof(SQLCHAR);
+      if (frac) {
+        *state = "01S07";
+        return SQL_SUCCESS_WITH_INFO;
+      }
+      return SQL_SUCCESS;
+    }
+    }
 
   case SQL_C_NUMERIC:
     if (buf)
