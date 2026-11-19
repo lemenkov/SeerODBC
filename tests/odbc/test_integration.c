@@ -1498,6 +1498,27 @@ static void check_dbms_ver(SQLHDBC dbc)
   }
 }
 
+/* SQL_DRIVER_VER is this build's release in the ODBC form "##.##.####" (#310).
+ * The driver builds it from the SEERTNS_VERSION_* macros, while meson passes
+ * the project version here, so this also catches the two drifting apart. */
+static void check_driver_ver(SQLHDBC dbc)
+{
+  const char *name = "SQL_DRIVER_VER is the release version";
+  char ver[64] = "", want[24] = "";
+  int maj = 0, min = 0, pat = 0;
+  SQLRETURN rc = SQLGetInfo(dbc, SQL_DRIVER_VER, ver, sizeof ver, NULL);
+  if (sscanf(SEER_PROJECT_VERSION, "%d.%d.%d", &maj, &min, &pat) == 3)
+    snprintf(want, sizeof want, "%02d.%02d.%04d", maj, min, pat);
+  if (SQL_SUCCEEDED(rc) && want[0] != '\0' && strcmp(ver, want) == 0)
+    pass(name);
+  else {
+    char m[160];
+    snprintf(m, sizeof m, "SQL_DRIVER_VER '%s', want '%s' (project %s)", ver, want,
+             SEER_PROJECT_VERSION);
+    fail(name, m);
+  }
+}
+
 /* SQL_MAX_IDENTIFIER_LEN (and the column / table / schema name lengths) is the
  * server's own limit: 128 from 12.2 on, as the server states it at login, and
  * 30 before. The server is the judge: an alias that long is taken, and one a
@@ -6413,6 +6434,7 @@ int main(void)
 
   check_scalar(dbc, "SELECT literal", "SELECT 3 + 4 FROM DUAL", "7");
   check_dbms_ver(dbc);
+  check_driver_ver(dbc);
   check_max_identifier_len(dbc);
   check_zero_length_columns(dbc);
   check_timestamp_zero_fraction_bind(dbc);
