@@ -5514,8 +5514,8 @@ static void check_c_type_targets(SQLHDBC dbc)
  * text. Columns: a DATE fills a timestamp struct, RAW gives its bytes,
  * BINARY_DOUBLE a double (10g+), NUMBER stays text, through SQLGetData and a
  * bound column alike. Parameters: a double, an integer and RAW bytes arrive
- * as such (RAW was mangled on 8i as text), and a timestamp struct from 9i
- * (8.1.7 binds no TIMESTAMP). */
+ * as such (RAW was mangled on 8i as text), and a timestamp struct (as a DATE
+ * on 8i, #318). */
 static void check_c_default(SQLHDBC dbc)
 {
   const char *name = "SQL_C_DEFAULT is the SQL type's default C type";
@@ -5572,7 +5572,7 @@ static void check_c_default(SQLHDBC dbc)
       {SQL_INTEGER, "SELECT TO_CHAR(? + 1) FROM dual", "43", 0},
       {SQL_VARBINARY, "SELECT RAWTOHEX(?) FROM dual", "DEADBEEF", 0},
       {SQL_TYPE_TIMESTAMP, "SELECT TO_CHAR(?, 'YYYY-MM-DD HH24:MI:SS') FROM dual",
-       "2026-11-19 10:11:12", 9},
+       "2026-11-19 10:11:12", 0},
   };
   SQL_TIMESTAMP_STRUCT pts = {2026, 11, 19, 10, 11, 12, 0};
   SQLDOUBLE pd = 2.5;
@@ -5605,6 +5605,53 @@ static void check_c_default(SQLHDBC dbc)
                err, P[i].want);
     SQLFreeHandle(SQL_HANDLE_STMT, s);
   }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* A SQL_C_TYPE_TIMESTAMP parameter on every release (#318): 8.1.7 has no
+ * TIMESTAMP, so there it goes out as a DATE. The date and the time of day
+ * arrive, through an expression and stored into a DATE column. */
+static void check_timestamp_param_date(SQLHDBC dbc)
+{
+  const char *name = "SQL_C_TYPE_TIMESTAMP parameter into a DATE (8i too)";
+  char m[400] = "", err[256] = "", out[64] = "";
+  SQL_TIMESTAMP_STRUCT ts = {2026, 11, 19, 23, 58, 59, 0};
+  SQLLEN ind = 0, len = sizeof ts;
+  SQLHSTMT s;
+  exec_do(dbc, "DROP TABLE seer_ts8", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_ts8 (d DATE)", err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  static const char *const Q[] = {
+      "SELECT TO_CHAR(?, 'YYYY-MM-DD HH24:MI:SS') FROM dual",
+      "INSERT INTO seer_ts8 (d) VALUES (?)",
+  };
+  for (size_t i = 0; i < 2 && m[0] == '\0'; i++) {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLRETURN rc = SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP,
+                                    19, 0, &ts, sizeof ts, &len);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLExecDirect(s, (SQLCHAR *)Q[i], SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && i == 0 && SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, SQL_C_CHAR, out, sizeof out, &ind);
+    if (!SQL_SUCCEEDED(rc)) {
+      diag_text(SQL_HANDLE_STMT, s, err, sizeof err);
+      snprintf(m, sizeof m, "%s: %s", Q[i], err);
+    } else if (i == 0 && strcmp(out, "2026-11-19 23:58:59") != 0) {
+      snprintf(m, sizeof m, "TO_CHAR(?) '%s'", out);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0' &&
+      (!SQL_SUCCEEDED(exec_scalar(dbc, "SELECT TO_CHAR(d, 'YYYY-MM-DD HH24:MI:SS') FROM seer_ts8",
+                                  out, sizeof out, err, sizeof err)) ||
+       strcmp(out, "2026-11-19 23:58:59") != 0))
+    snprintf(m, sizeof m, "stored '%s' %s", out, err);
+  exec_do(dbc, "DROP TABLE seer_ts8", err, sizeof err);
   if (m[0] == '\0')
     pass(name);
   else
@@ -6845,6 +6892,7 @@ int main(void)
   check_mult_result_sets(dbc);
   check_c_type_targets(dbc);
   check_c_default(dbc);
+  check_timestamp_param_date(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);

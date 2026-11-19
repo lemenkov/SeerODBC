@@ -67,9 +67,11 @@ static size_t ctype_stride(SQLSMALLINT c_type, SQLLEN buflen)
 }
 
 /* Bind one parameter value (the value at `valptr`, length hint `ind`) into core
- * statement `core` at `param`, dispatching on the ODBC C type. */
+ * statement `core` at `param`, dispatching on the ODBC C type. `date_only`: the
+ * server has no TIMESTAMP (8i, #318), so a timestamp goes out as a DATE. */
 static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
-                                 SQLSMALLINT sql_type, const void *valptr, SQLLEN ind)
+                                 SQLSMALLINT sql_type, const void *valptr, SQLLEN ind,
+                                 bool date_only)
 {
   /* A NULL still declares the parameter's SQL type (SQLBindParameter's
    * ParameterType), so the server types it as a NUMBER / DATE / RAW rather
@@ -104,6 +106,12 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
   case SQL_C_TYPE_TIMESTAMP:
   case SQL_C_TIMESTAMP: {
     const SQL_TIMESTAMP_STRUCT *t = valptr;
+    /* 8.1.7 has no TIMESTAMP; every column such a value goes to is a DATE,
+     * which keeps the time to the second. The fraction is dropped, as 9i+
+     * drop it storing a TIMESTAMP into a DATE (#318). */
+    if (date_only)
+      return seer_stmt_bind_date(core, param, t->year, t->month, t->day, t->hour, t->minute,
+                                 t->second);
     /* `fraction` is nanoseconds (ODBC); a native TIMESTAMP bind keeps it
      * (bind_date would truncate to whole seconds). */
     return seer_stmt_bind_timestamp(core, param, t->year, t->month, t->day, t->hour, t->minute,
@@ -214,6 +222,12 @@ static SQLSMALLINT param_c_type(const OdbcParam *p)
   return p->c_type == SQL_C_DEFAULT ? seer_odbc_default_c_type(p->sql_type) : p->c_type;
 }
 
+/* The server has no TIMESTAMP type: Oracle 8i (#318). */
+static bool no_timestamp(const OdbcStmt *s)
+{
+  return s->dbc != NULL && seer_odbc_server_major(s->dbc) == 8;
+}
+
 static void *param_buf(const OdbcStmt *s, const OdbcParam *p)
 {
   return seer_odbc_bound_at(p->buf, s->param_bind_offset, 0, 0, 0);
@@ -317,7 +331,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
         const SQLLEN *indp = seer_odbc_bound_at(p->indicator, s->param_bind_offset,
                                                 s->param_bind_type, sizeof(SQLLEN), row);
         SQLLEN ind = indp ? *indp : SQL_NTS;
-        st = bind_one_value(s->core, param, param_c_type(p), p->sql_type, val, ind);
+        st =
+            bind_one_value(s->core, param, param_c_type(p), p->sql_type, val, ind, no_timestamp(s));
         if (st != SEER_OK)
           return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
       }
@@ -339,7 +354,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
       if (p->dae_null)
         seer_stmt_bind_null_typed(s->core, param, ora_type_for_sql(p->sql_type));
       else if (bind_one_value(s->core, param, param_c_type(p), p->sql_type,
-                              p->dae_buf ? p->dae_buf : "", (SQLLEN)p->dae_len) != SEER_OK)
+                              p->dae_buf ? p->dae_buf : "", (SQLLEN)p->dae_len,
+                              no_timestamp(s)) != SEER_OK)
         return seer_odbc_diag(s, "HY000", 0, "Parameter bind failed", SQL_ERROR);
       continue;
     }
@@ -350,8 +366,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
       if (p->io_type == SQL_PARAM_INPUT_OUTPUT && p->sql_type != SQL_REFCURSOR) {
         const SQLLEN *indp = param_ind(s, p);
         SQLLEN ind = indp ? *indp : SQL_NTS;
-        SeerStatus st =
-            bind_one_value(s->core, param, param_c_type(p), p->sql_type, param_buf(s, p), ind);
+        SeerStatus st = bind_one_value(s->core, param, param_c_type(p), p->sql_type,
+                                       param_buf(s, p), ind, no_timestamp(s));
         if (st == SEER_OK)
           st = seer_stmt_bind_set_inout(s->core, param, sz);
         if (st != SEER_OK)
@@ -367,8 +383,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
     }
     const SQLLEN *indp = param_ind(s, p);
     SQLLEN ind = indp ? *indp : SQL_NTS;
-    SeerStatus st =
-        bind_one_value(s->core, param, param_c_type(p), p->sql_type, param_buf(s, p), ind);
+    SeerStatus st = bind_one_value(s->core, param, param_c_type(p), p->sql_type, param_buf(s, p),
+                                   ind, no_timestamp(s));
     if (st != SEER_OK)
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
   }
@@ -1174,7 +1190,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
       const SQLLEN *indp = seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type,
                                               sizeof(SQLLEN), (SQLULEN)elem);
       SQLLEN ind = indp ? *indp : SQL_NTS;
-      bind_one_value(dml, ++k, ct, 0, vp, ind);
+      bind_one_value(dml, ++k, ct, 0, vp, ind, no_timestamp(s));
     }
     seer_stmt_bind_text(dml, nset + 1, s->rowids[r], -1);
 

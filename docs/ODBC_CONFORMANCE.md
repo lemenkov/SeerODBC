@@ -165,6 +165,10 @@ reported as success.
   - NUMBER and the character types give text.
   - A parameter's buffer is read the same way. Before, it was always taken as
     text: a struct or a number was refused, and on 8i RAW bytes were mangled.
+- **A timestamp-struct parameter on 8i** goes out as a DATE (#318), because
+  8.1.7 has no TIMESTAMP. The date and the time to the second arrive, and
+  the fraction is dropped, as 9i and later drop it storing a TIMESTAMP into a
+  DATE.
 
 INTERVAL columns are still described as `SQL_VARCHAR`, so `SQL_C_DEFAULT` for
 them is text.
