@@ -96,7 +96,20 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   seer_odbc_diag_clear(c);
 
   if (Attribute == SQL_ATTR_AUTOCOMMIT) {
-    c->autocommit = (SQLUINTEGER)(SQLULEN)ValuePtr;
+    SQLUINTEGER on = (SQLUINTEGER)(SQLULEN)ValuePtr;
+    /* Back to autocommit from manual: ODBC has the driver commit the open
+     * transaction. If the commit fails, its error stands and the mode stays
+     * manual (#342). */
+    if (on == SQL_AUTOCOMMIT_ON && c->autocommit == SQL_AUTOCOMMIT_OFF && c->connected &&
+        c->conn != NULL) {
+      SeerStatus st = seer_commit(c->conn);
+      if (st != SEER_OK) {
+        const char *ora = st == SEER_EDB ? seer_last_error(c->conn) : NULL;
+        return seer_odbc_diag(c, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st),
+                              SQL_ERROR);
+      }
+    }
+    c->autocommit = on;
     if (c->connected && c->conn != NULL)
       seer_set_autocommit(c->conn, c->autocommit == SQL_AUTOCOMMIT_ON);
   }
