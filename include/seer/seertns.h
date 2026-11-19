@@ -113,6 +113,9 @@ void seer_disconnect(SeerConn *conn);
 void seer_set_autocommit(SeerConn *conn, int on);
 SeerStatus seer_commit(SeerConn *conn);
 SeerStatus seer_rollback(SeerConn *conn);
+/* Whether a transaction is open on the session, as the server's last reply
+ * said: 1 open, 0 none, -1 unknown (8i and 9i replies don't say). */
+int seer_txn_open(const SeerConn *conn);
 
 /* Request boundaries (§35, 21c+). Bracket a logical request on a (typically
  * pooled) connection so the server can reset session state between requests.

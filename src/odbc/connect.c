@@ -447,6 +447,15 @@ SQLRETURN SQL_API SQLDisconnect(SQLHDBC ConnectionHandle)
   if (c == NULL)
     return SQL_INVALID_HANDLE;
   seer_odbc_diag_clear(c);
+  /* In manual-commit mode with a transaction open, ODBC refuses (25000) and
+   * leaves the connection up, for the application to commit or roll back:
+   * logging off would have Oracle commit the work behind its back. Only
+   * where the server says so (10g+; 8i / 9i replies don't), and only on a
+   * live session (#344). */
+  if (c->connected && c->conn != NULL && c->autocommit == SQL_AUTOCOMMIT_OFF && !c->session_dead &&
+      !seer_conn_lost(c->conn) && seer_txn_open(c->conn) == 1)
+    return seer_odbc_diag(c, "25000", 0, "Invalid transaction state: a transaction is open",
+                          SQL_ERROR);
   if (c->connected && c->conn != NULL) {
     seer_disconnect(c->conn);
     c->conn = NULL;
