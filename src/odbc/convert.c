@@ -13,20 +13,133 @@
 
 #include "charset.h"
 
-/* Parse a "YYYY-MM-DD HH:MM:SS[.fffffffff]" value (as the core renders DATE /
- * TIMESTAMP). Fraction is nanoseconds. Returns 0 on success. */
-static int parse_datetime(const char *s, int *Y, int *Mo, int *D, int *h, int *mi, int *se,
-                          unsigned long *frac)
+/* A date / time value from its text (#334). */
+typedef struct {
+  bool has_date, has_time;
+  int Y, Mo, D, h, mi, se;
+  unsigned long ns; /* nanoseconds */
+  bool frac_cut;    /* fraction digits past 9 dropped */
+} DateTime;
+
+/* Up to `max` decimal digits at *p into *v; how many were read. */
+static int dt_digits(const char **p, int max, int *v)
 {
-  *Y = *Mo = *D = *h = *mi = *se = 0;
-  *frac = 0;
-  int n = sscanf(s, "%d-%d-%d %d:%d:%d", Y, Mo, D, h, mi, se);
-  if (n < 3)
+  int n = 0;
+  *v = 0;
+  while (n < max && **p >= '0' && **p <= '9') {
+    *v = *v * 10 + (**p - '0');
+    (*p)++;
+    n++;
+  }
+  return n;
+}
+
+static int days_in_month(int y, int m)
+{
+  static const int D[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m != 2)
+    return D[m - 1];
+  /* Oracle's calendar is Julian before the 1582 reform: every 4th year. */
+  bool leap = y < 1583 ? y % 4 == 0 : (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+  return leap ? 29 : 28;
+}
+
+/* H:M:S[.f] at *p, range-checked. */
+static int dt_time(const char **p, DateTime *t)
+{
+  if (dt_digits(p, 2, &t->h) == 0 || **p != ':')
     return -1;
-  const char *dot = strchr(s, '.');
-  if (dot != NULL)
-    *frac = strtoul(dot + 1, NULL, 10); /* 9-digit nanoseconds */
+  (*p)++;
+  if (dt_digits(p, 2, &t->mi) != 2 || **p != ':')
+    return -1;
+  (*p)++;
+  if (dt_digits(p, 2, &t->se) != 2)
+    return -1;
+  if (**p == '.') {
+    (*p)++;
+    int n = 0;
+    while (**p >= '0' && **p <= '9') {
+      if (n < 9)
+        t->ns = t->ns * 10 + (unsigned long)(**p - '0');
+      else
+        t->frac_cut = t->frac_cut || **p != '0';
+      (*p)++;
+      n++;
+    }
+    if (n == 0)
+      return -1;
+    for (; n < 9; n++)
+      t->ns *= 10;
+  }
+  if (t->h > 23 || t->mi > 59 || t->se > 59)
+    return -1;
+  t->has_time = true;
   return 0;
+}
+
+/* Parse "[-]Y-M-D", "[-]Y-M-D H:M:S[.f]" or "H:M:S[.f]", bare or in an ODBC
+ * escape ({d '...'}, {t '...'}, {ts '...'}), blanks around it; the core
+ * renders DATE / TIMESTAMP as "YYYY-MM-DD HH:MI:SS[.fffffffff]". Months, days
+ * and times are range-checked. Returns 0, or -1 if it is none of those. */
+static int parse_dt(const char *s, DateTime *t)
+{
+  memset(t, 0, sizeof *t);
+  while (*s == ' ' || *s == '\t')
+    s++;
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+    n--;
+  char buf[96];
+  if (n >= sizeof buf)
+    return -1;
+  memcpy(buf, s, n);
+  buf[n] = '\0';
+  const char *p = buf;
+  if (*p == '{') { /* {d '...'} / {t '...'} / {ts '...'} */
+    p++;
+    while (*p == ' ')
+      p++;
+    while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z'))
+      p++;
+    while (*p == ' ')
+      p++;
+    if (*p != '\'' || n < 2 || buf[n - 1] != '}')
+      return -1;
+    p++;
+    char *close = strrchr(buf, '\'');
+    if (close == NULL || close < p)
+      return -1;
+    *close = '\0';
+  }
+  const char *q = p;
+  bool neg = *q == '-';
+  if (neg)
+    q++;
+  int v;
+  int nd = dt_digits(&q, 5, &v);
+  if (nd > 0 && *q == '-') { /* a date */
+    t->Y = neg ? -v : v;
+    q++;
+    if (dt_digits(&q, 2, &t->Mo) == 0 || *q != '-')
+      return -1;
+    q++;
+    if (dt_digits(&q, 2, &t->D) == 0)
+      return -1;
+    if (t->Mo < 1 || t->Mo > 12 || t->D < 1 || t->D > days_in_month(t->Y, t->Mo))
+      return -1;
+    t->has_date = true;
+    if (*q == ' ') {
+      while (*q == ' ')
+        q++;
+      if (dt_time(&q, t) != 0)
+        return -1;
+    }
+  } else { /* a time on its own */
+    q = p;
+    if (dt_time(&q, t) != 0)
+      return -1;
+  }
+  return *q == '\0' ? 0 : -1;
 }
 
 /* An interval value from its text (#314): Oracle renders INTERVAL DAY TO
@@ -827,63 +940,58 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
     return SQL_SUCCESS;
   }
 
-  /* ---- date / time ---- */
+  /* ---- date / time (#334): fields checked, truncation reported ---- */
   case SQL_C_TYPE_TIMESTAMP:
-  case SQL_C_TIMESTAMP: {
-    int Y, Mo, D, h, mi, se;
-    unsigned long fr;
-    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0) {
-      *state = "22018";
-      return SQL_ERROR;
-    }
-    if (buf) {
-      SQL_TIMESTAMP_STRUCT *t = buf;
-      t->year = (SQLSMALLINT)Y;
-      t->month = (SQLUSMALLINT)Mo;
-      t->day = (SQLUSMALLINT)D;
-      t->hour = (SQLUSMALLINT)h;
-      t->minute = (SQLUSMALLINT)mi;
-      t->second = (SQLUSMALLINT)se;
-      t->fraction = (SQLUINTEGER)fr;
-    }
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQL_TIMESTAMP_STRUCT);
-    return SQL_SUCCESS;
-  }
+  case SQL_C_TIMESTAMP:
   case SQL_C_TYPE_DATE:
-  case SQL_C_DATE: {
-    int Y, Mo, D, h, mi, se;
-    unsigned long fr;
-    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0) {
-      *state = "22018";
-      return SQL_ERROR;
-    }
-    if (buf) {
-      SQL_DATE_STRUCT *t = buf;
-      t->year = (SQLSMALLINT)Y;
-      t->month = (SQLUSMALLINT)Mo;
-      t->day = (SQLUSMALLINT)D;
-    }
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQL_DATE_STRUCT);
-    return SQL_SUCCESS;
-  }
+  case SQL_C_DATE:
   case SQL_C_TYPE_TIME:
   case SQL_C_TIME: {
-    int Y, Mo, D, h, mi, se;
-    unsigned long fr;
-    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0) {
+    DateTime t;
+    bool want_time = target == SQL_C_TYPE_TIME || target == SQL_C_TIME;
+    if (is_binary || parse_dt(s, &t) != 0 || (want_time ? !t.has_time : !t.has_date)) {
       *state = "22018";
       return SQL_ERROR;
     }
-    if (buf) {
-      SQL_TIME_STRUCT *t = buf;
-      t->hour = (SQLUSMALLINT)h;
-      t->minute = (SQLUSMALLINT)mi;
-      t->second = (SQLUSMALLINT)se;
+    bool cut = t.frac_cut;
+    if (target == SQL_C_TYPE_TIMESTAMP || target == SQL_C_TIMESTAMP) {
+      if (buf) {
+        SQL_TIMESTAMP_STRUCT *o = buf;
+        o->year = (SQLSMALLINT)t.Y;
+        o->month = (SQLUSMALLINT)t.Mo;
+        o->day = (SQLUSMALLINT)t.D;
+        o->hour = (SQLUSMALLINT)t.h;
+        o->minute = (SQLUSMALLINT)t.mi;
+        o->second = (SQLUSMALLINT)t.se;
+        o->fraction = (SQLUINTEGER)t.ns;
+      }
+      if (ind)
+        *ind = (SQLLEN)sizeof(SQL_TIMESTAMP_STRUCT);
+    } else if (!want_time) {
+      cut = cut || t.h != 0 || t.mi != 0 || t.se != 0 || t.ns != 0; /* a time dropped */
+      if (buf) {
+        SQL_DATE_STRUCT *o = buf;
+        o->year = (SQLSMALLINT)t.Y;
+        o->month = (SQLUSMALLINT)t.Mo;
+        o->day = (SQLUSMALLINT)t.D;
+      }
+      if (ind)
+        *ind = (SQLLEN)sizeof(SQL_DATE_STRUCT);
+    } else {
+      cut = cut || t.ns != 0; /* a fraction dropped; any date is ignored */
+      if (buf) {
+        SQL_TIME_STRUCT *o = buf;
+        o->hour = (SQLUSMALLINT)t.h;
+        o->minute = (SQLUSMALLINT)t.mi;
+        o->second = (SQLUSMALLINT)t.se;
+      }
+      if (ind)
+        *ind = (SQLLEN)sizeof(SQL_TIME_STRUCT);
     }
-    if (ind)
-      *ind = (SQLLEN)sizeof(SQL_TIME_STRUCT);
+    if (cut) {
+      *state = "01S07";
+      return SQL_SUCCESS_WITH_INFO;
+    }
     return SQL_SUCCESS;
   }
 

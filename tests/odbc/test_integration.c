@@ -5936,6 +5936,55 @@ static void check_numeric_struct(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Date / time fetch targets (#334): a DATE's time dropped into a date struct
+ * and a TIMESTAMP's fraction dropped into a time struct are 01S07; an
+ * impossible date in text is 22018; a time literal fills a time struct.
+ * Two-way: a midnight DATE into a date struct is plain SQL_SUCCESS. */
+static void check_datetime_targets(SQLHDBC dbc)
+{
+  const char *name = "date / time fetch targets: truncation, field checks";
+  char m[300] = "";
+  struct {
+    const char *expr;
+    SQLSMALLINT ct;
+    SQLRETURN rc;
+    const char *state;
+    int from;
+  } T[] = {
+      {"TO_DATE('2026-11-19 13:14:15','YYYY-MM-DD HH24:MI:SS')", SQL_C_TYPE_DATE,
+       SQL_SUCCESS_WITH_INFO, "01S07", 8},
+      {"TO_DATE('2026-11-19','YYYY-MM-DD')", SQL_C_TYPE_DATE, SQL_SUCCESS, "", 8},
+      {"TO_TIMESTAMP('2026-11-19 13:14:15.5','YYYY-MM-DD HH24:MI:SS.FF')", SQL_C_TYPE_TIME,
+       SQL_SUCCESS_WITH_INFO, "01S07", 9},
+      {"'2026-13-45'", SQL_C_TYPE_DATE, SQL_ERROR, "22018", 8},
+      {"'13:14:15'", SQL_C_TYPE_TIME, SQL_SUCCESS, "", 8},
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    if (g_release < T[i].from)
+      continue;
+    char sql[160], st[6] = "";
+    snprintf(sql, sizeof sql, "SELECT %s FROM dual", T[i].expr);
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQL_TIMESTAMP_STRUCT v; /* big enough for the date and time structs */
+    memset(&v, 0, sizeof v);
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, T[i].ct, &v, sizeof v, &ind);
+    if (rc != SQL_SUCCESS)
+      diag_state(SQL_HANDLE_STMT, s, st);
+    if (rc != T[i].rc || strcmp(st, T[i].state) != 0)
+      snprintf(m, sizeof m, "%s as C type %d: rc=%d '%s' (want rc=%d '%s')", T[i].expr,
+               (int)T[i].ct, (int)rc, st, (int)T[i].rc, T[i].state);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7174,6 +7223,7 @@ int main(void)
   check_param_c_types(dbc);
   check_numeric_targets(dbc);
   check_numeric_struct(dbc);
+  check_datetime_targets(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);
