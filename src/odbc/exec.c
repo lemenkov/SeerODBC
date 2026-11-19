@@ -124,7 +124,12 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
   case SQL_C_DOUBLE:
     return seer_stmt_bind_double(core, param, *(const SQLDOUBLE *)valptr);
   case SQL_C_BIT:
-    return seer_stmt_bind_bool(core, param, *(const unsigned char *)valptr != 0);
+    /* A boolean only for an SQL_BIT target (a BOOLEAN on 23ai+). Into
+     * anything else a bit is the number 0 / 1 - "0" / "1" for a character
+     * target, Appendix D - on every release, not 23ai's TRUE (#327). */
+    if (sql_type == SQL_BIT || sql_type == 0)
+      return seer_stmt_bind_bool(core, param, *(const unsigned char *)valptr != 0);
+    return seer_stmt_bind_int64(core, param, *(const unsigned char *)valptr != 0);
   case SQL_C_BINARY:
     return seer_stmt_bind_raw(core, param, valptr, (ind >= 0) ? (int)ind : 0);
   case SQL_C_TYPE_TIMESTAMP:

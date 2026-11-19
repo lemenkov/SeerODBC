@@ -5692,6 +5692,7 @@ static void check_param_c_types(SQLHDBC dbc)
   ns.val[0] = 12345 & 0xFF;
   ns.val[1] = 12345 >> 8;
   SQLGUID g = {0x12345678, 0x9abc, 0xdef0, {1, 2, 3, 4, 5, 6, 7, 8}};
+  unsigned char bit = 1;
   static const char *const Q = "SELECT TO_CHAR(?) FROM dual";
   struct {
     SQLSMALLINT ct, st;
@@ -5704,6 +5705,9 @@ static void check_param_c_types(SQLHDBC dbc)
       {SQL_C_UBIGINT, SQL_NUMERIC, &ub, 0, "18000000000000000000"},
       {SQL_C_NUMERIC, SQL_NUMERIC, &ns, sizeof ns, "-123.45"},
       {SQL_C_GUID, SQL_CHAR, &g, sizeof g, "12345678-9ABC-DEF0-0102-030405060708"},
+      /* a bit into a character or numeric target is 0 / 1, not 23ai's TRUE (#327) */
+      {SQL_C_BIT, SQL_CHAR, &bit, 0, "1"},
+      {SQL_C_BIT, SQL_INTEGER, &bit, 0, "1"},
   };
   for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++)
     if (!SQL_SUCCEEDED(param_text(dbc, Q, T[i].ct, T[i].st, T[i].v, T[i].len, out, sizeof out, err,

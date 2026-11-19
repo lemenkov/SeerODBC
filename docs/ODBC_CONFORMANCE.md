@@ -184,6 +184,10 @@ bind had no case for had its buffer sent as text, reported as success.
   and 128-bit mantissa. It doesn't depend on `NLS_NUMERIC_CHARACTERS`. A
   value outside NUMBER's range is 22003.
 - **`SQL_C_GUID`** is sent as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` text.
+- **`SQL_C_BIT`** is a boolean only for a `SQL_BIT` parameter: a BOOLEAN on
+  23ai and later, a NUMBER before. For any other `ParameterType` it is the
+  number 0 or 1, which a character column stores as "0" or "1" on every
+  release (#327). Before, 23ai stored `TRUE` and a CHAR(1) refused it.
 - **All 13 interval C types** (9i+) become INTERVAL YEAR TO MONTH or DAY TO
   SECOND:
   - only the fields the type names are read;
