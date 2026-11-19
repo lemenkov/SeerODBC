@@ -974,29 +974,36 @@ void core_objbind(void)
           snprintf(m, sizeof m, "the OUT REF (%zu bytes) found row '%s', want 8 (status %d)", orl,
                    row8, (int)ost);
       }
-      if (m[0] == '\0') {
-        s = NULL;
-        int isnull = 0;
-        ost = seer_stmt_prepare(c, "BEGIN :1 := NULL; END;", &s);
-        if (ost == SEER_OK)
-          ost = seer_stmt_bind_ref_out(s, 1, schema, "SEER_RFO");
-        if (ost == SEER_OK)
-          ost = seer_stmt_execute(s);
-        if (ost == SEER_OK) {
-          const void *d = NULL;
-          size_t l = 0;
-          int isbin = 0;
-          seer_stmt_out_data(s, 1, &d, &l, &isnull, &isbin);
-        }
-        seer_stmt_close(s);
-        if (ost != SEER_OK || !isnull)
-          snprintf(m, sizeof m, "NULL REF OUT: status %d, null %d %s", (int)ost, isnull,
-                   seer_last_error(c) ? seer_last_error(c) : "");
-      }
       if (m[0] == '\0')
         pass(oname);
       else
         fail(oname, m);
+    }
+    /* A block assigning NULL to a REF OUT: it reads as NULL. */
+    if (!gated_as("REF OUT bind", "NULL REF OUT bind")) {
+      const char *nname = "NULL REF OUT bind";
+      s = NULL;
+      int isnull = 0;
+      SeerStatus ost = seer_stmt_prepare(c, "BEGIN :1 := NULL; END;", &s);
+      if (ost == SEER_OK)
+        ost = seer_stmt_bind_ref_out(s, 1, schema, "SEER_RFO");
+      if (ost == SEER_OK)
+        ost = seer_stmt_execute(s);
+      if (ost == SEER_OK) {
+        const void *d = NULL;
+        size_t l = 0;
+        int isbin = 0;
+        seer_stmt_out_data(s, 1, &d, &l, &isnull, &isbin);
+      }
+      seer_stmt_close(s);
+      if (ost == SEER_OK && isnull)
+        pass(nname);
+      else {
+        char m[300];
+        snprintf(m, sizeof m, "status %d, null %d %s", (int)ost, isnull,
+                 seer_last_error(c) ? seer_last_error(c) : "");
+        fail(nname, m);
+      }
     }
     run(c, "DROP TABLE seer_rft");
     run(c, "DROP TYPE seer_rfo");

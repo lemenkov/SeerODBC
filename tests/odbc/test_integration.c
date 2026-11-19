@@ -66,8 +66,6 @@ static const Gate GATES[] = {
     {"column annotations", 8, 21, GATE_SERVER, "no ANNOTATIONS before 23ai"},
     {"REF IN parameter (SQL_SEER_REF)", 10, 11, GATE_TODO,
      "REF binds on 10g / 11g: no measured thin form (#241)"},
-    {"REF OUT parameter (SQL_SEER_REF)", 8, 8, GATE_TODO,
-     "REF OUT on 8i: its pure-OUT value isn't measured (#241)"},
     {"REF OUT parameter (SQL_SEER_REF)", 10, 11, GATE_TODO,
      "REF binds on 10g / 11g: no measured thin form (#241)"},
     {"implicit result rows holding a CURSOR() column", 8, 11, GATE_SERVER,

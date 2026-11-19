@@ -6751,6 +6751,12 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
     *size = 32;
     return SEER_OK;
   }
+  if (b->oac_type == ORA_TYPE_REF && b->oac_override != NULL) {
+    /* A REF, IN or pure OUT: the value ref_bind built (#241, bus 88). */
+    seer_writer_bytes(val, v, vn);
+    *size = b->oac_size ? b->oac_size : 1;
+    return SEER_OK;
+  }
   if (b->oac_type == ORA_TYPE_REFCURSOR) {
     /* A REF CURSOR sends an empty slot, 01 00 (§19.17a). */
     seer_writer_u8(val, 0x01);
@@ -7395,6 +7401,20 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
     } else {
       seer_writer_free(&img);
     }
+    return;
+  }
+  if (b->oac_type == ORA_TYPE_REF && b->oac_override != NULL) {
+    /* A REF: `2a` + its 42 bytes as a value, then the status directly - no
+     * indicator, no return code, like an object's OUT cell (bus 85, #241). */
+    SeerWriter v;
+    if (!seer_writer_init(&v, 48)) {
+      r->bad = true;
+      return;
+    }
+    o8r_value(r, &v);
+    if (!r->cut && !r->bad && v.len > 0 && seer_writer_ok(&v))
+      (void)decode_scalar(ORA_TYPE_REF, v.buf, v.len, &b->out);
+    seer_writer_free(&v);
     return;
   }
   if (b->ret_lob != 0) {
@@ -10248,7 +10268,9 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
  * on 9i, as for a NULL - and comes back as the REF's bytes: on 12c+ a value
  * and its ub4 return code (NULL: an empty value, return code -1); on 9i the
  * block's OUT cell. A pure OUT sends an empty value on 12c+ (JDBC thin) and
- * none on 9i, which prompts for INs only. 8i's pure-OUT value isn't measured. */
+ * none on 9i, which prompts for INs only. 8i sends OCI's empty OCIRef,
+ * `04 00 02 00 00` (bus 88), and reads back the REF as a value with no
+ * indicator after it (bus 85). */
 static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
                            const char *type_name, const uint8_t *ref, size_t len, bool out)
 {
@@ -10260,10 +10282,6 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
   bool o8i = c->is_8i, o9i = !o8i && fv < TTC_FIELD_VERSION_10_2;
   if (!o8i && !o9i && fv < TTC_FIELD_VERSION_12_1) {
     seer_log(SEER_LOG_WARNING, "stmt: a REF bind on 10g / 11g is not supported (#241)");
-    return SEER_ENOTIMPL;
-  }
-  if (out && o8i) {
-    seer_log(SEER_LOG_WARNING, "stmt: a REF OUT on 8i is not supported yet (#241)");
     return SEER_ENOTIMPL;
   }
   uint8_t oid[16];
@@ -10293,7 +10311,14 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
     seer_writer_u8(&oac, 0x00); /* charset */
     seer_writer_u8(&oac, 0x00);
     seer_writer_u8(&oac, 0x00); /* form */
-    o8w_chr(&v, ref, len);
+    if (out) {
+      /* OCI's image of an empty OCIRef: body length 2, a 2-byte zero body
+       * (bus 88, the same on 9.2 native). */
+      static const uint8_t EMPTY_REF[4] = {0x00, 0x02, 0x00, 0x00};
+      o8w_chr(&v, EMPTY_REF, sizeof EMPTY_REF);
+    } else {
+      o8w_chr(&v, ref, len);
+    }
   } else if (o9i) { /* ojdbc14 9.0.2 on 9.2.0.4 */
     seer_writer_u8(&oac, ORA_TYPE_REF);
     seer_writer_u8(&oac, 0x01);

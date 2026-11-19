@@ -89,7 +89,7 @@ static const Gate GATES[] = {
     {"NVARCHAR2 object attribute + element bind", 8, 8, GATE_SERVER,
      "8.1.7's national charset is WE8ISO8859P1"},
     {"REF bind", 10, 11, GATE_TODO, "REF binds on 10g / 11g: no measured thin form (#241)"},
-    {"REF OUT bind", 8, 8, GATE_TODO, "REF OUT on 8i: its pure-OUT value isn't measured (#241)"},
+    {"NULL REF OUT bind", 8, 8, GATE_TODO, "8.1.7 answers a NULL REF OUT with ORA-01405 (#325)"},
     {"REF OUT bind", 10, 11, GATE_TODO, "REF binds on 10g / 11g: no measured thin form (#241)"},
     {"native JSON bind", 8, 18, GATE_SERVER, "no JSON type before 21c"},
     {"native VECTOR bind", 8, 21, GATE_SERVER, "no VECTOR type before 23ai"},
