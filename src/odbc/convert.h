@@ -53,6 +53,12 @@ size_t seer_odbc_c_fixed_size(SQLSMALLINT t);
  * if `cap` is too small (300 always fits). */
 size_t seer_odbc_numeric_to_text(const SQL_NUMERIC_STRUCT *ns, char *out, size_t cap);
 
+/* An ODBC numeric literal ([+-]digits[.digits][e[+-]digits], blanks around;
+ * '.' the decimal point whatever the session's NLS) as the plain decimal
+ * seer_stmt_bind_number_text takes, the exponent applied. Returns its length,
+ * or 0 if `s` is not such a literal (or won't fit `cap`) (#354). */
+size_t seer_odbc_numeric_literal(const char *s, size_t n, char *out, size_t cap);
+
 /* SQLGUID as canonical text, xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars and
  * a NUL). */
 void seer_odbc_guid_to_text(const SQLGUID *g, char out[37]);

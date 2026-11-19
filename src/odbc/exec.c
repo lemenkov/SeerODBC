@@ -67,6 +67,42 @@ static size_t ctype_stride(SQLSMALLINT c_type, SQLLEN buflen)
   return buflen > 0 ? (size_t)buflen : 1;
 }
 
+/* Whether SQL type `t` is a number: character data bound as one is an ODBC
+ * numeric literal, '.' the decimal point (#354). */
+static bool sql_type_numeric(SQLSMALLINT t)
+{
+  switch (t) {
+  case SQL_NUMERIC:
+  case SQL_DECIMAL:
+  case SQL_INTEGER:
+  case SQL_SMALLINT:
+  case SQL_BIGINT:
+  case SQL_TINYINT:
+  case SQL_FLOAT:
+  case SQL_REAL:
+  case SQL_DOUBLE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* Character data `txt` for a parameter of SQL type `sql_type`: a numeric
+ * literal for a numeric type goes as an exact NUMBER, whatever the session's
+ * NLS_NUMERIC_CHARACTERS; anything else as text, for the server to convert
+ * (or refuse, ORA-01722 / 22018) as before (#354). */
+static SeerStatus bind_char_value(SeerStmt *core, int param, SQLSMALLINT sql_type, const char *txt,
+                                  int len)
+{
+  if (sql_type_numeric(sql_type)) {
+    size_t n = len < 0 ? strlen(txt) : (size_t)len;
+    char plain[600];
+    if (seer_odbc_numeric_literal(txt, n, plain, sizeof plain) > 0)
+      return seer_stmt_bind_number_text(core, param, plain);
+  }
+  return seer_stmt_bind_text(core, param, txt, len);
+}
+
 /* Bind one parameter value (the value at `valptr`, length hint `ind`) into core
  * statement `core` at `param`, dispatching on the ODBC C type. `date_only`: the
  * server has no TIMESTAMP (8i, #318), so a timestamp goes out as a DATE. */
@@ -196,13 +232,14 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
     size_t u8len = 0;
     if (seer_iconv(SEER_UTF16, "UTF-8", (const char *)valptr, inbytes, &u8, &u8len) != 0)
       return SEER_EPROTO;
-    SeerStatus st = seer_stmt_bind_text(core, param, u8, (int)u8len);
+    SeerStatus st = bind_char_value(core, param, sql_type, u8, (int)u8len);
     free(u8);
     return st;
   }
   case SQL_C_CHAR:
   case SQL_C_DEFAULT:
-    return seer_stmt_bind_text(core, param, (const char *)valptr, (ind == SQL_NTS) ? -1 : (int)ind);
+    return bind_char_value(core, param, sql_type, (const char *)valptr,
+                           (ind == SQL_NTS) ? -1 : (int)ind);
   default:
     /* Not a C type this driver knows (SQLBindParameter refuses those with
      * HY003; a descriptor field can still set one). Never send its bytes as
@@ -225,7 +262,10 @@ static const char *bind_sqlstate(SeerStatus st, SQLSMALLINT ct)
 {
   if (!param_c_type_known(ct))
     return "07006";
-  if (st == SEER_EPARAM && (ct == SQL_C_NUMERIC || ct == SQL_C_UBIGINT))
+  /* ... and character data for a numeric parameter past NUMBER's range
+   * (#354) */
+  if (st == SEER_EPARAM &&
+      (ct == SQL_C_NUMERIC || ct == SQL_C_UBIGINT || ct == SQL_C_CHAR || ct == SQL_C_WCHAR))
     return "22003";
   /* SQL_C_INTERVAL_x is 100 + SQL_CODE_x, YEAR (1) to MINUTE_TO_SECOND (13). */
   if (st == SEER_EPARAM && ct >= SQL_C_INTERVAL_YEAR && ct <= SQL_C_INTERVAL_MINUTE_TO_SECOND)

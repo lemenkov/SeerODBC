@@ -63,6 +63,33 @@ int main(void)
     assert(CV("false", 5, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 0);
   }
 
+  /* --- ODBC numeric literals for numeric parameters (#354) --- */
+  {
+    char o[64];
+#define NL(txt) (seer_odbc_numeric_literal((txt), strlen(txt), o, sizeof o) > 0 ? o : "")
+    assert(strcmp(NL("1.5"), "1.5") == 0);
+    assert(strcmp(NL("  -1.50  "), "-1.50") == 0);
+    assert(strcmp(NL("+42"), "42") == 0);
+    assert(strcmp(NL(".5"), "0.5") == 0);
+    assert(strcmp(NL("5."), "5") == 0);
+    assert(strcmp(NL("007"), "7") == 0);
+    assert(strcmp(NL("1.5e3"), "1500") == 0);
+    assert(strcmp(NL("1.5E-3"), "0.0015") == 0);
+    assert(strcmp(NL("-12.34e1"), "-123.4") == 0);
+    assert(strcmp(NL("0.000"), "0") == 0);
+    assert(strcmp(NL("-0"), "0") == 0);
+    assert(strcmp(NL("1e126"), "1" /* then 126 zeros */) != 0);    /* too long for o: refused */
+    assert(seer_odbc_numeric_literal("1,5", 3, o, sizeof o) == 0); /* ',' is not a literal */
+    assert(seer_odbc_numeric_literal("abc", 3, o, sizeof o) == 0);
+    assert(seer_odbc_numeric_literal("", 0, o, sizeof o) == 0);
+    assert(seer_odbc_numeric_literal("1e", 2, o, sizeof o) == 0);
+    assert(seer_odbc_numeric_literal("1.5x", 4, o, sizeof o) == 0);
+    assert(seer_odbc_numeric_literal(".", 1, o, sizeof o) == 0);
+    char big[300];
+    assert(seer_odbc_numeric_literal("1e126", 5, big, sizeof big) == 127); /* 1 + 126 zeros */
+#undef NL
+  }
+
   /* --- a number / date cut short in a character buffer (#336) --- */
   {
     char c[32];

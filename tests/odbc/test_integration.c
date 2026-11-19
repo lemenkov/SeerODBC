@@ -6731,6 +6731,67 @@ static void check_disconnect_open_txn(SQLHDBC dbc, const char *drv, const char *
     fail(name, m);
 }
 
+/* Character data bound as a numeric parameter is an ODBC numeric literal,
+ * '.' the decimal point, whatever the session's NLS_NUMERIC_CHARACTERS
+ * (#354). With ',' as the decimal separator, "1.5" as SQL_NUMERIC /
+ * SQL_DOUBLE (and as SQL_C_WCHAR) doubles to 3. Two-way: the same text as
+ * SQL_VARCHAR is text, which the server still refuses there (ORA-01722) - so
+ * the NLS setting is in force. */
+static void check_numeric_text_params(const char *drv, const char *host, const char *port,
+                                      const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "character data for a numeric parameter ignores the session's NLS";
+  char m[300] = "", why[256] = "", err[256];
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC a = open_conn(e, drv, host, port, svc, user, pwd, why, sizeof why);
+  if (a == NULL) {
+    snprintf(m, sizeof m, "connection: %s", why);
+  } else if (!SQL_SUCCEEDED(
+                 exec_do(a, "ALTER SESSION SET NLS_NUMERIC_CHARACTERS = ',.'", err, sizeof err))) {
+    snprintf(m, sizeof m, "ALTER SESSION: %s", err);
+  } else {
+    static const SQLWCHAR W15[] = {'1', '.', '5', 0};
+    struct {
+      SQLSMALLINT ct, st;
+      const void *v;
+      int ok;
+    } T[] = {
+        {SQL_C_CHAR, SQL_NUMERIC, "1.5", 1},
+        {SQL_C_CHAR, SQL_DOUBLE, "1.5", 1},
+        {SQL_C_WCHAR, SQL_DECIMAL, W15, 1},
+        {SQL_C_CHAR, SQL_VARCHAR, "1.5", 0},
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+      SQLHSTMT s;
+      SQLAllocHandle(SQL_HANDLE_STMT, a, &s);
+      SQLLEN ind = SQL_NTS, oi = 0;
+      char out[32] = "", st[6] = "";
+      SQLBindParameter(s, 1, SQL_PARAM_INPUT, T[i].ct, T[i].st, 20, 2, (SQLPOINTER)T[i].v, 0, &ind);
+      SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)"SELECT ? * 2 FROM dual", SQL_NTS);
+      if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+        rc = SQLGetData(s, 1, SQL_C_CHAR, out, sizeof out, &oi);
+      if (!SQL_SUCCEEDED(rc))
+        diag_state(SQL_HANDLE_STMT, s, st);
+      if (T[i].ok ? (!SQL_SUCCEEDED(rc) || strcmp(out, "3") != 0)
+                  : (rc != SQL_ERROR || strcmp(st, "22018") != 0))
+        snprintf(m, sizeof m, "C type %d as SQL type %d: rc=%d '%s' [%s] (want %s)", (int)T[i].ct,
+                 (int)T[i].st, (int)rc, st, out, T[i].ok ? "3" : "22018, the text refused");
+      SQLFreeHandle(SQL_HANDLE_STMT, s);
+    }
+  }
+  if (a != NULL) {
+    SQLDisconnect(a);
+    SQLFreeHandle(SQL_HANDLE_DBC, a);
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -7614,6 +7675,7 @@ int main(void)
   check_session_killed(drv, host, port, svc, user, pwd);
   check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);
   check_disconnect_open_txn(dbc, drv, host, port, svc, user, pwd);
+  check_numeric_text_params(drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
