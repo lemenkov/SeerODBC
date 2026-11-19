@@ -206,6 +206,7 @@ typedef struct {
   int dae_current;    /* param index being filled, -1 before the first */
   int getdata_col;    /* last SQLGetData column, for fragment tracking */
   SQLLEN getdata_off; /* bytes already returned for getdata_col */
+  int getdata_done;   /* getdata_col was returned to its end (#351) */
   /* Array (bulk) parameter binding. */
   SQLULEN paramset_size;         /* SQL_ATTR_PARAMSET_SIZE (rows), default 1 */
   SQLULEN param_bind_type;       /* SQL_ATTR_PARAM_BIND_TYPE, default by-column */

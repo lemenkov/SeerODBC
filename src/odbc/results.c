@@ -435,6 +435,7 @@ SQLRETURN SQL_API SQLMoreResults(SQLHSTMT StatementHandle)
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   s->getdata_col = -1;
   s->getdata_off = 0;
+  s->getdata_done = 0;
   s->rowset_start = -1;
   s->cur_row = -1;
   return SQL_SUCCESS;
@@ -1173,6 +1174,7 @@ static SQLRETURN fetch_rowset(OdbcStmt *s, long start)
   s->cur_row = s->rowset_start; /* WHERE CURRENT OF: the rowset's first row (#288) */
   s->getdata_col = -1;          /* SQLGetData targets the last fetched row */
   s->getdata_off = 0;
+  s->getdata_done = 0;
 
   if (got == 0)
     return SQL_NO_DATA;
@@ -1292,6 +1294,7 @@ SQLRETURN SQL_API SQLSetPos(SQLHSTMT StatementHandle, SQLSETPOSIROW RowNumber,
     s->cur_row = s->rowset_start + off; /* the row WHERE CURRENT OF means (#288) */
     s->getdata_col = -1;
     s->getdata_off = 0;
+    s->getdata_done = 0;
     return SQL_SUCCESS;
   }
   case SQL_REFRESH:
@@ -1331,6 +1334,7 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   if ((int)ColumnNumber != s->getdata_col) {
     s->getdata_col = (int)ColumnNumber;
     s->getdata_off = 0;
+    s->getdata_done = 0;
   }
 
   const void *val = NULL;
@@ -1342,8 +1346,11 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   if (!is_null)
     vlen = max_length_cap(s, col, val, vlen, is_binary);
 
-  /* A repeat call after the value was fully returned signals end-of-column. */
-  if (!is_null && s->getdata_off > 0 && (size_t)s->getdata_off >= vlen)
+  /* A repeat call after the value was fully returned signals end-of-column.
+   * Known by the last piece having fitted, not by comparing the offset with
+   * vlen: the offset counts the target's bytes (UTF-16 for SQL_C_WCHAR),
+   * vlen the value's UTF-8 ones (#351). */
+  if (!is_null && s->getdata_done)
     return SQL_NO_DATA;
 
   /* SQL_ARD_TYPE: the type the column's ARD record names (#314). */
@@ -1357,6 +1364,11 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, TargetType,
                                   TargetValuePtr, BufferLength, StrLen_or_IndPtr, &s->getdata_off,
                                   &state, sql_type_of(seer_stmt_col_type(s->core, col)));
+  /* A variable-length target got the rest of the value: the next call on this
+   * column is SQL_NO_DATA (#351). */
+  if (r == SQL_SUCCESS && !is_null && seer_odbc_c_fixed_size(TargetType) == 0 &&
+      TargetValuePtr != NULL)
+    s->getdata_done = 1;
   if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
     return seer_odbc_diag(s, state ? state : "01004", 0, seer_odbc_convert_text(state), r);
   return r;
@@ -1388,6 +1400,7 @@ SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option)
     }
     s->getdata_col = -1;
     s->getdata_off = 0;
+    s->getdata_done = 0;
     s->cur_row = -1; /* closed: no current row for WHERE CURRENT OF (#288) */
     return SQL_SUCCESS;
   case SQL_UNBIND:
@@ -1422,6 +1435,7 @@ SQLRETURN SQL_API SQLCloseCursor(SQLHSTMT StatementHandle)
   s->core = NULL;
   s->getdata_col = -1;
   s->getdata_off = 0;
+  s->getdata_done = 0;
   s->cur_row = -1;
   return SQL_SUCCESS;
 }

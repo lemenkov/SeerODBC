@@ -499,6 +499,7 @@ SQLRETURN seer_odbc_run_query(OdbcStmt *s, const char *sql, const char *const *p
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   s->getdata_col = -1;
   s->getdata_off = 0;
+  s->getdata_done = 0;
   s->rowset_start = -1;
   s->cur_row = -1;
   return SQL_SUCCESS;
@@ -729,6 +730,7 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
   s->getdata_col = -1;
   s->getdata_off = 0;
+  s->getdata_done = 0;
   s->rowset_start = -1;
   s->cur_row = -1;
   return result;
