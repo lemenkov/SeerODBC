@@ -9018,6 +9018,18 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
     return SEER_EPARAM;
   if (!stmt->conn->authenticated)
     return SEER_EPROTO;
+  /* A REF CURSOR OUT hands back a cursor whose rows can each hold a nested
+   * CURSOR(), and from 10g the server keeps every one of those open while the
+   * query is (10g's default open_cursors is 50). Its rows are fetched by a
+   * call that carries no piggybacks, so the statement cache's hidden cursors
+   * are queued closed now and go out ahead of this execute, freeing their
+   * slots before the nested cursors need them (#337). */
+  if (stmt->conn->stmt_cache_n > 0)
+    for (int i = 0; i < stmt->npbinds; i++)
+      if (stmt->pbinds[i].oac_type == ORA_TYPE_REFCURSOR && stmt->pbinds[i].is_out) {
+        stmt_cache_flush(stmt->conn);
+        break;
+      }
   BindExpansion x;
   SeerStatus st = expand_binds(stmt, &x);
   if (st != SEER_OK)
@@ -9155,6 +9167,7 @@ static SeerStatus execute_now(SeerStmt *stmt)
     free(sig);
   }
   bool was_reuse = stmt->reuse_cursor > 0;
+  bool retried_open_cursors = false; /* #337 */
   SeerWriter w;
   uint8_t *resp = NULL;
   size_t rlen = 0;
@@ -9230,6 +9243,37 @@ retry_exec:
       free_columns(stmt->cols, stmt->ncols);
       stmt->cols = NULL;
       stmt->ncols = 0;
+      free_rows(stmt);
+      free_pending_lobs(stmt);
+      free_pending_objs(stmt);
+      stmt->cursor_id = 0;
+      goto retry_exec;
+    }
+    /* ORA-01000 (alone, or under ORA-00604 when recursive SQL hit it) while
+     * the statement cache holds parsed cursors: those are the
+     * driver's, unseen by the application, and on a server with a small
+     * open_cursors (10g's default is 50) they can be what tips it over.
+     * Queue them closed - the retry's request carries the closes ahead of
+     * the parse - and run the statement once more. The failed call was
+     * rolled back by the server, so the retry repeats no transactional work
+     * (#337). */
+    bool open_cursors =
+        oer.err_code == 1000 || (oer.err_code == 604 && stmt->conn->last_error != NULL &&
+                                 strstr(stmt->conn->last_error, "ORA-01000") != NULL);
+    if (open_cursors && stmt->conn->stmt_cache_n > 0 && !retried_open_cursors) {
+      retried_open_cursors = true;
+      seer_log(SEER_LOG_DEBUG, "stmt: ORA-01000 with %d cached cursors: closing them, retrying",
+               stmt->conn->stmt_cache_n);
+      stmt_cache_flush(stmt->conn);
+      queue_cursor_close(stmt->conn, oer.cursor_id);
+      if (was_reuse) {
+        was_reuse = false;
+        queue_cursor_close(stmt->conn, stmt->reuse_cursor);
+        stmt->reuse_cursor = 0;
+        free_columns(stmt->cols, stmt->ncols);
+        stmt->cols = NULL;
+        stmt->ncols = 0;
+      }
       free_rows(stmt);
       free_pending_lobs(stmt);
       free_pending_objs(stmt);
