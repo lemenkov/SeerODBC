@@ -1945,6 +1945,13 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
     case TTI_OER:
       st = parse_oer(&r, stmt, oer);
       got_oer = true;
+      /* The end-of-call status says whether a transaction is open: bit
+       * 0x02, measured on 10g, 11g and 23ai after DML and SELECT FOR UPDATE
+       * (open) and after COMMIT, a committing block and DDL (closed). 8i and
+       * 9i replies carry no such word: their state stays unknown (#344). */
+      if (st == SEER_OK && !stmt->conn->is_8i &&
+          stmt->conn->field_version >= TTC_FIELD_VERSION_10_2)
+        stmt->conn->txn_state = (oer->call_status & 0x02) ? 1 : 0;
       break;
     case TTI_STA:
       got_oer = true; /* treat as terminal */

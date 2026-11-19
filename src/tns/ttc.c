@@ -2188,16 +2188,28 @@ SeerStatus seer_request_end(SeerConn *conn)
 
 SeerStatus seer_commit(SeerConn *conn)
 {
-  if (conn != NULL && conn->is_8i)
-    return seer_o8i_tran(conn, true); /* 8i has no TTI_COMMIT: COMMIT rides its OALL8 */
-  return seer_ttc_tran(conn, TTI_COMMIT);
+  SeerStatus st = conn != NULL && conn->is_8i
+                      ? seer_o8i_tran(conn, true) /* 8i has no TTI_COMMIT: it rides its OALL8 */
+                      : seer_ttc_tran(conn, TTI_COMMIT);
+  if (st == SEER_OK && conn != NULL)
+    conn->txn_state = 0; /* #344 */
+  return st;
 }
 
 SeerStatus seer_rollback(SeerConn *conn)
 {
-  if (conn != NULL && conn->is_8i)
-    return seer_o8i_tran(conn, false); /* likewise ROLLBACK */
-  return seer_ttc_tran(conn, TTI_ROLLBACK);
+  SeerStatus st = conn != NULL && conn->is_8i ? seer_o8i_tran(conn, false) /* likewise */
+                                              : seer_ttc_tran(conn, TTI_ROLLBACK);
+  if (st == SEER_OK && conn != NULL)
+    conn->txn_state = 0;
+  return st;
+}
+
+int seer_txn_open(const SeerConn *conn)
+{
+  if (conn == NULL || conn->is_8i || conn->field_version < TTC_FIELD_VERSION_10_2)
+    return -1;
+  return conn->txn_state;
 }
 
 void seer_ttc_logoff(SeerConn *conn)

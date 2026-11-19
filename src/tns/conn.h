@@ -60,6 +60,7 @@ struct SeerConn {
   uint16_t db_charset;     /* the database charset id, from the PRO reply */
   char *last_error;        /* last ORA-NNNNN message (malloc'd)       */
   long last_error_offset;  /* its parse offset into the SQL text, 0 if none */
+  int txn_state;           /* 1 a transaction is open, 0 none, -1 unknown (8i / 9i; #344) */
   volatile bool in_call;   /* blocked in seer_ttc_recv (cancel window) */
   int call_timeout_ms;     /* seer_set_call_timeout: 0 = none (#209)  */
   bool call_timed_out;     /* a reply was interrupted by that timeout  */

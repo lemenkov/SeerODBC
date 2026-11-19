@@ -6593,6 +6593,68 @@ static void check_autocommit_switch(SQLHDBC dbc, const char *drv, const char *ho
     fail(name, m);
 }
 
+/* SQLDisconnect in manual-commit mode with a transaction open is 25000 and
+ * leaves the connection up (#344); after a rollback it disconnects, and the
+ * row was never committed. Two-way: with only a query run, disconnect
+ * succeeds at once. 10g and later: 8i / 9i replies don't say whether a
+ * transaction is open. */
+static void check_disconnect_open_txn(SQLHDBC dbc, const char *drv, const char *host,
+                                      const char *port, const char *svc, const char *user,
+                                      const char *pwd)
+{
+  const char *name = "SQLDisconnect with an open transaction is 25000";
+  if (g_release > 0 && g_release < 10) {
+    skip(name, "server: 8i / 9i replies don't say whether a transaction is open (#344)");
+    return;
+  }
+  char m[300] = "", why[256] = "", err[256], cnt[16] = "", st[6] = "", one[8] = "";
+  exec_do(dbc, "DROP TABLE seer_dctx", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_dctx (n NUMBER)", err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC a = open_conn(e, drv, host, port, svc, user, pwd, why, sizeof why);
+  if (a == NULL) {
+    snprintf(m, sizeof m, "second connection: %s", why);
+  } else {
+    SQLSetConnectAttr(a, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+    exec_do(a, "INSERT INTO seer_dctx VALUES (1)", err, sizeof err);
+    SQLRETURN rc = SQLDisconnect(a);
+    diag_state(SQL_HANDLE_DBC, a, st);
+    if (rc != SQL_ERROR || strcmp(st, "25000") != 0)
+      snprintf(m, sizeof m, "disconnect with the insert open: rc=%d '%s', want 25000", (int)rc, st);
+    else if (!SQL_SUCCEEDED(exec_scalar(a, "SELECT 1 FROM dual", one, sizeof one, err, sizeof err)))
+      snprintf(m, sizeof m, "the connection did not stay up: %s", err);
+    SQLEndTran(SQL_HANDLE_DBC, a, SQL_ROLLBACK);
+    rc = SQLDisconnect(a);
+    if (!m[0] && !SQL_SUCCEEDED(rc))
+      snprintf(m, sizeof m, "disconnect after the rollback failed (rc=%d)", (int)rc);
+    exec_scalar(dbc, "SELECT COUNT(*) FROM seer_dctx", cnt, sizeof cnt, err, sizeof err);
+    if (!m[0] && strcmp(cnt, "0") != 0)
+      snprintf(m, sizeof m, "the rolled-back row is there (%s rows)", cnt);
+    SQLFreeHandle(SQL_HANDLE_DBC, a);
+    /* two-way: a query alone leaves no transaction */
+    a = m[0] ? NULL : open_conn(e, drv, host, port, svc, user, pwd, why, sizeof why);
+    if (a != NULL) {
+      SQLSetConnectAttr(a, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+      exec_scalar(a, "SELECT 1 FROM dual", one, sizeof one, err, sizeof err);
+      rc = SQLDisconnect(a);
+      if (!SQL_SUCCEEDED(rc))
+        snprintf(m, sizeof m, "disconnect after only a query: rc=%d", (int)rc);
+      SQLFreeHandle(SQL_HANDLE_DBC, a);
+    }
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  exec_do(dbc, "DROP TABLE seer_dctx", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -7474,6 +7536,7 @@ int main(void)
   check_expire_time(drv, host, port, svc, user, pwd);
   check_session_killed(drv, host, port, svc, user, pwd);
   check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);
+  check_disconnect_open_txn(dbc, drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
