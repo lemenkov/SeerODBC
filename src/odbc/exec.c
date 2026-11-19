@@ -17,6 +17,7 @@
 #include "compat.h"
 #include "convert.h"
 #include "odbc_internal.h"
+#include "types.h" /* ORA_TYPE_* */
 #include "sqlprep.h"
 
 /* Map an ODBC SQL parameter type to the Oracle type for an OUT bind's OAC. */
@@ -32,26 +33,26 @@ static int ora_type_for_sql(SQLSMALLINT t)
   case SQL_FLOAT:
   case SQL_REAL:
   case SQL_DOUBLE:
-    return 2; /* NUMBER */
+    return ORA_TYPE_NUMBER;
   case SQL_TYPE_TIMESTAMP:
   case SQL_TIMESTAMP:
   case SQL_TYPE_DATE:
   case SQL_DATE:
-    return 12; /* DATE */
+    return ORA_TYPE_DATE;
   case SQL_BINARY:
   case SQL_VARBINARY:
   case SQL_LONGVARBINARY:
-    return 23; /* RAW */
+    return ORA_TYPE_RAW;
   case SQL_REFCURSOR:
-    return 102; /* REF CURSOR */
+    return ORA_TYPE_REFCURSOR;
   case SQL_SEER_CLOB:
-    return 112; /* CLOB (#214) */
+    return ORA_TYPE_CLOB; /* #214 */
   case SQL_SEER_BLOB:
-    return 113; /* BLOB (#214) */
+    return ORA_TYPE_BLOB; /* #214 */
   case SQL_SEER_REF:
-    return 111; /* REF (#241) */
+    return ORA_TYPE_REF; /* #241 */
   default:
-    return 1; /* VARCHAR */
+    return ORA_TYPE_VARCHAR;
   }
 }
 
