@@ -47,7 +47,7 @@ TIMESTAMP / INTERVAL and national-character data. What a release itself lacks
 DRCP; JSON, VECTOR, BOOLEAN, implicit results) has nothing to reach. Still
 open: PL/SQL associative arrays on 9i (#254: no client binds one in 9.2's compact
 form; they work on 8i), package-level record and index-by types before 12c
-(#193), and a REF OUT parameter on 8i (#241).
+(#193), and a REF OUT the block sets to NULL on 8i (#325).
 
 - **Connect & auth** — O5LOGON across the 10g (DES), 11g (AES-192/SHA-1) and
   12c (AES-256/PBKDF2) verifiers, 23ai fv24 fast-auth, and 8i / 9i O3LOGON
