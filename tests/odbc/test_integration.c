@@ -6113,6 +6113,70 @@ static void check_cache_open_cursors(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Read column 1 of `sql` with SQLGetData(SQL_C_WCHAR) in pieces of `piece`
+ * bytes; the UTF-16 units joined into out (n units), their count returned, -1
+ * on an error. */
+static int wchar_pieces(SQLHDBC dbc, const char *sql, SQLLEN piece, SQLWCHAR *out, int n)
+{
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  int k = -1;
+  if (SQL_SUCCEEDED(SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS)) && SQL_SUCCEEDED(SQLFetch(s))) {
+    k = 0;
+    for (int calls = 0; calls < 200; calls++) {
+      SQLWCHAR buf[32];
+      SQLLEN ind = 0;
+      SQLRETURN rc = SQLGetData(s, 1, SQL_C_WCHAR, buf, piece, &ind);
+      if (rc == SQL_NO_DATA)
+        break;
+      if (!SQL_SUCCEEDED(rc)) {
+        k = -1;
+        break;
+      }
+      int units = rc == SQL_SUCCESS ? (int)(ind / 2) : (int)(piece / 2 - 1);
+      for (int i = 0; i < units && k < n; i++)
+        out[k++] = buf[i];
+    }
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  return k;
+}
+
+/* SQLGetData in pieces as SQL_C_WCHAR returns the whole value (#351): it
+ * stopped once the UTF-16 offset passed the value's UTF-8 length, so 'hello
+ * world' in 6-byte pieces came back as 'hello '. Two-way: the same value read
+ * at once, and the pieces joined, are equal - for ASCII, for multi-byte text
+ * with a surrogate pair, and for a CLOB. */
+static void check_getdata_wchar_pieces(SQLHDBC dbc)
+{
+  const char *name = "SQLGetData in SQL_C_WCHAR pieces returns the whole value";
+  char m[300] = "";
+  struct {
+    const char *sql;
+    SQLLEN piece;
+    int from;
+  } T[] = {
+      {"SELECT 'hello world' FROM dual", 6, 8},
+      /* 8.1.7 has no UNISTR, and its WE8ISO8859P1 holds none of these */
+      {"SELECT UNISTR('a\\00E9b\\D83D\\DE00c\\4E2Dd\\00E9\\D83D\\DE00') FROM dual", 4, 9},
+      {"SELECT TO_CLOB('hello world, in a CLOB') FROM dual", 8, 9}, /* TO_CLOB is 9i+ */
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    if (g_release < T[i].from)
+      continue;
+    SQLWCHAR whole[128], joined[128];
+    int nw = wchar_pieces(dbc, T[i].sql, (SQLLEN)sizeof whole, whole, 128);
+    int nj = wchar_pieces(dbc, T[i].sql, T[i].piece, joined, 128);
+    if (nw <= 0 || nj != nw || memcmp(whole, joined, (size_t)nw * sizeof(SQLWCHAR)) != 0)
+      snprintf(m, sizeof m, "%.60s: %d units at once, %d in %ld-byte pieces", T[i].sql, nw, nj,
+               (long)T[i].piece);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7539,6 +7603,7 @@ int main(void)
   check_numeric_struct(dbc);
   check_datetime_targets(dbc);
   check_char_overflow(dbc);
+  check_getdata_wchar_pieces(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
