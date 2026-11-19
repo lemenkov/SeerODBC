@@ -2137,6 +2137,38 @@ SeerStatus seer_stmt_bind_int64(SeerStmt *stmt, int param, int64_t value)
   return store_bind(stmt, param, ORA_TYPE_NUMBER, 22, 0, 0, false, rxd, rl);
 }
 
+SeerStatus seer_stmt_bind_number_text(SeerStmt *stmt, int param, const char *dec)
+{
+  if (stmt == NULL || dec == NULL)
+    return SEER_EPARAM;
+  /* The encoder keeps 127 digits a side and drops the rest without a word;
+   * NUMBER itself spans 1e-130 to 1e126. Refuse anything outside that, so a
+   * digit is never lost silently. */
+  const char *p = dec;
+  if (*p == '-' || *p == '+')
+    p++;
+  while (*p == '0')
+    p++;
+  size_t ni = 0, nf = 0;
+  while (p[ni] >= '0' && p[ni] <= '9')
+    ni++;
+  if (p[ni] == '.')
+    while (p[ni + 1 + nf] >= '0' && p[ni + 1 + nf] <= '9')
+      nf++;
+  if (ni > 126 || nf > 127)
+    return SEER_EPARAM;
+  uint8_t num[24];
+  size_t nn = seer_encode_number_str(dec, num);
+  if (nn == 0)
+    return SEER_EPARAM; /* not a plain decimal */
+  uint8_t *rxd = NULL;
+  size_t rl = 0;
+  SeerStatus st = rxd_short(num, nn, &rxd, &rl);
+  if (st != SEER_OK)
+    return st;
+  return store_bind(stmt, param, ORA_TYPE_NUMBER, 22, 0, 0, false, rxd, rl);
+}
+
 static bool sql_is_block(const char *sql);
 static void emit_lob_oac(SeerWriter *w, int fv, uint8_t lob_type);
 

@@ -223,6 +223,78 @@ int main(void)
     assert(seer_odbc_c_fixed_size(SQL_C_CHAR) == 0 && seer_odbc_c_fixed_size(SQL_C_BINARY) == 0);
   }
 
+  /* --- parameter side (#322): SQL_NUMERIC_STRUCT -> exact decimal text --- */
+  {
+    char t[300];
+    SQL_NUMERIC_STRUCT n;
+    memset(&n, 0, sizeof n);
+    n.sign = 1;
+    n.scale = 2;
+    n.val[0] = 12345 & 0xFF;
+    n.val[1] = 12345 >> 8;
+    assert(seer_odbc_numeric_to_text(&n, t, sizeof t) == 6 && strcmp(t, "123.45") == 0);
+    n.sign = 0; /* negative */
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "-123.45") == 0);
+    n.scale = 7; /* more scale than digits */
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "-0.0012345") == 0);
+    n.scale = -3; /* negative scale: trailing zeros */
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "-12345000") == 0);
+    memset(n.val, 0, sizeof n.val); /* zero: no sign, no padding */
+    n.scale = -3;
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "0") == 0);
+    n.scale = 2;
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "0.00") == 0);
+    memset(n.val, 0xFF, sizeof n.val); /* 2^128 - 1 */
+    n.sign = 1;
+    n.scale = 0;
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "340282366920938463463374607431768211455") == 0);
+    assert(seer_odbc_numeric_to_text(&n, t, 10) == 0); /* too small: refused */
+  }
+
+  /* --- GUID -> canonical text --- */
+  {
+    SQLGUID g = {0x12345678, 0x9abc, 0xdef0, {1, 2, 3, 4, 5, 6, 7, 8}};
+    char t[37];
+    seer_odbc_guid_to_text(&g, t);
+    assert(strcmp(t, "12345678-9ABC-DEF0-0102-030405060708") == 0);
+  }
+
+  /* --- interval C struct -> the Oracle form, only the type's own fields --- */
+  {
+    SQL_INTERVAL_STRUCT iv;
+    SeerOdbcInterval v;
+    memset(&iv, 0, sizeof iv);
+    iv.intval.day_second.day = 7; /* not a field of HOUR: ignored */
+    iv.intval.day_second.hour = 30;
+    assert(seer_odbc_interval_from_c(SQL_C_INTERVAL_HOUR, &iv, &v) == 0);
+    assert(!v.year_month && v.days == 1 && v.hours == 6 && v.mins == 0 && !v.negative);
+
+    memset(&iv, 0, sizeof iv);
+    iv.interval_sign = SQL_TRUE;
+    iv.intval.year_month.year = 3; /* not a field of MONTH: ignored */
+    iv.intval.year_month.month = 14;
+    assert(seer_odbc_interval_from_c(SQL_C_INTERVAL_MONTH, &iv, &v) == 0);
+    assert(v.year_month && v.negative && v.years == 1 && v.months == 2);
+
+    memset(&iv, 0, sizeof iv);
+    iv.intval.day_second.minute = 2;
+    iv.intval.day_second.second = 59;
+    iv.intval.day_second.fraction = 1500000; /* 1.5 s in microseconds */
+    assert(seer_odbc_interval_from_c(SQL_C_INTERVAL_MINUTE_TO_SECOND, &iv, &v) == 0);
+    assert(v.days == 0 && v.hours == 0 && v.mins == 3 && v.secs == 0 && v.nanos == 500000000);
+
+    memset(&iv, 0, sizeof iv);
+    iv.intval.day_second.day = 1000000000; /* past INTERVAL DAY(9) */
+    assert(seer_odbc_interval_from_c(SQL_C_INTERVAL_DAY, &iv, &v) == -2);
+    assert(seer_odbc_interval_from_c(SQL_C_SLONG, &iv, &v) == -1);
+  }
+
   printf("test_convert: all assertions passed\n");
   return 0;
 }

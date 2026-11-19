@@ -700,3 +700,160 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
     return SQL_ERROR;
   }
 }
+
+size_t seer_odbc_numeric_to_text(const SQL_NUMERIC_STRUCT *ns, char *out, size_t cap)
+{
+  /* The mantissa's decimal digits, least significant first, by repeated
+   * division of the 16-byte little-endian value by 10. */
+  unsigned char m[SQL_MAX_NUMERIC_LEN];
+  memcpy(m, ns->val, sizeof m);
+  char rev[48];
+  size_t nd = 0;
+  for (;;) {
+    unsigned rem = 0;
+    bool nonzero = false;
+    for (int i = SQL_MAX_NUMERIC_LEN - 1; i >= 0; i--) {
+      unsigned cur = (rem << 8) | m[i];
+      m[i] = (unsigned char)(cur / 10);
+      rem = cur % 10;
+      nonzero = nonzero || m[i] != 0;
+    }
+    rev[nd++] = (char)('0' + rem);
+    if (!nonzero)
+      break;
+  }
+  bool zero = nd == 1 && rev[0] == '0';
+  int scale = ns->scale;
+  /* sign + "0." + leading zeros + digits + trailing zeros + NUL */
+  size_t need = 1 + 2 + nd + (size_t)(scale > 0 ? scale : -scale) + 1;
+  if (cap < need)
+    return 0;
+  size_t k = 0;
+  if (ns->sign == 0 && !zero) /* 0 = negative */
+    out[k++] = '-';
+  if (scale <= 0) {
+    for (size_t i = nd; i > 0; i--)
+      out[k++] = rev[i - 1];
+    if (!zero)
+      for (int i = 0; i < -scale; i++)
+        out[k++] = '0';
+  } else if ((size_t)scale >= nd) {
+    out[k++] = '0';
+    out[k++] = '.';
+    for (size_t i = nd; i < (size_t)scale; i++)
+      out[k++] = '0';
+    for (size_t i = nd; i > 0; i--)
+      out[k++] = rev[i - 1];
+  } else {
+    for (size_t i = nd; i > 0; i--) {
+      out[k++] = rev[i - 1];
+      if (i - 1 == (size_t)scale)
+        out[k++] = '.';
+    }
+  }
+  out[k] = '\0';
+  return k;
+}
+
+void seer_odbc_guid_to_text(const SQLGUID *g, char out[37])
+{
+  snprintf(out, 37, "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", (unsigned long)g->Data1,
+           (unsigned)g->Data2, (unsigned)g->Data3, g->Data4[0], g->Data4[1], g->Data4[2],
+           g->Data4[3], g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+}
+
+/* Oracle's largest leading field: INTERVAL ... (9). */
+#define IVL_LEAD_MAX 999999999UL
+
+int seer_odbc_interval_from_c(SQLSMALLINT c_type, const SQL_INTERVAL_STRUCT *iv,
+                              SeerOdbcInterval *out)
+{
+  memset(out, 0, sizeof *out);
+  out->negative = iv->interval_sign == SQL_TRUE;
+  const SQL_YEAR_MONTH_STRUCT *ym = &iv->intval.year_month;
+  const SQL_DAY_SECOND_STRUCT *ds = &iv->intval.day_second;
+  unsigned long long y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0, frac = 0;
+  switch (c_type) {
+  case SQL_C_INTERVAL_YEAR:
+    y = ym->year;
+    break;
+  case SQL_C_INTERVAL_MONTH:
+    mo = ym->month;
+    break;
+  case SQL_C_INTERVAL_YEAR_TO_MONTH:
+    y = ym->year;
+    mo = ym->month;
+    break;
+  case SQL_C_INTERVAL_DAY:
+    d = ds->day;
+    break;
+  case SQL_C_INTERVAL_HOUR:
+    h = ds->hour;
+    break;
+  case SQL_C_INTERVAL_MINUTE:
+    mi = ds->minute;
+    break;
+  case SQL_C_INTERVAL_SECOND:
+    s = ds->second;
+    frac = ds->fraction;
+    break;
+  case SQL_C_INTERVAL_DAY_TO_HOUR:
+    d = ds->day;
+    h = ds->hour;
+    break;
+  case SQL_C_INTERVAL_DAY_TO_MINUTE:
+    d = ds->day;
+    h = ds->hour;
+    mi = ds->minute;
+    break;
+  case SQL_C_INTERVAL_DAY_TO_SECOND:
+    d = ds->day;
+    h = ds->hour;
+    mi = ds->minute;
+    s = ds->second;
+    frac = ds->fraction;
+    break;
+  case SQL_C_INTERVAL_HOUR_TO_MINUTE:
+    h = ds->hour;
+    mi = ds->minute;
+    break;
+  case SQL_C_INTERVAL_HOUR_TO_SECOND:
+    h = ds->hour;
+    mi = ds->minute;
+    s = ds->second;
+    frac = ds->fraction;
+    break;
+  case SQL_C_INTERVAL_MINUTE_TO_SECOND:
+    mi = ds->minute;
+    s = ds->second;
+    frac = ds->fraction;
+    break;
+  default:
+    return -1;
+  }
+  switch (c_type) {
+  case SQL_C_INTERVAL_YEAR:
+  case SQL_C_INTERVAL_MONTH:
+  case SQL_C_INTERVAL_YEAR_TO_MONTH: {
+    unsigned long long tm = y * 12 + mo;
+    if (tm / 12 > IVL_LEAD_MAX)
+      return -2;
+    out->year_month = 1;
+    out->years = (long)(tm / 12);
+    out->months = (long)(tm % 12);
+    return 0;
+  }
+  default:
+    break;
+  }
+  /* fraction is in microseconds (precision 6); a whole second carries over. */
+  unsigned long long ts = ((d * 24 + h) * 60 + mi) * 60 + s + frac / 1000000;
+  if (ts / 86400 > IVL_LEAD_MAX)
+    return -2;
+  out->days = (long)(ts / 86400);
+  out->hours = (int)(ts / 3600 % 24);
+  out->mins = (int)(ts / 60 % 60);
+  out->secs = (int)(ts % 60);
+  out->nanos = (unsigned long)(frac % 1000000 * 1000);
+  return 0;
+}

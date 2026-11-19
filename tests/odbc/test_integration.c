@@ -5015,7 +5015,7 @@ static void check_interval_bind(SQLHDBC dbc)
   ds.intval.day_second.hour = 5;
   ds.intval.day_second.minute = 6;
   ds.intval.day_second.second = 7;
-  ds.intval.day_second.fraction = 890000000;
+  ds.intval.day_second.fraction = 890000; /* 0.89 s: microseconds, the default precision 6 (#322) */
   SQLHSTMT s;
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
   SQLLEN n1 = sizeof ym, n2 = sizeof ds;
@@ -5028,7 +5028,7 @@ static void check_interval_bind(SQLHDBC dbc)
   if (SQL_SUCCEEDED(rc) &&
       SQL_SUCCEEDED(exec_scalar(dbc, "SELECT ym FROM seer_iv", ymv, sizeof ymv, err, sizeof err)) &&
       SQL_SUCCEEDED(exec_scalar(dbc, "SELECT ds FROM seer_iv", dsv, sizeof dsv, err, sizeof err)) &&
-      strstr(ymv, "3-02") != NULL && strstr(dsv, "05:06:07") != NULL)
+      strstr(ymv, "3-02") != NULL && strstr(dsv, "05:06:07.89") != NULL)
     pass(name);
   else {
     char m[160];
@@ -5652,6 +5652,110 @@ static void check_timestamp_param_date(SQLHDBC dbc)
        strcmp(out, "2026-11-19 23:58:59") != 0))
     snprintf(m, sizeof m, "stored '%s' %s", out, err);
   exec_do(dbc, "DROP TABLE seer_ts8", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
+/* One parameter of C type `ct` through `sql`; the first column's text in out. */
+static SQLRETURN param_text(SQLHDBC dbc, const char *sql, SQLSMALLINT ct, SQLSMALLINT st, void *v,
+                            SQLLEN len, char *out, size_t n, char *err, size_t en)
+{
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLLEN ind = len, oi = 0;
+  out[0] = err[0] = '\0';
+  SQLRETURN rc = SQLBindParameter(s, 1, SQL_PARAM_INPUT, ct, st, 30, 0, v, len, &ind);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+  if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+    rc = SQLGetData(s, 1, SQL_C_CHAR, out, (SQLLEN)n, &oi);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, s, err, en);
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  return rc;
+}
+
+/* Parameter C types (#322) reach the server as their values: the unsigned
+ * integers, SQL_C_NUMERIC (exact, NLS-proof), GUID text, and every interval C
+ * type with its leading field normalised and the fraction in microseconds.
+ * Two-way: a C type the driver has no conversion for is HY003, not bytes sent
+ * as text. */
+static void check_param_c_types(SQLHDBC dbc)
+{
+  const char *name = "parameter C types: unsigned, NUMERIC, GUID, intervals";
+  char m[400] = "", err[256], out[64];
+  SQLUSMALLINT us = 65000;
+  unsigned char ut = 200;
+  SQLUBIGINT ub = 18000000000000000000ULL;
+  SQL_NUMERIC_STRUCT ns = {7, 2, 0, {0}}; /* -123.45: sign 0 = negative */
+  ns.val[0] = 12345 & 0xFF;
+  ns.val[1] = 12345 >> 8;
+  SQLGUID g = {0x12345678, 0x9abc, 0xdef0, {1, 2, 3, 4, 5, 6, 7, 8}};
+  static const char *const Q = "SELECT TO_CHAR(?) FROM dual";
+  struct {
+    SQLSMALLINT ct, st;
+    void *v;
+    SQLLEN len;
+    const char *want;
+  } T[] = {
+      {SQL_C_USHORT, SQL_INTEGER, &us, 0, "65000"},
+      {SQL_C_UTINYINT, SQL_INTEGER, &ut, 0, "200"},
+      {SQL_C_UBIGINT, SQL_NUMERIC, &ub, 0, "18000000000000000000"},
+      {SQL_C_NUMERIC, SQL_NUMERIC, &ns, sizeof ns, "-123.45"},
+      {SQL_C_GUID, SQL_CHAR, &g, sizeof g, "12345678-9ABC-DEF0-0102-030405060708"},
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++)
+    if (!SQL_SUCCEEDED(param_text(dbc, Q, T[i].ct, T[i].st, T[i].v, T[i].len, out, sizeof out, err,
+                                  sizeof err)) ||
+        strcmp(out, T[i].want) != 0)
+      snprintf(m, sizeof m, "C type %d: '%s' (want %s) %s", (int)T[i].ct, out, T[i].want, err);
+
+  if (!m[0] && g_release >= 9) { /* 8.1.7 has no INTERVAL */
+    SQL_INTERVAL_STRUCT h, mo, ds;
+    memset(&h, 0, sizeof h);
+    memset(&mo, 0, sizeof mo);
+    memset(&ds, 0, sizeof ds);
+    h.interval_type = SQL_IS_HOUR;
+    h.intval.day_second.hour = 30;
+    h.intval.day_second.day = 7; /* not a field of HOUR: ignored */
+    mo.interval_type = SQL_IS_MONTH;
+    mo.interval_sign = SQL_TRUE;
+    mo.intval.year_month.month = 14;
+    ds.interval_type = SQL_IS_DAY_TO_SECOND;
+    ds.intval.day_second.second = 1;
+    ds.intval.day_second.fraction = 500000;
+    struct {
+      SQLSMALLINT ct, st;
+      SQL_INTERVAL_STRUCT *v;
+      const char *want;
+    } I[] = {
+        {SQL_C_INTERVAL_HOUR, SQL_INTERVAL_HOUR, &h, "+000000001 06:00:00.000000000"},
+        {SQL_C_INTERVAL_MONTH, SQL_INTERVAL_MONTH, &mo, "-000000001-02"},
+        {SQL_C_INTERVAL_DAY_TO_SECOND, SQL_INTERVAL_DAY_TO_SECOND, &ds,
+         "+000000000 00:00:01.500000000"},
+    };
+    for (size_t i = 0; i < sizeof I / sizeof I[0] && !m[0]; i++)
+      if (!SQL_SUCCEEDED(param_text(dbc, Q, I[i].ct, I[i].st, I[i].v, sizeof *I[i].v, out,
+                                    sizeof out, err, sizeof err)) ||
+          strcmp(out, I[i].want) != 0)
+        snprintf(m, sizeof m, "interval %d: '%s' (want %s) %s", (int)I[i].ct, out, I[i].want, err);
+  }
+
+  /* Two-way: an unknown C type is refused at bind time. */
+  if (!m[0]) {
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    char st[6] = "", buf[8] = "1";
+    SQLLEN ind = 1;
+    SQLRETURN rc =
+        SQLBindParameter(s, 1, SQL_PARAM_INPUT, 9999, SQL_CHAR, 1, 0, buf, sizeof buf, &ind);
+    diag_state(SQL_HANDLE_STMT, s, st);
+    if (rc != SQL_ERROR || strcmp(st, "HY003") != 0)
+      snprintf(m, sizeof m, "C type 9999: rc=%d '%s', want HY003", (int)rc, st);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
   if (m[0] == '\0')
     pass(name);
   else
@@ -6893,6 +6997,7 @@ int main(void)
   check_c_type_targets(dbc);
   check_c_default(dbc);
   check_timestamp_param_date(dbc);
+  check_param_c_types(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);
