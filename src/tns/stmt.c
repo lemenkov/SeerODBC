@@ -7404,15 +7404,18 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
     return;
   }
   if (b->oac_type == ORA_TYPE_REF && b->oac_override != NULL) {
-    /* A REF: `2a` + its 42 bytes as a value, then the status directly - no
-     * indicator, no return code, like an object's OUT cell (bus 85, #241). */
+    /* A REF: `2a` + its 42 bytes as a value, then - as ref_bind's OUT
+     * descriptor sets flag 0x01 - a ub2 indicator; no return code. A NULL is
+     * an empty value and ff ff (bus 91, #325). Without the flag there is no
+     * indicator and a NULL is ORA-01405 (bus 85, #241). */
     SeerWriter v;
     if (!seer_writer_init(&v, 48)) {
       r->bad = true;
       return;
     }
     o8r_value(r, &v);
-    if (!r->cut && !r->bad && v.len > 0 && seer_writer_ok(&v))
+    uint16_t ind = (uint16_t)o8r_le16(r);
+    if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v))
       (void)decode_scalar(ORA_TYPE_REF, v.buf, v.len, &b->out);
     seer_writer_free(&v);
     return;
@@ -10297,7 +10300,9 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
   }
   if (o8i) { /* OCIBindObject (SQLT_REF) on 8.1.7: the 8i object descriptor, type 111 */
     seer_writer_u8(&oac, ORA_TYPE_REF);
-    seer_writer_u8(&oac, 0x00);
+    /* flag 0x01 on an OUT: an indicator comes back, so a NULL is -1, not
+     * ORA-01405 (bus 91, #325) */
+    seer_writer_u8(&oac, out ? 0x01 : 0x00);
     seer_writer_u8(&oac, 0x00);
     seer_writer_u8(&oac, 0x00);
     o8w_le32(&oac, 2000);

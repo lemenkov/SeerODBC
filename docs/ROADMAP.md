@@ -31,7 +31,7 @@ protocol variant with no feature behind it is not a gap.
       objects and collections read (#168) and bound (#172), REF binds IN and OUT (#241),
       associative arrays (#253), AQ RAW / object payloads through DBMS_AQ, XA via
       SYS.JAVA_XA (#171), query timeouts (#209). Both suites run on it. Open:
-      a REF OUT the block sets to NULL (#325) and package-level types (#193).
+      package-level types (#193).
 - [x] 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
