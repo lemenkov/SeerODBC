@@ -168,6 +168,15 @@ reported as success.
   - Non-numeric text is 22018.
   Before, the mantissa wrapped silently and text parsed as 0.
 - **Text that won't parse as the target** (a date, an interval) is 22018.
+- **Date and time structs** (#334):
+  - a DATE whose time isn't midnight, read into `SQL_C_TYPE_DATE`, gives
+    01S07, since Oracle DATEs are described as `SQL_TYPE_TIMESTAMP`;
+  - a TIMESTAMP's nonzero fraction read into `SQL_C_TYPE_TIME` gives 01S07;
+  - text must be a real date, time or timestamp, bare or as an ODBC escape.
+    Months, days (leap years Julian before 1583) and times are checked, so
+    `2026-13-45` is 22018;
+  - a text fraction scales by its digits, so `.5` is 500000000 ns;
+  - a bare time fills `SQL_C_TYPE_TIME` but not a date or timestamp.
 - **In a bound rowset**, a column that fails makes its row `SQL_ROW_ERROR`.
   The other rows are delivered with `SQL_SUCCESS_WITH_INFO`. A rowset where
   every row failed returns `SQL_ERROR`.

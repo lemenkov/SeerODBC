@@ -59,6 +59,52 @@ int main(void)
     assert(CV("false", 5, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 0);
   }
 
+  /* --- date / time targets: fields, truncation, fractions (#334) --- */
+  {
+    SQL_DATE_STRUCT dt;
+    SQL_TIME_STRUCT tm;
+    SQL_TIMESTAMP_STRUCT ts;
+#define DTV(txt, target, out) CV((txt), strlen(txt), 0, 0, (target), (out), 0, &ind)
+    /* a DATE with a time into a date struct: 01S07 */
+    assert(DTV("2026-11-19 13:14:15", SQL_C_TYPE_DATE, &dt) == SQL_SUCCESS_WITH_INFO &&
+           ST("01S07") && dt.year == 2026 && dt.month == 11 && dt.day == 19);
+    assert(DTV("2026-11-19 00:00:00", SQL_C_TYPE_DATE, &dt) == SQL_SUCCESS);
+    assert(DTV("2026-11-19", SQL_C_TYPE_DATE, &dt) == SQL_SUCCESS);
+    /* a fraction into a time struct: 01S07; the date part is ignored */
+    assert(DTV("2026-11-19 13:14:15.500000000", SQL_C_TYPE_TIME, &tm) == SQL_SUCCESS_WITH_INFO &&
+           ST("01S07") && tm.hour == 13 && tm.minute == 14 && tm.second == 15);
+    assert(DTV("2026-11-19 13:14:15", SQL_C_TYPE_TIME, &tm) == SQL_SUCCESS);
+    assert(DTV("13:14:15", SQL_C_TYPE_TIME, &tm) == SQL_SUCCESS && tm.hour == 13);
+    assert(DTV("{t '07:08:09'}", SQL_C_TYPE_TIME, &tm) == SQL_SUCCESS && tm.second == 9);
+    /* text fractions scale by digit count */
+    assert(DTV("2026-11-19 13:14:15.5", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_SUCCESS &&
+           ts.fraction == 500000000);
+    assert(DTV("2026-11-19 13:14:15.123456789", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_SUCCESS &&
+           ts.fraction == 123456789);
+    assert(DTV("2026-11-19 13:14:15.1234567891", SQL_C_TYPE_TIMESTAMP, &ts) ==
+               SQL_SUCCESS_WITH_INFO &&
+           ST("01S07") && ts.fraction == 123456789);
+    assert(DTV("2026-11-19", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_SUCCESS && ts.hour == 0);
+    assert(DTV(" {ts '2026-11-19 01:02:03'} ", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_SUCCESS &&
+           ts.minute == 2);
+    assert(DTV("{d '2024-02-29'}", SQL_C_TYPE_DATE, &dt) == SQL_SUCCESS && dt.day == 29);
+    assert(DTV("-044-03-15 00:00:00", SQL_C_TYPE_DATE, &dt) == SQL_SUCCESS && dt.year == -44);
+    assert(DTV("1500-02-29", SQL_C_TYPE_DATE, &dt) == SQL_SUCCESS); /* Julian leap year */
+    /* invalid fields and forms: 22018 */
+    assert(DTV("2026-13-45", SQL_C_TYPE_DATE, &dt) == SQL_ERROR && ST("22018"));
+    assert(DTV("2026-02-29", SQL_C_TYPE_DATE, &dt) == SQL_ERROR && ST("22018"));
+    assert(DTV("1900-02-29", SQL_C_TYPE_DATE, &dt) == SQL_ERROR && ST("22018"));
+    assert(DTV("25:00:00", SQL_C_TYPE_TIME, &tm) == SQL_ERROR && ST("22018"));
+    assert(DTV("12:60:00", SQL_C_TYPE_TIME, &tm) == SQL_ERROR && ST("22018"));
+    assert(DTV("13:14:15", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_ERROR && ST("22018"));
+    assert(DTV("13:14:15", SQL_C_TYPE_DATE, &dt) == SQL_ERROR && ST("22018"));
+    assert(DTV("2026-11-19 junk", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_ERROR && ST("22018"));
+    assert(DTV("garbage", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_ERROR && ST("22018"));
+    assert(DTV("5", SQL_C_TYPE_DATE, &dt) == SQL_ERROR && ST("22018"));
+    assert(DTV("2026-11-19 13:14:15.", SQL_C_TYPE_TIMESTAMP, &ts) == SQL_ERROR);
+#undef DTV
+  }
+
   /* --- SQL_C_NUMERIC: exact, past 128 bits, text (#332) --- */
   {
     SQL_NUMERIC_STRUCT n;
