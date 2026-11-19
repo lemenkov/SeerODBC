@@ -303,7 +303,7 @@ static void check_transaction(SQLHDBC dbc)
  * ORA number as the native error. It was once reported as success (#184). */
 static void check_refused_commit(SQLHDBC dbc)
 {
-  const char *name = "SQLEndTran on a refused commit: 40002, ORA-02091";
+  const char *name = "a refused commit (SQLEndTran, autocommit): 40002, ORA-02091";
   char err[256], out[64];
   exec_do(dbc, "DROP TABLE seer_odbc_defer", err, sizeof err);
   exec_do(dbc,
@@ -320,16 +320,28 @@ static void check_refused_commit(SQLHDBC dbc)
     SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, state, &native, msg, sizeof msg, &ml);
   SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
   SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+  /* The same in autocommit mode, where the statement's own commit fails: 40002
+   * too, where it was HY000 (#346). */
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLRETURN arc = SQLExecDirect(s, (SQLCHAR *)"INSERT INTO seer_odbc_defer VALUES (-2)", SQL_NTS);
+  SQLCHAR astate[6] = "";
+  SQLINTEGER anative = 0;
+  if (arc == SQL_ERROR)
+    SQLGetDiagRec(SQL_HANDLE_STMT, s, 1, astate, &anative, msg, sizeof msg, &ml);
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
   out[0] = '\0';
   exec_scalar(dbc, "SELECT COUNT(*) FROM seer_odbc_defer", out, sizeof out, err, sizeof err);
   exec_do(dbc, "DROP TABLE seer_odbc_defer", err, sizeof err);
   if (rc == SQL_ERROR && strcmp((char *)state, "40002") == 0 && native == 2091 &&
+      arc == SQL_ERROR && strcmp((char *)astate, "40002") == 0 && anative == 2091 &&
       strcmp(out, "0") == 0)
     pass(name);
   else {
     char m[400];
-    snprintf(m, sizeof m, "rc=%d state=%s native=%d kept=%s (%.200s)", (int)rc, (char *)state,
-             (int)native, out, (char *)msg);
+    snprintf(m, sizeof m, "SQLEndTran rc=%d %s/%d; autocommit rc=%d %s/%d; kept=%s (%.150s)",
+             (int)rc, (char *)state, (int)native, (int)arc, (char *)astate, (int)anative, out,
+             (char *)msg);
     fail(name, m);
   }
 }

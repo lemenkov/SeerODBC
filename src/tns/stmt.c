@@ -8369,8 +8369,11 @@ static SeerStatus fv2_execute_dml(SeerStmt *stmt)
 
   stmt->affected = (long)rowcount;
   stmt->executed = true;
+  /* No autocommit bit on the 9i parse: commit here, and report it - a commit
+   * the server refuses (a deferred constraint, ORA-02091) rolled the work
+   * back (#347). */
   if (c->autocommit)
-    seer_commit(c); /* no autocommit bit on the 9i parse */
+    return seer_commit(c);
   return SEER_OK;
 }
 
@@ -8795,7 +8798,7 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
   stmt->affected = (long)rowcount;
   stmt->executed = true;
   if (c->autocommit)
-    seer_commit(c);
+    return seer_commit(c); /* its failure is the statement's (#347) */
   return SEER_OK;
 }
 
