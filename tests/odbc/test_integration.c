@@ -6030,6 +6030,77 @@ static void check_char_overflow(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Run `sql` and count its rows; -1 (and the error in why) if it fails. */
+static int rows_of(SQLHDBC dbc, const char *sql, int refcursor, char *why, size_t n)
+{
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLRETURN rc = SQL_SUCCESS;
+  if (refcursor)
+    rc = SQLBindParameter(s, 1, SQL_PARAM_OUTPUT, SQL_C_DEFAULT, SEER_SQL_REFCURSOR, 0, 0, NULL, 0,
+                          NULL);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+  int rows = 0;
+  while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+    rows++;
+  if (rc != SQL_NO_DATA) {
+    diag_text(SQL_HANDLE_STMT, s, why, n);
+    rows = -1;
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  return rows;
+}
+
+/* The statement cache's hidden cursors (#337) must not cost the application
+ * cursors: with the cache filled (24), a REF CURSOR and a query whose 30 rows
+ * each hold a nested CURSOR(), and 30 result sets held open at once, all run.
+ * On 10g (open_cursors 50) each of these was ORA-01000. */
+static void check_cache_open_cursors(SQLHDBC dbc)
+{
+  const char *name = "statement cache leaves room for the application's cursors";
+  char m[400] = "", why[300] = "";
+  for (int i = 0; i < 24; i++) {
+    char q[64], err[128];
+    snprintf(q, sizeof q, "SELECT %d FROM dual", 7000 + i);
+    exec_do(dbc, q, err, sizeof err);
+  }
+  static const char *const NESTED = "SELECT rownum a, CURSOR(SELECT 1 FROM dual) c "
+                                    "FROM all_objects WHERE rownum <= 30";
+  int n = rows_of(dbc,
+                  "BEGIN OPEN :1 FOR 'SELECT rownum a, CURSOR(SELECT 1 FROM dual) c "
+                  "FROM all_objects WHERE rownum <= 30'; END;",
+                  1, why, sizeof why);
+  if (n != 30)
+    snprintf(m, sizeof m, "REF CURSOR with nested cursors: %d rows %s", n, why);
+  for (int i = 0; i < 24 && !m[0]; i++) { /* refill: the REF CURSOR emptied it */
+    char q[64], err[128];
+    snprintf(q, sizeof q, "SELECT %d FROM dual", 7100 + i);
+    exec_do(dbc, q, err, sizeof err);
+  }
+  if (!m[0] && (n = rows_of(dbc, NESTED, 0, why, sizeof why)) != 30)
+    snprintf(m, sizeof m, "query with nested cursors: %d rows %s", n, why);
+  SQLHSTMT held[30];
+  int nheld = 0;
+  for (; nheld < 30 && !m[0]; nheld++) {
+    char q[96];
+    snprintf(q, sizeof q, "SELECT rownum + %d FROM all_objects WHERE rownum <= 300", nheld);
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &held[nheld]);
+    if (!SQL_SUCCEEDED(SQLExecDirect(held[nheld], (SQLCHAR *)q, SQL_NTS))) {
+      diag_text(SQL_HANDLE_STMT, held[nheld], why, sizeof why);
+      snprintf(m, sizeof m, "open result set %d of 30: %s", nheld + 1, why);
+      nheld++;
+      break;
+    }
+  }
+  for (int i = 0; i < nheld; i++)
+    SQLFreeHandle(SQL_HANDLE_STMT, held[i]);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7269,8 +7340,9 @@ int main(void)
   check_numeric_targets(dbc);
   check_numeric_struct(dbc);
   check_datetime_targets(dbc);
+  check_char_overflow(dbc);
   check_refcursor_nested_cursor(dbc);
-  check_char_overflow(dbc); /* after it: 10g's open_cursors is 50 (#337) */
+  check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);
   check_proxy_auth(dbc, drv, host, port, svc);
