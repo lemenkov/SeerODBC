@@ -255,6 +255,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   c->conn = conn;
   c->dbms_ver[0] = '\0'; /* resolved again for this server */
   c->connected = 1;
+  c->session_dead = 0;
   free(c->info_dsn);
   free(c->info_user);
   free(c->info_server);

@@ -113,6 +113,7 @@ typedef struct {
   OdbcEnv *env;
   SeerConn *conn;
   int connected;
+  int session_dead; /* the server ended the session over a live socket (#340) */
   SQLUINTEGER autocommit;
   long login_timeout;        /* SQL_ATTR_LOGIN_TIMEOUT seconds, 0 = none; -1 unset (#216) */
   SQLUINTEGER txn_isolation; /* SQL_ATTR_TXN_ISOLATION, 0 = the server's default (#220) */

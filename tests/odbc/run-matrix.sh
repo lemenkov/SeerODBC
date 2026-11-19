@@ -22,6 +22,9 @@
 #   SEER_MATRIX_PASS      default password for every tier  (default pyo123)
 #   SEER_MATRIX_ONLY      same as --only
 #   SEER_MATRIX_SKIP      same as --skip
+#   SEER_TEST_DBA_USER/_PASS  a DBA login, passed to every tier: the ODBC check
+#                         of a killed session (#340) uses it to kill its own
+#                         session, and skips without it or where it fails
 #
 # Any field of one tier can be overridden with SEER_<TIER>_HOST, _PORT, _TARGET,
 # _USER or _PASS, where <TIER> is the tier name in upper case (11G, 18C, 21C,
