@@ -62,6 +62,16 @@ static const char *ora_sqlstate(SQLINTEGER code)
   switch (code) {
   case 1013: /* user requested cancel of current operation */
     return "HY008";
+  case 28:   /* your session has been killed */
+  case 1089: /* immediate shutdown in progress */
+  case 1092: /* ORACLE instance terminated, disconnection forced */
+  case 2396: /* exceeded maximum idle time */
+  case 3113: /* end-of-file on communication channel */
+  case 3114: /* not connected to ORACLE */
+  case 3135: /* connection lost contact */
+    return "08S01";
+  case 1012: /* not logged on */
+    return "08003";
   case 1:    /* unique constraint violated */
   case 1400: /* cannot insert NULL */
   case 1407: /* cannot update to NULL */
@@ -124,6 +134,20 @@ static OdbcDiagRec *diag_push(OdbcHeader *h, const char *state, SQLINTEGER nativ
     const char *mapped = ora_sqlstate(native);
     if (mapped != NULL)
       state = mapped;
+  }
+  /* A server error that says the session is gone - killed, the instance
+   * down, lost contact, not logged on - marks the connection dead, though its
+   * socket is still up: SQL_ATTR_CONNECTION_DEAD answers true from then on
+   * (#340). Every server error a handle reports passes through here. */
+  if (native > 0) {
+    const char *ms = ora_sqlstate(native);
+    if (ms != NULL && strncmp(ms, "08", 2) == 0) {
+      OdbcDbc *dbc = h->type == SQL_HANDLE_DBC    ? (OdbcDbc *)h
+                     : h->type == SQL_HANDLE_STMT ? ((OdbcStmt *)h)->dbc
+                                                  : NULL;
+      if (dbc != NULL)
+        dbc->session_dead = 1;
+    }
   }
   if (h->diag.count == h->diag.cap) {
     int cap = h->diag.cap ? h->diag.cap * 2 : 4;

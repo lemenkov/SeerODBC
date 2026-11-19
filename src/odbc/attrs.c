@@ -161,7 +161,7 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     return SQL_SUCCESS;
   case SQL_ATTR_CONNECTION_DEAD:
     *(SQLUINTEGER *)ValuePtr =
-        c->connected && !seer_conn_lost(c->conn) ? SQL_CD_FALSE : SQL_CD_TRUE;
+        c->connected && !c->session_dead && !seer_conn_lost(c->conn) ? SQL_CD_FALSE : SQL_CD_TRUE;
     return SQL_SUCCESS;
   case SQL_ATTR_CONNECTION_TIMEOUT:
     *(SQLUINTEGER *)ValuePtr = c->conn_timeout;

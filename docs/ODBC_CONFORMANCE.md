@@ -19,10 +19,10 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 | [x] | SQLSetEnvAttr / SQLGetEnvAttr | ODBC version |
 | [x] | SQLConnect / SQLDriverConnect | DSN from odbc.ini; HOST/PORT/SERVICE keys |
 | [x] | SQLDisconnect | |
-| [x] | SQLSetConnectAttr / SQLGetConnectAttr | autocommit |
+| [x] | SQLSetConnectAttr / SQLGetConnectAttr | autocommit; `SQL_ATTR_CONNECTION_DEAD` is true once the socket is gone, or once the server has ended the session over a live one (killed, instance down, lost contact, idle time; #340) |
 | [x] | SQLGetInfo | server-specific answer table (identifier quote, schemas-not-catalogs, txn, scroll options, …) |
 | [x] | SQLGetFunctions | incl. SQL_API_ODBC3_ALL_FUNCTIONS |
-| [x] | SQLGetDiagRec / SQLGetDiagField | ORA-code → SQLSTATE mapping; multi-record queue (array-DML row errors carry SQL_DIAG_ROW_NUMBER) |
+| [x] | SQLGetDiagRec / SQLGetDiagField | ORA-code → SQLSTATE mapping (a session the server ended: 08S01, and 08003 for ORA-01012); multi-record queue (array-DML row errors carry SQL_DIAG_ROW_NUMBER) |
 | [x] | SQLEndTran | commit / rollback |
 
 ## Statements & results

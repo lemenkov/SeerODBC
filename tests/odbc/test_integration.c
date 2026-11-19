@@ -6469,6 +6469,88 @@ static void check_connect_failover(const char *drv, const char *host, const char
 /* EXPIRE_TIME: a connection with dead-connection detection on logs in and runs
  * (the descriptor carries (EXPIRE_TIME=n), the socket TCP keepalive), and a
  * value that isn't a whole number of minutes is refused before connecting. */
+/* Open a connection of its own; NULL (and the reason in why) if it fails. */
+static SQLHDBC open_conn(SQLHENV e, const char *drv, const char *host, const char *port,
+                         const char *svc, const char *user, const char *pwd, char *why, size_t n)
+{
+  SQLHDBC d;
+  SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+  char cs[640];
+  snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;", drv, host,
+           port ? port : "1521", svc, user, pwd);
+  if (SQL_SUCCEEDED(
+          SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, NULL, 0, NULL, SQL_DRIVER_NOPROMPT)))
+    return d;
+  diag_text(SQL_HANDLE_DBC, d, why, n);
+  SQLFreeHandle(SQL_HANDLE_DBC, d);
+  return NULL;
+}
+
+/* A session the server ends over a live socket (#340): killed by a DBA, it
+ * answers 08S01 (ORA-00028), then 08003 (ORA-01012), and
+ * SQL_ATTR_CONNECTION_DEAD turns true. Needs a DBA login, from
+ * SEER_TEST_DBA_USER / SEER_TEST_DBA_PASS; only the check's own session is
+ * killed, found by its audit session id. */
+static void check_session_killed(const char *drv, const char *host, const char *port,
+                                 const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "a session the server killed reads dead (08S01, CONNECTION_DEAD)";
+  const char *du = getenv("SEER_TEST_DBA_USER"), *dp = getenv("SEER_TEST_DBA_PASS");
+  if (du == NULL || dp == NULL || !du[0]) {
+    skip(name, "set SEER_TEST_DBA_USER / SEER_TEST_DBA_PASS to kill a session");
+    return;
+  }
+  char m[400] = "", why[256] = "", err[256], aud[32] = "", q[160], sid[32] = "", ser[32] = "";
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC a = open_conn(e, drv, host, port, svc, user, pwd, why, sizeof why);
+  SQLHDBC b = a ? open_conn(e, drv, host, port, svc, du, dp, why, sizeof why) : NULL;
+  if (a == NULL || b == NULL) {
+    char r[300];
+    snprintf(r, sizeof r, "login failed: %s", why);
+    skip(name, r);
+  } else {
+    exec_scalar(a, "SELECT USERENV('SESSIONID') FROM dual", aud, sizeof aud, err, sizeof err);
+    snprintf(q, sizeof q, "SELECT sid FROM v$session WHERE audsid = %s", aud);
+    exec_scalar(b, q, sid, sizeof sid, err, sizeof err);
+    snprintf(q, sizeof q, "SELECT serial# FROM v$session WHERE audsid = %s", aud);
+    exec_scalar(b, q, ser, sizeof ser, err, sizeof err);
+    snprintf(q, sizeof q, "ALTER SYSTEM KILL SESSION '%s,%s'", sid, ser);
+    if (!aud[0] || !sid[0] || !SQL_SUCCEEDED(exec_do(b, q, err, sizeof err))) {
+      snprintf(m, sizeof m, "could not kill own session (audsid '%s' sid '%s'): %s", aud, sid, err);
+    } else {
+      static const char *const WANT[2] = {"08S01", "08003"};
+      for (int k = 0; k < 2 && !m[0]; k++) {
+        SQLHSTMT s;
+        SQLAllocHandle(SQL_HANDLE_STMT, a, &s);
+        char st[6] = "";
+        SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)"SELECT 1 FROM dual", SQL_NTS);
+        diag_state(SQL_HANDLE_STMT, s, st);
+        SQLFreeHandle(SQL_HANDLE_STMT, s);
+        SQLUINTEGER dead = 99;
+        SQLGetConnectAttr(a, SQL_ATTR_CONNECTION_DEAD, &dead, 0, NULL);
+        if (rc != SQL_ERROR || strcmp(st, WANT[k]) != 0 || dead != SQL_CD_TRUE)
+          snprintf(m, sizeof m, "call %d after the kill: rc=%d '%s' (want %s), CONNECTION_DEAD %u",
+                   k + 1, (int)rc, st, WANT[k], (unsigned)dead);
+      }
+    }
+    if (m[0] == '\0')
+      pass(name);
+    else
+      fail(name, m);
+  }
+  if (a != NULL) {
+    SQLDisconnect(a);
+    SQLFreeHandle(SQL_HANDLE_DBC, a);
+  }
+  if (b != NULL) {
+    SQLDisconnect(b);
+    SQLFreeHandle(SQL_HANDLE_DBC, b);
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -7348,6 +7430,7 @@ int main(void)
   check_proxy_auth(dbc, drv, host, port, svc);
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_expire_time(drv, host, port, svc, user, pwd);
+  check_session_killed(drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
