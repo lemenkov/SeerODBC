@@ -674,8 +674,9 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     if (seer_stmt_out_data(s->core, i + 1, &data, &dlen, &is_null, &is_binary) != SEER_OK)
       continue;
     const char *cstate = NULL;
-    SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, param_c_type(p),
-                                      param_buf(s, p), p->buflen, param_ind(s, p), NULL, &cstate);
+    SQLRETURN crc =
+        seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, param_c_type(p),
+                          param_buf(s, p), p->buflen, param_ind(s, p), NULL, &cstate, p->sql_type);
     /* A value that won't convert to the parameter's C type (#314). */
     if (crc == SQL_ERROR) {
       result = seer_odbc_diag(s, cstate ? cstate : "HY000", 0, seer_odbc_convert_text(cstate),

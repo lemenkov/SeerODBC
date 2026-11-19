@@ -18,7 +18,11 @@ static const char *cv_state; /* the SQLSTATE of the last CV() */
 
 #define CV(val, vlen, isnull, isbin, target, buf, buflen, ind)                                     \
   seer_odbc_convert((val), (vlen), (isnull), (isbin), (target), (buf), (buflen), (ind), NULL,      \
-                    &cv_state)
+                    &cv_state, 0)
+/* The same with the source's SQL type (#336). */
+#define CVS(val, src, target, buf, buflen, ind)                                                    \
+  seer_odbc_convert((val), strlen(val), 0, 0, (target), (buf), (buflen), (ind), NULL, &cv_state,   \
+                    (src))
 
 int main(void)
 {
@@ -57,6 +61,38 @@ int main(void)
     /* 23ai BOOLEAN text */
     assert(CV("TRUE", 4, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 1);
     assert(CV("false", 5, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 0);
+  }
+
+  /* --- a number / date cut short in a character buffer (#336) --- */
+  {
+    char c[32];
+    SQLWCHAR w[8];
+    SQL_DATE_STRUCT dt;
+    /* whole digits don't fit: 22003; only fraction digits lost: 01004 */
+    assert(CVS("12345", SQL_DECIMAL, SQL_C_CHAR, c, 4, &ind) == SQL_ERROR && ST("22003"));
+    assert(CVS("123.456", SQL_DECIMAL, SQL_C_CHAR, c, 3, &ind) == SQL_ERROR && ST("22003"));
+    assert(CVS("123.456", SQL_DECIMAL, SQL_C_CHAR, c, 4, &ind) == SQL_SUCCESS_WITH_INFO &&
+           ST("01004") && strcmp(c, "123") == 0);
+    assert(CVS("123.456", SQL_DECIMAL, SQL_C_CHAR, c, 5, &ind) == SQL_SUCCESS_WITH_INFO &&
+           strcmp(c, "123.") == 0);
+    assert(CVS("-12", SQL_INTEGER, SQL_C_CHAR, c, 3, &ind) == SQL_ERROR && ST("22003"));
+    assert(CVS("12345", SQL_DECIMAL, SQL_C_CHAR, c, 6, &ind) == SQL_SUCCESS);
+    assert(CVS("12345", SQL_DOUBLE, SQL_C_WCHAR, w, 8, &ind) == SQL_ERROR && ST("22003"));
+    assert(CVS("123", SQL_DOUBLE, SQL_C_WCHAR, w, 8, &ind) == SQL_SUCCESS);
+    /* a length probe is not an overflow */
+    assert(CVS("12345", SQL_DECIMAL, SQL_C_CHAR, NULL, 0, &ind) == SQL_SUCCESS && ind == 5);
+    /* a timestamp may lose its fraction, not its date or time */
+    assert(CVS("2026-11-19 13:14:15", SQL_TYPE_TIMESTAMP, SQL_C_CHAR, c, 11, &ind) == SQL_ERROR &&
+           ST("22003"));
+    assert(CVS("2026-11-19 13:14:15.5", SQL_TYPE_TIMESTAMP, SQL_C_CHAR, c, 20, &ind) ==
+               SQL_SUCCESS_WITH_INFO &&
+           ST("01004"));
+    /* text still truncates with 01004; an unknown source keeps the old rule */
+    assert(CVS("hello", SQL_VARCHAR, SQL_C_CHAR, c, 4, &ind) == SQL_SUCCESS_WITH_INFO &&
+           ST("01004"));
+    assert(CVS("12345", 0, SQL_C_CHAR, c, 4, &ind) == SQL_SUCCESS_WITH_INFO);
+    /* a number into a date struct: 07006 */
+    assert(CVS("5", SQL_DECIMAL, SQL_C_TYPE_DATE, &dt, 0, &ind) == SQL_ERROR && ST("07006"));
   }
 
   /* --- date / time targets: fields, truncation, fractions (#334) --- */
