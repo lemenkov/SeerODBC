@@ -29,45 +29,6 @@ static int parse_datetime(const char *s, int *Y, int *Mo, int *D, int *h, int *m
   return 0;
 }
 
-/* Fill an SQL_NUMERIC_STRUCT from a decimal string (sign, 128-bit LE mantissa,
- * scale = fractional digit count). */
-static void to_numeric(const char *s, SQL_NUMERIC_STRUCT *ns)
-{
-  memset(ns, 0, sizeof *ns);
-  ns->sign = 1;
-  const char *p = s;
-  if (*p == '-') {
-    ns->sign = 0;
-    p++;
-  } else if (*p == '+') {
-    p++;
-  }
-
-  unsigned char val[SQL_MAX_NUMERIC_LEN] = {0};
-  int scale = 0, prec = 0;
-  bool seen_dot = false;
-  for (; *p != '\0'; p++) {
-    if (*p == '.') {
-      seen_dot = true;
-      continue;
-    }
-    if (*p < '0' || *p > '9')
-      break;
-    int carry = *p - '0';
-    for (size_t i = 0; i < sizeof val; i++) {
-      int x = val[i] * 10 + carry;
-      val[i] = (unsigned char)(x & 0xFF);
-      carry = x >> 8;
-    }
-    prec++;
-    if (seen_dot)
-      scale++;
-  }
-  ns->precision = (SQLCHAR)(prec ? prec : 1);
-  ns->scale = (SQLSCHAR)scale;
-  memcpy(ns->val, val, sizeof val);
-}
-
 /* An interval value from its text (#314): Oracle renders INTERVAL DAY TO
  * SECOND as "[+-]D HH:MI:SS[.fffffffff]" and YEAR TO MONTH as "[+-]Y-MM"; a
  * plain integer is one field's count (an exact numeric source). */
@@ -647,6 +608,116 @@ static SQLRETURN put_real(const char *s, bool single, SQLPOINTER buf, SQLLEN *in
   return SQL_SUCCESS;
 }
 
+/* The largest SQL_NUMERIC_STRUCT mantissa, 2^128 - 1. */
+static const char NUMERIC_MAX[] = "340282366920938463463374607431768211455";
+
+/* Fill an SQL_NUMERIC_STRUCT from a value's text (#332): the grammar of
+ * parse_int_text, the natural scale kept, trailing zeros of a mantissa past
+ * 128 bits moved into a negative scale (1e39 = 1 scale -39, exact), fraction
+ * digits that still don't fit dropped (*trunc, 01S07). Returns 0, -1 (22018)
+ * or -2 (22003: integer digits past 128 bits, a scale past SQLSCHAR). */
+static int to_numeric(const char *s, SQL_NUMERIC_STRUCT *ns, bool *trunc)
+{
+  *trunc = false;
+  memset(ns, 0, sizeof *ns);
+  ns->sign = 1;
+  ns->precision = 1;
+  while (*s == ' ' || *s == '\t')
+    s++;
+  size_t n = strlen(s);
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+    n--;
+  if (word_is(s, n, "TRUE") || word_is(s, n, "FALSE")) {
+    ns->val[0] = word_is(s, n, "TRUE") ? 1 : 0;
+    return 0;
+  }
+  size_t i = 0;
+  bool neg = false;
+  if (i < n && (s[i] == '+' || s[i] == '-'))
+    neg = s[i++] == '-';
+  char dig[160]; /* significant digits, leading zeros dropped */
+  size_t nd = 0, seen = 0;
+  long scale = 0;    /* value = dig x 10^-scale */
+  bool lost = false; /* a nonzero digit past dig[] (never in practice) */
+  for (; i < n && s[i] >= '0' && s[i] <= '9'; i++, seen++) {
+    if (nd == 0 && s[i] == '0')
+      continue;
+    if (nd < sizeof dig)
+      dig[nd++] = s[i];
+    else if (s[i] != '0')
+      return -2; /* 160 significant integer digits: far past 128 bits */
+    else
+      scale--; /* a zero past the buffer: a power of ten */
+  }
+  if (i < n && s[i] == '.')
+    for (i++; i < n && s[i] >= '0' && s[i] <= '9'; i++, seen++) {
+      if (nd == 0 && s[i] == '0') {
+        scale++;
+        continue;
+      }
+      if (nd < sizeof dig) {
+        dig[nd++] = s[i];
+        scale++;
+      } else {
+        lost = lost || s[i] != '0';
+      }
+    }
+  if (seen == 0)
+    return -1;
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+    size_t j = i + 1;
+    bool eneg = false;
+    if (j < n && (s[j] == '+' || s[j] == '-'))
+      eneg = s[j++] == '-';
+    long ev = 0;
+    size_t ed = 0;
+    for (; j < n && s[j] >= '0' && s[j] <= '9'; j++, ed++)
+      if (ev < 100000)
+        ev = ev * 10 + (s[j] - '0');
+    if (ed == 0 || j != n)
+      return -1;
+    scale += eneg ? ev : -ev;
+  } else if (i != n) {
+    return -1;
+  }
+  if (nd == 0) /* zero */
+    return 0;
+  *trunc = lost;
+  /* Fit the mantissa into 128 bits and the scale into SQLSCHAR. */
+  for (;;) {
+    bool fits = nd < sizeof NUMERIC_MAX - 1 ||
+                (nd == sizeof NUMERIC_MAX - 1 && memcmp(dig, NUMERIC_MAX, nd) <= 0);
+    if (fits && scale <= 127)
+      break;
+    if (nd > 0 && dig[nd - 1] == '0') { /* exact: into the scale */
+      nd--;
+      scale--;
+    } else if (scale > 0) { /* a fraction digit: truncation */
+      nd--;
+      scale--;
+      *trunc = true;
+    } else {
+      return -2;
+    }
+    if (nd == 0) /* every digit truncated away: zero */
+      return 0;
+  }
+  if (scale < -128)
+    return -2;
+  for (size_t k = 0; k < nd; k++) {
+    unsigned carry = (unsigned)(dig[k] - '0');
+    for (size_t b = 0; b < SQL_MAX_NUMERIC_LEN; b++) {
+      unsigned x = ns->val[b] * 10u + carry;
+      ns->val[b] = (SQLCHAR)(x & 0xFF);
+      carry = x >> 8;
+    }
+  }
+  ns->sign = neg ? 0 : 1;
+  ns->precision = (SQLCHAR)nd;
+  ns->scale = (SQLSCHAR)scale;
+  return 0;
+}
+
 SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
                             SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
                             SQLLEN *offset, const char **sqlstate)
@@ -733,12 +804,28 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
     }
     }
 
-  case SQL_C_NUMERIC:
+  case SQL_C_NUMERIC: {
+    if (is_binary) {
+      *state = "07006";
+      return SQL_ERROR;
+    }
+    SQL_NUMERIC_STRUCT ns;
+    bool trunc;
+    int rc = to_numeric(s, &ns, &trunc);
+    if (rc != 0) {
+      *state = rc == -1 ? "22018" : "22003";
+      return SQL_ERROR;
+    }
     if (buf)
-      to_numeric(s, (SQL_NUMERIC_STRUCT *)buf);
+      memcpy(buf, &ns, sizeof ns);
     if (ind)
       *ind = (SQLLEN)sizeof(SQL_NUMERIC_STRUCT);
+    if (trunc) {
+      *state = "01S07";
+      return SQL_SUCCESS_WITH_INFO;
+    }
     return SQL_SUCCESS;
+  }
 
   /* ---- date / time ---- */
   case SQL_C_TYPE_TIMESTAMP:
