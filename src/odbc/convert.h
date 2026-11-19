@@ -27,7 +27,11 @@
  *   value converts to (SQL_C_GUID, a year-month into a day-time interval). */
 SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
                             SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
-                            SQLLEN *offset, const char **sqlstate);
+                            SQLLEN *offset, const char **sqlstate, SQLSMALLINT src_type);
+
+/* `src_type` (above) is the source's SQL type, 0 if unknown: a number or a
+ * date cut short in a character buffer is 22003, not 01004, and a number
+ * into a date / time struct is 07006 (#336). */
 
 /* The diagnostic text for a state seer_odbc_convert reported (NULL: 01004). */
 const char *seer_odbc_convert_text(const char *sqlstate);

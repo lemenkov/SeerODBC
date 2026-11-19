@@ -168,6 +168,14 @@ reported as success.
   - Non-numeric text is 22018.
   Before, the mantissa wrapped silently and text parsed as 0.
 - **Text that won't parse as the target** (a date, an interval) is 22018.
+- **A number or a date in a character buffer** (#336):
+  - a value too long for the buffer may lose only its fraction digits
+    (01004);
+  - if the part before the decimal point doesn't fit, it is 22003 rather than
+    a shorter number or date: 12345 in 4 bytes, or a DATE in 11;
+  - text and binary values still truncate with 01004;
+  - a length probe (no buffer) is unaffected;
+  - a number into a date or time struct is 07006.
 - **Date and time structs** (#334):
   - a DATE whose time isn't midnight, read into `SQL_C_TYPE_DATE`, gives
     01S07, since Oracle DATEs are described as `SQL_TYPE_TIMESTAMP`;

@@ -1124,7 +1124,7 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
         seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type, sizeof(SQLLEN), row);
     const char *state = NULL;
     SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, ct, buf, b->buflen,
-                                    ind, NULL, &state);
+                                    ind, NULL, &state, sql_type_of(seer_stmt_col_type(s->core, i)));
     /* Each column's own state: truncation, or a value that won't convert
      * (#314), which makes the row an error row. */
     if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
@@ -1354,9 +1354,9 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   TargetType = seer_odbc_col_c_type(s, col, TargetType); /* SQL_C_DEFAULT (#316) */
 
   const char *state = NULL;
-  SQLRETURN r =
-      seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, TargetType, TargetValuePtr,
-                        BufferLength, StrLen_or_IndPtr, &s->getdata_off, &state);
+  SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, TargetType,
+                                  TargetValuePtr, BufferLength, StrLen_or_IndPtr, &s->getdata_off,
+                                  &state, sql_type_of(seer_stmt_col_type(s->core, col)));
   if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
     return seer_odbc_diag(s, state ? state : "01004", 0, seer_odbc_convert_text(state), r);
   return r;

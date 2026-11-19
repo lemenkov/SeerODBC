@@ -831,9 +831,46 @@ static int to_numeric(const char *s, SQL_NUMERIC_STRUCT *ns, bool *trunc)
   return 0;
 }
 
+/* Whether SQL type `t` is a number / a date or time (#336). */
+static bool sql_numeric(SQLSMALLINT t)
+{
+  switch (t) {
+  case SQL_NUMERIC:
+  case SQL_DECIMAL:
+  case SQL_INTEGER:
+  case SQL_SMALLINT:
+  case SQL_BIGINT:
+  case SQL_TINYINT:
+  case SQL_FLOAT:
+  case SQL_REAL:
+  case SQL_DOUBLE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool sql_datetime(SQLSMALLINT t)
+{
+  return t == SQL_TYPE_TIMESTAMP || t == SQL_TYPE_DATE || t == SQL_TYPE_TIME ||
+         t == SQL_TIMESTAMP || t == SQL_DATE || t == SQL_TIME;
+}
+
+/* For a character target of `cap` characters (NUL excluded): a number or a
+ * date whose part before the decimal point doesn't fit is 22003 - only its
+ * fraction digits may be truncated (Appendix D, #336). */
+static bool whole_part_overflows(const char *s, size_t vallen, SQLSMALLINT src_type, size_t cap)
+{
+  if (!sql_numeric(src_type) && !sql_datetime(src_type))
+    return false;
+  const char *dot = memchr(s, '.', vallen);
+  size_t whole = dot != NULL ? (size_t)(dot - s) : vallen;
+  return whole > cap;
+}
+
 SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
                             SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
-                            SQLLEN *offset, const char **sqlstate)
+                            SQLLEN *offset, const char **sqlstate, SQLSMALLINT src_type)
 {
   const char *unused;
   const char **state = sqlstate != NULL ? sqlstate : &unused;
@@ -949,6 +986,10 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_TIME: {
     DateTime t;
     bool want_time = target == SQL_C_TYPE_TIME || target == SQL_C_TIME;
+    if (sql_numeric(src_type)) { /* no numeric -> datetime conversion (#336) */
+      *state = "07006";
+      return SQL_ERROR;
+    }
     if (is_binary || parse_dt(s, &t) != 0 || (want_time ? !t.has_time : !t.has_date)) {
       *state = "22018";
       return SQL_ERROR;
@@ -997,6 +1038,13 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
 
   /* ---- wide text ---- */
   case SQL_C_WCHAR: {
+    if (!is_binary && buf != NULL && buflen > 0 && (offset == NULL || *offset == 0) &&
+        whole_part_overflows(
+            s, vallen, src_type,
+            (size_t)buflen / sizeof(SQLWCHAR) ? (size_t)buflen / sizeof(SQLWCHAR) - 1 : 0)) {
+      *state = "22003";
+      return SQL_ERROR;
+    }
     char *u16 = NULL;
     size_t u16len = 0;
     if (seer_iconv("UTF-8", SEER_UTF16, (const char *)val, vallen, &u16, &u16len) != 0) {
@@ -1050,6 +1098,11 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   }
   case SQL_C_CHAR:
   case SQL_C_DEFAULT: {
+    if (!is_binary && buf != NULL && buflen > 0 && (offset == NULL || *offset == 0) &&
+        whole_part_overflows(s, vallen, src_type, (size_t)buflen - 1)) {
+      *state = "22003";
+      return SQL_ERROR;
+    }
     SQLRETURN r = copy_var((const unsigned char *)val, vallen, is_binary, buf, buflen, ind, offset);
     if (r == SQL_SUCCESS_WITH_INFO)
       *state = "01004";

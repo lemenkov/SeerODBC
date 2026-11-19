@@ -5985,6 +5985,51 @@ static void check_datetime_targets(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* A number or a date cut short in a character buffer (#336): its whole part
+ * not fitting is 22003, losing only fraction digits is 01004; a number into a
+ * date struct is 07006. Two-way: text still truncates with 01004. */
+static void check_char_overflow(SQLHDBC dbc)
+{
+  const char *name = "number / date into a short character buffer: 22003";
+  char m[300] = "";
+  struct {
+    const char *expr;
+    SQLSMALLINT ct;
+    SQLLEN len;
+    SQLRETURN rc;
+    const char *state;
+  } T[] = {
+      {"12345", SQL_C_CHAR, 4, SQL_ERROR, "22003"},
+      {"123.456", SQL_C_CHAR, 5, SQL_SUCCESS_WITH_INFO, "01004"},
+      {"TO_DATE('2026-11-19 13:14:15','YYYY-MM-DD HH24:MI:SS')", SQL_C_CHAR, 11, SQL_ERROR,
+       "22003"},
+      {"'hello'", SQL_C_CHAR, 4, SQL_SUCCESS_WITH_INFO, "01004"},
+      {"12345", SQL_C_WCHAR, 8, SQL_ERROR, "22003"},
+      {"5", SQL_C_TYPE_DATE, (SQLLEN)sizeof(SQL_DATE_STRUCT), SQL_ERROR, "07006"},
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    char sql[128], st[6] = "";
+    snprintf(sql, sizeof sql, "SELECT %s FROM dual", T[i].expr);
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    char buf[64];
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, T[i].ct, buf, T[i].len, &ind);
+    if (rc != SQL_SUCCESS)
+      diag_state(SQL_HANDLE_STMT, s, st);
+    if (rc != T[i].rc || strcmp(st, T[i].state) != 0)
+      snprintf(m, sizeof m, "%s as C type %d [%ld]: rc=%d '%s' (want rc=%d '%s')", T[i].expr,
+               (int)T[i].ct, (long)T[i].len, (int)rc, st, (int)T[i].rc, T[i].state);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7225,6 +7270,7 @@ int main(void)
   check_numeric_struct(dbc);
   check_datetime_targets(dbc);
   check_refcursor_nested_cursor(dbc);
+  check_char_overflow(dbc); /* after it: 10g's open_cursors is 50 (#337) */
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);
   check_proxy_auth(dbc, drv, host, port, svc);
