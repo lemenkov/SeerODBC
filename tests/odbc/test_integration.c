@@ -6551,6 +6551,48 @@ static void check_session_killed(const char *drv, const char *host, const char *
   SQLFreeHandle(SQL_HANDLE_ENV, e);
 }
 
+/* Switching SQL_ATTR_AUTOCOMMIT from OFF back to ON commits the open
+ * transaction (#342): a row inserted in manual mode is visible to another
+ * session right after the switch. Two-way: before it, it is not. */
+static void check_autocommit_switch(SQLHDBC dbc, const char *drv, const char *host,
+                                    const char *port, const char *svc, const char *user,
+                                    const char *pwd)
+{
+  const char *name = "autocommit back ON commits the open transaction";
+  char m[300] = "", why[256] = "", err[256], cnt[16] = "";
+  exec_do(dbc, "DROP TABLE seer_acsw", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_acsw (n NUMBER)", err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  SQLHDBC a = open_conn(e, drv, host, port, svc, user, pwd, why, sizeof why);
+  if (a == NULL) {
+    snprintf(m, sizeof m, "second connection: %s", why);
+  } else {
+    SQLSetConnectAttr(a, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_OFF, 0);
+    exec_do(a, "INSERT INTO seer_acsw VALUES (1)", err, sizeof err);
+    exec_scalar(dbc, "SELECT COUNT(*) FROM seer_acsw", cnt, sizeof cnt, err, sizeof err);
+    if (strcmp(cnt, "0") != 0)
+      snprintf(m, sizeof m, "before the switch another session sees %s rows, want 0", cnt);
+    SQLRETURN rc = SQLSetConnectAttr(a, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+    exec_scalar(dbc, "SELECT COUNT(*) FROM seer_acsw", cnt, sizeof cnt, err, sizeof err);
+    if (!m[0] && (!SQL_SUCCEEDED(rc) || strcmp(cnt, "1") != 0))
+      snprintf(m, sizeof m, "after the switch (rc=%d) another session sees %s rows, want 1",
+               (int)rc, cnt);
+    SQLDisconnect(a);
+    SQLFreeHandle(SQL_HANDLE_DBC, a);
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  exec_do(dbc, "DROP TABLE seer_acsw", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -7431,6 +7473,7 @@ int main(void)
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_expire_time(drv, host, port, svc, user, pwd);
   check_session_killed(drv, host, port, svc, user, pwd);
+  check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);
