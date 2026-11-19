@@ -55,45 +55,15 @@ static int ora_type_for_sql(SQLSMALLINT t)
   }
 }
 
-/* Element stride for column-wise array binding: the bound buffer length for
- * variable types, else the fixed C-type width. */
+/* Element stride for column-wise array binding: a fixed-length C type's own
+ * width (SQL_C_NUMERIC and the interval structs too, #314), whatever
+ * BufferLength says; a variable one's buffer length. */
 static size_t ctype_stride(SQLSMALLINT c_type, SQLLEN buflen)
 {
-  if (buflen > 0)
-    return (size_t)buflen;
-  switch (c_type) {
-  case SQL_C_SLONG:
-  case SQL_C_LONG:
-  case SQL_C_ULONG:
-    return sizeof(SQLINTEGER);
-  case SQL_C_SSHORT:
-  case SQL_C_SHORT:
-  case SQL_C_USHORT:
-    return sizeof(SQLSMALLINT);
-  case SQL_C_SBIGINT:
-  case SQL_C_UBIGINT:
-    return sizeof(SQLBIGINT);
-  case SQL_C_STINYINT:
-  case SQL_C_TINYINT:
-  case SQL_C_UTINYINT:
-  case SQL_C_BIT:
-    return 1;
-  case SQL_C_FLOAT:
-    return sizeof(SQLREAL);
-  case SQL_C_DOUBLE:
-    return sizeof(SQLDOUBLE);
-  case SQL_C_TYPE_TIMESTAMP:
-  case SQL_C_TIMESTAMP:
-    return sizeof(SQL_TIMESTAMP_STRUCT);
-  case SQL_C_TYPE_DATE:
-  case SQL_C_DATE:
-    return sizeof(SQL_DATE_STRUCT);
-  case SQL_C_TYPE_TIME:
-  case SQL_C_TIME:
-    return sizeof(SQL_TIME_STRUCT);
-  default:
-    return 1;
-  }
+  size_t fixed = seer_odbc_c_fixed_size(c_type);
+  if (fixed > 0)
+    return fixed;
+  return buflen > 0 ? (size_t)buflen : 1;
 }
 
 /* Bind one parameter value (the value at `valptr`, length hint `ind`) into core
@@ -601,8 +571,20 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     int is_null = 0, is_binary = 0;
     if (seer_stmt_out_data(s->core, i + 1, &data, &dlen, &is_null, &is_binary) != SEER_OK)
       continue;
+    const char *cstate = NULL;
     SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, p->c_type,
-                                      param_buf(s, p), p->buflen, param_ind(s, p), NULL);
+                                      param_buf(s, p), p->buflen, param_ind(s, p), NULL, &cstate);
+    /* A value that won't convert to the parameter's C type (#314). */
+    if (crc == SQL_ERROR) {
+      result = seer_odbc_diag(s, cstate ? cstate : "HY000", 0, seer_odbc_convert_text(cstate),
+                              SQL_ERROR);
+      continue;
+    }
+    if (crc == SQL_SUCCESS_WITH_INFO && cstate != NULL && strcmp(cstate, "01S07") == 0) {
+      result = seer_odbc_diag(s, cstate, 0, seer_odbc_convert_text(cstate),
+                              result == SQL_SUCCESS ? SQL_SUCCESS_WITH_INFO : result);
+      continue;
+    }
     /* Truncated either way - by the server to the declared ColumnSize (a
      * RETURNING value), or into the application's buffer - is 01004, with
      * the full length in the indicator where the server told us it. */

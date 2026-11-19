@@ -133,6 +133,34 @@ connected release (#305):
 - **8i** has no INTERVAL type, so there the escape stays as written and isn't
   advertised.
 
+## Fetching into C types
+
+Each SQL_C_* type ODBC defines either gets the value converted or gets an
+error. Before #314, a type the converter had no case for got the value's text,
+reported as success.
+
+- **The 13 `SQL_C_INTERVAL_*` structs** are filled from an INTERVAL value
+  (9i+), or from a plain count for a single-field type:
+  - the leading field takes in the larger ones, so `SQL_C_INTERVAL_HOUR` of
+    1 day 2 hours is 26;
+  - trailing parts the type has no field for, and fraction digits past the
+    default seconds precision of 6, are cut with 01S07;
+  - a year-month value into a day-time type, or the reverse, is 07006;
+  - a leading field past 32 bits is 22015.
+  The leading precision in the ARD isn't enforced.
+- **`SQL_C_GUID`** gets 07006, because Oracle has no GUID type.
+- **Text that won't parse as the target** (a date, an interval) is 22018.
+- **In a bound rowset**, a column that fails makes its row `SQL_ROW_ERROR`.
+  The other rows are delivered with `SQL_SUCCESS_WITH_INFO`. A rowset where
+  every row failed returns `SQL_ERROR`.
+- **Strides:** fixed-length C types, `SQL_C_NUMERIC` and the interval structs
+  included, are laid out at their own size in column-wise arrays, whatever
+  `BufferLength` says.
+- **`SQLGetData(SQL_ARD_TYPE)`** takes the type the column is bound with.
+
+INTERVAL columns are still described as `SQL_VARCHAR`, so `SQL_C_DEFAULT` for
+them is text.
+
 ## SQL-92 capabilities in SQLGetInfo
 
 The SQL-92 description masks say which statement forms each release accepts

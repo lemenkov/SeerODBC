@@ -5389,6 +5389,127 @@ static void diag_state(SQLSMALLINT type, SQLHANDLE h, char st[6])
   SQLGetDiagRec(type, h, 1, (SQLCHAR *)st, &nat, msg, sizeof msg, &len);
 }
 
+/* Values reach the C types ODBC defines, or get an error (#314): INTERVAL
+ * values fill the interval structs (9i+: 8.1.7 has no INTERVAL), a two-row
+ * column-wise rowset of fixed-length types bound with BufferLength 0 lands at
+ * each type's own size, SQL_C_GUID is 07006 (the row an error row), and
+ * SQL_ARD_TYPE takes the column's bound type. */
+static void check_c_type_targets(SQLHDBC dbc)
+{
+  const char *name = "C type targets: interval structs, fixed-size strides, 07006";
+  char m[400] = "", st[6] = "";
+  SQLHSTMT s;
+  SQLLEN ind = 0;
+  SQLRETURN rc;
+  SQL_INTERVAL_STRUCT iv;
+  if (g_release >= 9) {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    rc = SQLExecDirect(s,
+                       (SQLCHAR *)"SELECT INTERVAL '1 02:03:04.5' DAY TO SECOND, "
+                                  "INTERVAL '-3-4' YEAR TO MONTH FROM dual",
+                       SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(s);
+    memset(&iv, 0, sizeof iv);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLGetData(s, 1, SQL_C_INTERVAL_DAY_TO_SECOND, &iv, sizeof iv, &ind);
+    if (!SQL_SUCCEEDED(rc) || iv.interval_type != SQL_IS_DAY_TO_SECOND || iv.interval_sign ||
+        iv.intval.day_second.day != 1 || iv.intval.day_second.hour != 2 ||
+        iv.intval.day_second.minute != 3 || iv.intval.day_second.second != 4 ||
+        iv.intval.day_second.fraction != 500000)
+      snprintf(m, sizeof m, "DAY TO SECOND struct: rc %d type %d d %u h %u s %u f %u", rc,
+               (int)iv.interval_type, iv.intval.day_second.day, iv.intval.day_second.hour,
+               iv.intval.day_second.second, iv.intval.day_second.fraction);
+    memset(&iv, 0, sizeof iv);
+    if (m[0] == '\0') {
+      rc = SQLGetData(s, 2, SQL_C_INTERVAL_MONTH, &iv, sizeof iv, &ind);
+      if (!SQL_SUCCEEDED(rc) || iv.interval_type != SQL_IS_MONTH || !iv.interval_sign ||
+          iv.intval.year_month.month != 40)
+        snprintf(m, sizeof m, "YEAR TO MONTH as MONTH: rc %d sign %d months %u", rc,
+                 (int)iv.interval_sign, iv.intval.year_month.month);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+
+  /* Two rows column-wise, the fixed-length targets with BufferLength 0. */
+  if (m[0] == '\0') {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQL_NUMERIC_STRUCT num[2];
+    SQL_INTERVAL_STRUCT ivs[2];
+    SQLLEN nind[2], iind[2];
+    SQLULEN got = 0;
+    memset(num, 0, sizeof num);
+    memset(ivs, 0, sizeof ivs);
+    SQLSetStmtAttr(s, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)2, 0);
+    SQLSetStmtAttr(s, SQL_ATTR_ROWS_FETCHED_PTR, &got, 0);
+    SQLBindCol(s, 1, SQL_C_NUMERIC, num, 0, nind);
+    const char *q = g_release >= 9 ? "SELECT 11, INTERVAL '5' DAY FROM dual UNION ALL "
+                                     "SELECT 22, INTERVAL '6' DAY FROM dual"
+                                   : "SELECT 11, 5 FROM dual UNION ALL SELECT 22, 6 FROM dual";
+    SQLBindCol(s, 2, SQL_C_INTERVAL_DAY, ivs, 0, iind);
+    rc = SQLExecDirect(s, (SQLCHAR *)q, SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(s);
+    if (!SQL_SUCCEEDED(rc) || got != 2 || num[0].val[0] != 11 || num[1].val[0] != 22 ||
+        ivs[0].intval.day_second.day != 5 || ivs[1].intval.day_second.day != 6 ||
+        ivs[1].interval_type != SQL_IS_DAY)
+      snprintf(m, sizeof m, "rowset: rc %d got %lu numeric %u/%u days %u/%u", rc,
+               (unsigned long)got, num[0].val[0], num[1].val[0], ivs[0].intval.day_second.day,
+               ivs[1].intval.day_second.day);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+
+  /* SQL_C_GUID: no Oracle value converts to it. */
+  if (m[0] == '\0') {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLGUID g;
+    rc = SQLExecDirect(s, (SQLCHAR *)"SELECT 'abc' FROM dual", SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(s);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLGetData(s, 1, SQL_C_GUID, &g, sizeof g, &ind);
+    diag_state(SQL_HANDLE_STMT, s, st);
+    if (rc != SQL_ERROR || strcmp(st, "07006") != 0)
+      snprintf(m, sizeof m, "SQLGetData SQL_C_GUID: rc %d state '%s', want 07006", rc, st);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0') {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLGUID g;
+    SQLUSMALLINT rs = 0;
+    SQLSetStmtAttr(s, SQL_ATTR_ROW_STATUS_PTR, &rs, 0);
+    SQLBindCol(s, 1, SQL_C_GUID, &g, sizeof g, &ind);
+    rc = SQLExecDirect(s, (SQLCHAR *)"SELECT 'abc' FROM dual", SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(s);
+    diag_state(SQL_HANDLE_STMT, s, st);
+    if (rc != SQL_ERROR || strcmp(st, "07006") != 0 || rs != SQL_ROW_ERROR)
+      snprintf(m, sizeof m, "bound SQL_C_GUID: rc %d state '%s' row status %u", rc, st,
+               (unsigned)rs);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+
+  /* SQL_ARD_TYPE: the C type the column is bound with. */
+  if (m[0] == '\0') {
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLINTEGER bound = 0, v = 0;
+    SQLLEN bind_ind = 0;
+    SQLBindCol(s, 1, SQL_C_SLONG, &bound, 0, &bind_ind);
+    rc = SQLExecDirect(s, (SQLCHAR *)"SELECT 1234 FROM dual", SQL_NTS);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(s);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLGetData(s, 1, SQL_ARD_TYPE, &v, sizeof v, &ind);
+    if (!SQL_SUCCEEDED(rc) || v != 1234 || ind != (SQLLEN)sizeof v)
+      snprintf(m, sizeof m, "SQL_ARD_TYPE: rc %d value %d ind %ld", rc, (int)v, (long)ind);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -6621,6 +6742,7 @@ int main(void)
   check_annotations(dbc);
   check_implicit_results(dbc);
   check_mult_result_sets(dbc);
+  check_c_type_targets(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);
