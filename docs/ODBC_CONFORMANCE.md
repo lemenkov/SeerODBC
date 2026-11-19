@@ -195,6 +195,10 @@ bind had no case for had its buffer sent as text, reported as success.
   - past a 9-digit leading field is 22015.
 - **An unknown `ValueType`** is HY003 at `SQLBindParameter`. If a descriptor
   field sets one anyway, the execute fails with 07006.
+- **Data-at-execution of a fixed-size C type** takes the type's size and
+  ignores `StrLen_or_Ind`, as ODBC says (#323). A second `SQLPutData` piece
+  is HY019. Before, the length was honoured and the bind read past the
+  buffer.
 
 ## SQL-92 capabilities in SQLGetInfo
 

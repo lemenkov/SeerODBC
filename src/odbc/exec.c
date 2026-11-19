@@ -415,7 +415,11 @@ static SQLRETURN apply_params(OdbcStmt *s)
     if (p->dae) { /* value streamed in via SQLPutData */
       if (p->dae_null)
         seer_stmt_bind_null_typed(s->core, param, ora_type_for_sql(p->sql_type));
-      else {
+      else if (p->dae_len < seer_odbc_c_fixed_size(param_c_type(p))) {
+        /* No SQLPutData for a fixed-size value: nothing to read (#323). */
+        return seer_odbc_diag(s, "HY000", 0, "No data was put for a data-at-execution parameter",
+                              SQL_ERROR);
+      } else {
         SeerStatus st =
             bind_one_value(s->core, param, param_c_type(p), p->sql_type,
                            p->dae_buf ? p->dae_buf : "", (SQLLEN)p->dae_len, no_timestamp(s));
@@ -992,6 +996,19 @@ SQLRETURN SQL_API SQLPutData(SQLHSTMT StatementHandle, SQLPOINTER DataPtr, SQLLE
     return SQL_SUCCESS;
   }
   size_t n;
+  size_t fixed = seer_odbc_c_fixed_size(param_c_type(p));
+  if (fixed != 0) {
+    /* Fixed-length data: StrLen_or_Ind is ignored, the C type says the size,
+     * and the value comes in one piece (#323). */
+    if (p->dae_len != 0)
+      return seer_odbc_diag(s, "HY019", 0, "Non-character and non-binary data sent in pieces",
+                            SQL_ERROR);
+    if (DataPtr == NULL)
+      return seer_odbc_diag(s, "HY009", 0, "Invalid use of null pointer", SQL_ERROR);
+    if (dae_append(p, DataPtr, fixed) != 0)
+      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    return SQL_SUCCESS;
+  }
   if (StrLen_or_Ind == SQL_NTS)
     n = DataPtr ? strlen((const char *)DataPtr) : 0;
   else if (StrLen_or_Ind < 0)

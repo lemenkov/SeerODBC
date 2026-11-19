@@ -5681,10 +5681,11 @@ static SQLRETURN param_text(SQLHDBC dbc, const char *sql, SQLSMALLINT ct, SQLSMA
  * integers, SQL_C_NUMERIC (exact, NLS-proof), GUID text, and every interval C
  * type with its leading field normalised and the fraction in microseconds.
  * Two-way: a C type the driver has no conversion for is HY003, not bytes sent
- * as text. */
+ * as text. Data-at-execution of a fixed-size type ignores StrLen_or_Ind and
+ * takes one piece (#323). */
 static void check_param_c_types(SQLHDBC dbc)
 {
-  const char *name = "parameter C types: unsigned, NUMERIC, GUID, intervals";
+  const char *name = "parameter C types: unsigned, NUMERIC, GUID, intervals, DAE";
   char m[400] = "", err[256], out[64];
   SQLUSMALLINT us = 65000;
   unsigned char ut = 200;
@@ -5741,6 +5742,41 @@ static void check_param_c_types(SQLHDBC dbc)
                                     sizeof out, err, sizeof err)) ||
           strcmp(out, I[i].want) != 0)
         snprintf(m, sizeof m, "interval %d: '%s' (want %s) %s", (int)I[i].ct, out, I[i].want, err);
+  }
+
+  /* Data-at-execution, SQL_C_SLONG, put with StrLen_or_Ind 0: still 42; a
+   * second piece is HY019. */
+  for (int twice = 0; twice < 2 && !m[0]; twice++) {
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLINTEGER v = 42;
+    SQLLEN ind = SQL_DATA_AT_EXEC, oi = 0;
+    SQLPOINTER tok;
+    char st[6] = "";
+    SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, (SQLPOINTER)1, 0, &ind);
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)Q, SQL_NTS);
+    if (rc == SQL_NEED_DATA && (rc = SQLParamData(s, &tok)) == SQL_NEED_DATA) {
+      rc = SQLPutData(s, &v, 0);
+      if (twice) { /* the second piece is refused; the error ends the sequence */
+        rc = SQLPutData(s, &v, 0);
+        diag_state(SQL_HANDLE_STMT, s, st);
+        if (rc != SQL_ERROR || strcmp(st, "HY019") != 0)
+          snprintf(m, sizeof m, "second SQLPutData piece: rc=%d '%s', want HY019", (int)rc, st);
+        SQLCancel(s);
+        SQLFreeHandle(SQL_HANDLE_STMT, s);
+        continue;
+      }
+      if (SQL_SUCCEEDED(rc))
+        rc = SQLParamData(s, &tok);
+    }
+    out[0] = '\0';
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, SQL_C_CHAR, out, sizeof out, &oi);
+    if (!m[0] && (!SQL_SUCCEEDED(rc) || strcmp(out, "42") != 0)) {
+      diag_text(SQL_HANDLE_STMT, s, err, sizeof err);
+      snprintf(m, sizeof m, "DAE SLONG put with length 0: '%s' %s", out, err);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
   }
 
   /* Two-way: an unknown C type is refused at bind time. */
