@@ -178,6 +178,41 @@ int main(void)
            ST("01004"));
   }
 
+  /* --- SQL_C_DEFAULT is the SQL type's ODBC default C type (#316) --- */
+  {
+    static const struct {
+      SQLSMALLINT sql, c;
+    } D[] = {
+        {SQL_CHAR, SQL_C_CHAR},
+        {SQL_VARCHAR, SQL_C_CHAR},
+        {SQL_LONGVARCHAR, SQL_C_CHAR},
+        {SQL_DECIMAL, SQL_C_CHAR},
+        {SQL_NUMERIC, SQL_C_CHAR},
+        {SQL_WVARCHAR, SQL_C_WCHAR},
+        {SQL_BIT, SQL_C_BIT},
+        {SQL_TINYINT, SQL_C_STINYINT},
+        {SQL_SMALLINT, SQL_C_SSHORT},
+        {SQL_INTEGER, SQL_C_SLONG},
+        {SQL_BIGINT, SQL_C_SBIGINT},
+        {SQL_REAL, SQL_C_FLOAT},
+        {SQL_FLOAT, SQL_C_DOUBLE},
+        {SQL_DOUBLE, SQL_C_DOUBLE},
+        {SQL_VARBINARY, SQL_C_BINARY},
+        {SQL_LONGVARBINARY, SQL_C_BINARY},
+        {SQL_TYPE_DATE, SQL_C_TYPE_DATE},
+        {SQL_TYPE_TIME, SQL_C_TYPE_TIME},
+        {SQL_TYPE_TIMESTAMP, SQL_C_TYPE_TIMESTAMP},
+        {SQL_TIMESTAMP, SQL_C_TIMESTAMP},
+        {SQL_GUID, SQL_C_GUID},
+        {SQL_INTERVAL_YEAR, SQL_C_INTERVAL_YEAR},
+        {SQL_INTERVAL_DAY_TO_SECOND, SQL_C_INTERVAL_DAY_TO_SECOND},
+        {SQL_INTERVAL_MINUTE_TO_SECOND, SQL_C_INTERVAL_MINUTE_TO_SECOND},
+        {-9998, SQL_C_CHAR}, /* a driver-specific type (SQL_SEER_CLOB) */
+    };
+    for (size_t i = 0; i < sizeof D / sizeof D[0]; i++)
+      assert(seer_odbc_default_c_type(D[i].sql) == D[i].c);
+  }
+
   /* --- fixed-length C types have their own size (array strides) --- */
   {
     assert(seer_odbc_c_fixed_size(SQL_C_NUMERIC) == sizeof(SQL_NUMERIC_STRUCT));

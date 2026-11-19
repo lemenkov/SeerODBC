@@ -32,6 +32,11 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
 /* The diagnostic text for a state seer_odbc_convert reported (NULL: 01004). */
 const char *seer_odbc_convert_text(const char *sqlstate);
 
+/* What SQL_C_DEFAULT means for a value of SQL type `sql_type` (#316): the
+ * ODBC default C type (Appendix D), SQL_C_CHAR for character, decimal and
+ * driver-specific types. */
+SQLSMALLINT seer_odbc_default_c_type(SQLSMALLINT sql_type);
+
 /* The size of a fixed-length C type's value (SQL_C_NUMERIC's struct, the
  * interval structs, ...), 0 for the variable-length ones (#314). */
 size_t seer_odbc_c_fixed_size(SQLSMALLINT t);

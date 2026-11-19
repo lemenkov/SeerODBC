@@ -290,6 +290,66 @@ const char *seer_odbc_convert_text(const char *sqlstate)
   return "String data, right truncated";
 }
 
+SQLSMALLINT seer_odbc_default_c_type(SQLSMALLINT sql_type)
+{
+  switch (sql_type) {
+  case SQL_WCHAR:
+  case SQL_WVARCHAR:
+  case SQL_WLONGVARCHAR:
+    return SQL_C_WCHAR;
+  case SQL_BIT:
+    return SQL_C_BIT;
+  case SQL_TINYINT:
+    return SQL_C_STINYINT;
+  case SQL_SMALLINT:
+    return SQL_C_SSHORT;
+  case SQL_INTEGER:
+    return SQL_C_SLONG;
+  case SQL_BIGINT:
+    return SQL_C_SBIGINT;
+  case SQL_REAL:
+    return SQL_C_FLOAT;
+  case SQL_FLOAT:
+  case SQL_DOUBLE:
+    return SQL_C_DOUBLE;
+  case SQL_BINARY:
+  case SQL_VARBINARY:
+  case SQL_LONGVARBINARY:
+    return SQL_C_BINARY;
+  case SQL_TYPE_DATE:
+    return SQL_C_TYPE_DATE;
+  case SQL_TYPE_TIME:
+    return SQL_C_TYPE_TIME;
+  case SQL_TYPE_TIMESTAMP:
+    return SQL_C_TYPE_TIMESTAMP;
+  case SQL_DATE: /* the ODBC 2 names */
+    return SQL_C_DATE;
+  case SQL_TIME:
+    return SQL_C_TIME;
+  case SQL_TIMESTAMP:
+    return SQL_C_TIMESTAMP;
+  case SQL_GUID:
+    return SQL_C_GUID;
+  case SQL_INTERVAL_YEAR:
+  case SQL_INTERVAL_MONTH:
+  case SQL_INTERVAL_DAY:
+  case SQL_INTERVAL_HOUR:
+  case SQL_INTERVAL_MINUTE:
+  case SQL_INTERVAL_SECOND:
+  case SQL_INTERVAL_YEAR_TO_MONTH:
+  case SQL_INTERVAL_DAY_TO_HOUR:
+  case SQL_INTERVAL_DAY_TO_MINUTE:
+  case SQL_INTERVAL_DAY_TO_SECOND:
+  case SQL_INTERVAL_HOUR_TO_MINUTE:
+  case SQL_INTERVAL_HOUR_TO_SECOND:
+  case SQL_INTERVAL_MINUTE_TO_SECOND:
+    /* SQL_INTERVAL_x is 100 + SQL_CODE_x, as is its C type. */
+    return sql_type;
+  default: /* character, DECIMAL / NUMERIC, and the driver's own types */
+    return SQL_C_CHAR;
+  }
+}
+
 size_t seer_odbc_c_fixed_size(SQLSMALLINT t)
 {
   switch (t) {

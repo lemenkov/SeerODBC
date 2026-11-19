@@ -290,6 +290,9 @@ static inline void *seer_odbc_bound_at(void *base, const SQLLEN *offset, SQLULEN
 int seer_odbc_ensure_binds(OdbcStmt *s, int n);
 /* Grow a set of bindings (an ARD's or an explicit descriptor's) to n records. */
 int seer_odbc_bindset_ensure(OdbcBindSet *b, int n);
+/* A result column's C type `t`, SQL_C_DEFAULT taken as the default C type of
+ * the SQL type the column is described as (#316). */
+SQLSMALLINT seer_odbc_col_c_type(OdbcStmt *s, int col, SQLSMALLINT t);
 /* The connected server's major release: 9 for 9i, which sends no version at
  * login; 0 when not connected. */
 int seer_odbc_server_major(OdbcDbc *c);
