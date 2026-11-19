@@ -59,6 +59,52 @@ int main(void)
     assert(CV("false", 5, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 0);
   }
 
+  /* --- SQL_C_NUMERIC: exact, past 128 bits, text (#332) --- */
+  {
+    SQL_NUMERIC_STRUCT n;
+    char t[300];
+    assert(CV("-123.45", 7, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS);
+    assert(n.sign == 0 && n.scale == 2 && n.precision == 5);
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "-123.45") == 0);
+    /* 1e39: past 2^128 as written; exact as mantissa 1, scale -39 */
+    assert(CV("1e39", 4, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS);
+    assert(n.sign == 1 && n.scale == -39 && n.precision == 1 && n.val[0] == 1);
+    assert(CV("1000000000000000000000000000000000000000", 40, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) ==
+               SQL_SUCCESS &&
+           n.scale == -1);
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "1000000000000000000000000000000000000000") == 0);
+    /* 2^128 - 1 fits; 40 significant integer digits don't */
+    assert(CV("340282366920938463463374607431768211455", 39, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) ==
+           SQL_SUCCESS);
+    assert(n.scale == 0 && n.precision == 39 && n.val[15] == 0xFF);
+    assert(CV("1234567890123456789012345678901234567891", 40, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) ==
+               SQL_ERROR &&
+           ST("22003"));
+    /* too many fraction digits: the tail is dropped with 01S07 */
+    assert(CV("1.2345678901234567890123456789012345678901", 42, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) ==
+               SQL_SUCCESS_WITH_INFO &&
+           ST("01S07"));
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "1.23456789012345678901234567890123456789") == 0);
+    assert(CV("'1.5e3'", 0, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_ERROR && ST("22018"));
+    assert(CV("1.5e3", 5, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS);
+    seer_odbc_numeric_to_text(&n, t, sizeof t);
+    assert(strcmp(t, "1500") == 0);
+    assert(CV("abc", 3, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_ERROR && ST("22018"));
+    assert(CV("1e-20", 5, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS && n.scale == 20 &&
+           n.val[0] == 1);
+    assert(CV("1e-200", 6, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS_WITH_INFO &&
+           ST("01S07") && n.val[0] == 0); /* below SQLSCHAR scale: truncates to zero */
+    assert(CV("1e200", 5, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_ERROR && ST("22003"));
+    assert(CV("0.000", 5, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS && n.val[0] == 0 &&
+           n.sign == 1);
+    assert(CV("TRUE", 4, 0, 0, SQL_C_NUMERIC, &n, 0, &ind) == SQL_SUCCESS && n.val[0] == 1);
+    unsigned char raw[1] = {1};
+    assert(CV(raw, 1, 0, 1, SQL_C_NUMERIC, &n, 0, &ind) == SQL_ERROR && ST("07006"));
+  }
+
   /* --- integer ranges, truncation, non-numeric text (#329) --- */
   {
     SQLSMALLINT sh = 7;

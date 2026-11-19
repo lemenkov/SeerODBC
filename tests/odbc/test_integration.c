@@ -5865,6 +5865,77 @@ static void check_numeric_targets(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* An SQL_C_NUMERIC struct's 128-bit little-endian mantissa as decimal. */
+static void numeric_mantissa(const SQL_NUMERIC_STRUCT *n, char *out)
+{
+  unsigned char v[SQL_MAX_NUMERIC_LEN];
+  memcpy(v, n->val, sizeof v);
+  char rev[48];
+  size_t k = 0;
+  for (;;) {
+    unsigned rem = 0, nz = 0;
+    for (int i = SQL_MAX_NUMERIC_LEN - 1; i >= 0; i--) {
+      unsigned cur = (rem << 8) | v[i];
+      v[i] = (unsigned char)(cur / 10);
+      rem = cur % 10;
+      nz |= v[i];
+    }
+    rev[k++] = (char)('0' + rem);
+    if (!nz)
+      break;
+  }
+  for (size_t i = 0; i < k; i++)
+    out[i] = rev[k - 1 - i];
+  out[k] = '\0';
+}
+
+/* SQL_C_NUMERIC fetch (#332): a 40-digit NUMBER is past a 128-bit mantissa
+ * as written and comes back exact, its trailing zero moved into the scale
+ * (it used to wrap); non-numeric text is 22018. Two-way: an ordinary value
+ * keeps its natural scale. */
+static void check_numeric_struct(SQLHDBC dbc)
+{
+  const char *name = "SQL_C_NUMERIC fetch: exact past 128 bits, text refused";
+  char m[300] = "";
+  struct {
+    const char *expr;
+    SQLRETURN rc;
+    const char *state;
+    int sign, scale;
+    const char *mant;
+  } T[] = {
+      {"-123.45", SQL_SUCCESS, "", 0, 2, "12345"},
+      {"1234567890123456789012345678901234567890", SQL_SUCCESS, "", 1, -1,
+       "123456789012345678901234567890123456789"},
+      {"'abc'", SQL_ERROR, "22018", 0, 0, ""},
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    char sql[96], st[6] = "", mant[48] = "";
+    snprintf(sql, sizeof sql, "SELECT %s FROM dual", T[i].expr);
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQL_NUMERIC_STRUCT n;
+    memset(&n, 0, sizeof n);
+    SQLLEN ind = 0;
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+    if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, SQL_C_NUMERIC, &n, sizeof n, &ind);
+    if (rc != SQL_SUCCESS)
+      diag_state(SQL_HANDLE_STMT, s, st);
+    numeric_mantissa(&n, mant);
+    if (rc != T[i].rc || strcmp(st, T[i].state) != 0 ||
+        (SQL_SUCCEEDED(rc) &&
+         (n.sign != T[i].sign || n.scale != T[i].scale || strcmp(mant, T[i].mant) != 0)))
+      snprintf(m, sizeof m, "%s: rc=%d '%s' sign %d scale %d mantissa %s", T[i].expr, (int)rc, st,
+               n.sign, n.scale, mant);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7102,6 +7173,7 @@ int main(void)
   check_timestamp_param_date(dbc);
   check_param_c_types(dbc);
   check_numeric_targets(dbc);
+  check_numeric_struct(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);

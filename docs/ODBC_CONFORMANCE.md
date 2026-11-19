@@ -158,6 +158,15 @@ reported as success.
   - binary data into a numeric type is 07006.
   Before, the value was cast without a word: 70000 into a `SQLSMALLINT` was
   4464, `'abc'` was 0, and a BOOLEAN TRUE read as 0.
+- **`SQL_C_NUMERIC`** keeps a value's natural scale, so 123.45 is mantissa
+  12345 at scale 2 (#332).
+  - A NUMBER past the 128-bit mantissa (40 digits) moves its trailing zeros
+    into a negative scale and stays exact.
+  - Fraction digits that still don't fit are dropped with 01S07.
+  - Significant integer digits past 128 bits are 22003, and so is a scale
+    outside -128..127.
+  - Non-numeric text is 22018.
+  Before, the mantissa wrapped silently and text parsed as 0.
 - **Text that won't parse as the target** (a date, an interval) is 22018.
 - **In a bound rowset**, a column that fails makes its row `SQL_ROW_ERROR`.
   The other rows are delivered with `SQL_SUCCESS_WITH_INFO`. A rowset where
