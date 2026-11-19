@@ -1047,41 +1047,12 @@ SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
  * variable types, else the fixed C-type width. */
 static size_t c_elem_stride(SQLSMALLINT t, SQLLEN buflen)
 {
-  if (buflen > 0)
-    return (size_t)buflen;
-  switch (t) {
-  case SQL_C_SLONG:
-  case SQL_C_LONG:
-  case SQL_C_ULONG:
-    return sizeof(SQLINTEGER);
-  case SQL_C_SSHORT:
-  case SQL_C_SHORT:
-  case SQL_C_USHORT:
-    return sizeof(SQLSMALLINT);
-  case SQL_C_SBIGINT:
-  case SQL_C_UBIGINT:
-    return sizeof(SQLBIGINT);
-  case SQL_C_STINYINT:
-  case SQL_C_TINYINT:
-  case SQL_C_UTINYINT:
-  case SQL_C_BIT:
-    return 1;
-  case SQL_C_FLOAT:
-    return sizeof(SQLREAL);
-  case SQL_C_DOUBLE:
-    return sizeof(SQLDOUBLE);
-  case SQL_C_TYPE_TIMESTAMP:
-  case SQL_C_TIMESTAMP:
-    return sizeof(SQL_TIMESTAMP_STRUCT);
-  case SQL_C_TYPE_DATE:
-  case SQL_C_DATE:
-    return sizeof(SQL_DATE_STRUCT);
-  case SQL_C_TYPE_TIME:
-  case SQL_C_TIME:
-    return sizeof(SQL_TIME_STRUCT);
-  default:
-    return sizeof(SQLLEN);
-  }
+  /* A fixed-length type is its own size, whatever BufferLength says (ODBC
+   * ignores it for them): SQL_C_NUMERIC and the interval structs too (#314). */
+  size_t fixed = seer_odbc_c_fixed_size(t);
+  if (fixed > 0)
+    return fixed;
+  return buflen > 0 ? (size_t)buflen : sizeof(SQLLEN);
 }
 
 /* SQL_ATTR_MAX_LENGTH (#248): a character or binary value as at most that
@@ -1143,9 +1114,16 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
                                    c_elem_stride(b->target_type, b->buflen), row);
     SQLLEN *ind =
         seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type, sizeof(SQLLEN), row);
+    const char *state = NULL;
     SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, b->target_type, buf,
-                                    b->buflen, ind, NULL);
-    if (r == SQL_SUCCESS_WITH_INFO)
+                                    b->buflen, ind, NULL, &state);
+    /* Each column's own state: truncation, or a value that won't convert
+     * (#314), which makes the row an error row. */
+    if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
+      seer_odbc_diag(s, state ? state : "01004", 0, seer_odbc_convert_text(state), r);
+    if (r == SQL_ERROR)
+      ret = SQL_ERROR;
+    else if (r == SQL_SUCCESS_WITH_INFO && ret == SQL_SUCCESS)
       ret = SQL_SUCCESS_WITH_INFO;
   }
   return ret;
@@ -1157,7 +1135,7 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
 static SQLRETURN fetch_rowset(OdbcStmt *s, long start)
 {
   SQLULEN R = s->row_array_size ? s->row_array_size : 1;
-  SQLULEN got = 0;
+  SQLULEN got = 0, errs = 0;
   SQLRETURN ret = SQL_SUCCESS;
 
   for (SQLULEN row = 0; row < R; row++) {
@@ -1172,10 +1150,12 @@ static SQLRETURN fetch_rowset(OdbcStmt *s, long start)
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, seer_strerror(st), SQL_ERROR);
 
     SQLRETURN r = deliver_row(s, row);
-    if (r == SQL_SUCCESS_WITH_INFO)
+    if (r == SQL_ERROR)
+      errs++;
+    else if (r == SQL_SUCCESS_WITH_INFO)
       ret = SQL_SUCCESS_WITH_INFO;
     if (s->row_status)
-      s->row_status[row] = SQL_ROW_SUCCESS;
+      s->row_status[row] = r == SQL_ERROR ? SQL_ROW_ERROR : SQL_ROW_SUCCESS;
     got++;
   }
 
@@ -1188,8 +1168,10 @@ static SQLRETURN fetch_rowset(OdbcStmt *s, long start)
 
   if (got == 0)
     return SQL_NO_DATA;
-  if (ret == SQL_SUCCESS_WITH_INFO)
-    seer_odbc_diag(s, "01004", 0, "Data truncated", SQL_SUCCESS_WITH_INFO);
+  /* Each row's diagnostics are already queued. An error row leaves the
+   * others delivered (SQL_SUCCESS_WITH_INFO), unless every row is one. */
+  if (errs > 0)
+    return errs == got ? SQL_ERROR : SQL_SUCCESS_WITH_INFO;
   return ret;
 }
 
@@ -1356,12 +1338,18 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   if (!is_null && s->getdata_off > 0 && (size_t)s->getdata_off >= vlen)
     return SQL_NO_DATA;
 
-  SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, TargetType,
-                                  TargetValuePtr, BufferLength, StrLen_or_IndPtr, &s->getdata_off);
-  if (r == SQL_SUCCESS_WITH_INFO)
-    return seer_odbc_diag(s, "01004", 0, "Data truncated", SQL_SUCCESS_WITH_INFO);
-  if (r == SQL_ERROR)
-    return seer_odbc_diag(s, "22002", 0, "Indicator required for NULL", SQL_ERROR);
+  /* SQL_ARD_TYPE: the type the column's ARD record names (#314). */
+  if (TargetType == SQL_ARD_TYPE)
+    TargetType = col < s->ab->num_binds && s->ab->binds[col].target_type != 0
+                     ? s->ab->binds[col].target_type
+                     : SQL_C_DEFAULT;
+
+  const char *state = NULL;
+  SQLRETURN r =
+      seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, TargetType, TargetValuePtr,
+                        BufferLength, StrLen_or_IndPtr, &s->getdata_off, &state);
+  if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
+    return seer_odbc_diag(s, state ? state : "01004", 0, seer_odbc_convert_text(state), r);
   return r;
 }
 

@@ -10,8 +10,15 @@
 #include <stdio.h>
 #include <string.h>
 
+static const char *cv_state; /* the SQLSTATE of the last CV() */
+#define ST(want) (cv_state != NULL && strcmp(cv_state, (want)) == 0)
+
+/* An interval conversion of NUL-terminated `txt`. */
+#define IV(txt, target, out) CV((txt), strlen(txt), 0, 0, (target), (out), 0, &ind)
+
 #define CV(val, vlen, isnull, isbin, target, buf, buflen, ind)                                     \
-  seer_odbc_convert((val), (vlen), (isnull), (isbin), (target), (buf), (buflen), (ind), NULL)
+  seer_odbc_convert((val), (vlen), (isnull), (isbin), (target), (buf), (buflen), (ind), NULL,      \
+                    &cv_state)
 
 int main(void)
 {
@@ -100,7 +107,85 @@ int main(void)
     SQLINTEGER v = 1;
     assert(CV(NULL, 0, 1, 0, SQL_C_SLONG, &v, 0, &ind) == SQL_SUCCESS);
     assert(ind == SQL_NULL_DATA);
-    assert(CV(NULL, 0, 1, 0, SQL_C_SLONG, &v, 0, NULL) == SQL_ERROR); /* 22002 */
+    assert(CV(NULL, 0, 1, 0, SQL_C_SLONG, &v, 0, NULL) == SQL_ERROR && ST("22002"));
+  }
+
+  /* --- intervals from Oracle's text (#314) --- */
+  {
+    SQL_INTERVAL_STRUCT iv;
+    const char *ds = "+1 02:03:04.500000000";
+    assert(IV(ds, SQL_C_INTERVAL_DAY_TO_SECOND, &iv) == SQL_SUCCESS);
+    assert(ind == (SQLLEN)sizeof iv && iv.interval_type == SQL_IS_DAY_TO_SECOND &&
+           iv.interval_sign == SQL_FALSE && iv.intval.day_second.day == 1 &&
+           iv.intval.day_second.hour == 2 && iv.intval.day_second.minute == 3 &&
+           iv.intval.day_second.second == 4 && iv.intval.day_second.fraction == 500000);
+    /* The leading field takes in the larger ones; what has no field is cut. */
+    assert(IV(ds, SQL_C_INTERVAL_HOUR, &iv) == SQL_SUCCESS_WITH_INFO && ST("01S07"));
+    assert(iv.interval_type == SQL_IS_HOUR && iv.intval.day_second.hour == 26 &&
+           iv.intval.day_second.minute == 0);
+    assert(IV(ds, SQL_C_INTERVAL_MINUTE_TO_SECOND, &iv) == SQL_SUCCESS);
+    assert(iv.intval.day_second.minute == 26 * 60 + 3 && iv.intval.day_second.second == 4 &&
+           iv.intval.day_second.fraction == 500000 && iv.intval.day_second.hour == 0);
+    assert(IV(ds, SQL_C_INTERVAL_SECOND, &iv) == SQL_SUCCESS);
+    assert(iv.intval.day_second.second == ((26 * 60) + 3) * 60 + 4);
+    assert(IV(ds, SQL_C_INTERVAL_DAY_TO_HOUR, &iv) == SQL_SUCCESS_WITH_INFO && ST("01S07"));
+    assert(iv.intval.day_second.day == 1 && iv.intval.day_second.hour == 2);
+    assert(IV("+1 02:03:00.000000000", SQL_C_INTERVAL_DAY_TO_MINUTE, &iv) == SQL_SUCCESS);
+    assert(IV("+1 02:03:00.000000000", SQL_C_INTERVAL_HOUR_TO_MINUTE, &iv) == SQL_SUCCESS);
+    assert(iv.intval.day_second.hour == 26 && iv.intval.day_second.minute == 3);
+    assert(IV("-0 10:00:00.000000000", SQL_C_INTERVAL_HOUR_TO_SECOND, &iv) == SQL_SUCCESS);
+    assert(iv.interval_sign == SQL_TRUE && iv.intval.day_second.hour == 10);
+    assert(IV("+5 00:00:00.000000000", SQL_C_INTERVAL_DAY, &iv) == SQL_SUCCESS);
+    assert(iv.interval_type == SQL_IS_DAY && iv.intval.day_second.day == 5);
+    /* Nanoseconds past the default seconds precision (6) are cut. */
+    assert(IV("+0 00:00:01.123456789", SQL_C_INTERVAL_SECOND, &iv) == SQL_SUCCESS_WITH_INFO &&
+           ST("01S07") && iv.intval.day_second.fraction == 123456);
+    assert(IV("+000000001 02:03:04", SQL_C_INTERVAL_DAY_TO_SECOND, &iv) == SQL_SUCCESS);
+    assert(iv.intval.day_second.day == 1 && iv.intval.day_second.fraction == 0);
+
+    const char *ym = "-3-04";
+    assert(IV(ym, SQL_C_INTERVAL_YEAR_TO_MONTH, &iv) == SQL_SUCCESS);
+    assert(iv.interval_type == SQL_IS_YEAR_TO_MONTH && iv.interval_sign == SQL_TRUE &&
+           iv.intval.year_month.year == 3 && iv.intval.year_month.month == 4);
+    assert(IV(ym, SQL_C_INTERVAL_MONTH, &iv) == SQL_SUCCESS && iv.intval.year_month.month == 40);
+    assert(IV(ym, SQL_C_INTERVAL_YEAR, &iv) == SQL_SUCCESS_WITH_INFO && ST("01S07"));
+    assert(iv.intval.year_month.year == 3);
+
+    /* A plain count is one field; year-month and day-time don't mix; text
+     * that isn't an interval is 22018; a leading field past 32 bits 22015. */
+    assert(IV("42", SQL_C_INTERVAL_DAY, &iv) == SQL_SUCCESS && iv.intval.day_second.day == 42);
+    assert(IV("-7", SQL_C_INTERVAL_MONTH, &iv) == SQL_SUCCESS && iv.interval_sign == SQL_TRUE &&
+           iv.intval.year_month.month == 7);
+    assert(IV("42", SQL_C_INTERVAL_DAY_TO_SECOND, &iv) == SQL_ERROR && ST("22018"));
+    assert(IV(ym, SQL_C_INTERVAL_DAY_TO_SECOND, &iv) == SQL_ERROR && ST("07006"));
+    assert(IV(ds, SQL_C_INTERVAL_YEAR_TO_MONTH, &iv) == SQL_ERROR && ST("07006"));
+    assert(IV("abc", SQL_C_INTERVAL_DAY, &iv) == SQL_ERROR && ST("22018"));
+    assert(IV("+1 25:00:00", SQL_C_INTERVAL_DAY_TO_SECOND, &iv) == SQL_ERROR && ST("22018"));
+    assert(IV("+999999999 23:59:59.000000000", SQL_C_INTERVAL_SECOND, &iv) == SQL_ERROR &&
+           ST("22015"));
+  }
+
+  /* --- no Oracle value converts to a GUID; a bad date is 22018 --- */
+  {
+    SQLGUID g;
+    memset(&g, 0x5A, sizeof g);
+    assert(CV("abc", 3, 0, 0, SQL_C_GUID, &g, sizeof g, &ind) == SQL_ERROR && ST("07006"));
+    assert(((unsigned char *)&g)[0] == 0x5A); /* nothing written */
+    SQL_TIMESTAMP_STRUCT ts;
+    assert(CV("x", 1, 0, 0, SQL_C_TYPE_TIMESTAMP, &ts, 0, &ind) == SQL_ERROR && ST("22018"));
+    char small[4];
+    assert(CV("hello", 5, 0, 0, SQL_C_CHAR, small, sizeof small, &ind) == SQL_SUCCESS_WITH_INFO &&
+           ST("01004"));
+  }
+
+  /* --- fixed-length C types have their own size (array strides) --- */
+  {
+    assert(seer_odbc_c_fixed_size(SQL_C_NUMERIC) == sizeof(SQL_NUMERIC_STRUCT));
+    assert(seer_odbc_c_fixed_size(SQL_C_INTERVAL_DAY_TO_SECOND) == sizeof(SQL_INTERVAL_STRUCT));
+    assert(seer_odbc_c_fixed_size(SQL_C_INTERVAL_YEAR) == sizeof(SQL_INTERVAL_STRUCT));
+    assert(seer_odbc_c_fixed_size(SQL_C_GUID) == sizeof(SQLGUID));
+    assert(seer_odbc_c_fixed_size(SQL_C_SLONG) == sizeof(SQLINTEGER));
+    assert(seer_odbc_c_fixed_size(SQL_C_CHAR) == 0 && seer_odbc_c_fixed_size(SQL_C_BINARY) == 0);
   }
 
   printf("test_convert: all assertions passed\n");

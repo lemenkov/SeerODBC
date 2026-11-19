@@ -68,6 +68,283 @@ static void to_numeric(const char *s, SQL_NUMERIC_STRUCT *ns)
   memcpy(ns->val, val, sizeof val);
 }
 
+/* An interval value from its text (#314): Oracle renders INTERVAL DAY TO
+ * SECOND as "[+-]D HH:MI:SS[.fffffffff]" and YEAR TO MONTH as "[+-]Y-MM"; a
+ * plain integer is one field's count (an exact numeric source). */
+enum { IV_BAD, IV_YM, IV_DS, IV_INT };
+typedef struct {
+  int kind;
+  int neg;
+  unsigned long long y, mo, d, h, mi, se, ns; /* ns: nanoseconds */
+} Interval;
+
+static unsigned long long digits(const char **p, int *n)
+{
+  unsigned long long v = 0;
+  *n = 0;
+  while (**p >= '0' && **p <= '9' && *n < 19) {
+    v = v * 10 + (unsigned long long)(**p - '0');
+    (*p)++;
+    (*n)++;
+  }
+  return v;
+}
+
+static void parse_interval(const char *s, size_t len, Interval *iv)
+{
+  memset(iv, 0, sizeof *iv);
+  char tmp[64];
+  if (len >= sizeof tmp)
+    return; /* IV_BAD */
+  memcpy(tmp, s, len);
+  tmp[len] = '\0';
+  const char *p = tmp;
+  int n;
+  while (*p == ' ')
+    p++;
+  if (*p == '-' || *p == '+')
+    iv->neg = *p++ == '-';
+  unsigned long long lead = digits(&p, &n);
+  if (n == 0)
+    return;
+  if (*p == '\0') {
+    iv->kind = IV_INT;
+    iv->d = lead;
+    return;
+  }
+  if (*p == '-') { /* Y-MM */
+    p++;
+    iv->y = lead;
+    iv->mo = digits(&p, &n);
+    if (n == 0 || *p != '\0' || iv->mo > 11)
+      return;
+    iv->kind = IV_YM;
+    return;
+  }
+  if (*p != ' ') /* D HH:MI:SS[.f] */
+    return;
+  p++;
+  iv->d = lead;
+  iv->h = digits(&p, &n);
+  if (n == 0 || *p++ != ':')
+    return;
+  iv->mi = digits(&p, &n);
+  if (n == 0 || *p++ != ':')
+    return;
+  iv->se = digits(&p, &n);
+  if (n == 0)
+    return;
+  if (*p == '.') {
+    p++;
+    const char *f = p;
+    iv->ns = digits(&p, &n);
+    for (int k = (int)(p - f); k < 9; k++)
+      iv->ns *= 10;
+    for (int k = (int)(p - f); k > 9; k--)
+      iv->ns /= 10;
+  }
+  if (*p != '\0' || iv->h > 23 || iv->mi > 59 || iv->se > 59)
+    return;
+  iv->kind = IV_DS;
+}
+
+/* Fill an SQL_INTERVAL_STRUCT of C type `target` from `iv`. The leading field
+ * takes in the larger ones (SQL_C_INTERVAL_HOUR of 1 day 2 hours is 26);
+ * dropping non-zero trailing fields, or fraction digits past the default
+ * seconds precision of 6, is 01S07. Returns SQL_SUCCESS, SQL_SUCCESS_WITH_INFO
+ * or SQL_ERROR, with the SQLSTATE in *state. */
+static SQLRETURN to_interval(const Interval *iv, SQLSMALLINT target, SQL_INTERVAL_STRUCT *out,
+                             const char **state)
+{
+  const bool ym_target = target == SQL_C_INTERVAL_YEAR || target == SQL_C_INTERVAL_MONTH ||
+                         target == SQL_C_INTERVAL_YEAR_TO_MONTH;
+  const bool single = target == SQL_C_INTERVAL_YEAR || target == SQL_C_INTERVAL_MONTH ||
+                      target == SQL_C_INTERVAL_DAY || target == SQL_C_INTERVAL_HOUR ||
+                      target == SQL_C_INTERVAL_MINUTE || target == SQL_C_INTERVAL_SECOND;
+  Interval v = *iv;
+  if (v.kind == IV_BAD || (v.kind == IV_INT && !single)) {
+    *state = "22018";
+    return SQL_ERROR;
+  }
+  if (v.kind == IV_INT) { /* the count is the target's one field */
+    unsigned long long c = v.d;
+    v.d = 0;
+    switch (target) {
+    case SQL_C_INTERVAL_YEAR:
+      v.y = c;
+      break;
+    case SQL_C_INTERVAL_MONTH:
+      v.mo = c;
+      break;
+    case SQL_C_INTERVAL_DAY:
+      v.d = c;
+      break;
+    case SQL_C_INTERVAL_HOUR:
+      v.h = c;
+      break;
+    case SQL_C_INTERVAL_MINUTE:
+      v.mi = c;
+      break;
+    default:
+      v.se = c;
+      break;
+    }
+    v.kind = ym_target ? IV_YM : IV_DS;
+  }
+  if ((v.kind == IV_YM) != ym_target) {
+    *state = "07006"; /* year-month and day-time don't convert */
+    return SQL_ERROR;
+  }
+
+  memset(out, 0, sizeof *out);
+  out->interval_type = (SQLINTERVAL)(target - SQL_C_INTERVAL_YEAR + SQL_IS_YEAR);
+  out->interval_sign = v.neg ? SQL_TRUE : SQL_FALSE;
+  const unsigned long long hours = v.d * 24 + v.h, mins = hours * 60 + v.mi,
+                           secs = mins * 60 + v.se;
+  /* The leading field, in 64 bits so an overflow shows; the trailing fields
+   * are as they are; `trunc` when a non-zero part has no field. */
+  unsigned long long lead;
+  bool trunc = false;
+  SQLUINTEGER *lead_at;
+  switch (target) {
+  case SQL_C_INTERVAL_YEAR:
+    lead = v.y, lead_at = &out->intval.year_month.year, trunc = v.mo != 0;
+    break;
+  case SQL_C_INTERVAL_MONTH:
+    lead = v.y * 12 + v.mo, lead_at = &out->intval.year_month.month, trunc = false;
+    break;
+  case SQL_C_INTERVAL_YEAR_TO_MONTH:
+    lead = v.y, lead_at = &out->intval.year_month.year, trunc = false;
+    out->intval.year_month.month = (SQLUINTEGER)v.mo;
+    break;
+  case SQL_C_INTERVAL_DAY:
+  case SQL_C_INTERVAL_DAY_TO_HOUR:
+  case SQL_C_INTERVAL_DAY_TO_MINUTE:
+  case SQL_C_INTERVAL_DAY_TO_SECOND:
+    lead = v.d, lead_at = &out->intval.day_second.day;
+    break;
+  case SQL_C_INTERVAL_HOUR:
+  case SQL_C_INTERVAL_HOUR_TO_MINUTE:
+  case SQL_C_INTERVAL_HOUR_TO_SECOND:
+    lead = hours, lead_at = &out->intval.day_second.hour;
+    break;
+  case SQL_C_INTERVAL_MINUTE:
+  case SQL_C_INTERVAL_MINUTE_TO_SECOND:
+    lead = mins, lead_at = &out->intval.day_second.minute;
+    break;
+  default: /* SQL_C_INTERVAL_SECOND */
+    lead = secs, lead_at = &out->intval.day_second.second;
+    break;
+  }
+  if (!ym_target) {
+    /* The last field the target has: the hour, minute and second below the
+     * leading one are filled down to it; what lies past it is cut. */
+    const int last = target == SQL_C_INTERVAL_DAY                                            ? 0
+                     : target == SQL_C_INTERVAL_HOUR || target == SQL_C_INTERVAL_DAY_TO_HOUR ? 1
+                     : target == SQL_C_INTERVAL_MINUTE || target == SQL_C_INTERVAL_DAY_TO_MINUTE ||
+                             target == SQL_C_INTERVAL_HOUR_TO_MINUTE
+                         ? 2
+                         : 3;
+    const int first = lead_at == &out->intval.day_second.day      ? 0
+                      : lead_at == &out->intval.day_second.hour   ? 1
+                      : lead_at == &out->intval.day_second.minute ? 2
+                                                                  : 3;
+    if (first < 1 && last >= 1)
+      out->intval.day_second.hour = (SQLUINTEGER)v.h;
+    if (first < 2 && last >= 2)
+      out->intval.day_second.minute = (SQLUINTEGER)v.mi;
+    if (first < 3 && last >= 3)
+      out->intval.day_second.second = (SQLUINTEGER)v.se;
+    if (last == 3)
+      out->intval.day_second.fraction = (SQLUINTEGER)(v.ns / 1000);
+    trunc = (last < 1 && v.h) || (last < 2 && v.mi) || (last < 3 && v.se) ||
+            (last < 3 ? v.ns != 0 : v.ns % 1000 != 0);
+  }
+  if (lead > 0xFFFFFFFFULL) {
+    *state = "22015"; /* the leading field doesn't fit */
+    return SQL_ERROR;
+  }
+  *lead_at = (SQLUINTEGER)lead;
+  if (trunc) {
+    *state = "01S07";
+    return SQL_SUCCESS_WITH_INFO;
+  }
+  return SQL_SUCCESS;
+}
+
+const char *seer_odbc_convert_text(const char *sqlstate)
+{
+  static const struct {
+    const char *state, *text;
+  } T[] = {
+      {"01S07", "Fractional truncation: an interval part the target type has no field for"},
+      {"22002", "Indicator variable required but not supplied"},
+      {"22015", "Interval field overflow: the leading field doesn't fit the target"},
+      {"22018", "Invalid character value for cast specification"},
+      {"07006", "Restricted data type attribute violation: the value can't convert to that "
+                "C type"},
+  };
+  for (size_t i = 0; sqlstate != NULL && i < sizeof T / sizeof T[0]; i++)
+    if (strcmp(T[i].state, sqlstate) == 0)
+      return T[i].text;
+  return "String data, right truncated";
+}
+
+size_t seer_odbc_c_fixed_size(SQLSMALLINT t)
+{
+  switch (t) {
+  case SQL_C_SLONG:
+  case SQL_C_LONG:
+  case SQL_C_ULONG:
+    return sizeof(SQLINTEGER);
+  case SQL_C_SSHORT:
+  case SQL_C_SHORT:
+  case SQL_C_USHORT:
+    return sizeof(SQLSMALLINT);
+  case SQL_C_SBIGINT:
+  case SQL_C_UBIGINT:
+    return sizeof(SQLBIGINT);
+  case SQL_C_STINYINT:
+  case SQL_C_TINYINT:
+  case SQL_C_UTINYINT:
+  case SQL_C_BIT:
+    return 1;
+  case SQL_C_FLOAT:
+    return sizeof(SQLREAL);
+  case SQL_C_DOUBLE:
+    return sizeof(SQLDOUBLE);
+  case SQL_C_NUMERIC:
+    return sizeof(SQL_NUMERIC_STRUCT);
+  case SQL_C_TYPE_TIMESTAMP:
+  case SQL_C_TIMESTAMP:
+    return sizeof(SQL_TIMESTAMP_STRUCT);
+  case SQL_C_TYPE_DATE:
+  case SQL_C_DATE:
+    return sizeof(SQL_DATE_STRUCT);
+  case SQL_C_TYPE_TIME:
+  case SQL_C_TIME:
+    return sizeof(SQL_TIME_STRUCT);
+  case SQL_C_GUID:
+    return sizeof(SQLGUID);
+  case SQL_C_INTERVAL_YEAR:
+  case SQL_C_INTERVAL_MONTH:
+  case SQL_C_INTERVAL_DAY:
+  case SQL_C_INTERVAL_HOUR:
+  case SQL_C_INTERVAL_MINUTE:
+  case SQL_C_INTERVAL_SECOND:
+  case SQL_C_INTERVAL_YEAR_TO_MONTH:
+  case SQL_C_INTERVAL_DAY_TO_HOUR:
+  case SQL_C_INTERVAL_DAY_TO_MINUTE:
+  case SQL_C_INTERVAL_DAY_TO_SECOND:
+  case SQL_C_INTERVAL_HOUR_TO_MINUTE:
+  case SQL_C_INTERVAL_HOUR_TO_SECOND:
+  case SQL_C_INTERVAL_MINUTE_TO_SECOND:
+    return sizeof(SQL_INTERVAL_STRUCT);
+  default:
+    return 0;
+  }
+}
+
 /* Copy `n` source bytes / hex / text into buf with offset tracking. Helper for
  * the variable-length targets. Returns SQL_SUCCESS[_WITH_INFO]. */
 static SQLRETURN copy_var(const unsigned char *src, size_t total, int as_hex, SQLPOINTER buf,
@@ -138,11 +415,16 @@ static SQLRETURN copy_wide(const unsigned char *src, size_t total, SQLPOINTER bu
 
 SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
                             SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
-                            SQLLEN *offset)
+                            SQLLEN *offset, const char **sqlstate)
 {
+  const char *unused;
+  const char **state = sqlstate != NULL ? sqlstate : &unused;
+  *state = NULL;
   if (is_null) {
-    if (ind == NULL)
-      return SQL_ERROR; /* 22002 */
+    if (ind == NULL) {
+      *state = "22002";
+      return SQL_ERROR;
+    }
     *ind = SQL_NULL_DATA;
     return SQL_SUCCESS;
   }
@@ -235,8 +517,10 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_TIMESTAMP: {
     int Y, Mo, D, h, mi, se;
     unsigned long fr;
-    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0)
+    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0) {
+      *state = "22018";
       return SQL_ERROR;
+    }
     if (buf) {
       SQL_TIMESTAMP_STRUCT *t = buf;
       t->year = (SQLSMALLINT)Y;
@@ -255,8 +539,10 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_DATE: {
     int Y, Mo, D, h, mi, se;
     unsigned long fr;
-    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0)
+    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0) {
+      *state = "22018";
       return SQL_ERROR;
+    }
     if (buf) {
       SQL_DATE_STRUCT *t = buf;
       t->year = (SQLSMALLINT)Y;
@@ -271,8 +557,10 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_TIME: {
     int Y, Mo, D, h, mi, se;
     unsigned long fr;
-    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0)
+    if (parse_datetime(s, &Y, &Mo, &D, &h, &mi, &se, &fr) != 0) {
+      *state = "22018";
       return SQL_ERROR;
+    }
     if (buf) {
       SQL_TIME_STRUCT *t = buf;
       t->hour = (SQLUSMALLINT)h;
@@ -288,19 +576,67 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_WCHAR: {
     char *u16 = NULL;
     size_t u16len = 0;
-    if (seer_iconv("UTF-8", SEER_UTF16, (const char *)val, vallen, &u16, &u16len) != 0)
+    if (seer_iconv("UTF-8", SEER_UTF16, (const char *)val, vallen, &u16, &u16len) != 0) {
+      *state = "22018";
       return SQL_ERROR;
+    }
     SQLRETURN r = copy_wide((const unsigned char *)u16, u16len, buf, buflen, ind, offset);
     free(u16);
+    if (r == SQL_SUCCESS_WITH_INFO)
+      *state = "01004";
+    return r;
+  }
+
+  /* ---- intervals (#314) ---- */
+  case SQL_C_INTERVAL_YEAR:
+  case SQL_C_INTERVAL_MONTH:
+  case SQL_C_INTERVAL_DAY:
+  case SQL_C_INTERVAL_HOUR:
+  case SQL_C_INTERVAL_MINUTE:
+  case SQL_C_INTERVAL_SECOND:
+  case SQL_C_INTERVAL_YEAR_TO_MONTH:
+  case SQL_C_INTERVAL_DAY_TO_HOUR:
+  case SQL_C_INTERVAL_DAY_TO_MINUTE:
+  case SQL_C_INTERVAL_DAY_TO_SECOND:
+  case SQL_C_INTERVAL_HOUR_TO_MINUTE:
+  case SQL_C_INTERVAL_HOUR_TO_SECOND:
+  case SQL_C_INTERVAL_MINUTE_TO_SECOND: {
+    if (is_binary) {
+      *state = "07006";
+      return SQL_ERROR;
+    }
+    Interval iv;
+    SQL_INTERVAL_STRUCT tmp;
+    parse_interval(s, vallen, &iv);
+    SQLRETURN r = to_interval(&iv, target, &tmp, state);
+    if (r == SQL_ERROR)
+      return r;
+    if (buf)
+      memcpy(buf, &tmp, sizeof tmp);
+    if (ind)
+      *ind = (SQLLEN)sizeof(SQL_INTERVAL_STRUCT);
     return r;
   }
 
   /* ---- raw / text ---- */
-  case SQL_C_BINARY:
-    return copy_var((const unsigned char *)val, vallen, 0, buf, buflen, ind, offset);
+  case SQL_C_BINARY: {
+    SQLRETURN r = copy_var((const unsigned char *)val, vallen, 0, buf, buflen, ind, offset);
+    if (r == SQL_SUCCESS_WITH_INFO)
+      *state = "01004";
+    return r;
+  }
   case SQL_C_CHAR:
-  case SQL_C_DEFAULT:
+  case SQL_C_DEFAULT: {
+    SQLRETURN r = copy_var((const unsigned char *)val, vallen, is_binary, buf, buflen, ind, offset);
+    if (r == SQL_SUCCESS_WITH_INFO)
+      *state = "01004";
+    return r;
+  }
   default:
-    return copy_var((const unsigned char *)val, vallen, is_binary, buf, buflen, ind, offset);
+    /* SQL_C_GUID (Oracle has no GUID type) and anything else no Oracle value
+     * converts to: the restricted data type attribute violation, not the
+     * value's text in a buffer of another type. */
+    *state = "07006";
+    return SQL_ERROR;
   }
 }
