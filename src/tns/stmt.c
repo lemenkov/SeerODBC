@@ -5831,9 +5831,15 @@ static void fv2_resolve_lobs(SeerStmt *stmt)
         continue;
       }
     } else {
+      /* A failed GETLEN (a negative length) or READ is the cell's error, as
+       * for a BFILE above - not an empty value fetched as success (#349). */
       int64_t amount = fv2_lob_getlen(c, p->locator, p->loclen);
-      if (amount > 0)
-        fv2_lob_read(c, p->locator, p->loclen, amount, &content, &clen);
+      if (amount < 0 || (amount > 0 && fv2_lob_read(c, p->locator, p->loclen, amount, &content,
+                                                    &clen) != SEER_OK)) {
+        free(content);
+        record_cell_error(stmt, p->row, p->col);
+        continue;
+      }
     }
     SeerCell *cell = &stmt->rows[p->row][p->col];
     cell_set_bytes(cell, content ? content : (const uint8_t *)"", clen,
