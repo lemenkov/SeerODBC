@@ -91,11 +91,34 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
   case SQL_C_SSHORT:
   case SQL_C_SHORT:
     return seer_stmt_bind_int64(core, param, *(const SQLSMALLINT *)valptr);
+  case SQL_C_USHORT:
+    return seer_stmt_bind_int64(core, param, *(const SQLUSMALLINT *)valptr);
   case SQL_C_SBIGINT:
     return seer_stmt_bind_int64(core, param, (int64_t)*(const SQLBIGINT *)valptr);
+  case SQL_C_UBIGINT: {
+    SQLUBIGINT u = *(const SQLUBIGINT *)valptr;
+    if (u <= (SQLUBIGINT)INT64_MAX)
+      return seer_stmt_bind_int64(core, param, (int64_t)u);
+    char dec[24]; /* past INT64_MAX: exact, as a decimal NUMBER */
+    snprintf(dec, sizeof dec, "%llu", (unsigned long long)u);
+    return seer_stmt_bind_number_text(core, param, dec);
+  }
   case SQL_C_STINYINT:
   case SQL_C_TINYINT:
     return seer_stmt_bind_int64(core, param, *(const signed char *)valptr);
+  case SQL_C_UTINYINT:
+    return seer_stmt_bind_int64(core, param, *(const unsigned char *)valptr);
+  case SQL_C_NUMERIC: {
+    char dec[300];
+    if (seer_odbc_numeric_to_text(valptr, dec, sizeof dec) == 0)
+      return SEER_EPARAM;
+    return seer_stmt_bind_number_text(core, param, dec);
+  }
+  case SQL_C_GUID: {
+    char g[37];
+    seer_odbc_guid_to_text(valptr, g);
+    return seer_stmt_bind_text(core, param, g, 36);
+  }
   case SQL_C_FLOAT:
     return seer_stmt_bind_float(core, param, *(const SQLREAL *)valptr);
   case SQL_C_DOUBLE:
@@ -128,19 +151,30 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
     const SQL_TIME_STRUCT *t = valptr;
     return seer_stmt_bind_date(core, param, 1970, 1, 1, t->hour, t->minute, t->second);
   }
-  case SQL_C_INTERVAL_YEAR_TO_MONTH: {
-    const SQL_INTERVAL_STRUCT *iv = valptr;
-    int sgn = (iv->interval_sign == SQL_TRUE) ? -1 : 1;
-    return seer_stmt_bind_interval_ym(core, param, sgn * (int32_t)iv->intval.year_month.year,
-                                      sgn * (int32_t)iv->intval.year_month.month);
-  }
-  case SQL_C_INTERVAL_DAY_TO_SECOND: {
-    const SQL_INTERVAL_STRUCT *iv = valptr;
-    int sgn = (iv->interval_sign == SQL_TRUE) ? -1 : 1;
-    return seer_stmt_bind_interval_ds(
-        core, param, sgn * (int32_t)iv->intval.day_second.day,
-        sgn * (int32_t)iv->intval.day_second.hour, sgn * (int32_t)iv->intval.day_second.minute,
-        sgn * (int32_t)iv->intval.day_second.second, sgn * (int32_t)iv->intval.day_second.fraction);
+  case SQL_C_INTERVAL_YEAR:
+  case SQL_C_INTERVAL_MONTH:
+  case SQL_C_INTERVAL_YEAR_TO_MONTH:
+  case SQL_C_INTERVAL_DAY:
+  case SQL_C_INTERVAL_HOUR:
+  case SQL_C_INTERVAL_MINUTE:
+  case SQL_C_INTERVAL_SECOND:
+  case SQL_C_INTERVAL_DAY_TO_HOUR:
+  case SQL_C_INTERVAL_DAY_TO_MINUTE:
+  case SQL_C_INTERVAL_DAY_TO_SECOND:
+  case SQL_C_INTERVAL_HOUR_TO_MINUTE:
+  case SQL_C_INTERVAL_HOUR_TO_SECOND:
+  case SQL_C_INTERVAL_MINUTE_TO_SECOND: {
+    /* Only the fields the type names, normalised (HOUR 30 = 1 day 6 hours),
+     * and the fraction in microseconds as fetch delivers it (#322). */
+    SeerOdbcInterval v;
+    if (seer_odbc_interval_from_c(c_type, valptr, &v) != 0)
+      return SEER_EPARAM;
+    int32_t sgn = v.negative ? -1 : 1;
+    if (v.year_month)
+      return seer_stmt_bind_interval_ym(core, param, sgn * (int32_t)v.years,
+                                        sgn * (int32_t)v.months);
+    return seer_stmt_bind_interval_ds(core, param, sgn * (int32_t)v.days, sgn * v.hours,
+                                      sgn * v.mins, sgn * v.secs, sgn * (int32_t)v.nanos);
   }
   case SQL_C_WCHAR: {
     size_t inbytes;
@@ -163,9 +197,35 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
   }
   case SQL_C_CHAR:
   case SQL_C_DEFAULT:
-  default:
     return seer_stmt_bind_text(core, param, (const char *)valptr, (ind == SQL_NTS) ? -1 : (int)ind);
+  default:
+    /* Not a C type this driver knows (SQLBindParameter refuses those with
+     * HY003; a descriptor field can still set one). Never send its bytes as
+     * text (#322). */
+    return SEER_ENOTIMPL;
   }
+}
+
+/* Whether `t` is a C type a parameter can carry. */
+static bool param_c_type_known(SQLSMALLINT t)
+{
+  return t == SQL_C_CHAR || t == SQL_C_WCHAR || t == SQL_C_BINARY || t == SQL_C_DEFAULT ||
+         seer_odbc_c_fixed_size(t) != 0;
+}
+
+/* The SQLSTATE for a failed bind_one_value of C type `ct`: 07006 for a C type
+ * with no conversion, 22003 / 22015 for a value past the server type's range,
+ * else the core's status (#322). */
+static const char *bind_sqlstate(SeerStatus st, SQLSMALLINT ct)
+{
+  if (!param_c_type_known(ct))
+    return "07006";
+  if (st == SEER_EPARAM && (ct == SQL_C_NUMERIC || ct == SQL_C_UBIGINT))
+    return "22003";
+  /* SQL_C_INTERVAL_x is 100 + SQL_CODE_x, YEAR (1) to MINUTE_TO_SECOND (13). */
+  if (st == SEER_EPARAM && ct >= SQL_C_INTERVAL_YEAR && ct <= SQL_C_INTERVAL_MINUTE_TO_SECOND)
+    return "22015";
+  return seer_odbc_sqlstate(st);
 }
 
 /* True if a bound parameter's length/indicator marks it data-at-execution
@@ -335,7 +395,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
         st =
             bind_one_value(s->core, param, param_c_type(p), p->sql_type, val, ind, no_timestamp(s));
         if (st != SEER_OK)
-          return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
+          return seer_odbc_diag(s, bind_sqlstate(st, param_c_type(p)), 0, "Parameter bind failed",
+                                SQL_ERROR);
       }
     }
     return SQL_SUCCESS;
@@ -354,10 +415,18 @@ static SQLRETURN apply_params(OdbcStmt *s)
     if (p->dae) { /* value streamed in via SQLPutData */
       if (p->dae_null)
         seer_stmt_bind_null_typed(s->core, param, ora_type_for_sql(p->sql_type));
-      else if (bind_one_value(s->core, param, param_c_type(p), p->sql_type,
-                              p->dae_buf ? p->dae_buf : "", (SQLLEN)p->dae_len,
-                              no_timestamp(s)) != SEER_OK)
-        return seer_odbc_diag(s, "HY000", 0, "Parameter bind failed", SQL_ERROR);
+      else if (p->dae_len < seer_odbc_c_fixed_size(param_c_type(p))) {
+        /* No SQLPutData for a fixed-size value: nothing to read (#323). */
+        return seer_odbc_diag(s, "HY000", 0, "No data was put for a data-at-execution parameter",
+                              SQL_ERROR);
+      } else {
+        SeerStatus st =
+            bind_one_value(s->core, param, param_c_type(p), p->sql_type,
+                           p->dae_buf ? p->dae_buf : "", (SQLLEN)p->dae_len, no_timestamp(s));
+        if (st != SEER_OK)
+          return seer_odbc_diag(s, bind_sqlstate(st, param_c_type(p)), 0, "Parameter bind failed",
+                                SQL_ERROR);
+      }
       continue;
     }
     if (p->bound && (p->io_type == SQL_PARAM_OUTPUT || p->io_type == SQL_PARAM_INPUT_OUTPUT)) {
@@ -372,7 +441,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
         if (st == SEER_OK)
           st = seer_stmt_bind_set_inout(s->core, param, sz);
         if (st != SEER_OK)
-          return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
+          return seer_odbc_diag(s, bind_sqlstate(st, param_c_type(p)), 0, "Parameter bind failed",
+                                SQL_ERROR);
         continue;
       }
       seer_stmt_bind_out(s->core, param, ora_type_for_sql(p->sql_type), sz);
@@ -387,7 +457,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
     SeerStatus st = bind_one_value(s->core, param, param_c_type(p), p->sql_type, param_buf(s, p),
                                    ind, no_timestamp(s));
     if (st != SEER_OK)
-      return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
+      return seer_odbc_diag(s, bind_sqlstate(st, param_c_type(p)), 0, "Parameter bind failed",
+                            SQL_ERROR);
   }
   return SQL_SUCCESS;
 }
@@ -925,6 +996,19 @@ SQLRETURN SQL_API SQLPutData(SQLHSTMT StatementHandle, SQLPOINTER DataPtr, SQLLE
     return SQL_SUCCESS;
   }
   size_t n;
+  size_t fixed = seer_odbc_c_fixed_size(param_c_type(p));
+  if (fixed != 0) {
+    /* Fixed-length data: StrLen_or_Ind is ignored, the C type says the size,
+     * and the value comes in one piece (#323). */
+    if (p->dae_len != 0)
+      return seer_odbc_diag(s, "HY019", 0, "Non-character and non-binary data sent in pieces",
+                            SQL_ERROR);
+    if (DataPtr == NULL)
+      return seer_odbc_diag(s, "HY009", 0, "Invalid use of null pointer", SQL_ERROR);
+    if (dae_append(p, DataPtr, fixed) != 0)
+      return seer_odbc_diag(s, "HY001", 0, "Out of memory", SQL_ERROR);
+    return SQL_SUCCESS;
+  }
   if (StrLen_or_Ind == SQL_NTS)
     n = DataPtr ? strlen((const char *)DataPtr) : 0;
   else if (StrLen_or_Ind < 0)
@@ -973,6 +1057,8 @@ SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT Parame
   seer_odbc_diag_clear(s);
   if (ParameterNumber < 1 || ParameterNumber > 1024)
     return seer_odbc_diag(s, "07009", 0, "Invalid parameter number", SQL_ERROR);
+  if (!param_c_type_known(ValueType)) /* #322: never bind unknown bytes as text */
+    return seer_odbc_diag(s, "HY003", 0, "Invalid application buffer type", SQL_ERROR);
 
   if (ParameterNumber > (SQLUSMALLINT)s->num_params) {
     OdbcParam *np = realloc(s->params, (size_t)ParameterNumber * sizeof *np);

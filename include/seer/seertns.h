@@ -317,6 +317,11 @@ SeerStatus seer_stmt_prepare(SeerConn *conn, const char *sql, SeerStmt **out);
  * release, for SQL and PL/SQL alike. ODBC's ? markers are numbered in order,
  * so they bind as written. */
 SeerStatus seer_stmt_bind_int64(SeerStmt *stmt, int param, int64_t value);
+/* Bind an exact NUMBER from a plain decimal string ("[-]digits[.digits]", no
+ * exponent). Unlike text, it does not depend on the session's
+ * NLS_NUMERIC_CHARACTERS. SEER_EPARAM if the string is not a decimal, or is
+ * outside NUMBER's range. */
+SeerStatus seer_stmt_bind_number_text(SeerStmt *stmt, int param, const char *dec);
 SeerStatus seer_stmt_bind_text(SeerStmt *stmt, int param, const char *str, int len);
 SeerStatus seer_stmt_bind_raw(SeerStmt *stmt, int param, const void *data, int len);
 

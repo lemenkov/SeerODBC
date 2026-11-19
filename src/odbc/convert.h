@@ -41,4 +41,34 @@ SQLSMALLINT seer_odbc_default_c_type(SQLSMALLINT sql_type);
  * interval structs, ...), 0 for the variable-length ones (#314). */
 size_t seer_odbc_c_fixed_size(SQLSMALLINT t);
 
+/* Parameter side (#322): turn C values the server has no direct form for into
+ * what the core binds. */
+
+/* SQL_NUMERIC_STRUCT as exact plain decimal text ("-123.45"). Uses the struct's
+ * own sign, scale and 128-bit little-endian mantissa. Returns the length, or 0
+ * if `cap` is too small (300 always fits). */
+size_t seer_odbc_numeric_to_text(const SQL_NUMERIC_STRUCT *ns, char *out, size_t cap);
+
+/* SQLGUID as canonical text, xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars and
+ * a NUL). */
+void seer_odbc_guid_to_text(const SQLGUID *g, char out[37]);
+
+/* An interval C value, normalised into the two forms Oracle has. */
+typedef struct {
+  int year_month; /* 1: INTERVAL YEAR TO MONTH, 0: DAY TO SECOND */
+  int negative;
+  long years, months; /* year_month; months < 12 */
+  long days;          /* day-to-second: hours < 24, mins/secs < 60 */
+  int hours, mins, secs;
+  unsigned long nanos;
+} SeerOdbcInterval;
+
+/* Read the fields SQL_C_INTERVAL_* `c_type` names from `iv`, carrying a leading
+ * field past its usual range (HOUR 30 = 1 day 6 hours). `fraction` is at the
+ * default seconds precision 6, i.e. microseconds, as the fetch side delivers
+ * it. Returns 0, -1 if `c_type` is not an interval type, or -2 (22015) if the
+ * value is past Oracle's 9-digit leading field. */
+int seer_odbc_interval_from_c(SQLSMALLINT c_type, const SQL_INTERVAL_STRUCT *iv,
+                              SeerOdbcInterval *out);
+
 #endif /* SEERODBC_CONVERT_H */

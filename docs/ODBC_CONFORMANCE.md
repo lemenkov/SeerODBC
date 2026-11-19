@@ -173,6 +173,33 @@ reported as success.
 INTERVAL columns are still described as `SQL_VARCHAR`, so `SQL_C_DEFAULT` for
 them is text.
 
+## Parameter C types
+
+Every C type ODBC defines is sent as its value (#322). Before, a C type the
+bind had no case for had its buffer sent as text, reported as success.
+
+- **The unsigned integers** go out as NUMBER. A `SQL_C_UBIGINT` past
+  `INT64_MAX` is sent as its exact decimal.
+- **`SQL_C_NUMERIC`** is an exact NUMBER, built from the struct's sign, scale
+  and 128-bit mantissa. It doesn't depend on `NLS_NUMERIC_CHARACTERS`. A
+  value outside NUMBER's range is 22003.
+- **`SQL_C_GUID`** is sent as `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` text.
+- **All 13 interval C types** (9i+) become INTERVAL YEAR TO MONTH or DAY TO
+  SECOND:
+  - only the fields the type names are read;
+  - a leading field past its usual range is carried, so `SQL_C_INTERVAL_HOUR`
+    30 is 1 day 6 hours;
+  - `fraction` is in microseconds (the default seconds precision 6), as fetch
+    delivers it. Before, it was taken as nanoseconds, so 1.5 s went in as
+    1.0005 s;
+  - past a 9-digit leading field is 22015.
+- **An unknown `ValueType`** is HY003 at `SQLBindParameter`. If a descriptor
+  field sets one anyway, the execute fails with 07006.
+- **Data-at-execution of a fixed-size C type** takes the type's size and
+  ignores `StrLen_or_Ind`, as ODBC says (#323). A second `SQLPutData` piece
+  is HY019. Before, the length was honoured and the bind read past the
+  buffer.
+
 ## SQL-92 capabilities in SQLGetInfo
 
 The SQL-92 description masks say which statement forms each release accepts
