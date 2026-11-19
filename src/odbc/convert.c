@@ -1171,6 +1171,91 @@ size_t seer_odbc_numeric_to_text(const SQL_NUMERIC_STRUCT *ns, char *out, size_t
   return k;
 }
 
+size_t seer_odbc_numeric_literal(const char *s, size_t n, char *out, size_t cap)
+{
+  while (n > 0 && (*s == ' ' || *s == '\t')) {
+    s++;
+    n--;
+  }
+  while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+    n--;
+  size_t i = 0;
+  bool neg = false;
+  if (i < n && (s[i] == '+' || s[i] == '-'))
+    neg = s[i++] == '-';
+  char dig[160];
+  size_t nd = 0, nint = 0;
+  for (; i < n && s[i] >= '0' && s[i] <= '9'; i++, nint++)
+    if (nd < sizeof dig)
+      dig[nd++] = s[i];
+    else
+      return 0;
+  if (i < n && s[i] == '.')
+    for (i++; i < n && s[i] >= '0' && s[i] <= '9'; i++)
+      if (nd < sizeof dig)
+        dig[nd++] = s[i];
+      else
+        return 0;
+  if (nd == 0)
+    return 0;
+  long exp = 0;
+  if (i < n && (s[i] == 'e' || s[i] == 'E')) {
+    i++;
+    bool eneg = false;
+    if (i < n && (s[i] == '+' || s[i] == '-'))
+      eneg = s[i++] == '-';
+    size_t ed = 0;
+    for (; i < n && s[i] >= '0' && s[i] <= '9'; i++, ed++)
+      if (exp < 100000)
+        exp = exp * 10 + (s[i] - '0');
+    if (ed == 0)
+      return 0;
+    if (eneg)
+      exp = -exp;
+  }
+  if (i != n || exp > 400 || exp < -400)
+    return 0;
+  /* value = 0.dig x 10^point, with leading zeros dropped */
+  long point = (long)nint + exp;
+  size_t lead = 0;
+  while (lead < nd && dig[lead] == '0') {
+    lead++;
+    point--;
+  }
+  size_t k = 0;
+  if (lead == nd) { /* zero */
+    if (cap < 2)
+      return 0;
+    out[0] = '0';
+    out[1] = '\0';
+    return 1;
+  }
+  size_t sig = nd - lead;
+  size_t need = 1 + sig + 2 + (size_t)(point < 0 ? -point : point) + 1;
+  if (need > cap)
+    return 0;
+  if (neg)
+    out[k++] = '-';
+  if (point <= 0) {
+    out[k++] = '0';
+    out[k++] = '.';
+    for (long z = 0; z < -point; z++)
+      out[k++] = '0';
+    for (size_t j = lead; j < nd; j++)
+      out[k++] = dig[j];
+  } else {
+    for (long j = 0; j < point; j++)
+      out[k++] = (size_t)j < sig ? dig[lead + (size_t)j] : '0';
+    if ((size_t)point < sig) {
+      out[k++] = '.';
+      for (size_t j = lead + (size_t)point; j < nd; j++)
+        out[k++] = dig[j];
+    }
+  }
+  out[k] = '\0';
+  return k;
+}
+
 void seer_odbc_guid_to_text(const SQLGUID *g, char out[37])
 {
   snprintf(out, 37, "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X", (unsigned long)g->Data1,
