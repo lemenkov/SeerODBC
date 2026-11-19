@@ -5510,6 +5510,107 @@ static void check_c_type_targets(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* SQL_C_DEFAULT is the SQL type's ODBC default C type (#316), not always
+ * text. Columns: a DATE fills a timestamp struct, RAW gives its bytes,
+ * BINARY_DOUBLE a double (10g+), NUMBER stays text, through SQLGetData and a
+ * bound column alike. Parameters: a double, an integer and RAW bytes arrive
+ * as such (RAW was mangled on 8i as text), and a timestamp struct from 9i
+ * (8.1.7 binds no TIMESTAMP). */
+static void check_c_default(SQLHDBC dbc)
+{
+  const char *name = "SQL_C_DEFAULT is the SQL type's default C type";
+  char m[400] = "";
+  SQLHSTMT s;
+  SQLRETURN rc;
+  SQLLEN ind = 0;
+  SQL_TIMESTAMP_STRUCT ts;
+  unsigned char raw[8];
+  SQLDOUBLE dv = 0;
+  char txt[16] = "";
+
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  char q[200];
+  snprintf(q, sizeof q,
+           "SELECT TO_DATE('2026-11-19 10:11:12','YYYY-MM-DD HH24:MI:SS'), "
+           "HEXTORAW('DEADBEEF'), 1.5%s FROM dual",
+           g_release >= 10 ? ", CAST(2.5 AS BINARY_DOUBLE)" : "");
+  SQLLEN bind_ind = 0;
+  memset(&ts, 0, sizeof ts);
+  SQLBindCol(s, 1, SQL_C_DEFAULT, &ts, sizeof ts, &bind_ind); /* bound: the DATE */
+  rc = SQLExecDirect(s, (SQLCHAR *)q, SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLFetch(s);
+  if (!SQL_SUCCEEDED(rc) || ts.year != 2026 || ts.month != 11 || ts.day != 19 || ts.hour != 10 ||
+      ts.minute != 11 || ts.second != 12 || bind_ind != (SQLLEN)sizeof ts)
+    snprintf(m, sizeof m, "bound DATE: rc %d %d-%u-%u %u:%u:%u ind %ld", rc, ts.year, ts.month,
+             ts.day, ts.hour, ts.minute, ts.second, (long)bind_ind);
+  if (m[0] == '\0') {
+    memset(raw, 0, sizeof raw);
+    rc = SQLGetData(s, 2, SQL_C_DEFAULT, raw, sizeof raw, &ind);
+    if (!SQL_SUCCEEDED(rc) || ind != 4 || raw[0] != 0xDE || raw[3] != 0xEF)
+      snprintf(m, sizeof m, "RAW: rc %d ind %ld bytes %02x%02x", rc, (long)ind, raw[0], raw[1]);
+  }
+  if (m[0] == '\0') {
+    rc = SQLGetData(s, 3, SQL_C_DEFAULT, txt, sizeof txt, &ind);
+    if (!SQL_SUCCEEDED(rc) || strcmp(txt, "1.5") != 0)
+      snprintf(m, sizeof m, "NUMBER: rc %d '%s', want text '1.5'", rc, txt);
+  }
+  if (m[0] == '\0' && g_release >= 10) {
+    rc = SQLGetData(s, 4, SQL_C_DEFAULT, &dv, sizeof dv, &ind);
+    if (!SQL_SUCCEEDED(rc) || dv != 2.5 || ind != (SQLLEN)sizeof dv)
+      snprintf(m, sizeof m, "BINARY_DOUBLE: rc %d %g ind %ld", rc, dv, (long)ind);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+
+  /* Parameters bound SQL_C_DEFAULT: the buffer holds the default C type. */
+  static const struct {
+    SQLSMALLINT sqltype;
+    const char *sql, *want;
+    int from;
+  } P[] = {
+      {SQL_DOUBLE, "SELECT TO_CHAR(? * 2) FROM dual", "5", 0},
+      {SQL_INTEGER, "SELECT TO_CHAR(? + 1) FROM dual", "43", 0},
+      {SQL_VARBINARY, "SELECT RAWTOHEX(?) FROM dual", "DEADBEEF", 0},
+      {SQL_TYPE_TIMESTAMP, "SELECT TO_CHAR(?, 'YYYY-MM-DD HH24:MI:SS') FROM dual",
+       "2026-11-19 10:11:12", 9},
+  };
+  SQL_TIMESTAMP_STRUCT pts = {2026, 11, 19, 10, 11, 12, 0};
+  SQLDOUBLE pd = 2.5;
+  SQLINTEGER pi = 42;
+  unsigned char praw[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+  for (size_t i = 0; i < sizeof P / sizeof P[0] && m[0] == '\0'; i++) {
+    if (g_release < P[i].from)
+      continue;
+    void *val = P[i].sqltype == SQL_DOUBLE      ? (void *)&pd
+                : P[i].sqltype == SQL_INTEGER   ? (void *)&pi
+                : P[i].sqltype == SQL_VARBINARY ? (void *)praw
+                                                : (void *)&pts;
+    SQLLEN len = P[i].sqltype == SQL_VARBINARY ? 4 : 0;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    rc = SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_DEFAULT, P[i].sqltype,
+                          P[i].sqltype == SQL_TYPE_TIMESTAMP ? 19 : 15, 0, val, len, &len);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLExecDirect(s, (SQLCHAR *)P[i].sql, SQL_NTS);
+    char out[64] = "", err[256] = "";
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLFetch(s);
+    if (SQL_SUCCEEDED(rc))
+      rc = SQLGetData(s, 1, SQL_C_CHAR, out, sizeof out, &ind);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_STMT, s, err, sizeof err);
+    /* 10g+ renders a BINARY_DOUBLE product as 5.0E+000. */
+    if (!SQL_SUCCEEDED(rc) ||
+        (strcmp(out, P[i].want) != 0 && !(P[i].sqltype == SQL_DOUBLE && atof(out) == 5.0)))
+      snprintf(m, sizeof m, "parameter type %d: rc %d '%s' %s, want '%s'", P[i].sqltype, rc, out,
+               err, P[i].want);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -6743,6 +6844,7 @@ int main(void)
   check_implicit_results(dbc);
   check_mult_result_sets(dbc);
   check_c_type_targets(dbc);
+  check_c_default(dbc);
   check_refcursor_nested_cursor(dbc);
   check_array_dml_rowcounts(dbc);
   check_browse_connect(browse_dir, user, pwd);

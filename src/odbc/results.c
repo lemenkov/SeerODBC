@@ -49,6 +49,13 @@ static SQLSMALLINT sql_type_of(int ora_type)
   }
 }
 
+SQLSMALLINT seer_odbc_col_c_type(OdbcStmt *s, int col, SQLSMALLINT t)
+{
+  if (t != SQL_C_DEFAULT || s == NULL || s->core == NULL)
+    return t;
+  return seer_odbc_default_c_type(sql_type_of(seer_stmt_col_type(s->core, col)));
+}
+
 static const char *type_name_of(int ora_type)
 {
   switch (ora_type) {
@@ -1110,13 +1117,14 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
     /* Column-wise or row-wise (the struct size), past the bind offset
      * (#243). */
     vlen = max_length_cap(s, i, val, vlen, is_binary);
+    const SQLSMALLINT ct = seer_odbc_col_c_type(s, i, b->target_type); /* #316 */
     void *buf = seer_odbc_bound_at(b->buf, s->row_bind_offset, s->row_bind_type,
-                                   c_elem_stride(b->target_type, b->buflen), row);
+                                   c_elem_stride(ct, b->buflen), row);
     SQLLEN *ind =
         seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type, sizeof(SQLLEN), row);
     const char *state = NULL;
-    SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, b->target_type, buf,
-                                    b->buflen, ind, NULL, &state);
+    SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, ct, buf, b->buflen,
+                                    ind, NULL, &state);
     /* Each column's own state: truncation, or a value that won't convert
      * (#314), which makes the row an error row. */
     if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
@@ -1343,6 +1351,7 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
     TargetType = col < s->ab->num_binds && s->ab->binds[col].target_type != 0
                      ? s->ab->binds[col].target_type
                      : SQL_C_DEFAULT;
+  TargetType = seer_odbc_col_c_type(s, col, TargetType); /* SQL_C_DEFAULT (#316) */
 
   const char *state = NULL;
   SQLRETURN r =

@@ -157,6 +157,14 @@ reported as success.
   included, are laid out at their own size in column-wise arrays, whatever
   `BufferLength` says.
 - **`SQLGetData(SQL_ARD_TYPE)`** takes the type the column is bound with.
+- **`SQL_C_DEFAULT`** is the ODBC default C type of the SQL type (#316): the
+  type a column is described as, or a parameter's `ParameterType`.
+  - DATE and TIMESTAMP columns fill a timestamp struct.
+  - RAW, LONG RAW and BLOB give their bytes.
+  - BINARY_DOUBLE and BINARY_FLOAT give a double and a float.
+  - NUMBER and the character types give text.
+  - A parameter's buffer is read the same way. Before, it was always taken as
+    text: a struct or a number was refused, and on 8i RAW bytes were mangled.
 
 INTERVAL columns are still described as `SQL_VARCHAR`, so `SQL_C_DEFAULT` for
 them is text.

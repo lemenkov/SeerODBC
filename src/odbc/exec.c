@@ -206,6 +206,14 @@ static SQLRETURN exec_finish(OdbcStmt *s);
  * iteration per row, each row's value read at buf + row*stride. OUT / IN OUT
  * params declare an OUT bind (single-row only). */
 /* A single parameter set's value and indicator, past the bind offset (#243). */
+/* The parameter's C type, SQL_C_DEFAULT taken as its SQL type's default C
+ * type (#316): a timestamp struct for SQL_TYPE_TIMESTAMP, the bytes for
+ * SQL_VARBINARY, and text only where ODBC says so. */
+static SQLSMALLINT param_c_type(const OdbcParam *p)
+{
+  return p->c_type == SQL_C_DEFAULT ? seer_odbc_default_c_type(p->sql_type) : p->c_type;
+}
+
 static void *param_buf(const OdbcStmt *s, const OdbcParam *p)
 {
   return seer_odbc_bound_at(p->buf, s->param_bind_offset, 0, 0, 0);
@@ -305,11 +313,11 @@ static SQLRETURN apply_params(OdbcStmt *s)
          * past the bind offset. Read by column whatever the attribute, a
          * row-wise set came from the next field and ran past the array. */
         const void *val = seer_odbc_bound_at(p->buf, s->param_bind_offset, s->param_bind_type,
-                                             ctype_stride(p->c_type, p->buflen), row);
+                                             ctype_stride(param_c_type(p), p->buflen), row);
         const SQLLEN *indp = seer_odbc_bound_at(p->indicator, s->param_bind_offset,
                                                 s->param_bind_type, sizeof(SQLLEN), row);
         SQLLEN ind = indp ? *indp : SQL_NTS;
-        st = bind_one_value(s->core, param, p->c_type, p->sql_type, val, ind);
+        st = bind_one_value(s->core, param, param_c_type(p), p->sql_type, val, ind);
         if (st != SEER_OK)
           return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
       }
@@ -330,8 +338,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
     if (p->dae) { /* value streamed in via SQLPutData */
       if (p->dae_null)
         seer_stmt_bind_null_typed(s->core, param, ora_type_for_sql(p->sql_type));
-      else if (bind_one_value(s->core, param, p->c_type, p->sql_type, p->dae_buf ? p->dae_buf : "",
-                              (SQLLEN)p->dae_len) != SEER_OK)
+      else if (bind_one_value(s->core, param, param_c_type(p), p->sql_type,
+                              p->dae_buf ? p->dae_buf : "", (SQLLEN)p->dae_len) != SEER_OK)
         return seer_odbc_diag(s, "HY000", 0, "Parameter bind failed", SQL_ERROR);
       continue;
     }
@@ -343,7 +351,7 @@ static SQLRETURN apply_params(OdbcStmt *s)
         const SQLLEN *indp = param_ind(s, p);
         SQLLEN ind = indp ? *indp : SQL_NTS;
         SeerStatus st =
-            bind_one_value(s->core, param, p->c_type, p->sql_type, param_buf(s, p), ind);
+            bind_one_value(s->core, param, param_c_type(p), p->sql_type, param_buf(s, p), ind);
         if (st == SEER_OK)
           st = seer_stmt_bind_set_inout(s->core, param, sz);
         if (st != SEER_OK)
@@ -359,7 +367,8 @@ static SQLRETURN apply_params(OdbcStmt *s)
     }
     const SQLLEN *indp = param_ind(s, p);
     SQLLEN ind = indp ? *indp : SQL_NTS;
-    SeerStatus st = bind_one_value(s->core, param, p->c_type, p->sql_type, param_buf(s, p), ind);
+    SeerStatus st =
+        bind_one_value(s->core, param, param_c_type(p), p->sql_type, param_buf(s, p), ind);
     if (st != SEER_OK)
       return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, "Parameter bind failed", SQL_ERROR);
   }
@@ -572,7 +581,7 @@ static SQLRETURN exec_finish(OdbcStmt *s)
     if (seer_stmt_out_data(s->core, i + 1, &data, &dlen, &is_null, &is_binary) != SEER_OK)
       continue;
     const char *cstate = NULL;
-    SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, p->c_type,
+    SQLRETURN crc = seer_odbc_convert(data ? data : "", dlen, is_null, is_binary, param_c_type(p),
                                       param_buf(s, p), p->buflen, param_ind(s, p), NULL, &cstate);
     /* A value that won't convert to the parameter's C type (#314). */
     if (crc == SQL_ERROR) {
@@ -960,7 +969,7 @@ SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT Parame
 
   OdbcParam *p = &s->params[ParameterNumber - 1];
   p->io_type = InputOutputType;
-  p->c_type = (ValueType == SQL_C_DEFAULT) ? SQL_C_CHAR : ValueType;
+  p->c_type = ValueType; /* SQL_C_DEFAULT resolves where it is used (#316) */
   p->sql_type = ParameterType;
   p->column_size = ColumnSize;
   p->buf = ParameterValuePtr;
@@ -1159,12 +1168,13 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
       OdbcBind *b = &s->ab->binds[i];
       if (!b->bound || seer_stmt_col_name(s->core, i) == NULL)
         continue;
+      SQLSMALLINT ct = seer_odbc_col_c_type(s, i, b->target_type); /* #316 */
       void *vp = seer_odbc_bound_at(b->buf, s->row_bind_offset, s->row_bind_type,
-                                    ctype_stride(b->target_type, b->buflen), (SQLULEN)elem);
+                                    ctype_stride(ct, b->buflen), (SQLULEN)elem);
       const SQLLEN *indp = seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type,
                                               sizeof(SQLLEN), (SQLULEN)elem);
       SQLLEN ind = indp ? *indp : SQL_NTS;
-      bind_one_value(dml, ++k, b->target_type, 0, vp, ind);
+      bind_one_value(dml, ++k, ct, 0, vp, ind);
     }
     seer_stmt_bind_text(dml, nset + 1, s->rowids[r], -1);
 
