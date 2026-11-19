@@ -99,6 +99,8 @@ static const char *ora_sqlstate(SQLINTEGER code)
   case 60:   /* deadlock detected */
   case 8177: /* can't serialize access for this transaction */
     return "40001";
+  case 2091: /* transaction rolled back (a deferred constraint, at commit) */
+    return "40002";
   case 1476: /* divisor is equal to zero */
     return "22012";
   case 1722: /* invalid number */

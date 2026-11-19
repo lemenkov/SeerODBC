@@ -147,14 +147,13 @@ SQLRETURN SQL_API SQLEndTran(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLI
   SeerStatus st = (CompletionType == SQL_ROLLBACK) ? seer_rollback(c->conn) : seer_commit(c->conn);
   if (st == SEER_OK)
     return SQL_SUCCESS;
-  /* A database error carries the server's text and ORA number. A commit the
-   * server rolled back (ORA-02091, a deferred constraint) is ODBC's 40002,
-   * "integrity constraint violation" (#184). */
+  /* A database error carries the server's text and ORA number; its SQLSTATE
+   * comes from the ORA map - a commit the server rolled back (ORA-02091, a
+   * deferred constraint) is 40002 there (#184, #346). */
   const char *ora = st == SEER_EDB ? seer_last_error(c->conn) : NULL;
   SQLINTEGER native = (ora != NULL && strncmp(ora, "ORA-", 4) == 0) ? (SQLINTEGER)atoi(ora + 4) : 0;
-  const char *state =
-      (CompletionType == SQL_COMMIT && native == 2091) ? "40002" : seer_odbc_sqlstate(st);
-  return seer_odbc_diag(c, state, native, ora ? ora : seer_strerror(st), SQL_ERROR);
+  return seer_odbc_diag(c, seer_odbc_sqlstate(st), native, ora ? ora : seer_strerror(st),
+                        SQL_ERROR);
 }
 
 SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute,
