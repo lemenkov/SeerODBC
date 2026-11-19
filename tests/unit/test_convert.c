@@ -48,8 +48,64 @@ int main(void)
     unsigned char bit = 9;
     CV("0", 1, 0, 0, SQL_C_BIT, &bit, 0, &ind);
     assert(bit == 0);
-    CV("5", 1, 0, 0, SQL_C_BIT, &bit, 0, &ind);
-    assert(bit == 1); /* nonzero -> 1 */
+    /* a bit is 0 or 1: 5 is 22003, the buffer untouched (#329) */
+    assert(CV("5", 1, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_ERROR && ST("22003") && bit == 0);
+    assert(CV("1.5", 3, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS_WITH_INFO && ST("01S07") &&
+           bit == 1);
+    assert(CV("-1", 2, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_ERROR && ST("22003"));
+    assert(CV("-0.5", 4, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_ERROR && ST("22003"));
+    /* 23ai BOOLEAN text */
+    assert(CV("TRUE", 4, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 1);
+    assert(CV("false", 5, 0, 0, SQL_C_BIT, &bit, 0, &ind) == SQL_SUCCESS && bit == 0);
+  }
+
+  /* --- integer ranges, truncation, non-numeric text (#329) --- */
+  {
+    SQLSMALLINT sh = 7;
+    assert(CV("70000", 5, 0, 0, SQL_C_SSHORT, &sh, 0, &ind) == SQL_ERROR && ST("22003") && sh == 7);
+    assert(CV("-32768", 6, 0, 0, SQL_C_SSHORT, &sh, 0, &ind) == SQL_SUCCESS && sh == -32768);
+    assert(CV("32768", 5, 0, 0, SQL_C_SSHORT, &sh, 0, &ind) == SQL_ERROR && ST("22003"));
+    SQLUSMALLINT us = 0;
+    assert(CV("65535", 5, 0, 0, SQL_C_USHORT, &us, 0, &ind) == SQL_SUCCESS && us == 65535);
+    SQLINTEGER l = 0;
+    assert(CV("3.7", 3, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS_WITH_INFO && ST("01S07") &&
+           l == 3);
+    assert(CV("-3.7", 4, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS_WITH_INFO && l == -3);
+    assert(CV("12.000", 6, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS && l == 12);
+    assert(CV(".5", 2, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS_WITH_INFO && l == 0);
+    assert(CV("  42  ", 6, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS && l == 42);
+    assert(CV("1.5E+3", 6, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS && l == 1500);
+    assert(CV("abc", 3, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_ERROR && ST("22018"));
+    assert(CV("", 0, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_ERROR && ST("22018"));
+    assert(CV("1e", 2, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_ERROR && ST("22018"));
+    assert(CV("TRUE", 4, 0, 0, SQL_C_SLONG, &l, 0, &ind) == SQL_SUCCESS && l == 1);
+    SQLUINTEGER ul = 9;
+    assert(CV("-1", 2, 0, 0, SQL_C_ULONG, &ul, 0, &ind) == SQL_ERROR && ST("22003") && ul == 9);
+    assert(CV("-0.4", 4, 0, 0, SQL_C_ULONG, &ul, 0, &ind) == SQL_SUCCESS_WITH_INFO && ul == 0);
+    SQLBIGINT b = 0;
+    assert(CV("-9223372036854775808", 20, 0, 0, SQL_C_SBIGINT, &b, 0, &ind) == SQL_SUCCESS &&
+           b == (-9223372036854775807LL - 1));
+    assert(CV("9223372036854775808", 19, 0, 0, SQL_C_SBIGINT, &b, 0, &ind) == SQL_ERROR &&
+           ST("22003"));
+    assert(CV("1e20", 4, 0, 0, SQL_C_SBIGINT, &b, 0, &ind) == SQL_ERROR && ST("22003"));
+    SQLUBIGINT ub = 0;
+    assert(CV("18446744073709551615", 20, 0, 0, SQL_C_UBIGINT, &ub, 0, &ind) == SQL_SUCCESS &&
+           ub == 18446744073709551615ULL);
+    assert(CV("18446744073709551616", 20, 0, 0, SQL_C_UBIGINT, &ub, 0, &ind) == SQL_ERROR &&
+           ST("22003"));
+    SQLSCHAR t = 0;
+    assert(CV("-128", 4, 0, 0, SQL_C_STINYINT, &t, 0, &ind) == SQL_SUCCESS && t == -128);
+    assert(CV("128", 3, 0, 0, SQL_C_STINYINT, &t, 0, &ind) == SQL_ERROR && ST("22003"));
+    unsigned char raw[2] = {0x01, 0x02}; /* binary -> numeric: 07006 */
+    assert(CV(raw, 2, 0, 1, SQL_C_SLONG, &l, 0, &ind) == SQL_ERROR && ST("07006"));
+    SQLDOUBLE d = 0;
+    assert(CV("1e400", 5, 0, 0, SQL_C_DOUBLE, &d, 0, &ind) == SQL_ERROR && ST("22003"));
+    assert(CV("x1", 2, 0, 0, SQL_C_DOUBLE, &d, 0, &ind) == SQL_ERROR && ST("22018"));
+    SQLREAL f = 0;
+    assert(CV("1e39", 4, 0, 0, SQL_C_FLOAT, &f, 0, &ind) == SQL_ERROR && ST("22003"));
+    /* exactly representable: msvcrt's strtod is not correctly rounded (MinGW 32-bit) */
+    assert(CV("-1.25E+2", 8, 0, 0, SQL_C_DOUBLE, &d, 0, &ind) == SQL_SUCCESS && d == -125.0);
+    assert(CV("2.5e-1", 6, 0, 0, SQL_C_DOUBLE, &d, 0, &ind) == SQL_SUCCESS && d == 0.25);
   }
 
   /* --- NUMERIC struct (sign, scale, mantissa) --- */
