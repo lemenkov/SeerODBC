@@ -2205,6 +2205,13 @@ SeerStatus seer_rollback(SeerConn *conn)
   return st;
 }
 
+int seer_db_charset_unicode(const SeerConn *conn)
+{
+  /* 873 AL32UTF8, 871 UTF8; 0 not yet known (taken as Unicode: no change) */
+  return conn == NULL || conn->db_charset == 0 || conn->db_charset == 873 ||
+         conn->db_charset == 871;
+}
+
 int seer_txn_open(const SeerConn *conn)
 {
   /* 8i: its status flags (bus 95); 10g+: the call_status. 9i's compact
