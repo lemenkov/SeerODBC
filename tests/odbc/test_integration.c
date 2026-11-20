@@ -6292,6 +6292,56 @@ static void check_national_params(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* A block cursor whose rows 1 and 3 overflow the bound buffer (#369): those
+ * rows are SQL_ROW_SUCCESS_WITH_INFO and row 2 SQL_ROW_SUCCESS; there are two
+ * 01004 records, with SQL_DIAG_ROW_NUMBER 1 and 3. Each record used to replace
+ * the last, with no row number, and every row read SQL_ROW_SUCCESS. */
+static void check_rowset_truncation(SQLHDBC dbc)
+{
+  const char *name = "rowset: truncated rows say so, each 01004 with its row";
+  char m[300] = "";
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLUSMALLINT status[3] = {99, 99, 99};
+  SQLULEN fetched = 0;
+  SQLSetStmtAttr(s, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)3, 0);
+  SQLSetStmtAttr(s, SQL_ATTR_ROW_STATUS_PTR, status, 0);
+  SQLSetStmtAttr(s, SQL_ATTR_ROWS_FETCHED_PTR, &fetched, 0);
+  char buf[3][4];
+  SQLLEN ind[3];
+  SQLBindCol(s, 1, SQL_C_CHAR, buf, 4, ind);
+  SQLRETURN rc = SQLExecDirect(
+      s, (SQLCHAR *)"SELECT DECODE(rownum, 2, 'ab', 'longer') FROM all_objects WHERE rownum <= 3",
+      SQL_NTS);
+  if (SQL_SUCCEEDED(rc))
+    rc = SQLFetch(s);
+  if (rc != SQL_SUCCESS_WITH_INFO || fetched != 3 || status[0] != SQL_ROW_SUCCESS_WITH_INFO ||
+      status[1] != SQL_ROW_SUCCESS || status[2] != SQL_ROW_SUCCESS_WITH_INFO)
+    snprintf(m, sizeof m, "fetch rc=%d fetched=%lu statuses %u %u %u (want 1, 3, 6 0 6)", (int)rc,
+             (unsigned long)fetched, status[0], status[1], status[2]);
+  SQLLEN rows[2] = {0, 0};
+  int nrec = 0;
+  for (SQLSMALLINT r = 1; !m[0] && r <= 3; r++) {
+    SQLCHAR st[6];
+    SQLINTEGER n;
+    SQLSMALLINT l;
+    SQLCHAR msg[64];
+    if (SQLGetDiagRec(SQL_HANDLE_STMT, s, r, st, &n, msg, sizeof msg, &l) != SQL_SUCCESS)
+      break;
+    if (nrec < 2)
+      SQLGetDiagField(SQL_HANDLE_STMT, s, r, SQL_DIAG_ROW_NUMBER, &rows[nrec], 0, NULL);
+    nrec++;
+  }
+  if (!m[0] && (nrec != 2 || rows[0] != 1 || rows[1] != 3))
+    snprintf(m, sizeof m, "%d diagnostic records, rows %ld and %ld (want 2: rows 1 and 3)", nrec,
+             (long)rows[0], (long)rows[1]);
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7890,6 +7940,7 @@ int main(void)
   check_describe_no_markers(dbc);
   check_diag_text_trimmed(dbc);
   check_national_params(dbc);
+  check_rowset_truncation(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
