@@ -17,6 +17,7 @@
 
 #include "log.h"
 #include "odbc_internal.h"
+#include "tnsnames.h"
 #include "odbcini.h"
 #include "sqlprep.h"
 
@@ -234,6 +235,31 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   if (dbq != NULL && (host == NULL || svc == NULL) && easy_connect(dbq, &host, &port, &svc) != 0)
     tns_alias = host == NULL;
 
+  /* A TNS alias - a bare DBQ word, or a SERVICE / SID with no HOST - from
+   * tnsnames.ora (#374): its TCP / TCPS addresses become the HOST failover
+   * list (each with its port), its SERVICE_NAME or SID the target, and a
+   * TCPS address turns TLS on unless SSL / PROTOCOL said otherwise. */
+  const char *alias = tns_alias ? dbq : (host == NULL && svc != NULL ? svc : NULL);
+  bool use_sid = false;
+  int tns_rc = 1; /* 1: no alias looked up */
+  char tns_searched[600] = "";
+  SeerTnsEntry tns;
+  if (alias != NULL) {
+    tns_rc = seer_tns_lookup(alias, &tns, tns_searched, sizeof tns_searched);
+    if (tns_rc == 0) {
+      free(host);
+      host = strdup(tns.hosts);
+      free(svc);
+      svc = strdup(tns.service);
+      use_sid = tns.is_sid;
+      if (tns.tcps && cssl == NULL && cproto == NULL)
+        cproto = strdup("TCPS");
+      tns_alias = false;
+    } else {
+      tns_alias = true; /* the error names the alias */
+    }
+  }
+
   /* TLS is requested by SSL=1/yes/true or PROTOCOL=TCPS; verification is on by
    * default (TLSVERIFY=0 disables it, e.g. for a self-signed test endpoint). */
   int use_tls = flag_is_on(cssl) || proto_is_tcps(cproto);
@@ -252,11 +278,15 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   SQLRETURN ret;
   if (host == NULL || svc == NULL) {
     if (tns_alias) {
-      char m[300];
-      snprintf(m, sizeof m,
-               "DBQ=%.100s is a TNS alias: tnsnames.ora is not read; give the target as "
-               "host:port/service (Easy Connect) or HOST, PORT and SERVICE",
-               dbq);
+      char m[900];
+      if (tns_rc == -2)
+        snprintf(m, sizeof m,
+                 "TNS alias %.100s has no TCP / TCPS address or no SERVICE_NAME / SID "
+                 "SeerODBC can use",
+                 alias);
+      else
+        snprintf(m, sizeof m, "TNS alias %.100s not found (searched: %s)", alias,
+                 tns_searched[0] ? tns_searched : "no tnsnames.ora: set TNS_ADMIN");
       ret = seer_odbc_diag(c, "08001", 0, m, SQL_ERROR);
     } else {
       ret = seer_odbc_diag(c, "08001", 0, "Missing HOST or SERVICE in DSN/connection string",
@@ -300,7 +330,8 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
   SeerConnParams p = {
       .host = host,
       .port = port ? (uint16_t)atoi(port) : 1521,
-      .service_name = svc,
+      .service_name = use_sid ? NULL : svc,
+      .sid = use_sid ? svc : NULL, /* CONNECT_DATA = (SID = ...) in tnsnames.ora */
       .username = user,
       .password = pass,
       .use_tls = use_tls,

@@ -231,6 +231,12 @@ if build_driver
       dependencies : [test_dep, odbc_pure_dep],
     )
     test('odbc.ini reader', test_odbcini)
+
+    test_tnsnames = executable('test_tnsnames',
+      'unit/test_tnsnames.c',
+      dependencies : [test_dep, odbc_pure_dep],
+    )
+    test('tnsnames.ora reader', test_tnsnames)
   endif
 
   # Driver-level integration test: through the Driver Manager against a live

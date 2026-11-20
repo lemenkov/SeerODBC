@@ -17,7 +17,7 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 |--------|----------|-------|
 | [x] | SQLAllocHandle / SQLFreeHandle | ENV / DBC / STMT |
 | [x] | SQLSetEnvAttr / SQLGetEnvAttr | ODBC version |
-| [x] | SQLConnect / SQLDriverConnect | DSN from odbc.ini; HOST/PORT/SERVICE keys, or an Easy Connect `DBQ=[//]host[:port]/service` as Oracle's ODBC driver takes it (#362); a TNS alias is refused, as tnsnames.ora is not read |
+| [x] | SQLConnect / SQLDriverConnect | DSN from odbc.ini; HOST/PORT/SERVICE keys, or `DBQ` as Oracle's ODBC driver takes it: Easy Connect `[//]host[:port]/service` (#362) or a TNS alias from tnsnames.ora ($TNS_ADMIN, $ORACLE_HOME/network/admin, /etc; #374) |
 | [x] | SQLDisconnect | in manual-commit mode with a transaction open: 25000, the connection left up (8i and 10g+; 9i's compact replies don't say, #344) |
 | [x] | SQLSetConnectAttr / SQLGetConnectAttr | autocommit (switching back ON commits the open transaction, #342); `SQL_ATTR_CONNECTION_DEAD` is true once the socket is gone, or once the server has ended the session over a live one (killed, instance down, lost contact, idle time; #340) |
 | [x] | SQLGetInfo | server-specific answer table (identifier quote, schemas-not-catalogs, txn, scroll options, …) |

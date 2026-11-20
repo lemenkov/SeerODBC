@@ -4,7 +4,7 @@
 # CodeQL configuration for the c-cpp analysis (referenced from
 # .github/workflows/codeql.yml via `config-file`).
 #
-# We run the full security-and-quality suite, then exclude five queries whose
+# We run the full security-and-quality suite, then exclude six queries whose
 # alerts are, in this codebase, verified false positives or protocol
 # requirements rather than defects. Each was triaged individually (see the
 # per-rule notes below and PR history); inline `// codeql[...]` source
@@ -50,3 +50,13 @@ query-filters:
   # kept intentionally as defense-in-depth.
   - exclude:
       id: cpp/constant-comparison
+
+  # The driver opens only files its own caller names: odbc.ini through
+  # ODBCINI / HOME / ODBCSYSINI, tnsnames.ora through TNS_ADMIN /
+  # ORACLE_HOME or an IFILE line in a tnsnames.ora already chosen that way
+  # (#374) - the places Oracle's and unixODBC's own clients read. Whoever sets
+  # those variables or writes those files already runs as the application, so
+  # a "tainted" path crosses no trust boundary. The files are only read, never
+  # written or executed.
+  - exclude:
+      id: cpp/path-injection
