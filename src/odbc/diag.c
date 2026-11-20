@@ -163,6 +163,14 @@ static OdbcDiagRec *diag_push(OdbcHeader *h, const char *state, SQLINTEGER nativ
   snprintf(rec->state, sizeof rec->state, "%.5s", state ? state : "HY000");
   rec->native = native;
   snprintf(rec->message, sizeof rec->message, "%s", msg ? msg : "");
+  /* The server's text ends with a newline from 9i up (8i's is trimmed where
+   * read): ODBC's message is one line with no terminator. Inner line breaks
+   * - ORA-00604's inner error, say - stay (#364). */
+  for (size_t n = strlen(rec->message);
+       n > 0 &&
+       (rec->message[n - 1] == '\n' || rec->message[n - 1] == '\r' || rec->message[n - 1] == ' ');
+       n--)
+    rec->message[n - 1] = '\0';
   rec->row_number = row;
   rec->error_offset = 0;
   return rec;

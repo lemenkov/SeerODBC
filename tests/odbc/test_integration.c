@@ -6215,6 +6215,35 @@ static void check_describe_no_markers(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* A diagnostic's text is one message with no line terminator (#364): from 9i
+ * the server's ends with '\n', which went to the application as it came. The
+ * length SQLGetDiagRec reports is the text's. */
+static void check_diag_text_trimmed(SQLHDBC dbc)
+{
+  const char *name = "diagnostic text has no trailing newline";
+  char m[300] = "";
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)"SELECT seer_no_such_column FROM dual", SQL_NTS);
+  SQLCHAR st[6] = "", msg[512] = "";
+  SQLINTEGER native = 0;
+  SQLSMALLINT len = 0;
+  if (rc != SQL_ERROR ||
+      SQLGetDiagRec(SQL_HANDLE_STMT, s, 1, st, &native, msg, sizeof msg, &len) != SQL_SUCCESS)
+    snprintf(m, sizeof m, "no diagnostic (rc=%d)", (int)rc);
+  else {
+    size_t n = strlen((char *)msg);
+    if (n == 0 || msg[n - 1] == '\n' || msg[n - 1] == '\r' || msg[n - 1] == ' ' || (size_t)len != n)
+      snprintf(m, sizeof m, "message of %zu bytes (length %d) ends with 0x%02x: %.100s", n,
+               (int)len, n ? msg[n - 1] : 0, (char *)msg);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7811,6 +7840,7 @@ int main(void)
   check_char_overflow(dbc);
   check_getdata_wchar_pieces(dbc);
   check_describe_no_markers(dbc);
+  check_diag_text_trimmed(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
