@@ -120,6 +120,8 @@ int seer_txn_open(const SeerConn *conn);
  * not yet known. Otherwise (WE8ISO8859P1, say) text for an NVARCHAR2 has to go
  * in the national charset to survive (#367). */
 int seer_db_charset_unicode(const SeerConn *conn);
+/* The negotiated Session Data Unit in bytes; 0 if not connected (#373). */
+unsigned seer_conn_sdu(const SeerConn *conn);
 
 /* Request boundaries (§35, 21c+). Bracket a logical request on a (typically
  * pooled) connection so the server can reset session state between requests.
