@@ -1279,9 +1279,36 @@ static bool pos_ignored(const OdbcStmt *s, long row, long r)
          s->row_operation[r - s->rowset_start] == SQL_ROW_IGNORE;
 }
 
+/* One row's result of a positioned UPDATE / DELETE (#371): its status
+ * (SQL_ROW_UPDATED / SQL_ROW_DELETED, or SQL_ROW_ERROR with a diagnostic
+ * carrying the row's number in the rowset), counted for the call's return. */
+static void pos_row_result(OdbcStmt *s, long elem, SeerStatus st, SQLUSMALLINT done, int *ok,
+                           int *bad)
+{
+  if (st == SEER_OK) {
+    (*ok)++;
+  } else {
+    (*bad)++;
+    const char *ora = st == SEER_EDB ? seer_last_error(s->dbc->conn) : NULL;
+    seer_odbc_diag_add(s, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st),
+                       (SQLLEN)elem + 1);
+  }
+  if (s->row_status != NULL && elem >= 0)
+    s->row_status[elem] = st == SEER_OK ? done : SQL_ROW_ERROR;
+}
+
+/* The call's return: every row done, some failed, or all failed. */
+static SQLRETURN pos_return(int ok, int bad)
+{
+  if (bad == 0)
+    return SQL_SUCCESS;
+  return ok > 0 ? SQL_SUCCESS_WITH_INFO : SQL_ERROR;
+}
+
 SQLRETURN seer_odbc_pos_delete(OdbcStmt *s, long row)
 {
   long first, last;
+  int ok = 0, bad = 0;
   pos_range(s, row, &first, &last);
   for (long r = first; r <= last; r++) {
     if (r < 0 || (size_t)r >= s->num_rowids || s->rowids[r] == NULL || pos_ignored(s, row, r))
@@ -1295,17 +1322,16 @@ SQLRETURN seer_odbc_pos_delete(OdbcStmt *s, long row)
     seer_odbc_arm_timeout(s);
     SeerStatus st = seer_stmt_execute(dml);
     seer_stmt_close(dml);
-    if (st != SEER_OK) {
-      const char *ora = seer_last_error(s->dbc->conn);
-      return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
-    }
+    /* A failing row is its own error; the rest still run (#371). */
+    pos_row_result(s, r - s->rowset_start, st, SQL_ROW_DELETED, &ok, &bad);
   }
-  return SQL_SUCCESS;
+  return pos_return(ok, bad);
 }
 
 SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
 {
   long first, last;
+  int ok = 0, bad = 0;
   pos_range(s, row, &first, &last);
   for (long r = first; r <= last; r++) {
     if (r < 0 || (size_t)r >= s->num_rowids || s->rowids[r] == NULL || pos_ignored(s, row, r))
@@ -1366,10 +1392,7 @@ SQLRETURN seer_odbc_pos_update(OdbcStmt *s, long row)
     seer_odbc_arm_timeout(s);
     SeerStatus st = seer_stmt_execute(dml);
     seer_stmt_close(dml);
-    if (st != SEER_OK) {
-      const char *ora = seer_last_error(s->dbc->conn);
-      return seer_odbc_diag(s, seer_odbc_sqlstate(st), 0, ora ? ora : seer_strerror(st), SQL_ERROR);
-    }
+    pos_row_result(s, elem, st, SQL_ROW_UPDATED, &ok, &bad); /* the rest still run (#371) */
   }
-  return SQL_SUCCESS;
+  return pos_return(ok, bad);
 }

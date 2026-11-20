@@ -6342,6 +6342,86 @@ static void check_rowset_truncation(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Open a 3-row updatable rowset over seer_spos (id, v) on `s`. */
+static SQLRETURN open_spos(SQLHSTMT s, SQLUSMALLINT *st, SQLINTEGER *id, SQLLEN *ii, SQLINTEGER *v,
+                           SQLLEN *vi)
+{
+  SQLSetStmtAttr(s, SQL_ATTR_CURSOR_TYPE, (SQLPOINTER)SQL_CURSOR_STATIC, 0);
+  SQLSetStmtAttr(s, SQL_ATTR_CONCURRENCY, (SQLPOINTER)SQL_CONCUR_LOCK, 0);
+  SQLSetStmtAttr(s, SQL_ATTR_ROW_ARRAY_SIZE, (SQLPOINTER)3, 0);
+  SQLSetStmtAttr(s, SQL_ATTR_ROW_STATUS_PTR, st, 0);
+  SQLBindCol(s, 1, SQL_C_SLONG, id, 0, ii);
+  SQLBindCol(s, 2, SQL_C_SLONG, v, 0, vi);
+  SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)"SELECT id, v FROM seer_spos ORDER BY id", SQL_NTS);
+  return SQL_SUCCEEDED(rc) ? SQLFetchScroll(s, SQL_FETCH_NEXT, 0) : rc;
+}
+
+/* SQLSetPos(0, SQL_UPDATE / SQL_DELETE) over a rowset whose row 2 fails runs
+ * every row (#371): rows 1 and 3 are SQL_ROW_UPDATED / SQL_ROW_DELETED, row 2
+ * SQL_ROW_ERROR with a diagnostic for row 2, the call SQL_SUCCESS_WITH_INFO.
+ * It used to stop at row 2 (row 3 never ran) with SQL_ERROR and no statuses. */
+static void check_setpos_rowset_errors(SQLHDBC dbc)
+{
+  const char *name = "SQLSetPos over a rowset runs every row; a failing row is its own error";
+  char m[300] = "", err[256], out[64] = "";
+  exec_do(dbc, "DROP TABLE seer_spos_c", err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_spos", err, sizeof err);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_spos (id NUMBER PRIMARY KEY, v NUMBER CHECK (v < 100))",
+                  err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  exec_do(dbc, "CREATE TABLE seer_spos_c (p NUMBER REFERENCES seer_spos)", err, sizeof err);
+  for (int i = 1; i <= 3; i++) {
+    char ins[64];
+    snprintf(ins, sizeof ins, "INSERT INTO seer_spos VALUES (%d, %d)", i, i * 10);
+    exec_do(dbc, ins, err, sizeof err);
+  }
+  exec_do(dbc, "INSERT INTO seer_spos_c VALUES (2)", err, sizeof err);
+  for (int op = 0; op < 2 && !m[0]; op++) {
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLUSMALLINT st[3] = {99, 99, 99};
+    SQLINTEGER id[3], v[3];
+    SQLLEN ii[3], vi[3];
+    SQLRETURN rc = open_spos(s, st, id, ii, v, vi);
+    if (!SQL_SUCCEEDED(rc)) {
+      diag_text(SQL_HANDLE_STMT, s, err, sizeof err);
+      snprintf(m, sizeof m, "open the rowset: %s", err);
+      SQLFreeHandle(SQL_HANDLE_STMT, s);
+      break;
+    }
+    SQLUSMALLINT done = op == 0 ? SQL_ROW_UPDATED : SQL_ROW_DELETED;
+    if (op == 0) {
+      v[0] = 11, v[1] = 500, v[2] = 33; /* 500 breaks the CHECK */
+      rc = SQLSetPos(s, 0, SQL_UPDATE, SQL_LOCK_NO_CHANGE);
+    } else {
+      rc = SQLSetPos(s, 0, SQL_DELETE, SQL_LOCK_NO_CHANGE); /* row 2 has a child */
+    }
+    SQLLEN row = 0;
+    SQLGetDiagField(SQL_HANDLE_STMT, s, 1, SQL_DIAG_ROW_NUMBER, &row, 0, NULL);
+    if (rc != SQL_SUCCESS_WITH_INFO || st[0] != done || st[1] != SQL_ROW_ERROR || st[2] != done ||
+        row != 2)
+      snprintf(m, sizeof m, "%s: rc=%d statuses %u %u %u, diag row %ld (want 1, %u 5 %u, row 2)",
+               op ? "DELETE" : "UPDATE", (int)rc, st[0], st[1], st[2], (long)row, done, done);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+    SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+    exec_scalar(dbc, "SELECT COUNT(*) || ':' || SUM(v) FROM seer_spos", out, sizeof out, err,
+                sizeof err);
+    const char *want = op == 0 ? "3:64" : "1:20"; /* 11+20+33; then only row 2 left */
+    if (!m[0] && strcmp(out, want) != 0)
+      snprintf(m, sizeof m, "after %s the table holds %s (want %s)", op ? "DELETE" : "UPDATE", out,
+               want);
+  }
+  exec_do(dbc, "DROP TABLE seer_spos_c", err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_spos", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7941,6 +8021,7 @@ int main(void)
   check_diag_text_trimmed(dbc);
   check_national_params(dbc);
   check_rowset_truncation(dbc);
+  check_setpos_rowset_errors(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
