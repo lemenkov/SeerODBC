@@ -1171,6 +1171,28 @@ size_t seer_odbc_numeric_to_text(const SQL_NUMERIC_STRUCT *ns, char *out, size_t
   return k;
 }
 
+int seer_odbc_datetime_literal(const char *s, size_t n, SeerOdbcDateTime *out)
+{
+  char buf[128];
+  if (n >= sizeof buf)
+    return -1;
+  memcpy(buf, s, n);
+  buf[n] = '\0';
+  DateTime t;
+  if (parse_dt(buf, &t) != 0)
+    return -1;
+  out->has_date = t.has_date;
+  out->has_time = t.has_time;
+  out->year = t.Y;
+  out->month = t.Mo;
+  out->day = t.D;
+  out->hour = t.h;
+  out->minute = t.mi;
+  out->second = t.se;
+  out->nanos = t.ns;
+  return 0;
+}
+
 size_t seer_odbc_numeric_literal(const char *s, size_t n, char *out, size_t cap)
 {
   while (n > 0 && (*s == ' ' || *s == '\t')) {

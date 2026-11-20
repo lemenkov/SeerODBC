@@ -6792,6 +6792,72 @@ static void check_numeric_text_params(const char *drv, const char *host, const c
     fail(name, m);
 }
 
+/* ODBC date / timestamp literals as character data for a datetime parameter
+ * (#356): the session's NLS_DATE_FORMAT (DD-MON-RR by default) refused them
+ * (ORA-01861). Into a DATE and a TIMESTAMP column - bare, with a fraction, and
+ * as an escape - each reads back as written. Two-way: text that is no literal
+ * still goes as text, and the server still refuses it. */
+static void check_datetime_text_params(SQLHDBC dbc)
+{
+  const char *name = "date / timestamp literals as text for a datetime parameter";
+  char m[300] = "", err[256];
+  exec_do(dbc, "DROP TABLE seer_dtxt", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc,
+                             g_release >= 9 ? "CREATE TABLE seer_dtxt (d DATE, t TIMESTAMP(3))"
+                                            : "CREATE TABLE seer_dtxt (d DATE, t DATE)",
+                             err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  struct {
+    const char *col;
+    SQLSMALLINT st;
+    const char *in, *fmt, *want;
+    int from, ok;
+  } T[] = {
+      {"d", SQL_TYPE_TIMESTAMP, "2026-11-20 10:11:12", "YYYY-MM-DD HH24:MI:SS",
+       "2026-11-20 10:11:12", 8, 1},
+      {"d", SQL_TYPE_DATE, "2026-11-20", "YYYY-MM-DD HH24:MI:SS", "2026-11-20 00:00:00", 8, 1},
+      {"d", SQL_TYPE_TIMESTAMP, "{ts '2026-11-20 10:11:12'}", "YYYY-MM-DD HH24:MI:SS",
+       "2026-11-20 10:11:12", 8, 1},
+      {"t", SQL_TYPE_TIMESTAMP, "2026-11-20 10:11:12.5", "YYYY-MM-DD HH24:MI:SS.FF1",
+       "2026-11-20 10:11:12.5", 9, 1},
+      {"d", SQL_TYPE_DATE, "not a date", "", "", 8, 0},
+  };
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    if (g_release < T[i].from)
+      continue;
+    exec_do(dbc, "DELETE FROM seer_dtxt", err, sizeof err);
+    char ins[80], q[128], out[64] = "", st[6] = "";
+    snprintf(ins, sizeof ins, "INSERT INTO seer_dtxt (%s) VALUES (?)", T[i].col);
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLLEN ind = SQL_NTS;
+    SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_CHAR, T[i].st, 29, 3, (SQLPOINTER)T[i].in, 0,
+                     &ind);
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)ins, SQL_NTS);
+    if (!SQL_SUCCEEDED(rc))
+      diag_state(SQL_HANDLE_STMT, s, st);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+    if (!T[i].ok) {
+      if (SQL_SUCCEEDED(rc))
+        snprintf(m, sizeof m, "'%s' as SQL type %d was accepted", T[i].in, (int)T[i].st);
+      continue;
+    }
+    snprintf(q, sizeof q, "SELECT TO_CHAR(%s, '%s') FROM seer_dtxt", T[i].col, T[i].fmt);
+    if (SQL_SUCCEEDED(rc))
+      exec_scalar(dbc, q, out, sizeof out, err, sizeof err);
+    if (!SQL_SUCCEEDED(rc) || strcmp(out, T[i].want) != 0)
+      snprintf(m, sizeof m, "'%s' as SQL type %d into %s: rc=%d '%s' read [%s], want %s", T[i].in,
+               (int)T[i].st, T[i].col, (int)rc, st, out, T[i].want);
+  }
+  exec_do(dbc, "DROP TABLE seer_dtxt", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -7676,6 +7742,7 @@ int main(void)
   check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);
   check_disconnect_open_txn(dbc, drv, host, port, svc, user, pwd);
   check_numeric_text_params(drv, host, port, svc, user, pwd);
+  check_datetime_text_params(dbc);
   check_connect_error(drv, host, port, svc, user);
   check_connect_failover(drv, host, port, svc, user, pwd);
   check_unreachable_error(drv, svc, user, pwd);

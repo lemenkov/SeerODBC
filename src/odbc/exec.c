@@ -92,13 +92,30 @@ static bool sql_type_numeric(SQLSMALLINT t)
  * NLS_NUMERIC_CHARACTERS; anything else as text, for the server to convert
  * (or refuse, ORA-01722 / 22018) as before (#354). */
 static SeerStatus bind_char_value(SeerStmt *core, int param, SQLSMALLINT sql_type, const char *txt,
-                                  int len)
+                                  int len, bool date_only)
 {
+  size_t n = len < 0 ? strlen(txt) : (size_t)len;
   if (sql_type_numeric(sql_type)) {
-    size_t n = len < 0 ? strlen(txt) : (size_t)len;
     char plain[600];
     if (seer_odbc_numeric_literal(txt, n, plain, sizeof plain) > 0)
       return seer_stmt_bind_number_text(core, param, plain);
+  }
+  /* A datetime literal for a datetime type: the native value, not text the
+   * server would read by NLS_DATE_FORMAT (DD-MON-RR by default) (#356). A
+   * literal that doesn't fit the type goes as text, as before. */
+  SeerOdbcDateTime t;
+  if ((sql_type == SQL_TYPE_TIMESTAMP || sql_type == SQL_TIMESTAMP || sql_type == SQL_TYPE_DATE ||
+       sql_type == SQL_DATE || sql_type == SQL_TYPE_TIME || sql_type == SQL_TIME) &&
+      seer_odbc_datetime_literal(txt, n, &t) == 0) {
+    if ((sql_type == SQL_TYPE_TIMESTAMP || sql_type == SQL_TIMESTAMP) && t.has_date)
+      return date_only ? seer_stmt_bind_date(core, param, t.year, t.month, t.day, t.hour, t.minute,
+                                             t.second) /* 8i: no TIMESTAMP (#318) */
+                       : seer_stmt_bind_timestamp(core, param, t.year, t.month, t.day, t.hour,
+                                                  t.minute, t.second, (uint32_t)t.nanos);
+    if ((sql_type == SQL_TYPE_DATE || sql_type == SQL_DATE) && t.has_date && !t.has_time)
+      return seer_stmt_bind_date(core, param, t.year, t.month, t.day, 0, 0, 0);
+    if ((sql_type == SQL_TYPE_TIME || sql_type == SQL_TIME) && t.has_time && !t.has_date)
+      return seer_stmt_bind_date(core, param, 1970, 1, 1, t.hour, t.minute, t.second);
   }
   return seer_stmt_bind_text(core, param, txt, len);
 }
@@ -232,14 +249,14 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
     size_t u8len = 0;
     if (seer_iconv(SEER_UTF16, "UTF-8", (const char *)valptr, inbytes, &u8, &u8len) != 0)
       return SEER_EPROTO;
-    SeerStatus st = bind_char_value(core, param, sql_type, u8, (int)u8len);
+    SeerStatus st = bind_char_value(core, param, sql_type, u8, (int)u8len, date_only);
     free(u8);
     return st;
   }
   case SQL_C_CHAR:
   case SQL_C_DEFAULT:
     return bind_char_value(core, param, sql_type, (const char *)valptr,
-                           (ind == SQL_NTS) ? -1 : (int)ind);
+                           (ind == SQL_NTS) ? -1 : (int)ind, date_only);
   default:
     /* Not a C type this driver knows (SQLBindParameter refuses those with
      * HY003; a descriptor field can still set one). Never send its bytes as

@@ -224,6 +224,11 @@ bind had no case for had its buffer sent as text, reported as success.
   bound as an exact NUMBER whatever the session's `NLS_NUMERIC_CHARACTERS`
   (#354). Text that is no such literal goes as text, for the server to convert
   or refuse; past NUMBER's range is 22003.
+- **Character data for a datetime parameter** is an ODBC date, time or
+  timestamp literal (bare or `{d|t|ts '...'}`), bound as the native value, not
+  text the server would read by `NLS_DATE_FORMAT` (#356): a TIMESTAMP with its
+  fraction (a DATE on 8i), a DATE, or a TIME as a DATE on 1970-01-01. Text
+  that is no such literal goes as text.
 - **`SQL_C_BIT`** is a boolean only for a `SQL_BIT` parameter: a BOOLEAN on
   23ai and later, a NUMBER before. For any other `ParameterType` it is the
   number 0 or 1, which a character column stores as "0" or "1" on every

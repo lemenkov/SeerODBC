@@ -59,6 +59,16 @@ size_t seer_odbc_numeric_to_text(const SQL_NUMERIC_STRUCT *ns, char *out, size_t
  * or 0 if `s` is not such a literal (or won't fit `cap`) (#354). */
 size_t seer_odbc_numeric_literal(const char *s, size_t n, char *out, size_t cap);
 
+/* An ODBC date / time / timestamp literal - [-]Y-M-D, [-]Y-M-D H:M:S[.f],
+ * H:M:S[.f], bare or as {d|t|ts '...'} - field-checked (the parser fetch uses,
+ * #334). Returns 0, or -1 if `s` is no such literal (#356). */
+typedef struct {
+  int has_date, has_time;
+  int year, month, day, hour, minute, second;
+  unsigned long nanos;
+} SeerOdbcDateTime;
+int seer_odbc_datetime_literal(const char *s, size_t n, SeerOdbcDateTime *out);
+
 /* SQLGUID as canonical text, xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars and
  * a NUL). */
 void seer_odbc_guid_to_text(const SQLGUID *g, char out[37]);
