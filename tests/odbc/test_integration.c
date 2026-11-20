@@ -6672,15 +6672,15 @@ static void check_autocommit_switch(SQLHDBC dbc, const char *drv, const char *ho
 /* SQLDisconnect in manual-commit mode with a transaction open is 25000 and
  * leaves the connection up (#344); after a rollback it disconnects, and the
  * row was never committed. Two-way: with only a query run, disconnect
- * succeeds at once. 10g and later: 8i / 9i replies don't say whether a
- * transaction is open. */
+ * succeeds at once. 8i (its status flags, bus 95) and 10g+; not 9i, whose
+ * compact replies don't say whether a transaction is open. */
 static void check_disconnect_open_txn(SQLHDBC dbc, const char *drv, const char *host,
                                       const char *port, const char *svc, const char *user,
                                       const char *pwd)
 {
   const char *name = "SQLDisconnect with an open transaction is 25000";
-  if (g_release > 0 && g_release < 10) {
-    skip(name, "server: 8i / 9i replies don't say whether a transaction is open (#344)");
+  if (g_release == 9) {
+    skip(name, "server: 9i's compact replies don't say whether a transaction is open (#344)");
     return;
   }
   char m[300] = "", why[256] = "", err[256], cnt[16] = "", st[6] = "", one[8] = "";

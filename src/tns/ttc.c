@@ -2207,7 +2207,9 @@ SeerStatus seer_rollback(SeerConn *conn)
 
 int seer_txn_open(const SeerConn *conn)
 {
-  if (conn == NULL || conn->is_8i || conn->field_version < TTC_FIELD_VERSION_10_2)
+  /* 8i: its status flags (bus 95); 10g+: the call_status. 9i's compact
+   * replies carry neither (#344). */
+  if (conn == NULL || (!conn->is_8i && conn->field_version < TTC_FIELD_VERSION_10_2))
     return -1;
   return conn->txn_state;
 }
