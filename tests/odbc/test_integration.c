@@ -53,8 +53,9 @@ static const Gate GATES[] = {
     {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 8, GATE_SERVER,
      "8.1.7 has no UNISTR, and its national charset is WE8ISO8859P1"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
-    {"describe after SQLPrepare, before SQLExecute", 8, 8, GATE_SERVER,
-     "8i describes a query as it executes"},
+    {"describe after SQLPrepare, before SQLExecute", 8, 8, GATE_TODO,
+     "8i: a query with markers describes at execute; the unbound-marker descriptor isn't measured "
+     "(#353)"},
     {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 11, GATE_SERVER,
      "no temporary LOB carries a PL/SQL bind over 32 KB before 12c"},
     {"temporary LOBs of large PL/SQL binds are freed", 8, 11, GATE_SERVER,
@@ -6177,6 +6178,43 @@ static void check_getdata_wchar_pieces(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* A prepared query describes before it is executed - what result-layout tools
+ * (ADO, report designers) do. 8.1.7 answered 0 columns until the execute; it
+ * now sends the describe-only OALL8 (#353). Two-way: the execute after it
+ * still runs and fetches. */
+static void check_describe_no_markers(SQLHDBC dbc)
+{
+  const char *name = "a prepared query without markers describes before SQLExecute";
+  char m[300] = "";
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLPrepare(s, (SQLCHAR *)"SELECT owner, object_name, created FROM all_objects WHERE rownum <= 2",
+             SQL_NTS);
+  SQLSMALLINT n = -1, nl = 0, type = 0, dd, nul;
+  SQLULEN sz = 0;
+  SQLCHAR col[64] = "";
+  SQLRETURN rc = SQLNumResultCols(s, &n);
+  if (!SQL_SUCCEEDED(rc) || n != 3)
+    snprintf(m, sizeof m, "before execute: rc=%d, %d columns (want 3)", (int)rc, n);
+  else if (!SQL_SUCCEEDED(SQLDescribeCol(s, 3, col, sizeof col, &nl, &type, &sz, &dd, &nul)) ||
+           strcmp((char *)col, "CREATED") != 0 || type != SQL_TYPE_TIMESTAMP)
+    snprintf(m, sizeof m, "before execute: column 3 is '%s' type %d (want CREATED, %d)",
+             (char *)col, type, SQL_TYPE_TIMESTAMP);
+  int rows = 0;
+  if (!m[0]) {
+    rc = SQLExecute(s);
+    while (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(s)))
+      rows++;
+    if (!SQL_SUCCEEDED(rc) || rows != 2)
+      snprintf(m, sizeof m, "execute after the describe: rc=%d, %d rows (want 2)", (int)rc, rows);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7731,6 +7769,7 @@ int main(void)
   check_datetime_targets(dbc);
   check_char_overflow(dbc);
   check_getdata_wchar_pieces(dbc);
+  check_describe_no_markers(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
