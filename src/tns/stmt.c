@@ -607,7 +607,8 @@ static SeerStatus decode_scalar(uint8_t ora_type, const uint8_t *val, size_t vle
   case ORA_TYPE_TIMESTAMP:
   case ORA_TYPE_TIMESTAMPTZ:
   case ORA_TYPE_TIMESTAMPLTZ:
-    st = seer_decode_date(val, vlen, buf, sizeof buf);
+    st = ora_type == ORA_TYPE_TIMESTAMPTZ ? seer_decode_tstz(val, vlen, buf, sizeof buf)
+                                          : seer_decode_date(val, vlen, buf, sizeof buf);
     if (st == SEER_OK)
       cell_set_text(cell, strdup(buf));
     break;
@@ -10021,31 +10022,6 @@ static SeerStatus obj_lookup_elem(SeerConn *conn, const char *schema, const char
   return got ? SEER_OK : SEER_EDB;
 }
 
-/* Days from 1970-01-01 to a proleptic Gregorian civil date (any year), and
- * back (H. Hinnant's algorithms). */
-static int64_t days_from_civil(int64_t y, int m, int d)
-{
-  y -= m <= 2;
-  int64_t era = (y >= 0 ? y : y - 399) / 400;
-  int64_t yoe = y - era * 400;
-  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + doe - 719468;
-}
-
-static void civil_from_days(int64_t z, int *y, int *m, int *d)
-{
-  z += 719468;
-  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-  int64_t doe = z - era * 146097;
-  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  int64_t mp = (5 * doy + 2) / 153;
-  *d = (int)(doy - (153 * mp + 2) / 5 + 1);
-  *m = (int)(mp < 10 ? mp + 3 : mp - 9);
-  *y = (int)(yoe + era * 400 + (*m <= 2));
-}
-
 /* The explicit UTC offset at the end of a datetime text, in minutes: "+HH:MM",
  * "-HH:MM", "+HHMM" or "Z". false when the text carries none - a WITH TIME
  * ZONE value is then refused, never given a zone the caller did not state. */
@@ -10135,10 +10111,10 @@ static SeerStatus obj_encode_field(SeerWriter *body, uint8_t ora_type, const cha
         return SEER_EPARAM;
       }
       /* the wire carries the UTC instant: shift the wall clock back by the offset */
-      int64_t mins = (days_from_civil(y, mo, d) * 24 + h) * 60 + mi - off;
+      int64_t mins = (seer_days_from_civil(y, mo, d) * 24 + h) * 60 + mi - off;
       int64_t days = mins >= 0 ? mins / 1440 : -((-mins + 1439) / 1440);
       int64_t rem = mins - days * 1440;
-      civil_from_days(days, &y, &mo, &d);
+      seer_civil_from_days(days, &y, &mo, &d);
       h = (int)(rem / 60);
       mi = (int)(rem % 60);
     }

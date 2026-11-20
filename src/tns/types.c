@@ -311,6 +311,73 @@ SeerStatus seer_decode_date(const uint8_t *data, size_t len, char *out, size_t o
   return SEER_OK;
 }
 
+/* Days from 1970-01-01 to a proleptic Gregorian civil date (any year), and
+ * back (H. Hinnant's algorithms). */
+int64_t seer_days_from_civil(int64_t y, int m, int d)
+{
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = y - era * 400;
+  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+void seer_civil_from_days(int64_t z, int *y, int *m, int *d)
+{
+  z += 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+  *y = (int)(yoe + era * 400 + (*m <= 2));
+}
+
+/* TIMESTAMP WITH TIME ZONE (#359). The 13 bytes are the value's UTC instant
+ * (the TIMESTAMP layout) and its zone: a numeric offset as hour + 20 and
+ * minute + 60 in bytes 11 and 12, or a region when byte 11's top bit is set.
+ * With an offset the text is the wall-clock time in it, as stored and as
+ * SQL*Plus shows it, followed by the offset: 10:00 +02:00 reads
+ * "... 10:00:00 +02:00", not its UTC 08:00. A region's wall-clock time needs
+ * its daylight-saving rules, which the wire doesn't carry, so a region keeps
+ * the UTC time and says so: "+00:00". */
+SeerStatus seer_decode_tstz(const uint8_t *data, size_t len, char *out, size_t outsz)
+{
+  if (len < 13 || out == NULL || outsz < 40)
+    return seer_decode_date(data, len, out, outsz);
+  int off = 0; /* minutes east of UTC */
+  if ((data[11] & 0x80) == 0)
+    off = ((int)data[11] - 20) * 60 + ((int)data[12] - 60);
+  uint8_t wall[11];
+  memcpy(wall, data, sizeof wall);
+  if (off != 0) {
+    int y = (data[0] - 100) * 100 + (data[1] - 100), mo = data[2], d = data[3];
+    int64_t mins = (seer_days_from_civil(y, mo, d) * 24 + (data[4] - 1)) * 60 + (data[5] - 1) + off;
+    int64_t days = mins >= 0 ? mins / 1440 : -((-mins + 1439) / 1440);
+    int64_t rem = mins - days * 1440;
+    seer_civil_from_days(days, &y, &mo, &d);
+    if (y < -9999 || y > 9999) /* past what the layout holds: leave it UTC */
+      return seer_decode_date(data, len, out, outsz);
+    int cy = y >= 0 ? y / 100 : -((-y + 99) / 100);
+    wall[0] = (uint8_t)(cy + 100);
+    wall[1] = (uint8_t)(y - cy * 100 + 100);
+    wall[2] = (uint8_t)mo;
+    wall[3] = (uint8_t)d;
+    wall[4] = (uint8_t)(rem / 60 + 1);
+    wall[5] = (uint8_t)(rem % 60 + 1);
+  }
+  SeerStatus st = seer_decode_date(wall, sizeof wall, out, outsz);
+  if (st != SEER_OK)
+    return st;
+  size_t n = strlen(out);
+  int a = off < 0 ? -off : off;
+  snprintf(out + n, outsz - n, " %c%02d:%02d", off < 0 ? '-' : '+', a / 60, a % 60);
+  return SEER_OK;
+}
+
 /* big-endian ub4 read, debiased by 2**31 to a signed value. */
 static int32_t be32_debiased(const uint8_t *p)
 {

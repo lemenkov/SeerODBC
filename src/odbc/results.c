@@ -49,6 +49,25 @@ static SQLSMALLINT sql_type_of(int ora_type)
   }
 }
 
+/* A TIMESTAMP WITH TIME ZONE value's text ends in its offset (#359),
+ * "... 10:00:00 +02:00". The text targets keep it; a date / time / timestamp
+ * struct (or any other target) takes the wall-clock time before it, which is
+ * the value's own clock time. Returns the length to convert. */
+static const char *tz_cut(OdbcStmt *s, int col, const char *val, size_t *vlen, SQLSMALLINT ct,
+                          char cut[64])
+{
+  if (val == NULL || *vlen < 7 || *vlen >= 64 || ct == SQL_C_CHAR || ct == SQL_C_WCHAR ||
+      seer_stmt_col_type(s->core, col) != ORA_TYPE_TIMESTAMPTZ)
+    return val;
+  const char *z = val + *vlen - 7; /* " +HH:MM" */
+  if (z[0] != ' ' || (z[1] != '+' && z[1] != '-') || z[4] != ':')
+    return val;
+  *vlen -= 7; /* a copy: the conversion reads the text up to its NUL */
+  memcpy(cut, val, *vlen);
+  cut[*vlen] = '\0';
+  return cut;
+}
+
 SQLSMALLINT seer_odbc_col_c_type(OdbcStmt *s, int col, SQLSMALLINT t)
 {
   if (t != SQL_C_DEFAULT || s == NULL || s->core == NULL)
@@ -110,9 +129,10 @@ static SQLLEN display_size_of(int ora_type, int max_size)
   case ORA_TYPE_DATE:
     return 19;
   case ORA_TYPE_TIMESTAMP:
-  case ORA_TYPE_TIMESTAMPTZ:
   case ORA_TYPE_TIMESTAMPLTZ:
     return 29;
+  case ORA_TYPE_TIMESTAMPTZ: /* and " +HH:MM" (#359) */
+    return 36;
   case ORA_TYPE_RID:
   case ORA_TYPE_ROWID:
     /* The rowid's 18-character text. 8i and 9i describe a ROWID with a 1-byte
@@ -180,6 +200,8 @@ static ColMeta col_meta(OdbcStmt *s, int col)
     int fs = t == ORA_TYPE_DATE ? 0 : (sc >= 0 && sc <= 9 ? sc : 6);
     m.precision = m.scale = (SQLSMALLINT)fs;
     m.column_size = m.display_size = fs > 0 ? 20 + fs : 19;
+    if (t == ORA_TYPE_TIMESTAMPTZ) /* its text ends in " +HH:MM" (#359) */
+      m.display_size += 7;
     m.octet_length = (SQLLEN)sizeof(SQL_TIMESTAMP_STRUCT);
     break;
   }
@@ -1124,8 +1146,10 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
     SQLLEN *ind =
         seer_odbc_bound_at(b->indicator, s->row_bind_offset, s->row_bind_type, sizeof(SQLLEN), row);
     const char *state = NULL;
-    SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, ct, buf, b->buflen,
-                                    ind, NULL, &state, sql_type_of(seer_stmt_col_type(s->core, i)));
+    char cut[64];
+    const char *cv = tz_cut(s, i, val, &vlen, ct, cut);
+    SQLRETURN r = seer_odbc_convert(cv ? cv : "", vlen, is_null, is_binary, ct, buf, b->buflen, ind,
+                                    NULL, &state, sql_type_of(seer_stmt_col_type(s->core, i)));
     /* Each column's own state: truncation, or a value that won't convert
      * (#314), which makes the row an error row. Appended, with the row's
      * number in the rowset: replacing the queue kept only the last column's,
@@ -1366,7 +1390,9 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
   TargetType = seer_odbc_col_c_type(s, col, TargetType); /* SQL_C_DEFAULT (#316) */
 
   const char *state = NULL;
-  SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, TargetType,
+  char cut[64];
+  const char *cv = tz_cut(s, col, val, &vlen, TargetType, cut);
+  SQLRETURN r = seer_odbc_convert(cv ? cv : "", vlen, is_null, is_binary, TargetType,
                                   TargetValuePtr, BufferLength, StrLen_or_IndPtr, &s->getdata_off,
                                   &state, sql_type_of(seer_stmt_col_type(s->core, col)));
   /* A variable-length target got the rest of the value: the next call on this

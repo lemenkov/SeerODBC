@@ -51,6 +51,15 @@ SeerStatus seer_decode_number(const uint8_t *data, size_t len, char *out, size_t
  * a fractional-second suffix when present). */
 SeerStatus seer_decode_date(const uint8_t *data, size_t len, char *out, size_t outsz);
 
+/* TIMESTAMP WITH TIME ZONE (13 bytes) to "YYYY-MM-DD HH:MI:SS[.f] +HH:MM": the
+ * wall-clock time in the value's own offset, then the offset; a region zone
+ * keeps the UTC time, "+00:00" (#359). `outsz` >= 40. */
+SeerStatus seer_decode_tstz(const uint8_t *data, size_t len, char *out, size_t outsz);
+
+/* Days from 1970-01-01 to a proleptic Gregorian date, and back. */
+int64_t seer_days_from_civil(int64_t y, int m, int d);
+void seer_civil_from_days(int64_t z, int *y, int *m, int *d);
+
 /* Encode a 64-bit integer as an Oracle NUMBER (§11.1) into `out` (>= 24
  * bytes). Returns the number of bytes written. */
 size_t seer_encode_number_int(int64_t v, uint8_t *out);

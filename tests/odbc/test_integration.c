@@ -42,6 +42,8 @@ static int n_pass, n_fail, n_skip;
  * the issue). A gated check opens with GATE(name) and doesn't run; anything
  * not gated runs and fails if it fails. Ordered as the checks run. */
 static const Gate GATES[] = {
+    {"TIMESTAMP WITH TIME ZONE reads its own wall-clock time and offset", 8, 8, GATE_SERVER,
+     "8.1.7 has no TIMESTAMP WITH TIME ZONE"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 8, 8, GATE_SERVER,
      "8.1.7 has no TIMESTAMP type"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 9, 9, GATE_SERVER,
@@ -6422,6 +6424,53 @@ static void check_setpos_rowset_errors(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* TIMESTAMP WITH TIME ZONE reads as its own wall-clock time (#359): 10:00
+ * +02:00 is 10:00 in a timestamp struct, bound or through SQLGetData, and its
+ * text carries the offset - it read as its UTC 08:00, the zone dropped. A
+ * negative half-hour offset across midnight and a year end, with a fraction,
+ * too; the column's display size holds the text. */
+static void check_tstz_wall_clock(SQLHDBC dbc)
+{
+  const char *name = "TIMESTAMP WITH TIME ZONE reads its own wall-clock time and offset";
+  if (gated(name))
+    return;
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  char m[300] = "", t1[64] = "", t2[64] = "";
+  SQL_TIMESTAMP_STRUCT b1 = {0}, b2 = {0};
+  SQLLEN i1, i2, i3, i4, disp = 0;
+  SQLBindCol(s, 2, SQL_C_TYPE_TIMESTAMP, &b1, sizeof b1, &i2);
+  SQLBindCol(s, 4, SQL_C_TYPE_TIMESTAMP, &b2, sizeof b2, &i4);
+  if (!SQL_SUCCEEDED(SQLExecDirect(
+          s,
+          (SQLCHAR *)"SELECT a, a, b, b FROM (SELECT TIMESTAMP '2026-11-20 10:00:00 +02:00' a, "
+                     "TIMESTAMP '2026-12-31 21:45:07.5 -05:30' b FROM dual)",
+          SQL_NTS)) ||
+      !SQL_SUCCEEDED(SQLFetch(s))) {
+    diag_text(SQL_HANDLE_STMT, s, m, sizeof m);
+  } else {
+    SQLGetData(s, 1, SQL_C_CHAR, t1, sizeof t1, &i1);
+    SQLGetData(s, 3, SQL_C_CHAR, t2, sizeof t2, &i3);
+    SQLColAttribute(s, 3, SQL_DESC_DISPLAY_SIZE, NULL, 0, NULL, &disp);
+    if (strcmp(t1, "2026-11-20 10:00:00 +02:00") != 0 ||
+        strcmp(t2, "2026-12-31 21:45:07.500000000 -05:30") != 0)
+      snprintf(m, sizeof m, "text '%s' / '%s'", t1, t2);
+    else if (b1.hour != 10 || b1.minute != 0 || b1.day != 20)
+      snprintf(m, sizeof m, "+02:00 struct %u %02u:%02u", b1.day, b1.hour, b1.minute);
+    else if (b2.year != 2026 || b2.month != 12 || b2.day != 31 || b2.hour != 21 ||
+             b2.minute != 45 || b2.second != 7 || b2.fraction != 500000000)
+      snprintf(m, sizeof m, "-05:30 struct %d-%u-%u %u:%u:%u.%u", b2.year, b2.month, b2.day,
+               b2.hour, b2.minute, b2.second, (unsigned)b2.fraction);
+    else if (disp < (SQLLEN)strlen(t2))
+      snprintf(m, sizeof m, "display size %ld < %zu", (long)disp, strlen(t2));
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Attribute identifiers (#373): a number no ODBC range defines is HY092 on
  * the connection and the statement, set and get - it was accepted - and
  * asynchronous execution at the connection is HYC00, as on a statement.
@@ -8146,6 +8195,7 @@ int main(void)
   check_rowset_truncation(dbc);
   check_setpos_rowset_errors(dbc);
   check_attr_identifiers(dbc);
+  check_tstz_wall_clock(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);

@@ -91,6 +91,35 @@ int main(void)
     assert(strcmp(out, "2026-06-18 14:30:00") == 0);
   }
 
+  /* TIMESTAMP WITH TIME ZONE (#359): the wire's UTC instant shown as the
+   * wall-clock time in its offset, the offset after it; bytes as 9i / 11g /
+   * 23ai send them. */
+  {
+    char out[48];
+    /* TIMESTAMP '2026-11-20 10:00:00 +02:00': UTC 08:00, offset 22/60 */
+    const uint8_t p2[13] = {0x78, 0x7e, 0x0b, 0x14, 0x09, 1, 1, 0, 0, 0, 0, 0x16, 0x3c};
+    assert(seer_decode_tstz(p2, 13, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2026-11-20 10:00:00 +02:00") == 0);
+    /* +00:00 */
+    const uint8_t z[13] = {0x78, 0x7e, 0x0b, 0x14, 0x0b, 1, 1, 0, 0, 0, 0, 0x14, 0x3c};
+    assert(seer_decode_tstz(z, 13, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2026-11-20 10:00:00 +00:00") == 0);
+    /* a region (Europe/Berlin, top bit of byte 11): the UTC time, "+00:00" */
+    const uint8_t r[13] = {0x78, 0x7e, 0x0b, 0x14, 0x0a, 1, 1, 0, 0, 0, 0, 0x85, 0xfc};
+    assert(seer_decode_tstz(r, 13, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2026-11-20 09:00:00 +00:00") == 0);
+    /* -05:30 across midnight and a year, with fractional seconds:
+     * UTC 2027-01-01 03:15:07.5 is 2026-12-31 21:45:07.5 -05:30 */
+    const uint8_t n[13] = {0x78, 0x7f, 0x01, 0x01, 0x04,   0x10,   0x08,
+                           0x1d, 0xcd, 0x65, 0x00, 20 - 5, 60 - 30};
+    assert(seer_decode_tstz(n, 13, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2026-12-31 21:45:07.500000000 -05:30") == 0);
+    /* +14:00 across a leap day */
+    const uint8_t l[13] = {0x78, 0x7c, 0x02, 0x1c, 0x0b, 1, 1, 0, 0, 0, 0, 34, 60};
+    assert(seer_decode_tstz(l, 13, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2024-02-29 00:00:00 +14:00") == 0);
+  }
+
   /* BINARY_FLOAT / BINARY_DOUBLE order-preserving decode (§11.7). */
   {
     char out[32];
