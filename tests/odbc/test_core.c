@@ -58,8 +58,6 @@ void skip(const char *n, const char *w)
 /* The checks each release skips (gates.h), and the features several checks
  * share. Ordered as the checks run. */
 static const Gate GATES[] = {
-    {"describe before execute, with a placeholder", 8, 8, GATE_SERVER,
-     "8i returns a query's describe only with its execute"},
     {"national charset: NVARCHAR2 bind + fetch, UNISTR", 8, 8, GATE_SERVER,
      "8.1.7's national charset is WE8ISO8859P1, and it has no UNISTR"},
     /* core_tpc.c */

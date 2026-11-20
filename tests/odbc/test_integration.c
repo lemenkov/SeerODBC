@@ -53,9 +53,6 @@ static const Gate GATES[] = {
     {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 8, GATE_SERVER,
      "8.1.7 has no UNISTR, and its national charset is WE8ISO8859P1"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
-    {"describe after SQLPrepare, before SQLExecute", 8, 8, GATE_TODO,
-     "8i: a query with markers describes at execute; the unbound-marker descriptor isn't measured "
-     "(#353)"},
     {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 11, GATE_SERVER,
      "no temporary LOB carries a PL/SQL bind over 32 KB before 12c"},
     {"temporary LOBs of large PL/SQL binds are freed", 8, 11, GATE_SERVER,

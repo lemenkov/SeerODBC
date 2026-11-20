@@ -7761,10 +7761,9 @@ static SeerStatus o8i_fetch_rest(SeerStmt *stmt, uint32_t cursor, O8iStatus *s)
  * (function 2; the reply's RPA names it), then an OALL8 on it with PARSE |
  * DESCRIBE (0x00028001) and no EXECUTE or FETCH. The reply is the usual
  * describe, then the RPA and the status - no rows. The cursor is queued to
- * close with the next call. Markers aren't sent here: OCI's descriptor for an
- * unbound one isn't measured byte for byte, so a query with markers is left to
- * describe at execute, as before. */
-static SeerStatus o8i_describe_only(SeerStmt *stmt)
+ * close with the next call. A query's markers go as value-less descriptors
+ * (bus 99). */
+static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
 {
   SeerConn *c = stmt->conn;
   SeerWriter w;
@@ -7796,13 +7795,23 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt)
 
   size_t sqllen = 0;
   uint8_t *sql = o8i_latin1(stmt->sql, &sqllen);
-  if (sql == NULL || !seer_writer_init(&w, 160 + sqllen)) {
+  if (sql == NULL || !seer_writer_init(&w, 160 + sqllen + (size_t)nmarkers * 25)) {
     free(sql);
     queue_cursor_close(c, cursor);
     return SEER_ENOMEM;
   }
-  o8i_all8(c, &w, 0x00028001, cursor, sql, sqllen, true, 1, 0, 0, 1, 0, O8I_STMT_SELECT);
+  /* With markers: BIND (0x08) and, after al8i4, one descriptor per marker
+   * and no value - OCI's for a marker it has no value for is type 1, flag
+   * 0x80, size 0, the rest zeros (bus 99). */
+  o8i_all8(c, &w, nmarkers > 0 ? 0x00028009 : 0x00028001, cursor, sql, sqllen, true, 1, 0,
+           (uint32_t)nmarkers, 1, 0, O8I_STMT_SELECT);
   free(sql);
+  for (int i = 0; i < nmarkers; i++) {
+    seer_writer_u8(&w, ORA_TYPE_VARCHAR);
+    seer_writer_u8(&w, 0x80);
+    for (int k = 0; k < 23; k++)
+      seer_writer_u8(&w, 0);
+  }
   st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   if (st != SEER_OK) {
@@ -9194,14 +9203,14 @@ static SeerStatus describe_now(SeerStmt *stmt)
   if (stmt->ncols > 0 || stmt->executed || classify_sql(stmt->sql) != STMT_SELECT)
     return SEER_OK;
   if (stmt->conn->is_8i) {
-    /* A describe-only OALL8 (#353); a query with markers still describes at
-     * execute - the unbound-marker descriptor isn't measured. */
+    /* A describe-only OALL8 (#353), markers sent as value-less descriptors. */
     int *occ = NULL, nocc = 0, ndistinct = 0;
     int pr = seer_sql_placeholders(stmt->sql, &occ, &nocc, &ndistinct);
     free(occ);
-    if (pr != 0 || ndistinct > 0)
+    if (pr != 0)
       return SEER_OK;
-    SeerStatus ost = o8i_describe_only(stmt);
+    /* SQL binds by occurrence (#302): one descriptor per marker in the text */
+    SeerStatus ost = o8i_describe_only(stmt, nocc);
     if (ost == SEER_OK)
       stmt->described_only = true;
     return ost;
