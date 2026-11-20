@@ -1127,9 +1127,12 @@ static SQLRETURN deliver_row(OdbcStmt *s, SQLULEN row)
     SQLRETURN r = seer_odbc_convert(val ? val : "", vlen, is_null, is_binary, ct, buf, b->buflen,
                                     ind, NULL, &state, sql_type_of(seer_stmt_col_type(s->core, i)));
     /* Each column's own state: truncation, or a value that won't convert
-     * (#314), which makes the row an error row. */
+     * (#314), which makes the row an error row. Appended, with the row's
+     * number in the rowset: replacing the queue kept only the last column's,
+     * and no row number said which row it was (#369). */
     if (r == SQL_SUCCESS_WITH_INFO || r == SQL_ERROR)
-      seer_odbc_diag(s, state ? state : "01004", 0, seer_odbc_convert_text(state), r);
+      seer_odbc_diag_add(s, state ? state : "01004", 0, seer_odbc_convert_text(state),
+                         (SQLLEN)row + 1);
     if (r == SQL_ERROR)
       ret = SQL_ERROR;
     else if (r == SQL_SUCCESS_WITH_INFO && ret == SQL_SUCCESS)
@@ -1163,8 +1166,10 @@ static SQLRETURN fetch_rowset(OdbcStmt *s, long start)
       errs++;
     else if (r == SQL_SUCCESS_WITH_INFO)
       ret = SQL_SUCCESS_WITH_INFO;
-    if (s->row_status)
-      s->row_status[row] = r == SQL_ERROR ? SQL_ROW_ERROR : SQL_ROW_SUCCESS;
+    if (s->row_status) /* a truncated row says so (#369) */
+      s->row_status[row] = r == SQL_ERROR               ? SQL_ROW_ERROR
+                           : r == SQL_SUCCESS_WITH_INFO ? SQL_ROW_SUCCESS_WITH_INFO
+                                                        : SQL_ROW_SUCCESS;
     got++;
   }
 
