@@ -8,6 +8,7 @@
 #ifndef SEER_TNS_TYPES_H
 #define SEER_TNS_TYPES_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,6 +56,14 @@ SeerStatus seer_decode_date(const uint8_t *data, size_t len, char *out, size_t o
  * wall-clock time in the value's own offset, then the offset; a region zone
  * keeps the UTC time, "+00:00" (#359). `outsz` >= 40. */
 SeerStatus seer_decode_tstz(const uint8_t *data, size_t len, char *out, size_t outsz);
+
+/* "YYYY-MM-DD HH:MI:SS[.f]" moved by `minutes`, the fraction kept, into
+ * `out`; SEER_EPARAM if `in` isn't such a text. */
+SeerStatus seer_shift_datetime_text(const char *in, int minutes, char *out, size_t outsz);
+
+/* A UTC offset "+HH:MM" / "-HH:MM" in minutes; false for anything else (a
+ * region name). */
+bool seer_parse_offset(const char *s, int *minutes);
 
 /* Days from 1970-01-01 to a proleptic Gregorian date, and back. */
 int64_t seer_days_from_civil(int64_t y, int m, int d);

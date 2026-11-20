@@ -120,6 +120,28 @@ int main(void)
     assert(strcmp(out, "2024-02-29 00:00:00 +14:00") == 0);
   }
 
+  /* LOCAL TIME ZONE shift (#358): a datetime text moved by minutes, the
+   * fraction kept; offsets parsed, regions and junk refused, 9i's padding
+   * taken. */
+  {
+    char out[48];
+    assert(seer_shift_datetime_text("2026-11-20 08:00:00", 300, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2026-11-20 13:00:00") == 0);
+    assert(seer_shift_datetime_text("2026-01-01 01:15:00.123456", -210, out, sizeof out) ==
+           SEER_OK);
+    assert(strcmp(out, "2025-12-31 21:45:00.123456") == 0);
+    assert(seer_shift_datetime_text("2024-02-28 20:00:00", 240, out, sizeof out) == SEER_OK);
+    assert(strcmp(out, "2024-02-29 00:00:00") == 0);
+    assert(seer_shift_datetime_text("not a date", 60, out, sizeof out) == SEER_EPARAM);
+    int mins = 0;
+    assert(seer_parse_offset("+05:30", &mins) && mins == 330);
+    assert(seer_parse_offset("-08:00 ", &mins) && mins == -480);
+    assert(seer_parse_offset("+00:00", &mins) && mins == 0);
+    assert(!seer_parse_offset("Europe/Moscow", &mins));
+    assert(!seer_parse_offset("+5:30", &mins));
+    assert(!seer_parse_offset(NULL, &mins));
+  }
+
   /* BINARY_FLOAT / BINARY_DOUBLE order-preserving decode (§11.7). */
   {
     char out[32];

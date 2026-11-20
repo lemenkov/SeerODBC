@@ -110,7 +110,8 @@ static void free_columns(SeerColumn *cols, int n)
 typedef struct {
   char *data;
   size_t len;
-  bool binary; /* BLOB / RAW / LONG RAW */
+  bool binary;  /* BLOB / RAW / LONG RAW */
+  bool shifted; /* a LOCAL TIME ZONE value already in the session's zone (#358) */
 } SeerCell;
 
 /* A bind: the OAC descriptor parameters plus the encoded RXD value. oac_type 0
@@ -2937,6 +2938,26 @@ static StmtKind classify_sql(const char *sql)
   if (starts_with_word(p, "BEGIN") || starts_with_word(p, "DECLARE") || starts_with_word(p, "CALL"))
     return STMT_BLOCK;
   return STMT_CHANGE;
+}
+
+/* Whether a statement may have changed the session's time zone: an ALTER
+ * SESSION, or a PL/SQL block naming TIME_ZONE (EXECUTE IMMEDIATE, or
+ * DBMS_SESSION.SET_TIME_ZONE). A false alarm costs one query when an LTZ
+ * value is next read; a miss leaves the old shift (#358). */
+static bool may_set_time_zone(const char *sql)
+{
+  if (sql == NULL)
+    return false;
+  const char *p = sql_first_keyword(sql);
+  if (starts_with_word(p, "ALTER"))
+    return starts_with_word(sql_first_keyword(p + 5), "SESSION");
+  if (classify_sql(sql) != STMT_BLOCK)
+    return false;
+  static const char KW[] = "TIME_ZONE";
+  for (const char *q = sql; *q; q++)
+    if (strncasecmp(q, KW, sizeof KW - 1) == 0)
+      return true;
+  return false;
 }
 
 /* Whether `sql`'s parsed cursor is safe to keep in the statement cache and
@@ -9192,6 +9213,8 @@ SeerStatus seer_stmt_execute(SeerStmt *stmt)
     return st;
   st = execute_now(stmt);
   restore_binds(stmt, &x);
+  if (st == SEER_OK && may_set_time_zone(stmt->sql))
+    stmt->conn->ltz_state = 0; /* the LOCAL TIME ZONE shift is read again (#358) */
   return st;
 }
 
@@ -9859,6 +9882,59 @@ static void record_cell_error(SeerStmt *stmt, size_t row, int col)
   c->last_error = NULL; /* the query itself succeeded */
 }
 
+/* The minutes from DBTIMEZONE to SESSIONTIMEZONE, read with one query the
+ * first time a session needs them and kept (#358): a TIMESTAMP WITH LOCAL
+ * TIME ZONE value arrives in the database's zone, and OCI moves it to the
+ * session's on the client - nothing on the wire says either zone, and no
+ * define makes the server do it (seerdb, bus 100 / 103). Only numeric offsets
+ * convert exactly: a region on either side needs its daylight-saving rules,
+ * which the wire doesn't carry, so the value is then left as it came. */
+static bool ltz_shift(SeerConn *conn, int *minutes)
+{
+  if (conn->ltz_state == 0) {
+    conn->ltz_state = -1;
+    SeerStmt *q = NULL;
+    const char *db = NULL, *ses = NULL;
+    int null1 = 1, null2 = 1, dbm = 0, sesm = 0;
+    if (seer_stmt_prepare(conn, "SELECT DBTIMEZONE, SESSIONTIMEZONE FROM dual", &q) == SEER_OK &&
+        seer_stmt_execute(q) == SEER_OK && seer_stmt_fetch(q) == SEER_OK &&
+        seer_stmt_get_string(q, 0, &db, &null1) == SEER_OK &&
+        seer_stmt_get_string(q, 1, &ses, &null2) == SEER_OK && !null1 && !null2) {
+      if (seer_parse_offset(db, &dbm) && seer_parse_offset(ses, &sesm)) {
+        conn->ltz_state = 1;
+        conn->ltz_shift_min = sesm - dbm;
+      } else {
+        seer_log(SEER_LOG_WARNING,
+                 "LOCAL TIME ZONE values stay in DBTIMEZONE (%s), not moved to the session "
+                 "zone %s: a region's daylight-saving rules are not on the wire",
+                 db, ses);
+      }
+    } else {
+      seer_log(SEER_LOG_WARNING, "LOCAL TIME ZONE values stay in DBTIMEZONE: the zones "
+                                 "couldn't be read");
+    }
+    seer_stmt_close(q);
+  }
+  *minutes = conn->ltz_shift_min;
+  return conn->ltz_state == 1;
+}
+
+static void ltz_shift_cell(SeerConn *conn, SeerCell *cell)
+{
+  cell->shifted = true;
+  int m = 0;
+  char buf[64];
+  if (!ltz_shift(conn, &m) || m == 0 ||
+      seer_shift_datetime_text(cell->data, m, buf, sizeof buf) != SEER_OK)
+    return;
+  char *t = strdup(buf);
+  if (t == NULL)
+    return;
+  free(cell->data);
+  cell->data = t;
+  cell->len = strlen(t);
+}
+
 SeerStatus seer_stmt_get_data(SeerStmt *stmt, int col, const void **data, size_t *len, int *is_null,
                               int *is_binary)
 {
@@ -9883,6 +9959,8 @@ SeerStatus seer_stmt_get_data(SeerStmt *stmt, int col, const void **data, size_t
     }
 
   SeerCell *cell = &stmt->rows[stmt->cur][col];
+  if (cell->data != NULL && !cell->shifted && stmt->cols[col].ora_type == ORA_TYPE_TIMESTAMPLTZ)
+    ltz_shift_cell(stmt->conn, cell);
   if (cell->data != NULL) {
     *data = cell->data;
     *len = cell->len;

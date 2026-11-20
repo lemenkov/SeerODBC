@@ -44,6 +44,8 @@ static int n_pass, n_fail, n_skip;
 static const Gate GATES[] = {
     {"TIMESTAMP WITH TIME ZONE reads its own wall-clock time and offset", 8, 8, GATE_SERVER,
      "8.1.7 has no TIMESTAMP WITH TIME ZONE"},
+    {"LOCAL TIME ZONE value reads in the session's zone (after ALTER SESSION)", 8, 8, GATE_SERVER,
+     "8.1.7 has no TIMESTAMP WITH LOCAL TIME ZONE"},
     {"session time zone set at login (OS offset, ORA_SDTZ)", 8, 8, GATE_SERVER,
      "8.1.7 has no session time zone"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 8, 8, GATE_SERVER,
@@ -6426,6 +6428,52 @@ static void check_setpos_rowset_errors(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* TIMESTAMP WITH LOCAL TIME ZONE reads in the session's zone (#358): the
+ * server sends it in DBTIMEZONE, and the driver moves it, as OCI does. 10:00
+ * +02:00 reads 13:00 at a session +05:00, and 04:30 after an ALTER SESSION to
+ * -03:30 - the zones are read again. It read in DBTIMEZONE whatever the
+ * session (9i's -08:00 gave 00:00). Bound and through SQLGetData. */
+static void check_ltz_session_zone(SQLHDBC dbc)
+{
+  const char *name = "LOCAL TIME ZONE value reads in the session's zone (after ALTER SESSION)";
+  if (gated(name))
+    return;
+  static const char *const ZONE[2] = {"+05:00", "-03:30"};
+  static const char *const WANT[2] = {"2026-11-20 13:00:00", "2026-11-20 04:30:00"};
+  char m[300] = "";
+  for (int k = 0; k < 2 && !m[0]; k++) {
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    char alter[96], txt[64] = "";
+    snprintf(alter, sizeof alter, "ALTER SESSION SET TIME_ZONE = '%s'", ZONE[k]);
+    SQL_TIMESTAMP_STRUCT ts = {0};
+    SQLLEN i1 = 0, i2 = 0;
+    if (!SQL_SUCCEEDED(SQLExecDirect(s, (SQLCHAR *)alter, SQL_NTS))) {
+      diag_text(SQL_HANDLE_STMT, s, m, sizeof m);
+    } else {
+      SQLFreeStmt(s, SQL_CLOSE);
+      SQLBindCol(s, 2, SQL_C_TYPE_TIMESTAMP, &ts, sizeof ts, &i2);
+      if (!SQL_SUCCEEDED(
+              SQLExecDirect(s,
+                            (SQLCHAR *)"SELECT x, x FROM (SELECT CAST(TIMESTAMP '2026-11-20 "
+                                       "10:00:00 +02:00' AS TIMESTAMP WITH LOCAL TIME ZONE) x "
+                                       "FROM dual)",
+                            SQL_NTS)) ||
+          !SQL_SUCCEEDED(SQLFetch(s)))
+        diag_text(SQL_HANDLE_STMT, s, m, sizeof m);
+      else if (SQLGetData(s, 1, SQL_C_CHAR, txt, sizeof txt, &i1), strcmp(txt, WANT[k]) != 0)
+        snprintf(m, sizeof m, "session %s: text '%s', want '%s'", ZONE[k], txt, WANT[k]);
+      else if (ts.hour != (k == 0 ? 13 : 4) || ts.minute != (k == 0 ? 0 : 30))
+        snprintf(m, sizeof m, "session %s: struct %02u:%02u", ZONE[k], ts.hour, ts.minute);
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* TIMESTAMP WITH TIME ZONE reads as its own wall-clock time (#359): 10:00
  * +02:00 is 10:00 in a timestamp struct, bound or through SQLGetData, and its
  * text carries the offset - it read as its UTC 08:00, the zone dropped. A
@@ -8267,6 +8315,7 @@ int main(void)
   check_setpos_rowset_errors(dbc);
   check_attr_identifiers(dbc);
   check_tstz_wall_clock(dbc);
+  check_ltz_session_zone(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);
