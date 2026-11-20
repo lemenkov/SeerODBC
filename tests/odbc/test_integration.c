@@ -6422,6 +6422,48 @@ static void check_setpos_rowset_errors(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* Attribute identifiers (#373): a number no ODBC range defines is HY092 on
+ * the connection and the statement, set and get - it was accepted - and
+ * asynchronous execution at the connection is HYC00, as on a statement.
+ * Two-way: a standard attribute this driver has no use for (QUIET_MODE) is
+ * still accepted, and PACKET_SIZE reads the negotiated SDU. */
+static void check_attr_identifiers(SQLHDBC dbc)
+{
+  const char *name = "unknown attributes are HY092; standard ones still accepted";
+  char m[300] = "", st[6] = "";
+  SQLRETURN rc = SQLSetConnectAttr(dbc, 12345, (SQLPOINTER)1, 0);
+  diag_state(SQL_HANDLE_DBC, dbc, st);
+  if (rc != SQL_ERROR || strcmp(st, "HY092") != 0)
+    snprintf(m, sizeof m, "SQLSetConnectAttr(12345): rc=%d '%s'", (int)rc, st);
+  if (!m[0]) {
+    rc = SQLSetConnectAttr(dbc, SQL_ATTR_ASYNC_ENABLE, (SQLPOINTER)SQL_ASYNC_ENABLE_ON, 0);
+    diag_state(SQL_HANDLE_DBC, dbc, st);
+    if (rc != SQL_ERROR || strcmp(st, "HYC00") != 0)
+      snprintf(m, sizeof m, "connection ASYNC_ENABLE ON: rc=%d '%s'", (int)rc, st);
+  }
+  if (!m[0] && !SQL_SUCCEEDED(SQLSetConnectAttr(dbc, SQL_ATTR_QUIET_MODE, NULL, 0)))
+    snprintf(m, sizeof m, "QUIET_MODE (standard) was refused");
+  SQLUINTEGER pkt = 0;
+  if (!m[0] &&
+      (!SQL_SUCCEEDED(SQLGetConnectAttr(dbc, SQL_ATTR_PACKET_SIZE, &pkt, 0, NULL)) || pkt == 0))
+    snprintf(m, sizeof m, "PACKET_SIZE reads %u", (unsigned)pkt);
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  SQLULEN v = 0;
+  for (int k = 0; k < 2 && !m[0]; k++) {
+    rc =
+        k == 0 ? SQLSetStmtAttr(s, 12345, (SQLPOINTER)1, 0) : SQLGetStmtAttr(s, 12345, &v, 0, NULL);
+    diag_state(SQL_HANDLE_STMT, s, st);
+    if (rc != SQL_ERROR || strcmp(st, "HY092") != 0)
+      snprintf(m, sizeof m, "%sStmtAttr(12345): rc=%d '%s'", k ? "SQLGet" : "SQLSet", (int)rc, st);
+  }
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -8022,6 +8064,7 @@ int main(void)
   check_national_params(dbc);
   check_rowset_truncation(dbc);
   check_setpos_rowset_errors(dbc);
+  check_attr_identifiers(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);

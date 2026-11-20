@@ -2205,6 +2205,11 @@ SeerStatus seer_rollback(SeerConn *conn)
   return st;
 }
 
+unsigned seer_conn_sdu(const SeerConn *conn)
+{
+  return conn != NULL && conn->t != NULL ? conn->sdu : 0;
+}
+
 int seer_db_charset_unicode(const SeerConn *conn)
 {
   /* 873 AL32UTF8, 871 UTF8; 0 not yet known (taken as Unicode: no change) */

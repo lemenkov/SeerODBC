@@ -60,6 +60,20 @@ SQLRETURN SQL_API SQLGetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute,
  * advertises - set for the session's next transactions with ALTER SESSION;
  * the others, which it hasn't, refused (HYC00). Not yet connected, the level
  * is kept and applied once logged in. */
+/* Whether `a` is an attribute number ODBC, a driver or a vendor could mean
+ * (#373): the standard statement and connection attributes and ODBC 2's
+ * options (-2..200, statement ones arriving through the connection
+ * included), the ODBC 2 driver range and the DTC / XA / dead-connection ones
+ * (1000..1299), ODBC 3's 10000s, and any driver-specific attribute (16384 and
+ * up, this driver's 19100s among them). A standard attribute this driver has
+ * no use for is accepted as before; only a number none of those ranges holds
+ * is refused, HY092. */
+static int attr_defined(SQLINTEGER a)
+{
+  return (a >= -2 && a <= 200) || (a >= 1000 && a <= 1299) || (a >= 10000 && a <= 10099) ||
+         a >= 16384;
+}
+
 SQLRETURN seer_odbc_apply_isolation(OdbcDbc *c, SQLUINTEGER level)
 {
   const char *sql = NULL;
@@ -121,7 +135,13 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     c->metadata_id = (SQLULEN)ValuePtr == SQL_TRUE ? SQL_TRUE : SQL_FALSE;
   if (Attribute == SQL_ATTR_TXN_ISOLATION)
     return seer_odbc_apply_isolation(c, (SQLUINTEGER)(SQLULEN)ValuePtr);
-  /* Connection timeout, tracing, etc.: accept as no-ops. */
+  /* Asynchronous execution, refused as a statement refuses it - accepted,
+   * it then read back OFF (#373). */
+  if (Attribute == SQL_ATTR_ASYNC_ENABLE && (SQLULEN)ValuePtr != SQL_ASYNC_ENABLE_OFF)
+    return seer_odbc_diag(c, "HYC00", 0, "Asynchronous execution is not supported", SQL_ERROR);
+  if (!attr_defined(Attribute))
+    return seer_odbc_diag(c, "HY092", 0, "Invalid attribute identifier", SQL_ERROR);
+  /* Tracing, translation, quiet mode, ...: standard, of no use here. */
   return SQL_SUCCESS;
 }
 
@@ -201,7 +221,12 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
   case SQL_ATTR_METADATA_ID:
     *(SQLUINTEGER *)ValuePtr = c->metadata_id;
     return SQL_SUCCESS;
+  case SQL_ATTR_PACKET_SIZE: /* the negotiated SDU once connected (#373) */
+    *(SQLUINTEGER *)ValuePtr = c->conn != NULL ? seer_conn_sdu(c->conn) : 0;
+    return SQL_SUCCESS;
   default: /* the 32-bit ones: ACCESS_MODE read-write, AUTO_IPD false, ... */
+    if (!attr_defined(Attribute))
+      return seer_odbc_diag(c, "HY092", 0, "Invalid attribute identifier", SQL_ERROR);
     *(SQLUINTEGER *)ValuePtr = 0;
     return SQL_SUCCESS;
   }
@@ -365,7 +390,9 @@ SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
                           SQL_SUCCESS_WITH_INFO);
   }
   default:
-    /* Cursor type, etc.: accept as no-ops. */
+    if (!attr_defined(Attribute)) /* #373 */
+      return seer_odbc_diag(s, "HY092", 0, "Invalid attribute identifier", SQL_ERROR);
+    /* Standard, of no use here: accepted as a no-op. */
     return SQL_SUCCESS;
   }
 }
@@ -482,6 +509,8 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     *(SQLUSMALLINT **)ValuePtr = s->param_status;
     return SQL_SUCCESS;
   default:
+    if (!attr_defined(Attribute)) /* #373 */
+      return seer_odbc_diag(s, "HY092", 0, "Invalid attribute identifier", SQL_ERROR);
     *(SQLINTEGER *)ValuePtr = 0;
     return SQL_SUCCESS;
   }
