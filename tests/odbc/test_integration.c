@@ -6896,6 +6896,47 @@ static void check_datetime_text_params(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* An Easy Connect target in DBQ, as Oracle's ODBC driver takes it (#362):
+ * DBQ=host:port/service and DBQ=//host:port/service connect; a bare DBQ word
+ * is a TNS alias and fails saying so. Two-way: before, every DBQ form failed
+ * with "Missing HOST or SERVICE". */
+static void check_easy_connect(const char *drv, const char *host, const char *port, const char *svc,
+                               const char *user, const char *pwd)
+{
+  const char *name = "DBQ=host:port/service (Easy Connect) connects";
+  char m[400] = "";
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  for (int k = 0; k < 3 && !m[0]; k++) {
+    char cs[640], why[300] = "";
+    if (k == 2)
+      snprintf(cs, sizeof cs, "DRIVER=%s;DBQ=SEER_NO_SUCH_ALIAS;UID=%s;PWD=%s;", drv, user, pwd);
+    else
+      snprintf(cs, sizeof cs, "DRIVER=%s;DBQ=%s%s:%s/%s;UID=%s;PWD=%s;", drv, k ? "//" : "", host,
+               port ? port : "1521", svc, user, pwd);
+    SQLHDBC d;
+    SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+    SQLRETURN rc =
+        SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_DBC, d, why, sizeof why);
+    else
+      SQLDisconnect(d);
+    if (k < 2 && !SQL_SUCCEEDED(rc))
+      snprintf(m, sizeof m, "DBQ=%s%s:%s/%s: %s", k ? "//" : "", host, port ? port : "1521", svc,
+               why);
+    if (k == 2 && (SQL_SUCCEEDED(rc) || strstr(why, "TNS alias") == NULL))
+      snprintf(m, sizeof m, "a bare DBQ word: rc=%d '%s' (want a TNS-alias error)", (int)rc, why);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -7777,6 +7818,7 @@ int main(void)
   check_proxy_auth(dbc, drv, host, port, svc);
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_expire_time(drv, host, port, svc, user, pwd);
+  check_easy_connect(drv, host, port, svc, user, pwd);
   check_session_killed(drv, host, port, svc, user, pwd);
   check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);
   check_disconnect_open_txn(dbc, drv, host, port, svc, user, pwd);

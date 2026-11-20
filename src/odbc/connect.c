@@ -11,6 +11,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <strings.h>
 
@@ -102,6 +103,51 @@ static int proto_is_tcps(const char *s)
   return s && (s[0] == 'T' || s[0] == 't') && (s[3] == 'S' || s[3] == 's');
 }
 
+/* An Easy Connect target, [//]host[:port][/service][...] (an IPv6 host in
+ * brackets), as Oracle's ODBC driver takes in DBQ (#362): the parts it has go
+ * into the unset ones of *host / *port / *svc (malloc'd). Returns 0, or -1 if
+ * `s` is no Easy Connect string - a bare word, which is a TNS alias. */
+static int easy_connect(const char *s, char **host, char **port, char **svc)
+{
+  if (strncmp(s, "//", 2) == 0)
+    s += 2;
+  const char *h = s, *he;
+  if (*s == '[') { /* [IPv6] */
+    he = strchr(s, ']');
+    if (he == NULL)
+      return -1;
+    h = s + 1;
+    s = he + 1;
+  } else {
+    he = s + strcspn(s, ":/");
+    s = he;
+  }
+  if (*s != ':' && *s != '/')
+    return -1; /* no port, no service: a TNS alias */
+  if (he == h)
+    return -1;
+  const char *p = NULL, *pe = NULL;
+  if (*s == ':') {
+    p = ++s;
+    s += strspn(s, "0123456789");
+    pe = s;
+    if (pe == p)
+      return -1;
+  }
+  const char *v = NULL, *ve = NULL;
+  if (*s == '/') {
+    v = ++s;
+    ve = v + strcspn(v, ":/");
+  }
+  if (*host == NULL)
+    *host = odbc_strndup(h, (size_t)(he - h));
+  if (*port == NULL && p != NULL)
+    *port = odbc_strndup(p, (size_t)(pe - p));
+  if (*svc == NULL && v != NULL && ve > v)
+    *svc = odbc_strndup(v, (size_t)(ve - v));
+  return 0;
+}
+
 /* Resolve connection parameters, then connect. Ownership of the temporary
  * strings stays local. */
 static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const char *uid,
@@ -168,6 +214,26 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
       ctimeout = dsn_get(dsn, "CONNECT_TIMEOUT");
   }
 
+  /* An Easy Connect target (#362): DBQ, as Oracle's ODBC driver takes it, or
+   * a HOST / SERVER that holds a whole host:port/service. It fills only what
+   * HOST, PORT and SERVICE left unset. A bare DBQ word is a TNS alias, which
+   * needs tnsnames.ora - not read here, so it gets its own error. */
+  char *dbq = cs ? conn_str_get(cs, "DBQ") : NULL;
+  if (dbq == NULL && dsn != NULL)
+    dbq = dsn_get(dsn, "DBQ");
+  bool tns_alias = false;
+  if (host != NULL && strchr(host, '/') != NULL && svc == NULL) {
+    char *ez = host, *eh = NULL;
+    host = NULL;
+    if (easy_connect(ez, &eh, &port, &svc) == 0)
+      host = eh;
+    else
+      host = ez, ez = NULL;
+    free(ez);
+  }
+  if (dbq != NULL && (host == NULL || svc == NULL) && easy_connect(dbq, &host, &port, &svc) != 0)
+    tns_alias = host == NULL;
+
   /* TLS is requested by SSL=1/yes/true or PROTOCOL=TCPS; verification is on by
    * default (TLSVERIFY=0 disables it, e.g. for a self-signed test endpoint). */
   int use_tls = flag_is_on(cssl) || proto_is_tcps(cproto);
@@ -185,8 +251,17 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
 
   SQLRETURN ret;
   if (host == NULL || svc == NULL) {
-    ret = seer_odbc_diag(c, "08001", 0, "Missing HOST or SERVICE in DSN/connection string",
-                         SQL_ERROR);
+    if (tns_alias) {
+      char m[300];
+      snprintf(m, sizeof m,
+               "DBQ=%.100s is a TNS alias: tnsnames.ora is not read; give the target as "
+               "host:port/service (Easy Connect) or HOST, PORT and SERVICE",
+               dbq);
+      ret = seer_odbc_diag(c, "08001", 0, m, SQL_ERROR);
+    } else {
+      ret = seer_odbc_diag(c, "08001", 0, "Missing HOST or SERVICE in DSN/connection string",
+                           SQL_ERROR);
+    }
     goto out;
   }
 
@@ -278,6 +353,7 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
 
 out:
   free(host);
+  free(dbq);
   free(port);
   free(svc);
   free(cuid);
