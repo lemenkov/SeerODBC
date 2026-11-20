@@ -44,6 +44,8 @@ static int n_pass, n_fail, n_skip;
 static const Gate GATES[] = {
     {"TIMESTAMP WITH TIME ZONE reads its own wall-clock time and offset", 8, 8, GATE_SERVER,
      "8.1.7 has no TIMESTAMP WITH TIME ZONE"},
+    {"session time zone set at login (OS offset, ORA_SDTZ)", 8, 8, GATE_SERVER,
+     "8.1.7 has no session time zone"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 8, 8, GATE_SERVER,
      "8.1.7 has no TIMESTAMP type"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 9, 9, GATE_SERVER,
@@ -7316,6 +7318,75 @@ static void check_tns_alias(const char *drv, const char *host, const char *port,
 #endif
 }
 
+/* The session time zone is set at login, as OCI sets it (#358): the OS's UTC
+ * offset now, or ORA_SDTZ verbatim (an offset, a region) - it was the
+ * server's default whatever the client's zone. Two-way: each ORA_SDTZ gives
+ * its own SESSIONTIMEZONE, so the value isn't the server's default by chance. */
+static void check_session_time_zone(const char *drv, const char *host, const char *port,
+                                    const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "session time zone set at login (OS offset, ORA_SDTZ)";
+  if (gated(name))
+    return;
+#ifdef _WIN32
+  (void)drv, (void)host, (void)port, (void)svc, (void)user, (void)pwd;
+  skip(name, "todo: the check sets ORA_SDTZ with POSIX setenv");
+#else
+  time_t now = time(NULL);
+  struct tm g;
+  gmtime_r(&now, &g);
+  g.tm_isdst = -1;
+  int off = (int)(difftime(now, mktime(&g)) / 60.0), a = off < 0 ? -off : off;
+  char os[16];
+  snprintf(os, sizeof os, "%c%02d:%02d", off < 0 ? '-' : '+', a / 60, a % 60);
+  const char *old = getenv("ORA_SDTZ");
+  char *saved = old ? strdup(old) : NULL;
+  static const char *const SDTZ[3] = {NULL, "-03:30", "Europe/Moscow"};
+  char m[400] = "";
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  for (int k = 0; k < 3 && !m[0]; k++) {
+    if (SDTZ[k] == NULL)
+      unsetenv("ORA_SDTZ");
+    else
+      setenv("ORA_SDTZ", SDTZ[k], 1);
+    char why[300] = "", got[64] = "";
+    SQLHDBC d = open_conn(e, drv, host, port, svc, user, pwd, why, sizeof why);
+    if (d == NULL) {
+      snprintf(m, sizeof m, "ORA_SDTZ=%s: %s", SDTZ[k] ? SDTZ[k] : "(unset)", why);
+      break;
+    }
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, d, &s);
+    SQLLEN ind;
+    if (SQL_SUCCEEDED(SQLExecDirect(s, (SQLCHAR *)"SELECT SESSIONTIMEZONE FROM dual", SQL_NTS)) &&
+        SQL_SUCCEEDED(SQLFetch(s)))
+      SQLGetData(s, 1, SQL_C_CHAR, got, sizeof got, &ind);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+    SQLDisconnect(d);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+    for (size_t gl = strlen(got); gl > 0 && got[gl - 1] == ' '; gl--) /* 9i pads a region */
+      got[gl - 1] = '\0';
+    const char *want = SDTZ[k] ? SDTZ[k] : os;
+    if (strcmp(got, want) != 0)
+      snprintf(m, sizeof m, "ORA_SDTZ=%s: SESSIONTIMEZONE '%s', want '%s'",
+               SDTZ[k] ? SDTZ[k] : "(unset)", got, want);
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  if (saved != NULL) {
+    setenv("ORA_SDTZ", saved, 1);
+    free(saved);
+  } else {
+    unsetenv("ORA_SDTZ");
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+#endif
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -8204,6 +8275,7 @@ int main(void)
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_expire_time(drv, host, port, svc, user, pwd);
   check_tns_alias(drv, host, port, svc, user, pwd);
+  check_session_time_zone(drv, host, port, svc, user, pwd);
   check_easy_connect(drv, host, port, svc, user, pwd);
   check_session_killed(drv, host, port, svc, user, pwd);
   check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);
