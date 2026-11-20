@@ -30,7 +30,7 @@ if host_machine.system() == 'windows'
 endif
 
 odbc_pure = static_library('seerodbcpure',
-  files('sqlprep.c', 'convert.c', 'odbcini.c'),
+  files('sqlprep.c', 'convert.c', 'odbcini.c', 'tnsnames.c'),
   include_directories : include_directories('.'),
   dependencies : odbc_platform_deps,
 )

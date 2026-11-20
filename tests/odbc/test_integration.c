@@ -7186,6 +7186,87 @@ static void check_easy_connect(const char *drv, const char *host, const char *po
     fail(name, m);
 }
 
+/* A TNS alias from tnsnames.ora (#374): an entry for this tier's target,
+ * written to a temporary TNS_ADMIN, connects through DBQ=<alias> and through
+ * a SERVICE with no HOST; its first address is a dead one, so the entry's
+ * address list fails over to the next. Two-way: an alias that isn't there
+ * fails naming the file searched. */
+static void check_tns_alias(const char *drv, const char *host, const char *port, const char *svc,
+                            const char *user, const char *pwd)
+{
+  const char *name = "TNS alias from tnsnames.ora connects (DBQ / SERVICE, failover)";
+#ifdef _WIN32
+  (void)drv, (void)host, (void)port, (void)svc, (void)user, (void)pwd;
+  skip(name, "todo: the check's temporary TNS_ADMIN needs a POSIX harness");
+  return;
+#else
+  char dir[] = "/tmp/seer_tnsadmXXXXXX", path[256], m[400] = "";
+  if (mkdtemp(dir) == NULL) {
+    skip(name, "no temporary directory");
+    return;
+  }
+  snprintf(path, sizeof path, "%s/tnsnames.ora", dir);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600); /* owner-only */
+  FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+  if (f == NULL && fd >= 0)
+    close(fd);
+  if (f == NULL) {
+    skip(name, "can't write tnsnames.ora");
+    rmdir(dir);
+    return;
+  }
+  fprintf(f,
+          "# SeerODBC check_tns_alias\n"
+          "SEER_ALIAS, SEER_ALIAS.WORLD =\n"
+          "  (DESCRIPTION =\n"
+          "    (ADDRESS_LIST =\n"
+          "      (ADDRESS = (PROTOCOL = TCP)(HOST = 127.0.0.1)(PORT = 1))\n"
+          "      (ADDRESS = (PROTOCOL = TCP)(HOST = %s)(PORT = %s)))\n"
+          "    (CONNECT_DATA = (SERVER = DEDICATED)(SERVICE_NAME = %s)))\n",
+          host, port ? port : "1521", svc);
+  fclose(f);
+  const char *old = getenv("TNS_ADMIN");
+  char *saved = old ? strdup(old) : NULL;
+  setenv("TNS_ADMIN", dir, 1);
+  SQLHENV e;
+  SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
+  SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+  static const char *const TAIL[3] = {"DBQ=seer_alias.world", "SERVICE=SEER_ALIAS",
+                                      "DBQ=SEER_NO_SUCH_ALIAS"};
+  for (int k = 0; k < 3 && !m[0]; k++) {
+    char cs[640], why[400] = "";
+    snprintf(cs, sizeof cs, "DRIVER=%s;%s;UID=%s;PWD=%s;", drv, TAIL[k], user, pwd);
+    SQLHDBC d;
+    SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
+    SQLRETURN rc =
+        SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, NULL, 0, NULL, SQL_DRIVER_NOPROMPT);
+    if (!SQL_SUCCEEDED(rc))
+      diag_text(SQL_HANDLE_DBC, d, why, sizeof why);
+    else
+      SQLDisconnect(d);
+    if (k < 2 && !SQL_SUCCEEDED(rc))
+      snprintf(m, sizeof m, "%s: %s", TAIL[k], why);
+    if (k == 2 &&
+        (SQL_SUCCEEDED(rc) || strstr(why, "not found") == NULL || strstr(why, path) == NULL))
+      snprintf(m, sizeof m, "a missing alias: rc=%d '%s'", (int)rc, why);
+    SQLFreeHandle(SQL_HANDLE_DBC, d);
+  }
+  SQLFreeHandle(SQL_HANDLE_ENV, e);
+  if (saved != NULL) {
+    setenv("TNS_ADMIN", saved, 1);
+    free(saved);
+  } else {
+    unsetenv("TNS_ADMIN");
+  }
+  unlink(path);
+  rmdir(dir);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+#endif
+}
+
 static void check_expire_time(const char *drv, const char *host, const char *port, const char *svc,
                               const char *user, const char *pwd)
 {
@@ -8072,6 +8153,7 @@ int main(void)
   check_proxy_auth(dbc, drv, host, port, svc);
   check_drcp(dbc, drv, host, port, svc, user, pwd);
   check_expire_time(drv, host, port, svc, user, pwd);
+  check_tns_alias(drv, host, port, svc, user, pwd);
   check_easy_connect(drv, host, port, svc, user, pwd);
   check_session_killed(drv, host, port, svc, user, pwd);
   check_autocommit_switch(dbc, drv, host, port, svc, user, pwd);

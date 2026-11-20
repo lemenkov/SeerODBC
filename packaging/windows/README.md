@@ -78,6 +78,14 @@ servers, `SSL=1` / `TLSCA=` for TCPS, `CCLASS=` / `PURITY=` for DRCP,
 `EXPIRE_TIME=` and `LOBINLINE=1`. `HOST=` may list several addresses,
 comma-separated (`HOST=db1,db2:1522`), tried in order until one answers.
 
+The target can also come as Oracle's own ODBC driver takes it, in `DBQ=`:
+- an Easy Connect string, `DBQ=db.example.com:1521/ORCLPDB1`;
+- a TNS alias, `DBQ=ORCL`, looked up in `tnsnames.ora`.
+
+The alias lookup searches `%TNS_ADMIN%`, then `%ORACLE_HOME%\network\admin`. From
+the entry, its TCP / TCPS addresses become the failover list, and its
+`SERVICE_NAME` or `SID` the target.
+
 **With a data source (DSN)**, made in the *ODBC Data Source Administrator*
 (`odbcad32.exe`, or *ODBC Data Sources* in the Start menu; the 64-bit one for
 64-bit applications, the 32-bit one for 32-bit applications). On the *User DSN*
