@@ -6241,6 +6241,57 @@ static void check_diag_text_trimmed(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* A national parameter (SQL_WVARCHAR) keeps characters the database charset
+ * lacks (#367): on 9i (WE8ISO8859P1) U+4E2D bound as SQL_WVARCHAR reached an
+ * NVARCHAR2 as '¿'. It now goes in the national charset there; read back as
+ * SQL_C_WCHAR it is the same two characters on every tier from 9i. */
+static void check_national_params(SQLHDBC dbc)
+{
+  const char *name = "SQL_WVARCHAR parameters keep characters the database charset lacks";
+  if (g_release > 0 && g_release < 9) {
+    skip(name, "server: 8.1.7's national charset is WE8ISO8859P1 too");
+    return;
+  }
+  char m[300] = "", err[256];
+  exec_do(dbc, "DROP TABLE seer_npar", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_npar (n NVARCHAR2(10))", err, sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  static const SQLWCHAR W[] = {0x4E2D, 0x00E9, 0};
+  static const char U8[] = "\xe4\xb8\xad\xc3\xa9";
+  struct {
+    SQLSMALLINT ct;
+    const void *v;
+  } T[] = {{SQL_C_WCHAR, W}, {SQL_C_CHAR, U8}};
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    exec_do(dbc, "DELETE FROM seer_npar", err, sizeof err);
+    SQLHSTMT s;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    SQLLEN ind = SQL_NTS;
+    SQLBindParameter(s, 1, SQL_PARAM_INPUT, T[i].ct, SQL_WVARCHAR, 10, 0, (SQLPOINTER)T[i].v, 0,
+                     &ind);
+    SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)"INSERT INTO seer_npar VALUES (?)", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+    SQLWCHAR out[8] = {0};
+    SQLLEN oi = 0;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+    if (SQL_SUCCEEDED(rc) &&
+        SQL_SUCCEEDED(rc = SQLExecDirect(s, (SQLCHAR *)"SELECT n FROM seer_npar", SQL_NTS)) &&
+        SQL_SUCCEEDED(rc = SQLFetch(s)))
+      rc = SQLGetData(s, 1, SQL_C_WCHAR, out, sizeof out, &oi);
+    SQLFreeHandle(SQL_HANDLE_STMT, s);
+    if (!SQL_SUCCEEDED(rc) || oi != 4 || out[0] != 0x4E2D || out[1] != 0x00E9)
+      snprintf(m, sizeof m, "C type %d: rc=%d read %ld bytes U+%04X U+%04X (want U+4E2D U+00E9)",
+               (int)T[i].ct, (int)rc, (long)oi, out[0], out[1]);
+  }
+  exec_do(dbc, "DROP TABLE seer_npar", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* Cursor attributes (#226) are kept: STATIC reads back, KEYSET_DRIVEN becomes
  * STATIC and SENSITIVE becomes INSENSITIVE with 01S02, SCROLLABLE is a static
  * cursor - and that cursor scrolls (row 3 of 5 by SQL_FETCH_ABSOLUTE). */
@@ -7838,6 +7889,7 @@ int main(void)
   check_getdata_wchar_pieces(dbc);
   check_describe_no_markers(dbc);
   check_diag_text_trimmed(dbc);
+  check_national_params(dbc);
   check_refcursor_nested_cursor(dbc);
   check_cache_open_cursors(dbc);
   check_array_dml_rowcounts(dbc);

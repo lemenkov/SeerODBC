@@ -224,6 +224,11 @@ bind had no case for had its buffer sent as text, reported as success.
   bound as an exact NUMBER whatever the session's `NLS_NUMERIC_CHARACTERS`
   (#354). Text that is no such literal goes as text, for the server to convert
   or refuse; past NUMBER's range is 22003.
+- **National parameters** (`SQL_WVARCHAR` / `SQL_WCHAR` / `SQL_WLONGVARCHAR`) go in the
+  national charset when the database charset is not Unicode (9i's
+  WE8ISO8859P1), so an NVARCHAR2 keeps what that charset lacks (#367). On a
+  Unicode database they stay database-charset text, which loses nothing and
+  keeps VARCHAR2 indexes usable.
 - **Character data for a datetime parameter** is an ODBC date, time or
   timestamp literal (bare or `{d|t|ts '...'}`), bound as the native value, not
   text the server would read by `NLS_DATE_FORMAT` (#356): a TIMESTAMP with its

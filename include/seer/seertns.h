@@ -116,6 +116,10 @@ SeerStatus seer_rollback(SeerConn *conn);
 /* Whether a transaction is open on the session, as the server's last reply
  * said: 1 open, 0 none, -1 unknown (8i and 9i replies don't say). */
 int seer_txn_open(const SeerConn *conn);
+/* Whether the database charset holds every character: AL32UTF8 or UTF8, or
+ * not yet known. Otherwise (WE8ISO8859P1, say) text for an NVARCHAR2 has to go
+ * in the national charset to survive (#367). */
+int seer_db_charset_unicode(const SeerConn *conn);
 
 /* Request boundaries (§35, 21c+). Bracket a logical request on a (typically
  * pooled) connection so the server can reset session state between requests.
