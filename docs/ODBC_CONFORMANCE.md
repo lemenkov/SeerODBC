@@ -18,7 +18,7 @@ Legend: [x] implemented & live-validated · [~] partial · [ ] not implemented
 | [x] | SQLAllocHandle / SQLFreeHandle | ENV / DBC / STMT |
 | [x] | SQLSetEnvAttr / SQLGetEnvAttr | ODBC version |
 | [x] | SQLConnect / SQLDriverConnect | DSN from odbc.ini; HOST/PORT/SERVICE keys |
-| [x] | SQLDisconnect | in manual-commit mode with a transaction open: 25000, the connection left up (10g+; 8i / 9i replies don't say, #344) |
+| [x] | SQLDisconnect | in manual-commit mode with a transaction open: 25000, the connection left up (8i and 10g+; 9i's compact replies don't say, #344) |
 | [x] | SQLSetConnectAttr / SQLGetConnectAttr | autocommit (switching back ON commits the open transaction, #342); `SQL_ATTR_CONNECTION_DEAD` is true once the socket is gone, or once the server has ended the session over a live one (killed, instance down, lost contact, idle time; #340) |
 | [x] | SQLGetInfo | server-specific answer table (identifier quote, schemas-not-catalogs, txn, scroll options, …) |
 | [x] | SQLGetFunctions | incl. SQL_API_ODBC3_ALL_FUNCTIONS |

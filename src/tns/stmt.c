@@ -6079,6 +6079,8 @@ typedef struct {
   uint32_t cursor;
   uint32_t position;
   uint8_t warnings;
+  uint8_t flags; /* 0x40: no transaction open (seerdb bus 95, #344) */
+  bool complete; /* the whole fixed part was read */
   char *message; /* UTF-8, when the code is set */
 } O8iStatus;
 
@@ -6127,7 +6129,9 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
   (void)o8r_le16(r);
   s->cursor = o8r_le16(r);
   s->position = o8r_le16(r);
-  o8r_skip(r, 5); /* sql type, fatal, flags, cursor options, upi param */
+  o8r_skip(r, 2);       /* sql type, fatal */
+  s->flags = o8r_u8(r); /* 0x40: no transaction open (bus 95) */
+  o8r_skip(r, 2);       /* cursor options, upi param */
   s->warnings = o8r_u8(r);
   o8r_skip(r, 13);   /* rowid: ub4 object, ub2 file, a byte, ub4 block, ub2 slot */
   (void)o8r_le32(r); /* os error */
@@ -6136,6 +6140,7 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
   if (o8r_le16(r) > 0)
     o8r_value(r, NULL); /* oerrdd: the rowid again after a DML */
   o8r_skip(r, 12);      /* batch-error array counts */
+  s->complete = !r->cut && !r->bad;
   if (s->code != 0 && !r->cut && !r->bad) {
     SeerWriter m;
     if (!seer_writer_init(&m, 64)) {
@@ -6158,6 +6163,15 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
     }
     seer_writer_free(&m);
   }
+}
+
+/* An 8i status says whether a transaction is open: bit 0x40 of its flags is
+ * set when none is - the inverse of 10g's call_status 0x02, and on every
+ * status, a query's and an error's too (seerdb bus 95, #344). */
+static void o8i_note_txn(SeerConn *c, const O8iStatus *s)
+{
+  if (c != NULL && s->complete)
+    c->txn_state = (s->flags & 0x40) ? 0 : 1;
 }
 
 /* Test-only: read an 8i status reply; 0 when well formed (*code the ORA code),
@@ -6590,6 +6604,8 @@ static SeerStatus o8i_rows_reply(SeerStmt *stmt, SeerWriter *buf, size_t start, 
     SeerStatus st = o8i_read_rows(&r, stmt, &rows, &nrows, &nested);
     if (st == SEER_OK && !r.cut && !r.bad)
       o8i_read_status(&r, s);
+    if (!r.cut && !r.bad)
+      o8i_note_txn(stmt->conn, s);
     if (st == SEER_OK && !seer_writer_ok(&nested))
       st = SEER_ENOMEM;
     if (st == SEER_OK && !r.cut && !r.bad) {
@@ -7006,6 +7022,7 @@ static SeerStatus o8i_call(SeerConn *c, SeerStmt *stmt, const char *sql, int row
       break;
     O8iRd r = {buf.buf, buf.len, 0, false, false};
     o8i_read_status(&r, s);
+    o8i_note_txn(c, s);
     if (r.bad) {
       o8i_status_free(s);
       st = SEER_EPROTO;
@@ -7180,6 +7197,7 @@ static SeerStatus o8i_lobop_reply(SeerConn *c, bool has_amount, SeerWriter *cont
     }
     o8i_status_free(&s);
     o8i_read_status(&r, &s);
+    o8i_note_txn(c, &s);
     if (r.bad) {
       st = SEER_EPROTO;
       break;
@@ -7554,8 +7572,10 @@ static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, O8iStatus *s)
       }
     }
   }
-  if (!r->cut && !r->bad)
+  if (!r->cut && !r->bad) {
     o8i_read_status(r, s);
+    o8i_note_txn(stmt->conn, s);
+  }
 }
 
 static SeerStatus o8i_fetch_rest(SeerStmt *stmt, uint32_t cursor, O8iStatus *s);
@@ -7784,6 +7804,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
     if (buf.len > 0 && buf.buf[0] == TTI_OER) {
       O8iRd r = {buf.buf, buf.len, 0, false, false};
       o8i_read_status(&r, &s);
+      o8i_note_txn(c, &s);
       if (r.cut) {
         o8i_status_free(&s);
         st = o8i_recv_more(c, &buf);
@@ -7816,6 +7837,7 @@ static SeerStatus o8i_execute_select(SeerStmt *stmt)
       if (mlen > 0 && more[0] == TTI_OER) {
         O8iRd e = {more, mlen, 0, false, false};
         o8i_read_status(&e, &s);
+        o8i_note_txn(c, &s);
         if (!e.cut && !e.bad && s.code != 0 && s.message != NULL &&
             strncmp(s.message, "ORA-", 4) == 0) {
           free(more);
