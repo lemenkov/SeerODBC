@@ -7756,6 +7756,114 @@ static SeerStatus o8i_fetch_rest(SeerStmt *stmt, uint32_t cursor, O8iStatus *s)
   return SEER_OK;
 }
 
+/* Describe a query on 8.1.7 without running it (#353), as OCI's
+ * OCIStmtExecute(OCI_DESCRIBE_ONLY) does (seerdb bus 96): open a cursor
+ * (function 2; the reply's RPA names it), then an OALL8 on it with PARSE |
+ * DESCRIBE (0x00028001) and no EXECUTE or FETCH. The reply is the usual
+ * describe, then the RPA and the status - no rows. The cursor is queued to
+ * close with the next call. Markers aren't sent here: OCI's descriptor for an
+ * unbound one isn't measured byte for byte, so a query with markers is left to
+ * describe at execute, as before. */
+static SeerStatus o8i_describe_only(SeerStmt *stmt)
+{
+  SeerConn *c = stmt->conn;
+  SeerWriter w;
+  if (!seer_writer_init(&w, 32))
+    return SEER_ENOMEM;
+  o8i_closing(c, &w);
+  seer_ttc_fun_header(c, &w, TTI_OOPEN);
+  seer_writer_u8(&w, 1);
+  o8w_le32(&w, 0);
+  SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  seer_writer_free(&w);
+  if (st != SEER_OK)
+    return st;
+  uint8_t *resp = NULL;
+  size_t rlen = 0;
+  st = seer_ttc_recv(c, &resp, &rlen);
+  if (st != SEER_OK)
+    return st;
+  uint32_t cursor = 0;
+  if (rlen >= 5 && resp[0] == TTI_RPA) {
+    O8iRd r = {resp, rlen, 1, false, false};
+    cursor = o8r_le32(&r);
+  }
+  free(resp);
+  if (cursor == 0) {
+    seer_log(SEER_LOG_DEBUG, "o8i: describe: the server opened no cursor");
+    return SEER_EPROTO;
+  }
+
+  size_t sqllen = 0;
+  uint8_t *sql = o8i_latin1(stmt->sql, &sqllen);
+  if (sql == NULL || !seer_writer_init(&w, 160 + sqllen)) {
+    free(sql);
+    queue_cursor_close(c, cursor);
+    return SEER_ENOMEM;
+  }
+  o8i_all8(c, &w, 0x00028001, cursor, sql, sqllen, true, 1, 0, 0, 1, 0, O8I_STMT_SELECT);
+  free(sql);
+  st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  seer_writer_free(&w);
+  if (st != SEER_OK) {
+    queue_cursor_close(c, cursor);
+    return st;
+  }
+
+  SeerWriter buf;
+  if (!seer_writer_init(&buf, 2048)) {
+    queue_cursor_close(c, cursor);
+    return SEER_ENOMEM;
+  }
+  st = o8i_recv_more(c, &buf);
+  O8iStatus s = {0};
+  SeerColumn *cols = NULL;
+  int ncols = 0;
+  while (st == SEER_OK) {
+    if (buf.len > 0 && buf.buf[0] == TTI_OER) { /* refused at parse: its status alone */
+      O8iRd r = {buf.buf, buf.len, 0, false, false};
+      o8i_read_status(&r, &s);
+      if (r.cut) {
+        o8i_status_free(&s);
+        st = o8i_recv_more(c, &buf);
+        continue;
+      }
+      st = s.code ? o8i_fail(c, &s) : SEER_EPROTO;
+      break;
+    }
+    O8iRd r = {buf.buf, buf.len, 0, false, false};
+    o8i_read_describe(&r, &cols, &ncols);
+    if (!r.cut && !r.bad)
+      o8i_read_status(&r, &s); /* the RPA and the status behind the describe */
+    if (r.bad) {
+      st = SEER_EPROTO;
+      break;
+    }
+    if (r.cut) { /* read on: the describe or its status spans packets */
+      free_columns(cols, ncols);
+      cols = NULL;
+      ncols = 0;
+      o8i_status_free(&s);
+      st = o8i_recv_more(c, &buf);
+      continue;
+    }
+    if (s.code != 0)
+      st = o8i_fail(c, &s);
+    break;
+  }
+  seer_writer_free(&buf);
+  o8i_status_free(&s);
+  queue_cursor_close(c, cursor);
+  if (st != SEER_OK) {
+    free_columns(cols, ncols);
+    return st;
+  }
+  free_columns(stmt->cols, stmt->ncols);
+  stmt->cols = cols;
+  stmt->ncols = ncols;
+  return SEER_OK;
+}
+
 static SeerStatus o8i_execute_select(SeerStmt *stmt)
 {
   SeerConn *c = stmt->conn;
@@ -9082,11 +9190,22 @@ static SeerStatus describe_now(SeerStmt *stmt)
   if (stmt == NULL)
     return SEER_EPARAM;
   /* Already known (a cached cursor brings its describe), or nothing to
-   * describe: only a query has a result set to describe. 8i describes at
-   * execute only. */
-  if (stmt->ncols > 0 || stmt->executed || classify_sql(stmt->sql) != STMT_SELECT ||
-      stmt->conn->is_8i)
+   * describe: only a query has a result set to describe. */
+  if (stmt->ncols > 0 || stmt->executed || classify_sql(stmt->sql) != STMT_SELECT)
     return SEER_OK;
+  if (stmt->conn->is_8i) {
+    /* A describe-only OALL8 (#353); a query with markers still describes at
+     * execute - the unbound-marker descriptor isn't measured. */
+    int *occ = NULL, nocc = 0, ndistinct = 0;
+    int pr = seer_sql_placeholders(stmt->sql, &occ, &nocc, &ndistinct);
+    free(occ);
+    if (pr != 0 || ndistinct > 0)
+      return SEER_OK;
+    SeerStatus ost = o8i_describe_only(stmt);
+    if (ost == SEER_OK)
+      stmt->described_only = true;
+    return ost;
+  }
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2) { /* 9i: parse + describe */
     SeerStatus fst = fv2_describe_only(stmt);
     if (fst == SEER_OK)

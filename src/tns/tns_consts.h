@@ -136,6 +136,7 @@
  * (TTI_OCCA) so they don't leak until session end. */
 #define TTI_MSG_TYPE_PIGGYBACK 0x11
 #define TTI_OCCA 105 /* close cursors */
+#define TTI_OOPEN 2  /* 8i: open a cursor (describe-only, seerdb bus 96) */
 
 /* Request boundaries (§35, #464): a func-176 SESSION_STATE piggyback telling the
  * server a logical request begins/ends so it can reset session state between
