@@ -2531,6 +2531,14 @@ static void check_connect_failover(void)
     fail(name, m);
 }
 
+/* The core-API suite against one server, as run-matrix.sh runs it per tier.
+ * The target comes from the environment: SEER_TEST_HOST / _PORT, _SERVICE or
+ * _SID, _USER and _PASS, and SEER_TEST_RELEASE, which gates.h uses to skip a
+ * check a release lacks, with its reason. Without a host the suite is
+ * skipped (exit 77, as meson counts a skip); an unreachable server is one
+ * skip, not a failure. The checks share one connection, C. Each prints its
+ * PASS / FAIL / SKIP line, which run-matrix.sh counts. The SUMMARY line and
+ * the exit status (1 on any failure) are for meson and a direct run. */
 int main(void)
 {
   if (getenv("SEER_TEST_HOST") == NULL) {
@@ -2539,6 +2547,7 @@ int main(void)
                     "skipping\n");
     return 77; /* meson/automake "skipped" */
   }
+  /* The release decides the gates; without it no skip could be given. */
   if (gate_release_init() <= 0) {
     fprintf(stderr, "test_core: set SEER_TEST_RELEASE to the server's release (8, 9, 10, 11, 18, "
                     "21, 23, 26)\n");
@@ -2561,6 +2570,7 @@ int main(void)
     return 0;
   }
 
+  /* Queries, describes and the statement cache. */
   check_select_scalar();
   check_connect_failover();
   check_cache_redescribe();
@@ -2571,6 +2581,7 @@ int main(void)
   check_wide_select();
   check_nullability();
   check_null_fetch();
+  /* Binds, DML, errors and transactions. */
   check_dml_binds();
   check_date_bind();
   check_raw_bind();
@@ -2579,6 +2590,7 @@ int main(void)
   check_error_recovery();
   check_long_error_text();
   check_rollback();
+  /* PL/SQL, LOBs, national and long data, array DML. */
   check_plsql();
   check_block_directions();
   check_lob();
@@ -2597,6 +2609,7 @@ int main(void)
   check_session_identity();
   check_non_ascii_sql();
   check_fetch_error_text();
+  /* Type, NULL and error round trips across the value forms. */
   check_scalar_types();
   check_nulls_and_empty();
   check_multibatch();
@@ -2620,7 +2633,11 @@ int main(void)
   check_bfile_missing();
   check_table_nulls();
   check_cache_bind_types();
+  /* A refused login, with its own connection. */
   check_wrong_password(&P);
+  /* The feature suites in their own files (core_*.c): two-phase commit,
+   * request boundaries, sessionless transactions, pipelining, object binds
+   * and Advanced Queuing. */
   core_tpc();
   core_reqbound();
   core_sessionless();
@@ -2628,6 +2645,7 @@ int main(void)
   core_objbind();
   core_aq();
 
+  /* The totals, and the exit status, for meson and a direct run. */
   seer_disconnect(C);
   printf("SUMMARY pass=%d fail=%d skip=%d\n", pass_n, fail_n, skip_n);
   return fail_n > 0 ? 1 : 0;
