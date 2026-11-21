@@ -44,10 +44,10 @@ bound; REF columns and REF binds; Advanced Queuing (RAW and object payloads,
 through DBMS_AQ) and two-phase commit; query timeouts; 9i also XMLType,
 TIMESTAMP / INTERVAL and national-character data. What a release itself lacks
 (on 8i TIMESTAMP / INTERVAL and XMLType; before 10g BINARY_FLOAT / DOUBLE,
-DRCP; JSON, VECTOR, BOOLEAN, implicit results) has nothing to reach. Still
-open: PL/SQL associative arrays on 9i (#254: no client binds one in 9.2's compact
-form; they work on 8i) and package-level record and index-by types before 12c
-(#193).
+DRCP; JSON, VECTOR, BOOLEAN, implicit results; before 12.1 binding
+package-level PL/SQL record and index-by types, which no client can, #193) has
+nothing to reach. Still open: PL/SQL associative arrays on 9i (#254: no client
+binds one in 9.2's compact form; they work on 8i).
 
 - **Connect & auth** — O5LOGON across the 10g (DES), 11g (AES-192/SHA-1) and
   12c (AES-256/PBKDF2) verifiers, 23ai fv24 fast-auth, and 8i / 9i O3LOGON
