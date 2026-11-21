@@ -1733,7 +1733,8 @@ static void check_bind_refused(void)
       st = seer_stmt_execute(s);
     if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
       seer_stmt_get_string(s, 0, &v, &isn);
-    if (st != SEER_OK || v == NULL || strtod(v, NULL) != vals[i])
+    double back = v != NULL ? strtod(v, NULL) : 0; /* must be the same bits */
+    if (st != SEER_OK || v == NULL || memcmp(&back, &vals[i], sizeof back) != 0)
       snprintf(m, sizeof m, "%.17g: status %d, read back '%s'", vals[i], (int)st, v ? v : "");
     seer_stmt_close(s);
   }

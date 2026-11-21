@@ -4700,7 +4700,7 @@ static void check_double_params(SQLHDBC dbc)
       SQLGetData(st, 1, SQL_C_SLONG, &k, 0, &kl);
       SQLGetData(st, 2, SQL_C_DOUBLE, &d, 0, &dl);
       double want = k < 5 ? vals[k] : (double)fv;
-      if (d != want)
+      if (memcmp(&d, &want, sizeof d) != 0) /* exactly the stored bits */
         snprintf(m, sizeof m, "row %d: read back %.17g, stored %.17g", (int)k, d, want);
       rows++;
     }
