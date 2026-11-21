@@ -1122,6 +1122,9 @@ static void check_os_user(SQLHDBC dbc)
   const char *me = getenv("USER");
   if (me == NULL || !me[0])
     me = getenv("LOGNAME");
+  /* A replay-corpus run sends a fixed OS user (#396, src/tns/wire.c). */
+  if (getenv("SEER_WIRE_RECORD") != NULL || getenv("SEER_WIRE_REPLAY") != NULL)
+    me = "seer";
   if (me == NULL || !me[0]) {
     skip(name, "no USER / LOGNAME in the environment");
     return;

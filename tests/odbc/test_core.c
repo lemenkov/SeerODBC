@@ -1349,6 +1349,9 @@ static void check_session_identity(void)
     return;
   }
   host[sizeof host - 1] = '\0';
+  /* A replay-corpus run sends a fixed host name (#396, src/tns/wire.c). */
+  if (getenv("SEER_WIRE_RECORD") != NULL || getenv("SEER_WIRE_REPLAY") != NULL)
+    snprintf(host, sizeof host, "seer-corpus");
   char prog[128], mach[256];
   scalar("SELECT program FROM v$session WHERE audsid = USERENV('SESSIONID')", prog, sizeof prog);
   scalar("SELECT machine FROM v$session WHERE audsid = USERENV('SESSIONID')", mach, sizeof mach);

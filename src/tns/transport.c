@@ -6,6 +6,7 @@
 #include "transport.h"
 
 #include "log.h"
+#include "wire.h" /* the replay corpus's recorder (#396) */
 
 #include <stdbool.h>
 #include "netcompat.h"
@@ -79,6 +80,7 @@ struct SeerTransport {
   SSL *ssl; /* non-NULL once TLS is established */
   SSL_CTX *ctx;
   bool large_frames; /* 4-byte packet length (§ ver >= 315, #155) */
+  unsigned wire_id;  /* the connection's id in a wire record, 0 when none (#396) */
 };
 
 void seer_transport_set_large_frames(SeerTransport *t, int on)
@@ -113,6 +115,7 @@ SeerStatus seer_transport_send_oob(SeerTransport *t)
     return SEER_EPARAM;
   if (t->ssl != NULL)
     return SEER_ENOTIMPL;
+  seer_wire_event(t->wire_id, "OOB");
   return send(t->fd, "!", 1, MSG_OOB) == 1 ? SEER_OK : SEER_EIO;
 }
 
@@ -127,6 +130,8 @@ int seer_transport_wait_readable(SeerTransport *t, int timeout_ms)
   do {
     rc = seer_poll(&pfd, 1, timeout_ms);
   } while (rc < 0 && seer_sock_errno() == SEER_EINTR);
+  if (rc == 0)
+    seer_wire_event(t->wire_id, "WAIT0"); /* nothing came in time */
   return rc > 0 ? 1 : (rc == 0 ? 0 : -1);
 }
 
@@ -271,6 +276,7 @@ SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int time
   freeaddrinfo(res);
 
   if (fd == SEER_INVALID_SOCKET) {
+    (void)seer_wire_connect(host, port, 0);
     connect_error(err, errlen, host, port, first_why, timeout_ms);
     seer_log(SEER_LOG_ERROR, "transport: %s", err != NULL && err[0] ? err : "connect failed");
     return SEER_EIO;
@@ -282,6 +288,7 @@ SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int time
     return SEER_ENOMEM;
   }
   t->fd = fd;
+  t->wire_id = seer_wire_connect(host, port, 1);
   *out = t;
   seer_log(SEER_LOG_INFO, "transport: connected to %s:%u", host, (unsigned)port);
   return SEER_OK;
@@ -357,6 +364,7 @@ void seer_transport_close(SeerTransport *t)
 {
   if (t == NULL)
     return;
+  seer_wire_event(t->wire_id, "CLOSE");
   if (t->ssl != NULL) {
     SigpipeGuard g;
     sigpipe_block(&g);
@@ -403,6 +411,7 @@ SeerStatus seer_transport_write_all(SeerTransport *t, const void *buf, size_t le
     }
     off += (size_t)n;
   }
+  seer_wire_sent(t->wire_id, buf, len);
   return SEER_OK;
 }
 
@@ -427,6 +436,7 @@ SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len)
                    len, off);
         else
           seer_log(SEER_LOG_ERROR, "transport: TLS read failed: %s", ssl_err());
+        seer_wire_event(t->wire_id, "RFAIL");
         return SEER_EIO;
       }
       off += (size_t)n;
@@ -437,6 +447,7 @@ SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len)
       if (seer_sock_errno() == SEER_EINTR)
         continue;
       seer_log(SEER_LOG_ERROR, "transport: read failed (error %d)", seer_sock_errno());
+      seer_wire_event(t->wire_id, "RFAIL");
       return SEER_EIO;
     }
     if (n == 0) {
@@ -444,9 +455,11 @@ SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len)
                "transport: connection closed by peer "
                "(wanted %zu bytes, got %zu)",
                len, off);
+      seer_wire_event(t->wire_id, "RFAIL");
       return SEER_EIO;
     }
     off += (size_t)n;
   }
+  seer_wire_received(t->wire_id, buf, len);
   return SEER_OK;
 }

@@ -17,6 +17,7 @@
 #include "conn.h"
 #include "log.h"
 #include "netcompat.h" /* gethostname(): <unistd.h> on POSIX, Winsock on Windows */
+#include "wire.h"      /* the host name and OS user a connect sends (#396) */
 #include "packet.h"
 #include "reader.h"
 #include "tns_consts.h"
@@ -68,6 +69,11 @@
 void seer_client_os_user(char *out, size_t n)
 {
   out[0] = '\0';
+  const char *fixed = seer_wire_os_user(); /* a corpus run's (#396) */
+  if (fixed != NULL) {
+    snprintf(out, n, "%s", fixed);
+    return;
+  }
 #ifndef _WIN32
   struct passwd pw, *pwres = NULL;
   char pwbuf[1024];
@@ -104,7 +110,7 @@ static void cid_sanitize(char *v)
 static SeerStatus build_connect_body(const SeerConnParams *p, SeerWriter *w)
 {
   char hostname[256];
-  if (gethostname(hostname, sizeof hostname - 1) != 0)
+  if (seer_wire_hostname(hostname, sizeof hostname - 1) != 0)
     strcpy(hostname, "localhost");
   hostname[sizeof hostname - 1] = '\0';
   cid_sanitize(hostname);

@@ -20,3 +20,9 @@ option('driver_libdir',
                 'resolves to <libdir>/odbc (e.g. /usr/lib64/odbc), the ' +
                 'directory Fedora\'s odbcinst-generate probes to resolve bare ' +
                 'driver names. Set an absolute or prefix-relative path to override.')
+
+option('wire_corpus',
+  type : 'boolean', value : false,
+  description : 'TEST BUILDS ONLY: the replay corpus recorder (#396). With ' +
+                'SEER_WIRE_RECORD set it records every connection and makes the ' +
+                'client\'s random values fixed - never enable it in a shipped driver')
