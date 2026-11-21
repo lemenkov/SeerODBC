@@ -10541,8 +10541,9 @@ SeerStatus seer_stmt_bind_object(SeerStmt *stmt, int param, const char *schema,
 
 /* A REF bind (#241): the referenced type's OID in a descriptor of each
  * release's own (seerdb PROTOCOL.md §19.17c and bus 77 / 79), the REF bytes as
- * the value. 10g and 11g have no measured thin form; a NULL REF isn't sent on
- * any release (unfilled, 8.1.7 and 9.2 answer ORA-00600 [kokeermd1]). */
+ * the value. 10g and 11g take the 12c+ form without its 12.2 oaccolid - JDBC
+ * thin's (ojdbc6 11.2 on 10.2.0.5 and 11.2.0.2, bus 106). A NULL REF isn't sent
+ * on any release (unfilled, 8.1.7 and 9.2 answer ORA-00600 [kokeermd1]). */
 /* A REF OUT (#241, bus 85 / 86) takes the IN REF's descriptor - size 4000
  * on 9i, as for a NULL - and comes back as the REF's bytes: on 12c+ a value
  * and its ub4 return code (NULL: an empty value, return code -1); on 9i the
@@ -10559,10 +10560,6 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
   SeerConn *c = stmt->conn;
   uint8_t fv = c->field_version;
   bool o8i = c->is_8i, o9i = !o8i && fv < TTC_FIELD_VERSION_10_2;
-  if (!o8i && !o9i && fv < TTC_FIELD_VERSION_12_1) {
-    seer_log(SEER_LOG_WARNING, "stmt: a REF bind on 10g / 11g is not supported (#241)");
-    return SEER_ENOTIMPL;
-  }
   uint8_t oid[16];
   SeerStatus st = obj_lookup_oid(c, type_schema, type_name, oid);
   if (st != SEER_OK)
@@ -10618,7 +10615,7 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
       seer_writer_u8(&v, 0x00);
     else if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
-  } else { /* 12c+, a JDBC thin capture (seerdb #139) */
+  } else { /* 10g+, a JDBC thin capture (seerdb #139; 10g / 11g bus 106) */
     seer_writer_u8(&oac, ORA_TYPE_REF);
     seer_writer_u8(&oac, 0x03);
     seer_writer_u8(&oac, 0x00);
