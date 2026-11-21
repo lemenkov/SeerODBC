@@ -1115,6 +1115,14 @@ static void check_alter_session_state(SQLHDBC dbc, int has_editions)
 
 /* v$session.OSUSER (SYS_CONTEXT OS_USER) is the operating-system account
  * running the client, not the database user. */
+/* A replay-corpus run (#396): the driver then sends a fixed host name and OS
+ * user (src/tns/wire.c). */
+static int wire_corpus_run(void)
+{
+  const char *r = getenv("SEER_WIRE_RECORD"), *p = getenv("SEER_WIRE_REPLAY");
+  return (r != NULL && r[0] != '\0') || (p != NULL && p[0] != '\0');
+}
+
 static void check_os_user(SQLHDBC dbc)
 {
   const char *name = "OS user reported to the server";
@@ -1122,6 +1130,9 @@ static void check_os_user(SQLHDBC dbc)
   const char *me = getenv("USER");
   if (me == NULL || !me[0])
     me = getenv("LOGNAME");
+  /* A replay-corpus run sends a fixed OS user (#396, src/tns/wire.c). */
+  if (wire_corpus_run())
+    me = "seer";
   if (me == NULL || !me[0]) {
     skip(name, "no USER / LOGNAME in the environment");
     return;

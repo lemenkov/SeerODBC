@@ -11,6 +11,8 @@
 #include <openssl/provider.h>
 #include <openssl/rand.h>
 
+#include "wire.h" /* the client's random bytes (#396) */
+
 #include "log.h"
 #include "once.h"
 #include <stdio.h>
@@ -369,12 +371,12 @@ SeerStatus seer_o5logon0(const uint8_t *sess, size_t sess_len, const uint8_t *ke
       if (srv[i] != 0x08)
         padded = false;
     if (padded) {
-      if (RAND_bytes(cli, 40) != 1) {
+      if (seer_wire_rand(cli, 40) != 1) {
         st = SEER_EIO;
         goto done;
       }
       memset(cli + 40, 0x08, 8);
-    } else if (RAND_bytes(cli, (int)sess_len) != 1) {
+    } else if (seer_wire_rand(cli, (int)sess_len) != 1) {
       st = SEER_EIO;
       goto done;
     }
@@ -585,7 +587,7 @@ SeerStatus seer_o5logon(const uint8_t *sess, size_t sess_len, const uint8_t *sal
   memcpy(key, h512, 32);
 
   uint8_t dkey[80];
-  if (RAND_bytes(dkey, 16) != 1)
+  if (seer_wire_rand(dkey, 16) != 1)
     return SEER_EIO;
   memcpy(dkey + 16, data, 64);
 

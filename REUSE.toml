@@ -41,3 +41,11 @@ path = "docs/releases/*.md"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "© 2026 Peter Lemenkov and the SeerODBC contributors"
 SPDX-License-Identifier = "Apache-2.0"
+
+# The replay corpus (#396): each tier's recorded wire traffic, xz-compressed,
+# replayed offline by tests/odbc/replay-corpus.sh. Binary, so declared here.
+[[annotations]]
+path = "tests/fixtures/corpus/*.wire.xz"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "© 2026 Peter Lemenkov and the SeerODBC contributors"
+SPDX-License-Identifier = "Apache-2.0"

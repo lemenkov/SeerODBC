@@ -11,6 +11,7 @@
 #include "log.h"
 #include "marshal.h"
 #include "netcompat.h" /* gethostname(): <unistd.h> on POSIX, Winsock on Windows */
+#include "wire.h"      /* the host name and pid a login sends (#396) */
 #include "packet.h"
 #include "reader.h"
 #include "tns_consts.h"
@@ -913,12 +914,12 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
   size_t ulen = strlen(user);
 
   char host[256];
-  if (gethostname(host, sizeof host - 1) != 0)
+  if (seer_wire_hostname(host, sizeof host - 1) != 0)
     strcpy(host, "localhost");
   host[sizeof host - 1] = '\0';
 
   char pid[16];
-  snprintf(pid, sizeof pid, "%ld", (long)getpid());
+  snprintf(pid, sizeof pid, "%ld", seer_wire_pid());
 
   /* AUTH_SID is the operating-system account running the client - the server
    * shows it as v$session.OSUSER / SYS_CONTEXT('USERENV','OS_USER') - not the
@@ -1456,11 +1457,11 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
 {
   size_t ulen = strlen(user);
   char host[256];
-  if (gethostname(host, sizeof host - 1) != 0)
+  if (seer_wire_hostname(host, sizeof host - 1) != 0)
     strcpy(host, "localhost");
   host[sizeof host - 1] = '\0';
   char pid[16];
-  snprintf(pid, sizeof pid, "%ld", (long)getpid());
+  snprintf(pid, sizeof pid, "%ld", seer_wire_pid());
   char osuser[128];
   seer_client_os_user(osuser, sizeof osuser);
   static const char APP[] = "seerodbc";
@@ -1660,11 +1661,11 @@ static SeerStatus o8i_login_call(SeerConn *conn, uint8_t op, const char *user, u
                                  const char *password_field)
 {
   char host[256];
-  if (gethostname(host, sizeof host - 1) != 0)
+  if (seer_wire_hostname(host, sizeof host - 1) != 0)
     strcpy(host, "localhost");
   host[sizeof host - 1] = '\0';
   char pid[16];
-  snprintf(pid, sizeof pid, "%ld", (long)getpid());
+  snprintf(pid, sizeof pid, "%ld", seer_wire_pid());
   SeerWriter w;
   SeerStatus st = seer_o8i_build_login(conn, &w, op, user, mode, password_field, host, pid);
   if (st != SEER_OK)

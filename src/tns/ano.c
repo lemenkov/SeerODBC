@@ -18,6 +18,8 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
+#include "wire.h" /* the client's random bytes (#396) */
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -395,7 +397,7 @@ SeerStatus seer_ano_dh(const SeerAnoResponse *r, uint8_t **client_pub, size_t *c
   uint8_t *priv = malloc(r->prime_len);
   if (priv == NULL)
     return SEER_ENOMEM;
-  if (RAND_bytes(priv, (int)r->prime_len) != 1) {
+  if (seer_wire_rand(priv, (int)r->prime_len) != 1) {
     free(priv);
     return SEER_EPROTO;
   }
