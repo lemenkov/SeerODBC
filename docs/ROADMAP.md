@@ -30,8 +30,8 @@ protocol variant with no feature behind it is not a gap.
       and `CURSOR()` columns (#166), LOB OUT and LOBs via RETURNING (#167, #214),
       objects and collections read (#168) and bound (#172), REF binds IN and OUT (#241),
       associative arrays (#253), AQ RAW / object payloads through DBMS_AQ, XA via
-      SYS.JAVA_XA (#171), query timeouts (#209). Both suites run on it. Open:
-      package-level types (#193).
+      SYS.JAVA_XA (#171), query timeouts (#209). Both suites run on it.
+      Package-level PL/SQL types are a server limit before 12.1 (#193).
 - [x] 9i — **fv2, live-validated against a 9i VM** (SID=orcl;
       not containerizable — needs an old kernel/glibc). The whole legacy path is in:
       O3LOGON DES auth, the TTI_ALL7 (`0x47`) query/fetch dialect (distinct from the
@@ -41,8 +41,8 @@ protocol variant with no feature behind it is not a gap.
       (#167), temporary-LOB binds past 32512 bytes (#169), objects, collections,
       XMLType and REFs read (#168) and bound (#172, #241, REF OUT included), AQ,
       XA (#171), query timeouts (#209); both suites run on it. Open: associative
-      arrays (#254, no reference client in 9.2's compact form) and package-level
-      types (#193). See the
+      arrays (#254, no reference client in 9.2's compact form). Package-level
+      types are a server limit before 12.1 (#193). See the
       per-feature `[x]` entries below and seerdb's [`docs/PROTOCOL.md`](https://github.com/seerdb/seerdb/blob/master/docs/PROTOCOL.md) §19. Wired
       into `run-matrix.sh` as a **local-only** 9i row (SID-addressed; both the
       ODBC and the core-API suite run on it as on every tier, #148); it is deliberately *not*
