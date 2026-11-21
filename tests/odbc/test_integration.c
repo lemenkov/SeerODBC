@@ -6104,9 +6104,8 @@ static void check_cache_open_cursors(SQLHDBC dbc)
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &held[nheld]);
     if (!SQL_SUCCEEDED(SQLExecDirect(held[nheld], (SQLCHAR *)q, SQL_NTS))) {
       diag_text(SQL_HANDLE_STMT, held[nheld], why, sizeof why);
+      /* m set: the loop's own step counts this handle, so it is freed below */
       snprintf(m, sizeof m, "open result set %d of 30: %s", nheld + 1, why);
-      nheld++;
-      break;
     }
   }
   for (int i = 0; i < nheld; i++)

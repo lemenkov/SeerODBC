@@ -244,7 +244,10 @@ static int split_args(const char *p, size_t n, bool at_in, Span *out)
   int k = 0, depth = 0;
   char quote = 0;
   size_t start = 0;
-  for (size_t i = 0; i < all.n; i++) {
+  /* A separator two characters long (" IN ") is skipped whole: `next` is
+   * where the scan goes on. */
+  for (size_t i = 0, next; i < all.n; i = next) {
+    next = i + 1;
     char c = all.p[i];
     if (quote) {
       if (c == quote)
@@ -272,7 +275,7 @@ static int split_args(const char *p, size_t n, bool at_in, Span *out)
       return -1;
     out[k++] = trim_span(all.p + start, i - start);
     start = i + cut;
-    i += cut - 1;
+    next = i + cut;
     at_in = false; /* POSITION has one IN */
   }
   if (k == FN_MAX_ARGS)
@@ -308,12 +311,14 @@ static int expand(Buf *out, const char *t, const Span *args, int nargs, Ctx *ctx
       ctx->err = "this {fn} escape drops an argument that holds a parameter marker";
       return -1;
     }
-  for (const char *q = t; *q != '\0'; q++) {
+  /* A $N reference is two characters, written as its argument. */
+  for (const char *q = t, *next; *q != '\0'; q = next) {
+    next = q + 1;
     if (q[0] == '$' && q[1] >= '1' && q[1] <= '9' && q[1] - '1' < nargs) {
       const Span *a = &args[q[1] - '1'];
       if (buf_put(out, a->p, a->n))
         return -1;
-      q++;
+      next = q + 2;
     } else if (buf_put(out, q, 1)) {
       return -1;
     }
