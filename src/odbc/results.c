@@ -1013,10 +1013,10 @@ SQLRETURN SQL_API SQLCopyDesc(SQLHDESC SourceDescHandle, SQLHDESC TargetDescHand
         ts->params[i].bound = 0, ts->params[i].buf = NULL, ts->params[i].indicator = NULL;
     }
   }
-  /* The header fields are the statement's; an explicit descriptor has its
-   * records only (#291). */
-  if (sd->is_explicit || td->is_explicit) {
-  } else if (rc == SQL_SUCCESS && same && app_desc(sd->kind)) {
+  /* The header fields are the statement's, copied only between implicit
+   * descriptors: an explicit descriptor has its records only (#291). */
+  bool copy_header = !sd->is_explicit && !td->is_explicit && rc == SQL_SUCCESS && same;
+  if (copy_header && app_desc(sd->kind)) {
     int sr = sd->kind == SEER_DESC_ARD, tr = td->kind == SEER_DESC_ARD;
     SQLULEN size = sr ? ss->row_array_size : ss->paramset_size;
     SQLULEN bind = sr ? ss->row_bind_type : ss->param_bind_type;
@@ -1026,7 +1026,7 @@ SQLRETURN SQL_API SQLCopyDesc(SQLHDESC SourceDescHandle, SQLHDESC TargetDescHand
     *(tr ? &ts->row_bind_type : &ts->param_bind_type) = bind;
     *(tr ? &ts->row_bind_offset : &ts->param_bind_offset) = off;
     *(tr ? &ts->row_operation : &ts->param_operation) = op;
-  } else if (rc == SQL_SUCCESS && same) { /* IRD / IPD -> IPD */
+  } else if (copy_header) { /* IRD / IPD -> IPD */
     ts->param_status = sd->kind == SEER_DESC_IRD ? ss->row_status : ss->param_status;
     ts->params_processed = sd->kind == SEER_DESC_IRD ? ss->rows_fetched : ss->params_processed;
   }
