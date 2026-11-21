@@ -13,6 +13,49 @@
 
 #include "odbc_internal.h"
 
+/* A statement on connection `c`: its attribute defaults, a cursor name of
+ * its own, its implicit descriptors, and its place in the connection's list. */
+static SQLRETURN alloc_stmt(OdbcDbc *c, SQLHANDLE *OutputHandle)
+{
+  if (!c->connected)
+    return seer_odbc_diag(c, "08003", 0, "Connection not open", SQL_ERROR);
+  OdbcStmt *s = calloc(1, sizeof *s);
+  if (s == NULL)
+    return SQL_ERROR;
+  s->h.type = SQL_HANDLE_STMT;
+  s->dbc = c;
+  s->getdata_col = -1;
+  s->paramset_size = 1;
+  s->row_array_size = 1;
+  s->rowset_start = -1;
+  s->concurrency = SQL_CONCUR_READ_ONLY;
+  s->retrieve_data = SQL_RD_ON; /* SQL_RD_OFF is 0: calloc would turn retrieval off */
+  s->rowid_col = -1;
+  s->metadata_id = c->metadata_id; /* the connection's default (#278) */
+  /* A cursor name of its own, SQL_CURn, until the application sets one;
+   * the connection lists its statements to find one by name (#288). */
+  char name[32];
+  snprintf(name, sizeof name, "SQL_CUR%lu", ++c->cursor_seq);
+  s->cursor_name = strdup(name);
+  if (s->cursor_name == NULL) {
+    free(s);
+    return SQL_ERROR;
+  }
+  s->cur_row = -1;
+  s->next_stmt = c->stmts;
+  c->stmts = s;
+  /* The implicit descriptors share the statement's lifetime. */
+  s->ard.h.type = s->apd.h.type = s->ird.h.type = s->ipd.h.type = SQL_HANDLE_DESC;
+  s->ard.stmt = s->apd.stmt = s->ird.stmt = s->ipd.stmt = s;
+  s->ard.kind = SEER_DESC_ARD;
+  s->apd.kind = SEER_DESC_APD;
+  s->ird.kind = SEER_DESC_IRD;
+  s->ipd.kind = SEER_DESC_IPD;
+  s->ab = &s->own_binds; /* the implicit ARD's records, until one is set (#291) */
+  *OutputHandle = (SQLHANDLE)s;
+  return SQL_SUCCESS;
+}
+
 SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
                                  SQLHANDLE *OutputHandle)
 {
@@ -42,48 +85,10 @@ SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle,
     *OutputHandle = (SQLHANDLE)c;
     return SQL_SUCCESS;
   }
-  case SQL_HANDLE_STMT: {
+  case SQL_HANDLE_STMT:
     if (InputHandle == NULL)
       return SQL_INVALID_HANDLE;
-    OdbcDbc *c = (OdbcDbc *)InputHandle;
-    if (!c->connected)
-      return seer_odbc_diag(c, "08003", 0, "Connection not open", SQL_ERROR);
-    OdbcStmt *s = calloc(1, sizeof *s);
-    if (s == NULL)
-      return SQL_ERROR;
-    s->h.type = SQL_HANDLE_STMT;
-    s->dbc = c;
-    s->getdata_col = -1;
-    s->paramset_size = 1;
-    s->row_array_size = 1;
-    s->rowset_start = -1;
-    s->concurrency = SQL_CONCUR_READ_ONLY;
-    s->retrieve_data = SQL_RD_ON; /* SQL_RD_OFF is 0: calloc would turn retrieval off */
-    s->rowid_col = -1;
-    s->metadata_id = c->metadata_id; /* the connection's default (#278) */
-    /* A cursor name of its own, SQL_CURn, until the application sets one;
-     * the connection lists its statements to find one by name (#288). */
-    char name[32];
-    snprintf(name, sizeof name, "SQL_CUR%lu", ++c->cursor_seq);
-    s->cursor_name = strdup(name);
-    if (s->cursor_name == NULL) {
-      free(s);
-      return SQL_ERROR;
-    }
-    s->cur_row = -1;
-    s->next_stmt = c->stmts;
-    c->stmts = s;
-    /* The implicit descriptors share the statement's lifetime. */
-    s->ard.h.type = s->apd.h.type = s->ird.h.type = s->ipd.h.type = SQL_HANDLE_DESC;
-    s->ard.stmt = s->apd.stmt = s->ird.stmt = s->ipd.stmt = s;
-    s->ard.kind = SEER_DESC_ARD;
-    s->apd.kind = SEER_DESC_APD;
-    s->ird.kind = SEER_DESC_IRD;
-    s->ipd.kind = SEER_DESC_IPD;
-    s->ab = &s->own_binds; /* the implicit ARD's records, until one is set (#291) */
-    *OutputHandle = (SQLHANDLE)s;
-    return SQL_SUCCESS;
-  }
+    return alloc_stmt((OdbcDbc *)InputHandle, OutputHandle);
   case SQL_HANDLE_DESC: { /* explicit: an application descriptor of the connection (#291) */
     if (InputHandle == NULL)
       return SQL_INVALID_HANDLE;
