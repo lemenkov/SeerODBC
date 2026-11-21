@@ -378,6 +378,36 @@ SeerStatus seer_decode_tstz(const uint8_t *data, size_t len, char *out, size_t o
   return SEER_OK;
 }
 
+SeerStatus seer_shift_datetime_text(const char *in, int minutes, char *out, size_t outsz)
+{
+  int y, mo, d, h, mi, se, used = 0;
+  if (in == NULL || out == NULL || outsz < 20 ||
+      sscanf(in, "%d-%d-%d %d:%d:%d%n", &y, &mo, &d, &h, &mi, &se, &used) != 6)
+    return SEER_EPARAM;
+  int64_t mins = (seer_days_from_civil(y, mo, d) * 24 + h) * 60 + mi + minutes;
+  int64_t days = mins >= 0 ? mins / 1440 : -((-mins + 1439) / 1440);
+  int64_t rem = mins - days * 1440;
+  seer_civil_from_days(days, &y, &mo, &d);
+  snprintf(out, outsz, "%04d-%02d-%02d %02d:%02d:%02d%s", y, mo, d, (int)(rem / 60),
+           (int)(rem % 60), se, in + used);
+  return SEER_OK;
+}
+
+bool seer_parse_offset(const char *s, int *minutes)
+{
+  size_t n = s != NULL ? strlen(s) : 0;
+  while (n > 0 && s[n - 1] == ' ') /* 9i pads the zone names it returns */
+    n--;
+  if (n != 6 || (s[0] != '+' && s[0] != '-') || s[3] != ':')
+    return false;
+  for (int i = 1; i < 6; i++)
+    if (i != 3 && (s[i] < '0' || s[i] > '9'))
+      return false;
+  int v = ((s[1] - '0') * 10 + (s[2] - '0')) * 60 + (s[4] - '0') * 10 + (s[5] - '0');
+  *minutes = s[0] == '-' ? -v : v;
+  return true;
+}
+
 /* big-endian ub4 read, debiased by 2**31 to a signed value. */
 static int32_t be32_debiased(const uint8_t *p)
 {

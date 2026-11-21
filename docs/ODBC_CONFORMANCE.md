@@ -195,6 +195,21 @@ reported as success.
     the wire doesn't carry. The value stays UTC, and the text says so with
     `+00:00`.
   - The display size counts the 7 characters of the offset.
+- **The session's time zone** is set at login, as OCI sets it (#358), from
+  9i. It is `ORA_SDTZ` if set: an offset or a region verbatim, `OS_TZ` for
+  the OS's offset, `DB_TZ` for the database's zone. Otherwise it is the OS's
+  UTC offset at login. Before, every session took the server's default zone.
+- **TIMESTAMP WITH LOCAL TIME ZONE** reads in the session's zone (#358). The
+  server sends it in `DBTIMEZONE`, and the driver moves it, as OCI does.
+  - The driver reads both zones with one query, the first time a session
+    reads such a value. It reads them again after an `ALTER SESSION`, or a
+    PL/SQL block naming `TIME_ZONE`.
+  - Only numeric offsets convert. A region on either side needs
+    daylight-saving rules the wire doesn't carry, so the value then stays in
+    `DBTIMEZONE`, with a warning in the log.
+  - Not converted: LTZ attributes inside an object, and a zone changed in a
+    way the driver can't see (`DBMS_SESSION` called from a stored
+    procedure).
 - **In a bound rowset**, a column that fails makes its row `SQL_ROW_ERROR`.
   The other rows are delivered with `SQL_SUCCESS_WITH_INFO`. A rowset where
   every row failed returns `SQL_ERROR`.

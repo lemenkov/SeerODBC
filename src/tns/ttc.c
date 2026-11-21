@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---------------------------------------------------------- static messages */
@@ -1400,6 +1401,56 @@ static char *hex_upper(const uint8_t *in, size_t n)
  * TTI_3LOGON, copied with a block nobody understood and its fixed session
  * strings, so every 9i session reported program "JDBC Thin Client" on host
  * "o9i" (#123). */
+/* The client's UTC offset now, in minutes east: the OS zone at login, DST
+ * included, as OCI takes it. */
+static int os_utc_offset_minutes(void)
+{
+  time_t now = time(NULL);
+  struct tm g;
+#ifdef _WIN32
+  gmtime_s(&g, &now);
+#else
+  gmtime_r(&now, &g);
+#endif
+  g.tm_isdst = -1; /* read the UTC fields as local time: the difference is the offset */
+  time_t as_local = mktime(&g);
+  return (int)(difftime(now, as_local) / 60.0);
+}
+
+/* The session time zone a login sets (#358), as OCI sets it: an
+ * AUTH_ALTER_SESSION pair whose value is ALTER SESSION SET TIME_ZONE='<zone>'
+ * and its NUL, flags 1 (seerdb, bus 103: OCI 9.2 and 23.26 alike). The zone
+ * is ORA_SDTZ when set - verbatim, a region included - with its two
+ * keywords: OS_TZ the OS's offset, DB_TZ the database's zone (DBTIMEZONE,
+ * which OCI sends as a number it knows and we don't). Without it, the OS's
+ * numeric offset now. An ORA_SDTZ with characters no zone has is ignored,
+ * with a warning, rather than put into SQL. Returns the value's length,
+ * its NUL counted; 0 when none is sent. */
+static size_t session_tz_value(char *out, size_t n)
+{
+  const char *z = getenv("ORA_SDTZ");
+  if (z != NULL && z[0] != '\0' && strcmp(z, "OS_TZ") != 0) {
+    if (strcmp(z, "DB_TZ") == 0)
+      return (size_t)snprintf(out, n, "ALTER SESSION SET TIME_ZONE=DBTIMEZONE") + 1;
+    size_t zl = strlen(z);
+    int ok = zl < 64;
+    for (size_t i = 0; ok && i < zl; i++) {
+      unsigned char ch = (unsigned char)z[i];
+      ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+           ch == '/' || ch == '_' || ch == '+' || ch == '-' || ch == ':';
+    }
+    if (ok)
+      return (size_t)snprintf(out, n, "ALTER SESSION SET TIME_ZONE='%s'", z) + 1;
+    seer_log(SEER_LOG_WARNING,
+             "login: ORA_SDTZ is not a time zone name; using the OS's UTC offset");
+  }
+  int off = os_utc_offset_minutes();
+  int a = off < 0 ? -off : off;
+  return (size_t)snprintf(out, n, "ALTER SESSION SET TIME_ZONE='%c%02d:%02d'", off < 0 ? '-' : '+',
+                          a / 60, a % 60) +
+         1;
+}
+
 static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwdfield,
                                   SeerWriter *w)
 {
@@ -1422,7 +1473,9 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
   seer_enc_sb4(w, (uint32_t)ulen); /* user length               */
   seer_enc_sb4(w, 0x101);          /* logon mode, with the proof */
   seer_writer_u8(w, 1);
-  seer_enc_sb4(w, c->xa ? 8 : 6); /* key/value pairs */
+  char tz[96];
+  size_t tzlen = session_tz_value(tz, sizeof tz);
+  seer_enc_sb4(w, (uint32_t)((c->xa ? 8 : 6) + (tzlen ? 1 : 0))); /* key/value pairs */
   seer_writer_u8(w, 1);
   seer_writer_u8(w, 1);
   seer_writer_bytes(w, user, ulen); /* raw, as below 12.1 */
@@ -1441,6 +1494,8 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
     seer_enc_kv(w, "AUTH_INTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
     seer_enc_kv(w, "AUTH_EXTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
   }
+  if (tzlen)
+    seer_enc_kv(w, "AUTH_ALTER_SESSION", 18, tz, tzlen, 1, false);
   seer_enc_kv(w, "AUTH_ACL", 8, ACL, sizeof ACL - 1, 0, false);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
@@ -1869,9 +1924,11 @@ static SeerStatus build_auth(SeerConn *c, const SeerConnParams *p, const SeerAut
   if ((cclass || purity) && purity == 0)
     purity = SEER_PURITY_NEW;
 
+  char tz[96];
+  size_t tzlen = session_tz_value(tz, sizeof tz);
   seer_writer_u8(w, 1);
   seer_enc_sb4(w, (uint32_t)((has_speedy ? 3 : 2) + (proxy_schema ? 1 : 0) + (cclass ? 1 : 0) +
-                             (purity ? 1 : 0))); /* KV count */
+                             (purity ? 1 : 0) + (tzlen ? 1 : 0))); /* KV count */
   seer_writer_u8(w, 1);
   seer_writer_u8(w, 1);
   if (c->field_version >= TTC_FIELD_VERSION_12_1) {
@@ -1901,6 +1958,9 @@ static SeerStatus build_auth(SeerConn *c, const SeerConnParams *p, const SeerAut
     seer_enc_kv(w, "AUTH_KPPL_PURITY", 16, ps, (size_t)pl, 1,
                 c->field_version >= TTC_FIELD_VERSION_12_1);
   }
+  if (tzlen) /* the session time zone (#358) */
+    seer_enc_kv(w, "AUTH_ALTER_SESSION", 18, tz, tzlen, 1,
+                c->field_version >= TTC_FIELD_VERSION_12_1);
 
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);

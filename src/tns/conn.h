@@ -61,9 +61,14 @@ struct SeerConn {
   char *last_error;        /* last ORA-NNNNN message (malloc'd)       */
   long last_error_offset;  /* its parse offset into the SQL text, 0 if none */
   int txn_state;           /* 1 a transaction is open, 0 none, -1 unknown (8i / 9i; #344) */
-  volatile bool in_call;   /* blocked in seer_ttc_recv (cancel window) */
-  int call_timeout_ms;     /* seer_set_call_timeout: 0 = none (#209)  */
-  bool call_timed_out;     /* a reply was interrupted by that timeout  */
+  /* TIMESTAMP WITH LOCAL TIME ZONE (#358): the minutes from DBTIMEZONE to
+   * SESSIONTIMEZONE, read once - 0 not read yet, 1 read (ltz_shift_min),
+   * -1 can't (a region on either side, or the query failed). */
+  int ltz_state;
+  int ltz_shift_min;
+  volatile bool in_call; /* blocked in seer_ttc_recv (cancel window) */
+  int call_timeout_ms;   /* seer_set_call_timeout: 0 = none (#209)  */
+  bool call_timed_out;   /* a reply was interrupted by that timeout  */
   /* Server cursors of closed statements, flushed as a CLOSE_CURSORS piggyback
    * in front of the next execute so they don't leak until session end. */
   int close_cursors[256];
