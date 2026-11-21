@@ -868,6 +868,121 @@ static bool whole_part_overflows(const char *s, size_t vallen, SQLSMALLINT src_t
   return whole > cap;
 }
 
+/* The integer, bit and floating targets (#329): range-checked, a lost
+ * fraction reported. */
+static SQLRETURN convert_number(const char *s, int is_binary, SQLSMALLINT target, SQLPOINTER buf,
+                                SQLLEN *ind, const char **state)
+{
+  if (is_binary) { /* Appendix D has no binary -> numeric conversion */
+    *state = "07006";
+    return SQL_ERROR;
+  }
+  switch (target) {
+  case SQL_C_STINYINT:
+  case SQL_C_TINYINT:
+    return put_int(s, true, 1, buf, ind, state);
+  case SQL_C_UTINYINT:
+    return put_int(s, false, 1, buf, ind, state);
+  case SQL_C_SSHORT:
+  case SQL_C_SHORT:
+    return put_int(s, true, 2, buf, ind, state);
+  case SQL_C_USHORT:
+    return put_int(s, false, 2, buf, ind, state);
+  case SQL_C_SLONG:
+  case SQL_C_LONG:
+    return put_int(s, true, 4, buf, ind, state);
+  case SQL_C_ULONG:
+    return put_int(s, false, 4, buf, ind, state);
+  case SQL_C_SBIGINT:
+    return put_int(s, true, 8, buf, ind, state);
+  case SQL_C_UBIGINT:
+    return put_int(s, false, 8, buf, ind, state);
+  case SQL_C_FLOAT:
+    return put_real(s, true, buf, ind, state);
+  case SQL_C_DOUBLE:
+    return put_real(s, false, buf, ind, state);
+  default: { /* SQL_C_BIT: 0 or 1; below 0 or from 2 up is 22003 */
+    bool neg, frac;
+    unsigned long long mag;
+    int rc = parse_int_text(s, &neg, &mag, &frac);
+    if (rc == -1) {
+      *state = "22018";
+      return SQL_ERROR;
+    }
+    if (rc != 0 || mag > 1 || (neg && (mag > 0 || frac))) {
+      *state = "22003";
+      return SQL_ERROR;
+    }
+    if (buf)
+      *(SQLCHAR *)buf = (SQLCHAR)mag;
+    if (ind)
+      *ind = (SQLLEN)sizeof(SQLCHAR);
+    if (frac) {
+      *state = "01S07";
+      return SQL_SUCCESS_WITH_INFO;
+    }
+    return SQL_SUCCESS;
+  }
+  }
+}
+
+/* The date, time and timestamp targets (#334): fields checked, a dropped
+ * time or fraction reported; a number has no date form (#336). */
+static SQLRETURN convert_datetime(const char *s, int is_binary, SQLSMALLINT target, SQLPOINTER buf,
+                                  SQLLEN *ind, const char **state, SQLSMALLINT src_type)
+{
+  DateTime t;
+  bool want_time = target == SQL_C_TYPE_TIME || target == SQL_C_TIME;
+  if (sql_numeric(src_type)) { /* no numeric -> datetime conversion (#336) */
+    *state = "07006";
+    return SQL_ERROR;
+  }
+  if (is_binary || parse_dt(s, &t) != 0 || (want_time ? !t.has_time : !t.has_date)) {
+    *state = "22018";
+    return SQL_ERROR;
+  }
+  bool cut = t.frac_cut;
+  if (target == SQL_C_TYPE_TIMESTAMP || target == SQL_C_TIMESTAMP) {
+    if (buf) {
+      SQL_TIMESTAMP_STRUCT *o = buf;
+      o->year = (SQLSMALLINT)t.Y;
+      o->month = (SQLUSMALLINT)t.Mo;
+      o->day = (SQLUSMALLINT)t.D;
+      o->hour = (SQLUSMALLINT)t.h;
+      o->minute = (SQLUSMALLINT)t.mi;
+      o->second = (SQLUSMALLINT)t.se;
+      o->fraction = (SQLUINTEGER)t.ns;
+    }
+    if (ind)
+      *ind = (SQLLEN)sizeof(SQL_TIMESTAMP_STRUCT);
+  } else if (!want_time) {
+    cut = cut || t.h != 0 || t.mi != 0 || t.se != 0 || t.ns != 0; /* a time dropped */
+    if (buf) {
+      SQL_DATE_STRUCT *o = buf;
+      o->year = (SQLSMALLINT)t.Y;
+      o->month = (SQLUSMALLINT)t.Mo;
+      o->day = (SQLUSMALLINT)t.D;
+    }
+    if (ind)
+      *ind = (SQLLEN)sizeof(SQL_DATE_STRUCT);
+  } else {
+    cut = cut || t.ns != 0; /* a fraction dropped; any date is ignored */
+    if (buf) {
+      SQL_TIME_STRUCT *o = buf;
+      o->hour = (SQLUSMALLINT)t.h;
+      o->minute = (SQLUSMALLINT)t.mi;
+      o->second = (SQLUSMALLINT)t.se;
+    }
+    if (ind)
+      *ind = (SQLLEN)sizeof(SQL_TIME_STRUCT);
+  }
+  if (cut) {
+    *state = "01S07";
+    return SQL_SUCCESS_WITH_INFO;
+  }
+  return SQL_SUCCESS;
+}
+
 SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_binary,
                             SQLSMALLINT target, SQLPOINTER buf, SQLLEN buflen, SQLLEN *ind,
                             SQLLEN *offset, const char **sqlstate, SQLSMALLINT src_type)
@@ -902,57 +1017,7 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_BIT:
   case SQL_C_FLOAT:
   case SQL_C_DOUBLE:
-    if (is_binary) { /* Appendix D has no binary -> numeric conversion */
-      *state = "07006";
-      return SQL_ERROR;
-    }
-    switch (target) {
-    case SQL_C_STINYINT:
-    case SQL_C_TINYINT:
-      return put_int(s, true, 1, buf, ind, state);
-    case SQL_C_UTINYINT:
-      return put_int(s, false, 1, buf, ind, state);
-    case SQL_C_SSHORT:
-    case SQL_C_SHORT:
-      return put_int(s, true, 2, buf, ind, state);
-    case SQL_C_USHORT:
-      return put_int(s, false, 2, buf, ind, state);
-    case SQL_C_SLONG:
-    case SQL_C_LONG:
-      return put_int(s, true, 4, buf, ind, state);
-    case SQL_C_ULONG:
-      return put_int(s, false, 4, buf, ind, state);
-    case SQL_C_SBIGINT:
-      return put_int(s, true, 8, buf, ind, state);
-    case SQL_C_UBIGINT:
-      return put_int(s, false, 8, buf, ind, state);
-    case SQL_C_FLOAT:
-      return put_real(s, true, buf, ind, state);
-    case SQL_C_DOUBLE:
-      return put_real(s, false, buf, ind, state);
-    default: { /* SQL_C_BIT: 0 or 1; below 0 or from 2 up is 22003 */
-      bool neg, frac;
-      unsigned long long mag;
-      int rc = parse_int_text(s, &neg, &mag, &frac);
-      if (rc == -1) {
-        *state = "22018";
-        return SQL_ERROR;
-      }
-      if (rc != 0 || mag > 1 || (neg && (mag > 0 || frac))) {
-        *state = "22003";
-        return SQL_ERROR;
-      }
-      if (buf)
-        *(SQLCHAR *)buf = (SQLCHAR)mag;
-      if (ind)
-        *ind = (SQLLEN)sizeof(SQLCHAR);
-      if (frac) {
-        *state = "01S07";
-        return SQL_SUCCESS_WITH_INFO;
-      }
-      return SQL_SUCCESS;
-    }
-    }
+    return convert_number(s, is_binary, target, buf, ind, state);
 
   case SQL_C_NUMERIC: {
     if (is_binary) {
@@ -983,58 +1048,8 @@ SQLRETURN seer_odbc_convert(const void *val, size_t vallen, int is_null, int is_
   case SQL_C_TYPE_DATE:
   case SQL_C_DATE:
   case SQL_C_TYPE_TIME:
-  case SQL_C_TIME: {
-    DateTime t;
-    bool want_time = target == SQL_C_TYPE_TIME || target == SQL_C_TIME;
-    if (sql_numeric(src_type)) { /* no numeric -> datetime conversion (#336) */
-      *state = "07006";
-      return SQL_ERROR;
-    }
-    if (is_binary || parse_dt(s, &t) != 0 || (want_time ? !t.has_time : !t.has_date)) {
-      *state = "22018";
-      return SQL_ERROR;
-    }
-    bool cut = t.frac_cut;
-    if (target == SQL_C_TYPE_TIMESTAMP || target == SQL_C_TIMESTAMP) {
-      if (buf) {
-        SQL_TIMESTAMP_STRUCT *o = buf;
-        o->year = (SQLSMALLINT)t.Y;
-        o->month = (SQLUSMALLINT)t.Mo;
-        o->day = (SQLUSMALLINT)t.D;
-        o->hour = (SQLUSMALLINT)t.h;
-        o->minute = (SQLUSMALLINT)t.mi;
-        o->second = (SQLUSMALLINT)t.se;
-        o->fraction = (SQLUINTEGER)t.ns;
-      }
-      if (ind)
-        *ind = (SQLLEN)sizeof(SQL_TIMESTAMP_STRUCT);
-    } else if (!want_time) {
-      cut = cut || t.h != 0 || t.mi != 0 || t.se != 0 || t.ns != 0; /* a time dropped */
-      if (buf) {
-        SQL_DATE_STRUCT *o = buf;
-        o->year = (SQLSMALLINT)t.Y;
-        o->month = (SQLUSMALLINT)t.Mo;
-        o->day = (SQLUSMALLINT)t.D;
-      }
-      if (ind)
-        *ind = (SQLLEN)sizeof(SQL_DATE_STRUCT);
-    } else {
-      cut = cut || t.ns != 0; /* a fraction dropped; any date is ignored */
-      if (buf) {
-        SQL_TIME_STRUCT *o = buf;
-        o->hour = (SQLUSMALLINT)t.h;
-        o->minute = (SQLUSMALLINT)t.mi;
-        o->second = (SQLUSMALLINT)t.se;
-      }
-      if (ind)
-        *ind = (SQLLEN)sizeof(SQL_TIME_STRUCT);
-    }
-    if (cut) {
-      *state = "01S07";
-      return SQL_SUCCESS_WITH_INFO;
-    }
-    return SQL_SUCCESS;
-  }
+  case SQL_C_TIME:
+    return convert_datetime(s, is_binary, target, buf, ind, state, src_type);
 
   /* ---- wide text ---- */
   case SQL_C_WCHAR: {
