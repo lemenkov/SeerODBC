@@ -116,6 +116,10 @@ SeerStatus seer_rollback(SeerConn *conn);
 /* Whether a transaction is open on the session, as the server's last reply
  * said: 1 open, 0 none, -1 unknown (8i and 9i replies don't say). */
 int seer_txn_open(const SeerConn *conn);
+/* The same, asking the database where the replies don't say (9i: one query
+ * of DBMS_TRANSACTION.LOCAL_TRANSACTION_ID, #344): 1 open, 0 none, -1 when
+ * even that can't tell. */
+int seer_txn_check(SeerConn *conn);
 /* Whether the database charset holds every character: AL32UTF8 or UTF8, or
  * not yet known. Otherwise (WE8ISO8859P1, say) text for an NVARCHAR2 has to go
  * in the national charset to survive (#367). */

@@ -7064,10 +7064,6 @@ static void check_disconnect_open_txn(SQLHDBC dbc, const char *drv, const char *
                                       const char *pwd)
 {
   const char *name = "SQLDisconnect with an open transaction is 25000";
-  if (g_release == 9) {
-    skip(name, "server: 9i's compact replies don't say whether a transaction is open (#344)");
-    return;
-  }
   char m[300] = "", why[256] = "", err[256], cnt[16] = "", st[6] = "", one[8] = "";
   exec_do(dbc, "DROP TABLE seer_dctx", err, sizeof err);
   if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_dctx (n NUMBER)", err, sizeof err))) {
