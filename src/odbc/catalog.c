@@ -42,12 +42,16 @@ static char *name_dup(const void *s, SQLSMALLINT len, int literal)
   if (d == NULL)
     return NULL;
   size_t o = 0;
-  for (size_t i = 0; i < n; i++) {
+  /* An escape takes the character after it too: `next` is where the loop
+   * goes on. */
+  for (size_t i = 0, next; i < n; i = next) {
+    next = i + 1;
     char c = p[i];
     if (!literal && c == '\\' && i + 1 < n && p[i + 1] != '\0' &&
         strchr("_%\\", p[i + 1]) != NULL) {
       d[o++] = c;
-      d[o++] = p[++i];
+      d[o++] = p[i + 1];
+      next = i + 2;
       continue;
     }
     if (c == '\\' || (literal && (c == '_' || c == '%')))
@@ -70,10 +74,10 @@ static char *identifier_dup(const char *p, SQLSMALLINT len)
     return NULL;
   size_t o = 0;
   if (n >= 2 && p[0] == '"' && p[n - 1] == '"') {
-    for (size_t i = 1; i + 1 < n; i++) {
+    for (size_t i = 1, next; i + 1 < n; i = next) {
       id[o++] = p[i];
-      if (p[i] == '"' && p[i + 1] == '"' && i + 2 < n)
-        i++;
+      /* a doubled "" is one ": its second quote is skipped */
+      next = (p[i] == '"' && p[i + 1] == '"' && i + 2 < n) ? i + 2 : i + 1;
     }
   } else {
     while (n > 0 && p[n - 1] == ' ')
