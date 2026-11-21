@@ -265,7 +265,8 @@ RESEND/REFUSE), `auth.c` (O5LOGON + 9i O3LOGON), `ttc.c` (negotiation + RPC),
   SQL_DESC_SEER_REF_TYPE, "SCHEMA.TYPE", SQL_NTS)` - ODBC's own
   `SQL_DESC_TYPE_NAME` is read-only in an IPD, and SQL Server's driver names a
   table-valued parameter's type the same way (`SQL_CA_SS_TYPE_NAME`). A REF IN
-  works on 8i, 9i and 12c+, and so does a REF OUT, NULL included (#325); a NULL REF IN is refused
+  works on every release from 8i, and so does a REF OUT, NULL included (#325; 10g and
+  11g in JDBC thin's form, the 12c one without its 12.2 field); a NULL REF IN is refused
   (8i and 9i answer ORA-00600 for one), as is an IN OUT REF.
 - **Done — 10g / 12c auth variants.** `auth.c` now dispatches on the verifier
   the server offers (`seer_o5logon`): AUTH_VFR_DATA only -> 11g AES-192/SHA-1
