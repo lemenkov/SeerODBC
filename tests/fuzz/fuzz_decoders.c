@@ -30,6 +30,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n)
   char out[256];
   seer_decode_number(d, n, out, sizeof out);
   seer_decode_date(d, n, out, sizeof out);
+  seer_decode_tstz(d, n, out, sizeof out);
   seer_decode_bfloat(d, n, out, sizeof out);
   seer_decode_bdouble(d, n, out, sizeof out);
   seer_decode_interval_ym(d, n, out, sizeof out);

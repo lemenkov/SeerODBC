@@ -185,6 +185,16 @@ reported as success.
     `2026-13-45` is 22018;
   - a text fraction scales by its digits, so `.5` is 500000000 ns;
   - a bare time fills `SQL_C_TYPE_TIME` but not a date or timestamp.
+- **TIMESTAMP WITH TIME ZONE** reads as the time it was stored (#359). It is
+  described as `SQL_TYPE_TIMESTAMP`, since ODBC has no type with a zone.
+  - With a numeric offset, a struct gets the value's own wall-clock time, so
+    `10:00 +02:00` is 10:00. The text form ends in the offset:
+    `2026-11-20 10:00:00 +02:00`. Before, both gave the UTC time, 08:00, and
+    dropped the zone.
+  - With a region (`Europe/Berlin`), converting needs daylight-saving rules
+    the wire doesn't carry. The value stays UTC, and the text says so with
+    `+00:00`.
+  - The display size counts the 7 characters of the offset.
 - **In a bound rowset**, a column that fails makes its row `SQL_ROW_ERROR`.
   The other rows are delivered with `SQL_SUCCESS_WITH_INFO`. A rowset where
   every row failed returns `SQL_ERROR`.
