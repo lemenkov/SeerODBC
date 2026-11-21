@@ -1336,6 +1336,14 @@ static void check_non_ascii_sql(void)
 /* The session names this client: program "seerodbc" and this machine, the
  * login's AUTH_PROGRAM_NM and AUTH_MACHINE (#123). JDBC thin's positional
  * login, sent until then, named every 9i session "JDBC Thin Client" on "o9i". */
+/* A replay-corpus run (#396): the driver then sends a fixed host name and OS
+ * user (src/tns/wire.c). */
+static int wire_corpus_run(void)
+{
+  const char *r = getenv("SEER_WIRE_RECORD"), *p = getenv("SEER_WIRE_REPLAY");
+  return (r != NULL && r[0] != '\0') || (p != NULL && p[0] != '\0');
+}
+
 static void check_session_identity(void)
 {
   const char *name = "the session reports program seerodbc on this machine";
@@ -1350,7 +1358,7 @@ static void check_session_identity(void)
   }
   host[sizeof host - 1] = '\0';
   /* A replay-corpus run sends a fixed host name (#396, src/tns/wire.c). */
-  if (getenv("SEER_WIRE_RECORD") != NULL || getenv("SEER_WIRE_REPLAY") != NULL)
+  if (wire_corpus_run())
     snprintf(host, sizeof host, "seer-corpus");
   char prog[128], mach[256];
   scalar("SELECT program FROM v$session WHERE audsid = USERENV('SESSIONID')", prog, sizeof prog);

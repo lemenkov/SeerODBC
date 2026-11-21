@@ -22,6 +22,12 @@
 #   SEER_MATRIX_PASS      default password for every tier  (default pyo123)
 #   SEER_MATRIX_ONLY      same as --only
 #   SEER_MATRIX_SKIP      same as --skip
+#   SEER_MATRIX_RECORD_DIR  record the replay corpus (#396) into this directory:
+#                    <tier>-odbc.wire and <tier>-core.wire, each with the
+#                    environment it ran with and its check lines in its header.
+#                    Needs a build configured with -Dwire_corpus=true; the run
+#                    is in TZ=UTC and leaves out the TLS-proxy leg, whose port
+#                    and certificate change from run to run.
 #   SEER_TEST_DBA_USER/_PASS  a DBA login, passed to every tier: the ODBC check
 #                         of a killed session (#340) uses it to kill its own
 #                         session, and skips without it or where it fails
@@ -163,6 +169,28 @@ log=$(mktemp)
 xlog=$(mktemp)
 trap 'rm -f "$log" "$xlog"' EXIT
 
+RECORD_DIR="${SEER_MATRIX_RECORD_DIR:-}"
+if [[ -n "$RECORD_DIR" ]]; then
+    mkdir -p "$RECORD_DIR" || exit 1
+    export TZ=UTC # the login's time zone, the same in the record and the replay
+fi
+
+# The header of a corpus record: what the suite ran with, for the replay.
+record_head() {   # $1 file  $2 suite binary name  $3.. NAME=VALUE
+    local f="$1" suite="$2"; shift 2
+    {
+        echo "# SeerODBC replay corpus (#396): $suite, recorded $(date -u +%Y-%m-%d)"
+        echo "# suite $suite"
+        local kv
+        for kv in "TZ=UTC" "$@"; do echo "# env $kv"; done
+    } >"$f"
+}
+
+# Its check lines, after the run, for the replay to compare against.
+record_tail() {   # $1 file  $2 suite output
+    sed 's/\x1b\[[0-9;]*m//g' "$2" | grep -E '^ *(PASS|FAIL|SKIP) ' | sed 's/^/# expect /' >>"$1"
+}
+
 for row in "${TIERS[@]}"; do
     IFS='|' read -r name group host port target address release <<<"$row"
     if [[ -n "$ONLY" ]] && ! in_list "$name" "$ONLY"; then continue; fi
@@ -194,17 +222,35 @@ for row in "${TIERS[@]}"; do
     # The ODBC integration test, service-name addressed (9i's listener takes the
     # SID as a service name too), with an optional TLS-proxy leg from 10g.
     TLS_PORT=""; TLS_CA=""; TLS_PID=""
-    (( release >= 10 )) && start_tls_proxy "$host" "$port"
+    rec_odbc=""; rec_core=""
+    if [[ -n "$RECORD_DIR" ]]; then
+        rec_odbc="$RECORD_DIR/$name-odbc.wire"; rec_core="$RECORD_DIR/$name-core.wire"
+        dba=()
+        [[ -n "${SEER_TEST_DBA_USER:-}" ]] && dba=("SEER_TEST_DBA_USER=$SEER_TEST_DBA_USER" \
+                                                   "SEER_TEST_DBA_PASS=${SEER_TEST_DBA_PASS:-}")
+        common=("SEER_TEST_HOST=$host" "SEER_TEST_PORT=$port" "SEER_TEST_USER=$user"
+                "SEER_TEST_PASS=$pass" "SEER_TEST_RELEASE=$release" "${dba[@]}")
+        record_head "$rec_odbc" test_integration "${common[@]}" "SEER_TEST_SERVICE=$target"
+        if [[ "$address" == "sid" ]]; then
+            record_head "$rec_core" test_core "${common[@]}" "SEER_TEST_SID=$target"
+        else
+            record_head "$rec_core" test_core "${common[@]}" "SEER_TEST_SERVICE=$target"
+        fi
+    elif (( release >= 10 )); then
+        start_tls_proxy "$host" "$port"
+    fi
     SEER_TEST_SERVICE="$target" SEER_TLS_PROXY_PORT="$TLS_PORT" SEER_TLS_CA="$TLS_CA" \
-        "$BIN" >"$log" 2>/dev/null
+        SEER_WIRE_RECORD="$rec_odbc" "$BIN" >"$log" 2>/dev/null
+    [[ -n "$rec_odbc" ]] && record_tail "$rec_odbc" "$log"
     [[ -n "$TLS_PID" ]] && kill "$TLS_PID" 2>/dev/null && TLS_PID=""
     grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
     # The core-API suite, on every tier.
     if [[ "$address" == "sid" ]]; then
-        SEER_TEST_SID="$target" "$CORE_BIN" 2>/dev/null
+        SEER_TEST_SID="$target" SEER_WIRE_RECORD="$rec_core" "$CORE_BIN" 2>/dev/null
     else
-        SEER_TEST_SERVICE="$target" "$CORE_BIN" 2>/dev/null
+        SEER_TEST_SERVICE="$target" SEER_WIRE_RECORD="$rec_core" "$CORE_BIN" 2>/dev/null
     fi | grep -v '^SUMMARY' | tee -a "$xlog" | sed 's/^/  /'
+    [[ -n "$rec_core" ]] && record_tail "$rec_core" "$xlog"
     unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS SEER_TEST_RELEASE
 
     # The tier's main suite must have finished (its SUMMARY line); the totals

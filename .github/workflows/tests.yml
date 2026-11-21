@@ -80,6 +80,12 @@ jobs:
             sanitize: none
           - name: asan+ubsan
             sanitize: address,undefined
+          # Both live suites on every tier, offline: the replay corpus (#396),
+          # under the sanitizers - the 8i / 9i / 10g / 18c / 26ai paths no
+          # public container image covers included.
+          - name: replay corpus, asan+ubsan
+            sanitize: address,undefined
+            wire_corpus: true
     steps:
       - uses: actions/checkout@v7
       - name: Install build dependencies
@@ -88,7 +94,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             meson ninja-build pkg-config libssl-dev unixodbc-dev
       - name: Configure
-        run: meson setup build -Db_sanitize=${{ matrix.sanitize }}
+        run: meson setup build -Db_sanitize=${{ matrix.sanitize }} -Dwire_corpus=${{ matrix.wire_corpus || false }}
       - name: Compile
         run: meson compile -C build
       - name: Unit tests

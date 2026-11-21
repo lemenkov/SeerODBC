@@ -258,6 +258,16 @@ if build_driver
     # identically-named SQL* symbols.
     test('odbc integration', test_integration,
          depends : seerodbc_lib, is_parallel : false, timeout : 120)
+
+    # The replay corpus (#396): both live suites, every tier, run offline from
+    # tests/fixtures/corpus - each send byte for byte against the record, each
+    # check line against the live run's. Only a wire_corpus build can replay.
+    if get_option('wire_corpus')
+      test('replay corpus', find_program('odbc/replay-corpus.sh'),
+           args : [meson.project_build_root()],
+           depends : [seerodbc_lib, test_integration, test_core],
+           is_parallel : false, timeout : 1200)
+    endif
   endif
 
   # seer_smoke: a short check of an installed driver through the platform's
