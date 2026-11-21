@@ -4,7 +4,7 @@
 
 # RPM spec stub for Fedora.
 Name:           seerodbc
-Version:        0.4.0
+Version:        0.5.0
 Release:        %autorelease
 Summary:        Clean-room ODBC driver for a proprietary database
 License:        Apache-2.0
