@@ -2286,6 +2286,28 @@ int seer_txn_open(const SeerConn *conn)
   return conn->txn_state;
 }
 
+int seer_txn_check(SeerConn *conn)
+{
+  int st = seer_txn_open(conn);
+  if (st != -1 || conn == NULL || !conn->authenticated)
+    return st;
+  /* 9i (#344): its compact replies never say, so ask the database. The
+   * local transaction id is non-NULL while a transaction is open - after
+   * DML, SELECT ... FOR UPDATE, a SAVEPOINT or SET TRANSACTION - and NULL
+   * after COMMIT / ROLLBACK; the query opens none itself, and needs no
+   * privilege (seerdb, bus 106: 9.2.0.4, 10.2.0.5, 11.2.0.2). */
+  SeerStmt *q = NULL;
+  const char *id = NULL;
+  int is_null = 1, open = -1;
+  if (seer_stmt_prepare(conn, "SELECT DBMS_TRANSACTION.LOCAL_TRANSACTION_ID FROM dual", &q) ==
+          SEER_OK &&
+      seer_stmt_execute(q) == SEER_OK && seer_stmt_fetch(q) == SEER_OK &&
+      seer_stmt_get_string(q, 0, &id, &is_null) == SEER_OK)
+    open = is_null ? 0 : 1;
+  seer_stmt_close(q);
+  return open;
+}
+
 void seer_ttc_logoff(SeerConn *conn)
 {
   if (conn == NULL || conn->t == NULL || !conn->authenticated)
