@@ -622,7 +622,7 @@ static int parse_int_text(const char *s, bool *neg, unsigned long long *mag, boo
     if (!(a < 18446744073709551616.0)) /* also an infinity */
       return -2;
     *mag = (unsigned long long)a;
-    *frac = (double)*mag != a;
+    *frac = a > (double)*mag; /* mag is a truncated: anything left is a fraction */
     return 0;
   }
   if (i != n)

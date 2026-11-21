@@ -2513,6 +2513,18 @@ static bool binary_float_type_missing(const SeerConn *c)
   return c->is_8i || c->field_version < TTC_FIELD_VERSION_10_2;
 }
 
+/* Whether two values are the same bits: the exact round trip the shortest
+ * decimal must make, where an epsilon would be wrong (and -0.0 is not 0.0). */
+static bool same_double(double a, double b)
+{
+  return memcmp(&a, &b, sizeof a) == 0;
+}
+
+static bool same_float(float a, float b)
+{
+  return memcmp(&a, &b, sizeof a) == 0;
+}
+
 static SeerStatus bind_float_as_number(SeerStmt *stmt, int param, double value, bool single)
 {
   if (!isfinite(value)) {
@@ -2525,7 +2537,7 @@ static SeerStatus bind_float_as_number(SeerStmt *stmt, int param, double value, 
     for (int prec = 1; prec <= (single ? 9 : 17); prec++) {
       snprintf(e, sizeof e, "%.*e", prec - 1, value);
       double back = strtod(e, NULL);
-      if (single ? (float)back == (float)value : back == value)
+      if (single ? same_float((float)back, (float)value) : same_double(back, value))
         break;
     }
   }
