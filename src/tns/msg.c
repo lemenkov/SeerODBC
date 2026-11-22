@@ -49,6 +49,70 @@ const SeerField SEER_OAC_SCHEMA[] = {
    .off = offsetof(type_, member_),                                                                \
    .if_off = offsetof(type_, cond_)}
 
+#define O SeerOerMsg
+const SeerField SEER_OER_HEAD_SCHEMA[] = {
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, O, call_status),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, O, seq),
+    SEER_F(SF_N4, O, rows),
+    SEER_F(SF_N2, O, code),
+    SEER_END,
+};
+
+const SeerField SEER_OER_FLAGS_SCHEMA[] = {
+    SEER_F(SF_N2, O, array_err1),
+    SEER_F(SF_N2, O, array_err2),
+    SEER_F(SF_N2, O, cursor),
+    SEER_F(SF_N2, O, position),
+    SEER_F(SF_U8, O, sql_type),
+    SEER_F(SF_U8, O, fatal),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_12_1, 0, O, flags),
+    SEER_FV(SF_N1, 0, 0, TTC_FIELD_VERSION_12_1, O, flags),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_12_1, 0, O, cursor_opts),
+    SEER_FV(SF_N1, 0, 0, TTC_FIELD_VERSION_12_1, O, cursor_opts),
+    SEER_F(SF_U8, O, upi),
+    SEER_F(SF_U8, O, warnings),
+    SEER_END,
+};
+
+const SeerField SEER_OER_BATCH_SCHEMA[] = {
+    SEER_F(SF_N4, O, rowid_obj),
+    SEER_F(SF_N2, O, rowid_file),
+    SEER_F(SF_U8, O, rowid_res),
+    SEER_F(SF_N4, O, rowid_block),
+    SEER_F(SF_N2, O, rowid_slot),
+    SEER_F(SF_N4, O, os_error),
+    SEER_F(SF_U8, O, stmt_no),
+    SEER_F(SF_U8, O, call_no),
+    SEER_F(SF_N2, O, padding),
+    SEER_F(SF_N4, O, iterations),
+    {.kind = SF_COUNTED, .off = offsetof(O, oerrdd), .arg = SF_N2},
+    SEER_F(SF_COUNTED, O, codes),
+    SEER_F(SF_COUNTED, O, offsets),
+    SEER_F(SF_N4, O, nmsgs),
+    SEER_END,
+};
+
+const SeerField SEER_OER_TAIL_SCHEMA[] = {
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_1, 0, O, ext_error),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_1, 0, O, ext_rows),
+    {.kind = SF_N4,
+     .codecs = THIN,
+     .fv_min = TTC_FIELD_VERSION_12_1,
+     .sfv_min = TTC_FIELD_VERSION_20_1,
+     .off = offsetof(O, sql_type2)},
+    {.kind = SF_N4,
+     .codecs = THIN,
+     .fv_min = TTC_FIELD_VERSION_12_1,
+     .sfv_min = TTC_FIELD_VERSION_20_1,
+     .off = offsetof(O, checksum)},
+    {.kind = SF_VALUE,
+     .flags = SG_IF_SET | SG_IF_MORE,
+     .off = offsetof(O, message),
+     .if_off = offsetof(O, code)},
+    SEER_END,
+};
+#undef O
+
 const SeerField SEER_LOB_DATA_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerLobDataMsg, data),
     SEER_END,
