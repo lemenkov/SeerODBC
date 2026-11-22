@@ -18,6 +18,7 @@
 #include "oson.h"
 #include "placeholders.h"
 #include "log.h"
+#include "msg.h" /* the messages as schemas (#395 spike) */
 #include "marshal.h"
 #include "reader.h"
 #include "tns_consts.h"
@@ -2997,49 +2998,23 @@ static bool sql_is_cacheable(const char *sql)
 static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint32_t flag,
                      uint32_t charset)
 {
+  /* The values 10g+ sends; the layout is SEER_OAC_SCHEMA's (#395). From 12.1
+   * a charset is AL32UTF8 / AL16UTF16 / none with its form, and the flags are
+   * TNS_BIND_USE_INDICATORS; before, the caller's charset and continuation
+   * flag, form 2 for AL16UTF16 and 1 otherwise. */
+  SeerOacMsg m = {.data_type = dtype, .max_length = length};
   if (fv >= TTC_FIELD_VERSION_12_1) {
-    uint32_t bind_charset;
-    uint8_t csfrm;
-    if (charset == 0) {
-      bind_charset = 0;
-      csfrm = 0;
-    } else if (charset == 2000) {
-      bind_charset = 2000;
-      csfrm = 2;
-    } /* AL16UTF16 */
-    else {
-      bind_charset = 873;
-      csfrm = 1;
-    } /* AL32UTF8  */
-    seer_writer_u8(w, dtype);
-    seer_writer_u8(w, 1); /* TNS_BIND_USE_INDICATORS */
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, length);
-    seer_enc_sb4(w, 0);            /* max number of array elements */
-    seer_enc_sb4(w, 0);            /* cont flag (ub8) */
-    seer_enc_sb4(w, 0);            /* OID */
-    seer_enc_sb4(w, 0);            /* version */
-    seer_enc_sb4(w, bind_charset); /* charset id (ub2) */
-    seer_writer_u8(w, csfrm);      /* character set form */
-    seer_enc_sb4(w, 0);            /* LOB prefetch length */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      seer_enc_sb4(w, 0); /* oaccolid */
-    return;
+    m.flags = 1;
+    m.charset = charset == 0 ? 0 : charset == 2000 ? 2000 : 873;
+    m.csfrm = charset == 0 ? 0 : charset == 2000 ? 2 : 1;
+  } else {
+    m.flags = 3;
+    m.cont_flags = flag;
+    m.charset = charset;
+    m.csfrm = charset == 2000 ? 2 : 1;
   }
-  uint8_t form_of_use = (charset == 2000) ? 2 : 1; /* AL16UTF16 => 2 */
-  seer_writer_u8(w, dtype);
-  seer_writer_u8(w, 3);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, length);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, flag);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, charset);
-  seer_writer_u8(w, form_of_use);
-  seer_enc_sb4(w, 0); /* max */
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w);
 }
 
 /* The LOB type a DML RETURNING target is declared as, or 0. A VARCHAR / RAW
@@ -5506,15 +5481,10 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
     charset = 31;
     csfrm = 1;
   }
-  seer_writer_u8(w, type);
-  seer_writer_u8(w, 0x01);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, maxsize);
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, 0);
-  seer_enc_sb4(w, charset);
-  seer_writer_u8(w, csfrm);
+  SeerOacMsg m = {
+      .data_type = type, .flags = 0x01, .max_length = maxsize, .charset = charset, .csfrm = csfrm};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w); /* #395 */
 }
 
 /* Build the TTI_ALL7 parse message (shared by SELECT and DML). With input binds
@@ -6884,18 +6854,13 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
      * with its charset and form, a BLOB with neither (§19.17b, sqlplus 9.2
      * against 8.1.7; #167). */
     bool clob = b->ret_lob == ORA_TYPE_CLOB;
-    seer_writer_u8(w, b->ret_lob);
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 32);
-    seer_writer_u8(w, 0);
-    for (int i = 0; i < 13; i++)
-      seer_writer_u8(w, 0);
-    for (int i = 3; i >= 0; i--)
-      seer_writer_u8(w, (uint8_t)((clob ? 31u : 0u) >> (8 * i)));
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, clob ? 1 : 0);
+    SeerOacMsg m = {.data_type = b->ret_lob,
+                    .flags = 0x01,
+                    .max_length = 32,
+                    .charset = clob ? 31 : 0,
+                    .csfrm = clob ? 1 : 0};
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w); /* #395 */
     return;
   }
   switch (b->oac_type) {
@@ -6917,18 +6882,10 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
   }
   if (size > 0xFFFF)
     size = 0xFFFF;
-  seer_writer_u8(w, type);
-  seer_writer_u8(w, flag);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, (uint8_t)(size & 0xFF));
-  seer_writer_u8(w, (uint8_t)(size >> 8));
-  for (int i = 0; i < 13; i++)
-    seer_writer_u8(w, 0);
-  for (int i = 3; i >= 0; i--)
-    seer_writer_u8(w, (uint8_t)(charset >> (8 * i)));
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, csfrm);
+  SeerOacMsg m = {
+      .data_type = type, .flags = flag, .max_length = size, .charset = charset, .csfrm = csfrm};
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w); /* #395 */
 }
 
 /* The statement's binds, refused before anything is sent when 8i can't take
