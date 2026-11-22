@@ -35,23 +35,27 @@ typedef enum {
   SF_PAD,    /* `arg` bytes nobody reads: zeros written, skipped read */
   SF_VALUE,  /* bytes with their length: thin ub1 / 0xFE chunks, 8i the same at ub1 */
   SF_RAW,    /* bytes as they are, as many as the member at `arg` (an int64_t) says */
-  SF_COUNTED /* an N4 count, then (when > 0) a SF_VALUE: thin's bytes-with-length */
+  SF_COUNTED /* a count, then (when > 0) a SF_VALUE: thin's bytes-with-length */
 } SeerFieldKind;
 
-/* Guards: which codecs carry the field (0 = all), the field-version range it
- * has [fv_min, fv_max) (0 = unbounded), measured against the negotiated
- * version or, with SG_SERVER_FV, the server's; with SG_IF_SET the member at
- * `if_off` must be non-zero. */
-#define SG_SERVER_FV 0x01
+/* Guards: which codecs carry the field (0 = all); the field-version range it
+ * has [fv_min, fv_max) (0 = unbounded) on the negotiated version, and with
+ * sfv_min a minimum on the server's own - both on thin only, 8i having no
+ * field version; with SG_IF_SET the member at `if_off` must be non-zero, and
+ * with SG_IF_MORE bytes must remain (on thin; on 8i the field is read, and a
+ * reply that hasn't brought it yet is short). */
 #define SG_IF_SET 0x02
+#define SG_IF_MORE 0x04
 
 typedef struct {
   uint8_t kind;
   uint8_t codecs;
   uint8_t fv_min, fv_max;
+  uint8_t sfv_min;
   uint8_t flags;
   uint16_t off;    /* the member, offsetof the message struct */
-  uint16_t arg;    /* SF_PAD: bytes; SF_RAW: offsetof its length member */
+  uint16_t arg;    /* SF_PAD: bytes; SF_RAW: offsetof its length member;
+                    * SF_COUNTED: the count's kind (SF_N2 / SF_N4, 0 = N4) */
   uint16_t if_off; /* SG_IF_SET: offsetof the member that must be non-zero */
 } SeerField;
 

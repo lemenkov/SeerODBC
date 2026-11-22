@@ -34,11 +34,14 @@ static bool present(const SeerField *f, const SeerSchemaCtx *cx, const void *msg
 {
   if (f->codecs != 0 && (f->codecs & cx->codec) == 0)
     return false;
-  uint8_t fv = (f->flags & SG_SERVER_FV) ? cx->server_fv : cx->fv;
-  if (f->fv_min != 0 && fv < f->fv_min)
-    return false;
-  if (f->fv_max != 0 && fv >= f->fv_max)
-    return false;
+  if (cx->codec == SEER_CODEC_THIN) { /* 8i has no field version */
+    if (f->fv_min != 0 && cx->fv < f->fv_min)
+      return false;
+    if (f->fv_max != 0 && cx->fv >= f->fv_max)
+      return false;
+    if (f->sfv_min != 0 && cx->server_fv < f->sfv_min)
+      return false;
+  }
   if ((f->flags & SG_IF_SET) && *cnum(msg, f->if_off) == 0)
     return false;
   return true;
@@ -117,7 +120,7 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
     }
     case SF_COUNTED: {
       const SeerBytes *b = (const SeerBytes *)((const char *)msg + f->off);
-      put_num(w, cx, SF_N4, (int64_t)b->n);
+      put_num(w, cx, f->arg ? (uint8_t)f->arg : SF_N4, (int64_t)b->n);
       if (b->n > 0)
         put_value(w, cx, b);
       break;
@@ -194,6 +197,8 @@ bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerRe
   for (const SeerField *f = schema; f->kind != SF_END && seer_reader_ok(r); f++) {
     if (!present(f, cx, msg))
       continue;
+    if ((f->flags & SG_IF_MORE) && cx->codec == SEER_CODEC_THIN && seer_reader_remaining(r) == 0)
+      continue; /* thin only: an 8i reply may simply not have it yet */
     switch (f->kind) {
     case SF_U8:
       *num(msg, f->off) = seer_reader_u8(r);
@@ -223,7 +228,7 @@ bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerRe
     case SF_COUNTED: {
       SeerBytes *b = (SeerBytes *)((char *)msg + f->off);
       b->p = NULL, b->n = 0, b->owned = 0;
-      if (get_num(r, cx, SF_N4) > 0)
+      if (get_num(r, cx, f->arg ? (uint8_t)f->arg : SF_N4) > 0)
         get_value(r, cx, b);
       break;
     }

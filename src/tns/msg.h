@@ -50,6 +50,32 @@ typedef struct {
 
 extern const SeerField SEER_LOB_DATA_SCHEMA[];
 
+/* The end-of-call status (TTI_OER, after its token). One field list on every
+ * path, where three readers had it (#395 spike): 10g+ leads with the call
+ * status and sequence number, which 9i and 8i don't send; the flags and
+ * cursor options are one raw byte each from 12.1, compressed integers
+ * before (and on 9i), single bytes on 8i; 12.1 adds the extended error and
+ * row count, and a server from 20.1 the SQL type and checksum. Between the
+ * head and the tail come the batch errors' messages, which stay code; the
+ * error's text closes it when there is an error and bytes remain. */
+typedef struct {
+  int64_t call_status, seq, rows, code, array_err1, array_err2, cursor, position;
+  int64_t sql_type, fatal, flags, cursor_opts, upi, warnings;
+  int64_t rowid_obj, rowid_file, rowid_res, rowid_block, rowid_slot, os_error;
+  int64_t stmt_no, call_no, padding, iterations;
+  SeerBytes oerrdd, codes, offsets;
+  int64_t nmsgs;
+  int64_t ext_error, ext_rows, sql_type2, checksum;
+  SeerBytes message;
+} SeerOerMsg;
+
+/* In three parts, as the readers stop: up to the code (a short 9i status
+ * ends there), up to the warnings, then the rowid to the batch counts. */
+extern const SeerField SEER_OER_HEAD_SCHEMA[];
+extern const SeerField SEER_OER_FLAGS_SCHEMA[];
+extern const SeerField SEER_OER_BATCH_SCHEMA[];
+extern const SeerField SEER_OER_TAIL_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

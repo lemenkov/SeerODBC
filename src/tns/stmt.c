@@ -1394,101 +1394,65 @@ static void free_batch_errors(SeerStmt *stmt)
 /* Read an array-DML batch field (§6.7): a ub4 count, then a DALC blob packing
  * that many var-int ub4 values. On SEER_OK *out is a malloc'd array of *n
  * values (NULL/0 when the count is zero); caller frees. */
-static SeerStatus read_batch_ub4_array(SeerReader *r, uint32_t **out, size_t *n)
+/* The ub4s a batch-error array's value packs (TTC compressed integers). */
+static uint32_t *oer_ub4s(const SeerBytes *b, size_t *n)
 {
-  *out = NULL;
   *n = 0;
-  int64_t count = seer_dec_sb4(r);
-  if (count <= 0 || count > 65535)
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
-
-  uint8_t *blob = NULL;
-  size_t blen = 0;
-  if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
-    return SEER_EPROTO;
-  uint32_t *arr = malloc((size_t)count * sizeof *arr);
-  if (arr == NULL) {
-    free(blob);
-    return SEER_ENOMEM;
-  }
+  if (b->n == 0)
+    return NULL;
+  uint32_t *arr = malloc(b->n * sizeof *arr); /* at most one per byte */
+  if (arr == NULL)
+    return NULL;
   SeerReader br;
-  seer_reader_init(&br, blob, blen);
-  for (int64_t i = 0; i < count; i++)
-    arr[i] = (uint32_t)seer_dec_sb4(&br);
-  free(blob);
-  *out = arr;
-  *n = (size_t)count;
-  return SEER_OK;
+  seer_reader_init(&br, b->p, b->n);
+  while (seer_reader_remaining(&br) > 0 && seer_reader_ok(&br))
+    arr[(*n)++] = (uint32_t)seer_dec_sb4(&br);
+  return arr;
 }
 
+/* The end-of-call status, by SEER_OER_HEAD_SCHEMA / _TAIL_SCHEMA (#395
+ * spike): the batch errors' messages between them stay code. */
 static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
 {
-  oer->call_status = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r);            /* end-to-end seq# */
-  oer->row_count = seer_dec_sb4(r); /* current row number / DML rowcount */
-  oer->err_code = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* array elem error 1 */
-  (void)seer_dec_sb4(r); /* array elem error 2 */
-  oer->cursor_id = seer_dec_sb4(r);
-  oer->err_offset = seer_dec_sb4(r); /* error position (parse offset) */
-  /* sql_type, fatal, flags, user_cursor_options, upi_param, warn_flags: the
-   * last is a real signal (§6.3a). Below 12.1 `flags` is a variable-length
-   * ub2 - `00` when clear, `01 20` when a warning (e.g. an aggregate that
-   * skipped NULLs) sets it - so it cannot be read as one byte there. */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    const uint8_t *six = seer_reader_bytes(r, 6);
-    if (six != NULL)
-      oer->warn_flags = six[5];
-  } else {
-    seer_reader_bytes(r, 2); /* sql_type, fatal */
-    (void)seer_dec_sb4(r);   /* flags (ub2)     */
-    const uint8_t *three = seer_reader_bytes(r, 3);
-    if (three != NULL)
-      oer->warn_flags = three[2];
+  SeerConn *c = stmt->conn;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerOerMsg m = {0};
+  if (!seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, r, &m) ||
+      !seer_schema_decode(SEER_OER_FLAGS_SCHEMA, &cx, r, &m) ||
+      !seer_schema_decode(SEER_OER_BATCH_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_OER_BATCH_SCHEMA, &m);
+    return SEER_EPROTO;
   }
-  (void)seer_dec_sb4(r);          /* rowid: data object  */
-  (void)seer_dec_sb4(r);          /* rowid: file         */
-  seer_reader_bytes(r, 1);        /* rowid: reserved     */
-  (void)seer_dec_sb4(r);          /* rowid: block        */
-  (void)seer_dec_sb4(r);          /* rowid: slot         */
-  (void)seer_dec_sb4(r);          /* os error            */
-  seer_reader_bytes(r, 2);        /* statement #, call # */
-  (void)seer_dec_sb4(r);          /* padding             */
-  (void)seer_dec_sb4(r);          /* successful iterations */
-  seer_skip_bytes_with_length(r); /* oerrdd */
+  oer->call_status = m.call_status;
+  oer->row_count = m.rows;
+  oer->err_code = m.code;
+  oer->cursor_id = m.cursor;
+  oer->err_offset = m.position;
+  oer->warn_flags = (uint8_t)m.warnings;
 
-  /* Batch-error arrays (all empty for a plain statement; populated by an
-   * array-DML execute in batcherrors mode, §6.7). The code and offset arrays
-   * line up by position with the messages: error i hit iteration
-   * offsets[i] with ORA-codes[i] and text messages[i]. */
-  uint32_t *codes = NULL, *offsets = NULL;
+  /* The batch errors (§6.7): code i hit iteration offsets[i], text msgs[i]. */
   size_t ncodes = 0, noffsets = 0;
-  SeerStatus bst = read_batch_ub4_array(r, &codes, &ncodes);
-  if (bst == SEER_OK)
-    bst = read_batch_ub4_array(r, &offsets, &noffsets);
-  if (bst != SEER_OK) {
-    free(codes);
-    free(offsets);
-    return bst;
-  }
+  uint32_t *codes = oer_ub4s(&m.codes, &ncodes);
+  uint32_t *offsets = oer_ub4s(&m.offsets, &noffsets);
+  seer_schema_free(SEER_OER_BATCH_SCHEMA, &m);
 
   char **msgs = NULL;
   size_t nmsgs = 0;
-  int64_t nmsg = seer_dec_sb4(r);
-  if (nmsg > 0 && nmsg < 65536) {
-    msgs = calloc((size_t)nmsg, sizeof *msgs);
+  if (m.nmsgs > 0 && m.nmsgs < 65536) {
+    msgs = calloc((size_t)m.nmsgs, sizeof *msgs);
     seer_reader_bytes(r, 1); /* indicator byte */
-    for (int64_t i = 0; i < nmsg && seer_reader_ok(r); i++) {
-      char *m = NULL;
-      seer_read_str(r, &m);
+    for (int64_t i = 0; i < m.nmsgs && seer_reader_ok(r); i++) {
+      char *t = NULL;
+      seer_read_str(r, &t);
       if (msgs != NULL)
-        msgs[i] = m; /* takes ownership */
+        msgs[i] = t; /* takes ownership */
       else
-        free(m);
+        free(t);
       seer_reader_bytes(r, 2); /* per-message trailer */
     }
     if (msgs != NULL)
-      nmsgs = (size_t)nmsg;
+      nmsgs = (size_t)m.nmsgs;
   }
 
   if (!seer_reader_ok(r)) {
@@ -1500,7 +1464,6 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
     return SEER_EPROTO;
   }
 
-  /* Assemble the captured per-row failures onto the statement. */
   size_t nb = noffsets;
   if (ncodes > nb)
     nb = ncodes;
@@ -1526,42 +1489,20 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
     free(msgs[i]);
   free(msgs);
 
-  /* 12c+ extends the OER before the trailing message: an extended error number
-   * + rowcount (12.1+, by the negotiated version), then a SQL type + server
-   * checksum - which a 21c+ server sends to every session, so that pair follows
-   * the version the SERVER advertised, not the negotiated one
-   * (seerdb/seerdb@e513309). Read by the negotiated version, a session capped
-   * below 20.1 took the SQL type for the message length and lost every error's
-   * text. */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    (void)seer_dec_sb4(r); /* extended error number */
-    (void)seer_dec_sb4(r); /* extended rowcount (ub8) */
-    if (stmt->conn->server_field_version >= TTC_FIELD_VERSION_20_1 ||
-        stmt->conn->field_version >= TTC_FIELD_VERSION_20_1) {
-      (void)seer_dec_sb4(r); /* SQL type */
-      (void)seer_dec_sb4(r); /* server checksum */
+  /* The tail: 12.1's extended fields, a 20.1+ server's SQL type and
+   * checksum, then the "ORA-NNNNN: ..." text when there is an error. */
+  SeerOerMsg t = {.code = oer->err_code};
+  (void)seer_schema_decode(SEER_OER_TAIL_SCHEMA, &cx, r, &t);
+  if (t.message.n > 0) {
+    char *nbuf = malloc(t.message.n + 1);
+    if (nbuf != NULL) {
+      memcpy(nbuf, t.message.p, t.message.n);
+      nbuf[t.message.n] = '\0';
+      free(c->last_error);
+      c->last_error = nbuf;
     }
   }
-
-  /* Trailing "ORA-NNNNN: ..." message when the error code is non-zero. */
-  if (oer->err_code != 0 && seer_reader_remaining(r) > 0) {
-    uint8_t *msg = NULL;
-    size_t mlen = 0;
-    if (seer_dec_dalc(r, &msg, &mlen) == SEER_OK && msg != NULL) {
-      /* Build the replacement first, then swap: the old buffer is only
-       * freed once the new one is fully populated, so no read ever touches
-       * freed memory and an allocation failure leaves the prior error
-       * intact instead of nulling it. */
-      char *nbuf = malloc(mlen + 1);
-      if (nbuf != NULL) {
-        memcpy(nbuf, msg, mlen);
-        nbuf[mlen] = '\0';
-        free(stmt->conn->last_error);
-        stmt->conn->last_error = nbuf;
-      }
-    }
-    free(msg);
-  }
+  seer_schema_free(SEER_OER_TAIL_SCHEMA, &t);
   return SEER_OK;
 }
 
@@ -4769,26 +4710,19 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
   if (seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER)
     return false;
   r.pos += 1;
-  out->rows = seer_dec_sb4(&r);
-  out->code = seer_dec_sb4(&r);
-  if (!seer_reader_ok(&r))
+  /* SEER_OER_*_SCHEMA at field version 2 (#395 spike): no call status or
+   * sequence, the cursor options a compressed integer - 8 (`01 08`) on a
+   * session that logged on with the XA names (#171). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerOerMsg m = {0};
+  if (!seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, &r, &m))
     return false;
-  (void)seer_dec_sb4(&r); /* array error */
-  (void)seer_dec_sb4(&r); /* array error 2 */
-  (void)seer_dec_sb4(&r); /* cursor */
-  int64_t position = seer_dec_sb4(&r);
-  (void)seer_reader_u8(&r); /* sql type */
-  (void)seer_reader_u8(&r); /* fatal */
-  (void)seer_dec_sb4(&r);   /* flags (ub2) */
-  /* Cursor options are a compressed integer: 0 (`00`) on a plain session, 8
-   * (`01 08`) on one that logged on with the XA names (#171). Read as a byte,
-   * the 8 shifted the warning flags. */
-  (void)seer_dec_sb4(&r);   /* cursor options */
-  (void)seer_reader_u8(&r); /* UPI parameter */
-  uint8_t warnings = seer_reader_u8(&r);
-  if (seer_reader_ok(&r)) { /* a short status ends after the code */
-    out->position = position > 0 ? position : 0;
-    out->warnings = warnings;
+  out->rows = m.rows;
+  out->code = m.code;
+  if (seer_schema_decode(SEER_OER_FLAGS_SCHEMA, &cx, &r,
+                         &m)) { /* a short one ends after the code */
+    out->position = m.position > 0 ? m.position : 0;
+    out->warnings = (uint8_t)m.warnings;
     if (batch != NULL)
       fv2_read_batch_errors(&r, batch);
   }
@@ -4798,25 +4732,6 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
 static bool fv2_read_status(const uint8_t *data, size_t dlen, Fv2Status *out)
 {
   return fv2_read_status_ex(data, dlen, out, NULL);
-}
-
-/* `count` TTC ub4s packed in a batch-error array's value; NULL on a short one. */
-static uint32_t *fv2_ub4s(const uint8_t *blob, size_t len, int64_t count)
-{
-  if (count <= 0 || count > 65536)
-    return NULL;
-  uint32_t *v = calloc((size_t)count, sizeof *v);
-  if (v == NULL)
-    return NULL;
-  SeerReader r;
-  seer_reader_init(&r, blob, len);
-  for (int64_t i = 0; i < count; i++)
-    v[i] = (uint32_t)seer_dec_sb4(&r);
-  if (!seer_reader_ok(&r)) {
-    free(v);
-    return NULL;
-  }
-  return v;
 }
 
 /* The rest of a 9i status, from after the warning flags (seerdb PROTOCOL.md
@@ -4830,40 +4745,18 @@ static uint32_t *fv2_ub4s(const uint8_t *blob, size_t len, int64_t count)
  * offsets[i] with codes[i]. A status cut short stores nothing. */
 static void fv2_read_batch_errors(SeerReader *r, SeerStmt *stmt)
 {
-  (void)seer_dec_sb4(r);   /* rowid: data object */
-  (void)seer_dec_sb4(r);   /* relative file */
-  (void)seer_reader_u8(r); /* reserved */
-  (void)seer_dec_sb4(r);   /* block */
-  (void)seer_dec_sb4(r);   /* slot */
-  (void)seer_dec_sb4(r);   /* OS error */
-  (void)seer_reader_u8(r); /* statement number */
-  (void)seer_reader_u8(r); /* call number */
-  (void)seer_dec_sb4(r);   /* padding (ub2) */
-  (void)seer_dec_sb4(r);   /* iterations */
-  uint8_t *blob = NULL;
-  size_t blen = 0;
-  if (seer_dec_sb4(r) > 0) { /* oerrdd */
-    if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
-      return;
-    free(blob);
+  /* The rowid to the batch counts: SEER_OER_BATCH_SCHEMA, as 10g+'s (#395). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerOerMsg bm = {0};
+  if (!seer_schema_decode(SEER_OER_BATCH_SCHEMA, &cx, r, &bm)) {
+    seer_schema_free(SEER_OER_BATCH_SCHEMA, &bm);
+    return;
   }
-  uint32_t *codes = NULL, *offsets = NULL;
-  int64_t ncodes = seer_dec_sb4(r);
-  if (ncodes > 0) {
-    blob = NULL;
-    if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
-      return;
-    codes = fv2_ub4s(blob, blen, ncodes);
-    free(blob);
-  }
-  int64_t noffsets = seer_dec_sb4(r);
-  if (noffsets > 0) {
-    blob = NULL;
-    if (seer_dec_dalc(r, &blob, &blen) == SEER_OK)
-      offsets = fv2_ub4s(blob, blen, noffsets);
-    free(blob);
-  }
-  int64_t nmsgs = seer_dec_sb4(r);
+  size_t nc = 0, no = 0;
+  uint32_t *codes = oer_ub4s(&bm.codes, &nc), *offsets = oer_ub4s(&bm.offsets, &no);
+  int64_t ncodes = (int64_t)nc, noffsets = (int64_t)no;
+  seer_schema_free(SEER_OER_BATCH_SCHEMA, &bm);
+  int64_t nmsgs = bm.nmsgs;
   char **msgs = NULL;
   if (nmsgs > 0 && nmsgs <= 65536 && seer_reader_ok(r)) {
     (void)seer_reader_u8(r); /* indicator */
@@ -6157,32 +6050,46 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
     return;
   }
   r->pos++;
-  s->rows = o8r_le32(r);
-  s->code = o8r_le16(r);
-  (void)o8r_le16(r); /* array errors */
-  (void)o8r_le16(r);
-  s->cursor = o8r_le16(r);
-  s->position = o8r_le16(r);
-  o8r_skip(r, 2);       /* sql type, fatal */
-  s->flags = o8r_u8(r); /* 0x40: no transaction open (bus 95) */
-  o8r_skip(r, 2);       /* cursor options, upi param */
-  s->warnings = o8r_u8(r);
-  o8r_skip(r, 13);   /* rowid: ub4 object, ub2 file, a byte, ub4 block, ub2 slot */
-  (void)o8r_le32(r); /* os error */
-  o8r_skip(r, 4);    /* statement, call, padding */
-  (void)o8r_le32(r); /* iterations */
-  if (o8r_le16(r) > 0)
-    o8r_value(r, NULL); /* oerrdd: the rowid again after a DML */
-  o8r_skip(r, 12);      /* batch-error array counts */
-  s->complete = !r->cut && !r->bad;
-  if (s->code != 0 && !r->cut && !r->bad) {
+  /* SEER_OER_*_SCHEMA at 8i's widths (#395 spike): no call status or
+   * sequence; rows a ub4, code / cursor / position ub2s; the flags' 0x40 says
+   * no transaction is open (bus 95). The batch counts are three ub4s. */
+  SeerReader sr;
+  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerOerMsg om = {0};
+  bool whole = seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, &sr, &om) &&
+               seer_schema_decode(SEER_OER_FLAGS_SCHEMA, &cx, &sr, &om) &&
+               seer_schema_decode(SEER_OER_BATCH_SCHEMA, &cx, &sr, &om);
+  seer_schema_free(SEER_OER_BATCH_SCHEMA, &om);
+  s->rows = (uint32_t)om.rows;
+  s->code = (uint32_t)om.code;
+  s->cursor = (uint32_t)om.cursor;
+  s->position = (uint32_t)om.position;
+  s->flags = (uint8_t)om.flags;
+  s->warnings = (uint8_t)om.warnings;
+  if (!whole) {
+    r->cut = true;
+    return;
+  }
+  r->pos += sr.pos;
+  s->complete = true;
+  if (s->code != 0) {
+    SeerOerMsg tm = {.code = om.code};
+    if (!seer_schema_decode(SEER_OER_TAIL_SCHEMA, &cx, &sr, &tm)) {
+      seer_schema_free(SEER_OER_TAIL_SCHEMA, &tm);
+      r->cut = true;
+      return;
+    }
+    r->pos = (size_t)(sr.buf - r->b) + sr.pos;
     SeerWriter m;
     if (!seer_writer_init(&m, 64)) {
+      seer_schema_free(SEER_OER_TAIL_SCHEMA, &tm);
       r->bad = true;
       return;
     }
-    o8r_value(r, &m);
-    if (!r->cut && seer_writer_ok(&m)) {
+    seer_writer_bytes(&m, tm.message.p, tm.message.n);
+    seer_schema_free(SEER_OER_TAIL_SCHEMA, &tm);
+    if (seer_writer_ok(&m)) {
       SeerCell tmp = {0};
       if (o8i_text_cell(&tmp, m.buf, m.len) == SEER_OK) {
         s->message = malloc(tmp.len + 1);
