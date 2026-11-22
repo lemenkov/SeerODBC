@@ -76,6 +76,14 @@ extern const SeerField SEER_OER_FLAGS_SCHEMA[];
 extern const SeerField SEER_OER_BATCH_SCHEMA[];
 extern const SeerField SEER_OER_TAIL_SCHEMA[];
 
+/* A row's plain cell: its value (a ub1 length, or 0xFE and chunks; 0 and
+ * 0xFF are empty / NULL). Read in place - only a chunked value is copied. */
+typedef struct {
+  SeerBytes value;
+} SeerCellMsg;
+
+extern const SeerField SEER_CELL_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

@@ -692,13 +692,15 @@ static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *ce
     break;
   }
 
-  uint8_t *val = NULL;
-  size_t vlen = 0;
-  SeerStatus st = seer_dec_dalc(r, &val, &vlen);
-  if (st != SEER_OK)
-    return st;
-  st = decode_scalar(col->ora_type, val, vlen, cell);
-  free(val);
+  /* SEER_CELL_SCHEMA (#395 spike): the value read in place. */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN, .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m;
+  if (!seer_schema_decode(SEER_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_CELL_SCHEMA, &m);
+    return SEER_EPROTO;
+  }
+  SeerStatus st = decode_scalar(col->ora_type, m.value.p, m.value.n, cell);
+  seer_schema_free(SEER_CELL_SCHEMA, &m);
   if (st == SEER_OK)
     national_to_utf8(col, cell);
   return st;

@@ -175,7 +175,11 @@ static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b)
   bool wide = cx->codec == SEER_CODEC_THIN && cx->wide_chunks;
   for (;;) {
     int64_t cl = wide ? seer_dec_sb4(r) : seer_reader_u8(r);
-    if (!seer_reader_ok(r) || cl <= 0)
+    if (cl < 0) { /* a negative chunk length: no value */
+      seer_writer_free(&acc);
+      return false;
+    }
+    if (!seer_reader_ok(r) || cl == 0)
       break;
     const uint8_t *p = seer_reader_bytes(r, (size_t)cl);
     if (p == NULL)
