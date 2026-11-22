@@ -113,6 +113,11 @@ const SeerField SEER_OER_TAIL_SCHEMA[] = {
 };
 #undef O
 
+const SeerField SEER_CELL_SCHEMA[] = {
+    SEER_F(SF_VALUE, SeerCellMsg, value),
+    SEER_END,
+};
+
 const SeerField SEER_LOB_DATA_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerLobDataMsg, data),
     SEER_END,
