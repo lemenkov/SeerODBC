@@ -5,6 +5,8 @@
  */
 #include "lob.h"
 
+#include "msg.h" /* the LOBOPS body as a schema (#395 spike) */
+
 #include "conn.h"
 #include "log.h"
 #include "marshal.h"
@@ -44,28 +46,20 @@ static SeerStatus build_lobop(SeerConn *c, const uint8_t *loc, size_t loclen, ui
 
   seer_ttc_fun_header(c, w, TTI_LOBOPS);
 
-  seer_writer_u8(w, 1);                                        /* source pointer present     */
-  seer_enc_sb4(w, (uint32_t)(prefixed ? loclen + 2 : loclen)); /* src loc len */
-  seer_writer_u8(w, 0);                                        /* dest pointer absent        */
-  seer_enc_sb4(w, 0);                                          /* dest length                */
-  seer_enc_sb4(w, 0);                                          /* short source offset        */
-  seer_enc_sb4(w, 0);                                          /* short dest offset          */
-  seer_writer_u8(w, 0);                                        /* charset pointer absent     */
-  seer_writer_u8(w, 0);                                        /* short amount absent        */
-  seer_writer_u8(w, 0);                                        /* null lob pointer absent    */
-  seer_enc_sb4(w, op);                                         /* operation                  */
-  seer_writer_u8(w, 0);                                        /* scn array pointer absent   */
-  seer_writer_u8(w, 0);                                        /* scn array length           */
-  seer_enc_sb4(w, source_offset);                              /* source offset (1-based)    */
-  seer_enc_sb4(w, 0);                                          /* dest offset                */
-  seer_writer_u8(w, send_amount ? 1 : 0);                      /* amount pointer present     */
-  for (int i = 0; i < 6; i++)                                  /* three reserved array slots */
-    seer_writer_u8(w, 0);
-  if (prefixed)
-    seer_writer_u16(w, (uint16_t)loclen); /* ub2 length prefix       */
-  seer_writer_bytes(w, loc, loclen);      /* locator                    */
-  if (send_amount)
-    seer_enc_sb4(w, amount); /* read amount / open mode    */
+  SeerLobopMsg m = {
+      .src_ptr = 1,
+      .src_len = (int64_t)(prefixed ? loclen + 2 : loclen),
+      .op = op,
+      .src_off = source_offset,
+      .amount_ptr = send_amount,
+      .loc_prefixed = prefixed,
+      .loc_len = (int64_t)loclen,
+      .locator = {.p = loc, .n = loclen},
+      .has_amount = send_amount,
+      .amount = amount,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, &m, w);
 
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
@@ -103,37 +97,15 @@ static SeerStatus accumulate_lob_content(const uint8_t *resp, size_t rlen, bool 
     if (r.buf[r.pos] != TTI_LOB)
       break;
     (void)seer_reader_u8(&r); /* TTI_LOB token */
-    uint8_t len = seer_reader_u8(&r);
-    if (!seer_reader_ok(&r)) {
+    SeerLobDataMsg m = {0};
+    SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN, .wide_chunks = sb4_chunks};
+    if (!seer_schema_decode(SEER_LOB_DATA_SCHEMA, &cx, &r, &m)) { /* #395 */
+      seer_schema_free(SEER_LOB_DATA_SCHEMA, &m);
       truncated = true;
       break;
     }
-    if (len == 0)
-      continue;
-    if (len == 0xFE) {
-      for (;;) {
-        int64_t clen = sb4_chunks ? seer_dec_sb4(&r) : (int64_t)seer_reader_u8(&r);
-        if (!seer_reader_ok(&r)) {
-          truncated = true;
-          break;
-        }
-        if (clen <= 0)
-          break; /* the run's terminator */
-        const uint8_t *p = seer_reader_bytes(&r, (size_t)clen);
-        if (p == NULL) {
-          truncated = true;
-          break;
-        }
-        seer_writer_bytes(&acc, p, (size_t)clen);
-      }
-    } else {
-      const uint8_t *p = seer_reader_bytes(&r, len);
-      if (p == NULL) {
-        truncated = true;
-        break;
-      }
-      seer_writer_bytes(&acc, p, len);
-    }
+    seer_writer_bytes(&acc, m.data.p, m.data.n);
+    seer_schema_free(SEER_LOB_DATA_SCHEMA, &m);
   }
   if (truncated) {
     seer_log(SEER_LOG_ERROR, "lob: content runs past the end of the reply (%zu bytes)", rlen);
@@ -289,24 +261,30 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
    * LOB kind and charset spliced in (PROTOCOL.md §14.2): the shared head, the
    * charset form (CLOB `01 01`, BLOB none), `01` + the LOB type, 47 zero bytes,
    * then the charset id. */
-  static const uint8_t HEAD[16] = {0x01, 0x01, 0x28, 0x00, 0x01, 0x0a, 0x00, 0x00,
-                                   0x01, 0x00, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00};
+  /* As the LOBOPS schema reads it: a 40-byte empty locator, the duration
+   * (10) in the destination length, the charset and null-LOB pointers set,
+   * the charset form (CLOB 1, BLOB none) in the source offset, the LOB type
+   * in the destination offset, the charset after the locator. */
+  static const uint8_t EMPTY[40] = {0};
   SeerWriter req;
   if (!seer_writer_init(&req, 128))
     return SEER_ENOMEM;
   seer_ttc_fun_header(conn, &req, TTI_LOBOPS);
-  seer_writer_bytes(&req, HEAD, sizeof HEAD);
-  if (!blob) {
-    seer_writer_u8(&req, 0x01);
-    seer_writer_u8(&req, 0x01); /* implicit (database) charset form */
-  } else {
-    seer_writer_u8(&req, 0x00);
-  }
-  seer_writer_u8(&req, 0x01);
-  seer_writer_u8(&req, blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB);
-  for (int i = 0; i < 47; i++)
-    seer_writer_u8(&req, 0);
-  seer_enc_sb4(&req, 873); /* AL32UTF8, for BLOB too */
+  SeerLobopMsg m = {
+      .src_ptr = 1,
+      .src_len = sizeof EMPTY,
+      .dst_len = 10,
+      .charset_ptr = 1,
+      .null_lob_ptr = 1,
+      .op = LOB_OP_CREATE_TEMP,
+      .src_off = blob ? 0 : 1,
+      .dst_off = blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB,
+      .loc_len = sizeof EMPTY,
+      .locator = {.p = EMPTY, .n = sizeof EMPTY},
+      .charset = 873, /* AL32UTF8, for BLOB too */
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, &m, &req);
   if (!seer_writer_ok(&req)) {
     seer_writer_free(&req);
     return SEER_ENOMEM;

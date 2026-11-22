@@ -5617,8 +5617,6 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
  * GETLEN learns the length, READ pulls exactly that many chars/bytes. Every request
  * is `03 60 00 01 <sb4 loclen> <op middle> <locator[1:]> <trailer>`. The captured
  * locator (from the RXD) is echoed with its leading byte dropped. (PROTOCOL §19.5) */
-static const uint8_t FV2_LOBOP_GETLEN_MID[] = {0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0};
-static const uint8_t FV2_LOBOP_READ_MID[] = {0, 0, 1, 1, 0, 0, 1, 0, 1, 2, 0, 0, 0};
 
 /* Parse an accumulated 9i LOBOPS READ reply: TTI_LOB(0e) [fe] then <ub1 len><bytes>
  * chunks ending at a zero-length chunk. *complete is false until that terminator is
@@ -5654,9 +5652,12 @@ static void fv2_parse_lob_chunks(const uint8_t *data, size_t dlen, uint8_t **out
 }
 
 /* Build + send a fv2 LOBOPS request (op `mid`, `trailer`) and receive the reply. */
-static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen, const uint8_t *mid,
-                                 size_t midlen, const uint8_t *trailer, size_t trlen,
-                                 uint8_t **resp, size_t *rlen)
+/* #395 spike: 9i's CREATE_TEMP, as ojdbc14 writes it, has its BLOB form as
+ * `01 00` - a length-1 integer where the compact form of 0 is `00` - so it
+ * keeps its captured bytes; every other 9i LOBOPS call is SEER_LOBOPS_SCHEMA. */
+static SeerStatus fv2_lobop_send_raw(SeerConn *c, const uint8_t *loc, size_t loclen,
+                                     const uint8_t *mid, size_t midlen, const uint8_t *trailer,
+                                     size_t trlen, uint8_t **resp, size_t *rlen)
 {
   SeerWriter w;
   if (!seer_writer_init(&w, 16 + loclen + midlen + trlen))
@@ -5680,14 +5681,39 @@ static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen,
   return st;
 }
 
+static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen, SeerLobopMsg *m,
+                                 const uint8_t *tail, size_t taillen, uint8_t **resp, size_t *rlen)
+{
+  SeerWriter w;
+  if (!seer_writer_init(&w, 64 + loclen + taillen))
+    return SEER_ENOMEM;
+  seer_writer_u8(&w, TTI_FUN);
+  seer_writer_u8(&w, TTI_LOBOPS);
+  seer_writer_u8(&w, 0);
+  m->src_ptr = 1;
+  m->src_len = (int64_t)loclen;
+  m->loc_len = loclen > 1 ? (int64_t)loclen - 1 : 0; /* its first byte goes as 00 */
+  m->locator = (SeerBytes){.p = loclen > 1 ? loc + 1 : loc, .n = (size_t)m->loc_len};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, m, &w); /* #395 */
+  if (taillen > 0)
+    seer_writer_bytes(&w, tail, taillen);
+  if (!seer_writer_ok(&w)) {
+    seer_writer_free(&w);
+    return SEER_ENOMEM;
+  }
+  SeerStatus st = fv2_txn(c, w.buf, w.len, resp, rlen);
+  seer_writer_free(&w);
+  return st;
+}
+
 /* GETLEN: the LOB length (chars for CLOB, bytes for BLOB). -1 on error. */
 static int64_t fv2_lob_getlen(SeerConn *c, const uint8_t *loc, size_t loclen)
 {
-  static const uint8_t trl[] = {0};
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_GETLEN_MID, sizeof FV2_LOBOP_GETLEN_MID, trl,
-                     sizeof trl, &resp, &rlen) != SEER_OK)
+  SeerLobopMsg m = {.short_amount_ptr = 1, .op = LOB_OP_GET_LENGTH, .has_amount = 1};
+  if (fv2_lobop_send(c, loc, loclen, &m, NULL, 0, &resp, &rlen) != SEER_OK)
     return -1;
   int64_t amount = 0; /* RPA 00 <ub1 loclen><echo> <ub4 amount> */
   if (rlen >= 3 && resp[0] == TTI_RPA) {
@@ -5723,8 +5749,13 @@ static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, i
   /* Send READ; the first reply comes back via fv2_lobop_send, then accumulate. */
   uint8_t *pkt = NULL;
   size_t plen = 0;
-  if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_READ_MID, sizeof FV2_LOBOP_READ_MID, trailer, trlen,
-                     &pkt, &plen) != SEER_OK)
+  (void)trlen;
+  SeerLobopMsg m = {.short_src_off = 1,
+                    .short_amount_ptr = 1,
+                    .op = LOB_OP_READ,
+                    .has_amount = 1,
+                    .amount = amount};
+  if (fv2_lobop_send(c, loc, loclen, &m, NULL, 0, &pkt, &plen) != SEER_OK)
     return SEER_EPROTO;
   SeerWriter acc;
   if (!seer_writer_init(&acc, (size_t)amount + 32)) {
@@ -5762,8 +5793,6 @@ static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, i
 /* 9i BFILE read: FILE_OPEN -> GETLEN -> READ -> FILE_CLOSE (PROTOCOL §19.8). The
  * FILE_OPEN reply's RPA carries an *updated* (open-flagged) locator that GETLEN /
  * READ / FILE_CLOSE must use. FILE_CLOSE always runs (best-effort). */
-static const uint8_t FV2_LOBOP_FOPEN_MID[] = {0, 0, 0, 0, 0, 1, 0, 2, 1, 0, 0, 0, 0};
-static const uint8_t FV2_LOBOP_FCLOSE_MID[] = {0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0};
 
 static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen, uint8_t **content,
                                  size_t *contentlen)
@@ -5774,8 +5803,9 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
 
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_FOPEN_MID, sizeof FV2_LOBOP_FOPEN_MID, fopen_trl,
-                     sizeof fopen_trl, &resp, &rlen) != SEER_OK)
+  (void)fopen_trl;
+  SeerLobopMsg om = {.short_amount_ptr = 1, .op = LOB_OP_FILE_OPEN, .has_amount = 1, .amount = 11};
+  if (fv2_lobop_send(c, loc, loclen, &om, NULL, 0, &resp, &rlen) != SEER_OK)
     return SEER_EPROTO;
   /* Opened locator: RPA 00 <ub1 len><body>  ->  00 <ub1 len><body>. A file
    * that won't open is answered with a status: its error (ORA-22285 for a
@@ -5811,8 +5841,8 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
 
   uint8_t *cresp = NULL;
   size_t crlen = 0;
-  if (fv2_lobop_send(c, opened, openedlen, FV2_LOBOP_FCLOSE_MID, sizeof FV2_LOBOP_FCLOSE_MID, NULL,
-                     0, &cresp, &crlen) == SEER_OK)
+  SeerLobopMsg cm = {.op = LOB_OP_FILE_CLOSE};
+  if (fv2_lobop_send(c, opened, openedlen, &cm, NULL, 0, &cresp, &crlen) == SEER_OK)
     free(cresp);
   free(opened);
   return rst;
@@ -7117,21 +7147,19 @@ static SeerStatus o8i_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen,
     return SEER_ENOMEM;
   o8i_closing(c, &w);
   seer_ttc_fun_header(c, &w, TTI_LOBOPS);
-  seer_writer_u8(&w, 1); /* source */
-  o8w_le32(&w, (uint32_t)loclen);
-  seer_writer_u8(&w, 0); /* destination */
-  o8w_le32(&w, 0);
-  o8w_le32(&w, offset);
-  o8w_le32(&w, 0);       /* destination offset */
-  seer_writer_u8(&w, 0); /* charset */
-  seer_writer_u8(&w, has_amount ? 1 : 0);
-  seer_writer_u8(&w, 0); /* null LOB */
-  o8w_le32(&w, op);
-  seer_writer_u8(&w, 0); /* SCN */
-  o8w_le32(&w, 0);
-  seer_writer_bytes(&w, loc, loclen);
-  if (has_amount)
-    o8w_le32(&w, amount);
+  SeerLobopMsg m = {
+      .src_ptr = 1,
+      .src_len = (int64_t)loclen,
+      .short_src_off = offset,
+      .short_amount_ptr = has_amount,
+      .op = op,
+      .loc_len = (int64_t)loclen,
+      .locator = {.p = loc, .n = loclen},
+      .has_amount = has_amount,
+      .amount = amount,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, &m, &w); /* #395 */
   SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   return st;
@@ -8198,8 +8226,8 @@ static SeerStatus fv2_create_temp(SeerConn *c, uint8_t type, uint8_t loc[86])
   uint8_t *resp = NULL;
   size_t rlen = 0;
   SeerStatus st = seer_writer_ok(&tw)
-                      ? fv2_lobop_send(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, mid,
-                                       sizeof mid, tw.buf, tw.len, &resp, &rlen)
+                      ? fv2_lobop_send_raw(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, mid,
+                                           sizeof mid, tw.buf, tw.len, &resp, &rlen)
                       : SEER_ENOMEM;
   seer_writer_free(&tw);
   if (st == SEER_OK &&
@@ -8219,12 +8247,14 @@ static SeerStatus fv2_create_temp(SeerConn *c, uint8_t type, uint8_t loc[86])
 static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_t *data, size_t n,
                                 uint32_t amount)
 {
-  static const uint8_t mid[] = {0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
-                                0x00, 0x01, 0x40, 0x00, 0x00, 0x00};
+  SeerLobopMsg m = {.short_src_off = 1,
+                    .short_amount_ptr = 1,
+                    .op = LOB_OP_WRITE,
+                    .has_amount = 1,
+                    .amount = amount};
   SeerWriter tw;
   if (!seer_writer_init(&tw, n + n / 252 + 16))
     return SEER_ENOMEM;
-  seer_enc_sb4(&tw, amount);
   seer_writer_u8(&tw, TTI_LOB);
   if (n <= 252) {
     seer_writer_u8(&tw, (uint8_t)n);
@@ -8240,9 +8270,8 @@ static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_
   }
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  SeerStatus st = seer_writer_ok(&tw)
-                      ? fv2_lobop_send(c, loc, 86, mid, sizeof mid, tw.buf, tw.len, &resp, &rlen)
-                      : SEER_ENOMEM;
+  SeerStatus st = seer_writer_ok(&tw) ? fv2_lobop_send(c, loc, 86, &m, tw.buf, tw.len, &resp, &rlen)
+                                      : SEER_ENOMEM;
   seer_writer_free(&tw);
   if (st == SEER_OK && (rlen < 1 || resp[0] != TTI_RPA)) {
     fv2_set_error(c, resp, rlen);
@@ -8255,11 +8284,10 @@ static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_
 /* FREE_TEMP (op 0x111), as ojdbc14 frees one: the locator, all else zero. */
 static void fv2_free_temp(SeerConn *c, const uint8_t loc[86])
 {
-  static const uint8_t mid[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                0x02, 0x01, 0x11, 0x00, 0x00, 0x00};
+  SeerLobopMsg m = {.op = LOB_OP_FREE_TEMP};
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  if (fv2_lobop_send(c, loc, 86, mid, sizeof mid, NULL, 0, &resp, &rlen) == SEER_OK) {
+  if (fv2_lobop_send(c, loc, 86, &m, NULL, 0, &resp, &rlen) == SEER_OK) {
     if (rlen < 1 || resp[0] != TTI_RPA)
       seer_log(SEER_LOG_WARNING, "stmt: 9i: a temporary LOB was not freed (reply %02x)",
                rlen ? resp[0] : 0);

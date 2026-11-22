@@ -23,6 +23,33 @@ typedef struct {
 
 extern const SeerField SEER_OAC_SCHEMA[];
 
+/* A LOBOPS call's body, after the function header. One field list on every
+ * path (seerdb _O7_LOBOPS): 8i and 9i carry the offsets and amount in the
+ * short slots, 10g+ adds the long ones and three reserved array slots and
+ * may ub2-prefix the locator; 9i sends the locator's first byte as 00. After
+ * the locator: the charset when its pointer is set, the amount when either
+ * amount pointer is. */
+typedef struct {
+  int64_t src_ptr, src_len, dst_ptr, dst_len, short_src_off, short_dst_off;
+  int64_t charset_ptr, short_amount_ptr, null_lob_ptr, op, scn_ptr, scn_len;
+  int64_t src_off, dst_off, amount_ptr; /* 10g+ */
+  int64_t loc_prefixed, loc_len;        /* thin: a ub2-prefixed locator */
+  SeerBytes locator;
+  int64_t charset, has_amount, amount;
+} SeerLobopMsg;
+
+extern const SeerField SEER_LOBOPS_SCHEMA[];
+
+/* A LOB data message's content (TTI_LOB, after its token): a value, chunked
+ * past 252 bytes - on thin. 8i and 9i frame it as ub1 chunks to a zero
+ * whether or not it starts with 0xFE (#395 spike finding: their readers
+ * keep that form). */
+typedef struct {
+  SeerBytes data;
+} SeerLobDataMsg;
+
+extern const SeerField SEER_LOB_DATA_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 
