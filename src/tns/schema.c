@@ -44,6 +44,8 @@ static bool present(const SeerField *f, const SeerSchemaCtx *cx, const void *msg
   }
   if ((f->flags & SG_IF_SET) && *cnum(msg, f->if_off) == 0)
     return false;
+  if ((f->flags & SG_IF_CLEAR) && *cnum(msg, f->if_off) != 0)
+    return false;
   return true;
 }
 
@@ -112,6 +114,11 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
     case SF_VALUE:
       put_value(w, cx, (const SeerBytes *)((const char *)msg + f->off));
       break;
+    case SF_U8L:
+      if (cx->codec == SEER_CODEC_THIN)
+        seer_writer_u8(w, 1);
+      seer_writer_u8(w, (uint8_t)*cnum(msg, f->off));
+      break;
     case SF_RAW: {
       const SeerBytes *b = (const SeerBytes *)((const char *)msg + f->off);
       seer_writer_bytes(w, b->p,
@@ -154,7 +161,7 @@ static int64_t get_num(SeerReader *r, const SeerSchemaCtx *cx, uint8_t kind)
 /* A value: a ub1 length (0 and 0xFF are empty / NULL) and the bytes, pointed
  * into; or 0xFE then chunks to a zero length - each a ub1, or on thin from
  * 12.1 an sb4 - assembled into an owned buffer. */
-static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b)
+static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b, bool *bad)
 {
   b->p = NULL;
   b->n = 0;
@@ -177,6 +184,7 @@ static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b)
     int64_t cl = wide ? seer_dec_sb4(r) : seer_reader_u8(r);
     if (cl < 0) { /* a negative chunk length: no value */
       seer_writer_free(&acc);
+      *bad = true;
       return false;
     }
     if (!seer_reader_ok(r) || cl == 0)
@@ -196,9 +204,11 @@ static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b)
   return true;
 }
 
-bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerReader *r, void *msg)
+SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchemaCtx *cx,
+                                       SeerReader *r, void *msg)
 {
-  for (const SeerField *f = schema; f->kind != SF_END && seer_reader_ok(r); f++) {
+  bool bad = false;
+  for (const SeerField *f = schema; f->kind != SF_END && seer_reader_ok(r) && !bad; f++) {
     if (!present(f, cx, msg))
       continue;
     if ((f->flags & SG_IF_MORE) && cx->codec == SEER_CODEC_THIN && seer_reader_remaining(r) == 0)
@@ -219,7 +229,10 @@ bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerRe
       (void)seer_reader_bytes(r, f->arg);
       break;
     case SF_VALUE:
-      get_value(r, cx, (SeerBytes *)((char *)msg + f->off));
+      get_value(r, cx, (SeerBytes *)((char *)msg + f->off), &bad);
+      break;
+    case SF_U8L:
+      *num(msg, f->off) = cx->codec == SEER_CODEC_THIN ? seer_dec_sb4(r) : seer_reader_u8(r);
       break;
     case SF_RAW: {
       SeerBytes *b = (SeerBytes *)((char *)msg + f->off);
@@ -233,14 +246,21 @@ bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerRe
       SeerBytes *b = (SeerBytes *)((char *)msg + f->off);
       b->p = NULL, b->n = 0, b->owned = 0;
       if (get_num(r, cx, f->arg ? (uint8_t)f->arg : SF_N4) > 0)
-        get_value(r, cx, b);
+        get_value(r, cx, b, &bad);
       break;
     }
     default:
       break;
     }
   }
-  return seer_reader_ok(r);
+  if (bad)
+    return SCH_BAD;
+  return seer_reader_ok(r) ? SCH_OK : SCH_SHORT;
+}
+
+bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerReader *r, void *msg)
+{
+  return seer_schema_decode_ex(schema, cx, r, msg) == SCH_OK;
 }
 
 void seer_schema_free(const SeerField *schema, void *msg)

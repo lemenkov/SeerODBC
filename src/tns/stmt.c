@@ -5513,69 +5513,7 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
  * is `03 60 00 01 <sb4 loclen> <op middle> <locator[1:]> <trailer>`. The captured
  * locator (from the RXD) is echoed with its leading byte dropped. (PROTOCOL §19.5) */
 
-/* Parse an accumulated 9i LOBOPS READ reply: TTI_LOB(0e) [fe] then <ub1 len><bytes>
- * chunks ending at a zero-length chunk. *complete is false until that terminator is
- * seen (content spans more packets). Caller frees *out. */
-static void fv2_parse_lob_chunks(const uint8_t *data, size_t dlen, uint8_t **out, size_t *outlen,
-                                 bool *complete)
-{
-  *out = NULL;
-  *outlen = 0;
-  *complete = false;
-  if (dlen < 2 || data[0] != TTI_LOB)
-    return;
-  size_t pos = (data[1] == 0xFE) ? 2 : 1;
-  SeerWriter w;
-  if (!seer_writer_init(&w, dlen))
-    return;
-  while (pos < dlen) {
-    uint8_t clen = data[pos];
-    if (clen == 0) {
-      *complete = true;
-      break;
-    }
-    if (pos + 1 + clen > dlen)
-      break; /* chunk split across packets */
-    seer_writer_bytes(&w, data + pos + 1, clen);
-    pos += 1 + clen;
-  }
-  if (seer_writer_ok(&w)) {
-    *out = w.buf;
-    *outlen = w.len;
-  } else
-    seer_writer_free(&w);
-}
-
 /* Build + send a fv2 LOBOPS request (op `mid`, `trailer`) and receive the reply. */
-/* #395 spike: 9i's CREATE_TEMP, as ojdbc14 writes it, has its BLOB form as
- * `01 00` - a length-1 integer where the compact form of 0 is `00` - so it
- * keeps its captured bytes; every other 9i LOBOPS call is SEER_LOBOPS_SCHEMA. */
-static SeerStatus fv2_lobop_send_raw(SeerConn *c, const uint8_t *loc, size_t loclen,
-                                     const uint8_t *mid, size_t midlen, const uint8_t *trailer,
-                                     size_t trlen, uint8_t **resp, size_t *rlen)
-{
-  SeerWriter w;
-  if (!seer_writer_init(&w, 16 + loclen + midlen + trlen))
-    return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, TTI_LOBOPS);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x01);
-  seer_enc_sb4(&w, (uint32_t)loclen);
-  seer_writer_bytes(&w, mid, midlen);
-  if (loclen > 1)
-    seer_writer_bytes(&w, loc + 1, loclen - 1); /* locator[1:] */
-  if (trlen > 0)
-    seer_writer_bytes(&w, trailer, trlen);
-  if (!seer_writer_ok(&w)) {
-    seer_writer_free(&w);
-    return SEER_ENOMEM;
-  }
-  SeerStatus st = fv2_txn(c, w.buf, w.len, resp, rlen);
-  seer_writer_free(&w);
-  return st;
-}
-
 static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen, SeerLobopMsg *m,
                                  const uint8_t *tail, size_t taillen, uint8_t **resp, size_t *rlen)
 {
@@ -5610,16 +5548,15 @@ static int64_t fv2_lob_getlen(SeerConn *c, const uint8_t *loc, size_t loclen)
   SeerLobopMsg m = {.short_amount_ptr = 1, .op = LOB_OP_GET_LENGTH, .has_amount = 1};
   if (fv2_lobop_send(c, loc, loclen, &m, NULL, 0, &resp, &rlen) != SEER_OK)
     return -1;
-  int64_t amount = 0; /* RPA 00 <ub1 loclen><echo> <ub4 amount> */
-  if (rlen >= 3 && resp[0] == TTI_RPA) {
-    size_t pos = 2;
-    size_t el = resp[pos];
-    pos += 1 + el;
-    if (pos < rlen) {
-      SeerReader r;
-      seer_reader_init(&r, resp + pos, rlen - pos);
-      amount = seer_dec_sb4(&r);
-    }
+  /* The RPA: the locator echoed, then the length (SEER_LOBOPS_REPLY_SCHEMA). */
+  int64_t amount = 0;
+  if (rlen >= 1 && resp[0] == TTI_RPA) {
+    SeerReader r;
+    seer_reader_init(&r, resp + 1, rlen - 1);
+    SeerLobopReplyMsg rm = {.has_amount = 1};
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    (void)seer_schema_decode(SEER_LOBOPS_REPLY_SCHEMA, &cx, &r, &rm);
+    amount = rm.amount;
   }
   free(resp);
   return amount;
@@ -5660,18 +5597,29 @@ static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, i
   seer_writer_bytes(&acc, pkt, plen);
   free(pkt);
   for (int guard = 0; guard < 1000000; guard++) {
-    uint8_t *cont = NULL;
-    size_t clen = 0;
-    bool complete = false;
-    if (seer_writer_ok(&acc))
-      fv2_parse_lob_chunks(acc.buf, acc.len, &cont, &clen, &complete);
-    if (complete) {
-      *content = cont;
-      *contentlen = clen;
-      seer_writer_free(&acc);
-      return SEER_OK;
+    /* SEER_LOB_DATA_SCHEMA, its old framing: whole once the zero arrives,
+     * short while the chunks are still coming. */
+    if (seer_writer_ok(&acc) && acc.len >= 2 && acc.buf[0] == TTI_LOB) {
+      SeerReader r;
+      seer_reader_init(&r, acc.buf + 1, acc.len - 1);
+      SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+      SeerLobDataMsg lm = {0};
+      SeerSchemaResult res = seer_schema_decode_ex(SEER_LOB_DATA_SCHEMA, &cx, &r, &lm);
+      if (res == SCH_OK) {
+        size_t n = lm.data.n;
+        uint8_t *cont = malloc(n ? n : 1);
+        if (cont != NULL && n > 0)
+          memcpy(cont, lm.data.p, n);
+        seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
+        seer_writer_free(&acc);
+        if (cont == NULL)
+          return SEER_ENOMEM;
+        *content = cont;
+        *contentlen = n;
+        return SEER_OK;
+      }
+      seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
     }
-    free(cont);
     uint8_t *more = NULL;
     size_t morelen = 0;
     if (seer_ttc_recv(c, &more, &morelen) != SEER_OK) {
@@ -5710,24 +5658,21 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
     free(resp);
     return SEER_EDB;
   }
-  if (rlen < 3 || resp[0] != TTI_RPA) {
+  SeerLobopReplyMsg orm = {0};
+  SeerSchemaCtx ocx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerReader orr;
+  if (rlen > 0)
+    seer_reader_init(&orr, resp + 1, rlen - 1);
+  if (rlen < 3 || resp[0] != TTI_RPA ||
+      !seer_schema_decode(SEER_LOBOPS_REPLY_SCHEMA, &ocx, &orr, &orm)) {
     free(resp);
     return SEER_EPROTO;
   }
-  size_t olen = resp[2];
-  if (3 + olen > rlen) {
-    free(resp);
-    return SEER_EPROTO;
-  }
-  size_t openedlen = 2 + olen;
-  uint8_t *opened = malloc(openedlen);
-  if (opened == NULL) {
-    free(resp);
-    return SEER_ENOMEM;
-  }
-  opened[0] = 0;
-  memcpy(opened + 1, resp + 2, 1 + olen); /* the length byte + body */
+  size_t openedlen = 0;
+  uint8_t *opened = seer_lobop_reply_locator(&orm, &openedlen); /* its length + body */
   free(resp);
+  if (opened == NULL)
+    return SEER_ENOMEM;
 
   int64_t amount = fv2_lob_getlen(c, opened, openedlen);
   SeerStatus rst = SEER_OK;
@@ -7092,83 +7037,63 @@ static SeerStatus o8i_lobop_reply(SeerConn *c, bool has_amount, SeerWriter *cont
     return SEER_ENOMEM;
   SeerStatus st;
   O8iStatus s = {0};
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerLobDataMsg lm = {0};
+  SeerLobopReplyMsg rm = {0};
   for (;;) {
     st = o8i_recv_more(c, &buf);
     if (st != SEER_OK)
       break;
-    O8iRd r = {buf.buf, buf.len, 0, false, false};
-    if (o8r_has(&r, 1) && r.b[0] == TTI_LOB) {
-      r.pos = o8r_has(&r, 2) && r.b[1] == 0xFE ? 2 : 1;
-      for (;;) {
-        uint8_t cl = o8r_u8(&r);
-        if (r.cut || cl == 0)
-          break;
-        o8r_skip(&r, cl);
-        if (r.cut)
-          break;
-      }
-      if (r.cut)
-        continue;
-    }
-    if (o8r_has(&r, 1) && r.b[r.pos] == TTI_RPA) {
+    /* The reply by its schemas, at 8i's widths: the LOB data (a READ's
+     * content), the RPA, then the status. A part that hasn't fully arrived
+     * reads short: read on (#398). */
+    seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
+    seer_schema_free(SEER_LOBOPS_REPLY_SCHEMA, &rm);
+    lm = (SeerLobDataMsg){0};
+    rm = (SeerLobopReplyMsg){.has_amount = has_amount};
+    SeerReader r;
+    seer_reader_init(&r, buf.buf, buf.len);
+    SeerSchemaResult res = SCH_OK;
+    if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_LOB) {
       r.pos++;
-      uint32_t n = 0;
-      if (o8r_has(&r, 2)) {
-        n = (uint32_t)r.b[r.pos] << 8 | r.b[r.pos + 1];
-        r.pos += 2;
-      }
-      o8r_skip(&r, n);
-      if (has_amount)
-        (void)o8r_le32(&r);
-      if (r.cut)
-        continue;
+      res = seer_schema_decode_ex(SEER_LOB_DATA_SCHEMA, &cx, &r, &lm);
     }
-    o8i_status_free(&s);
-    o8i_read_status(&r, &s);
-    o8i_note_txn(c, &s);
-    if (r.bad) {
+    if (res == SCH_OK && seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_RPA) {
+      r.pos++;
+      res = seer_schema_decode_ex(SEER_LOBOPS_REPLY_SCHEMA, &cx, &r, &rm);
+    }
+    if (res == SCH_SHORT)
+      continue;
+    if (res == SCH_BAD) {
       st = SEER_EPROTO;
       break;
     }
-    if (!r.cut)
+    O8iRd sr = {buf.buf, buf.len, r.pos, false, false};
+    o8i_status_free(&s);
+    o8i_read_status(&sr, &s);
+    o8i_note_txn(c, &s);
+    if (sr.bad) {
+      st = SEER_EPROTO;
+      break;
+    }
+    if (!sr.cut)
       break;
   }
   if (st == SEER_OK && s.code != 0) {
     st = o8i_fail(c, &s);
   } else if (st == SEER_OK) {
     /* Whole now: take the parts out. */
-    size_t pos = 0;
-    if (buf.buf[0] == TTI_LOB) {
-      uint8_t *data = NULL;
-      size_t dlen = 0;
-      bool complete = false;
-      fv2_parse_lob_chunks(buf.buf, buf.len, &data, &dlen, &complete);
-      if (content != NULL)
-        seer_writer_bytes(content, data, dlen);
-      free(data);
-      pos = buf.buf[1] == 0xFE ? 2 : 1;
-      while (pos < buf.len && buf.buf[pos] != 0)
-        pos += 1 + (size_t)buf.buf[pos];
-      pos++;
-    }
-    if (pos < buf.len && buf.buf[pos] == TTI_RPA && pos + 3 <= buf.len) {
-      size_t n = (size_t)buf.buf[pos + 1] << 8 | buf.buf[pos + 2];
-      if (loc != NULL && pos + 3 + n <= buf.len) {
-        *loc = malloc(2 + n);
-        if (*loc != NULL) {
-          memcpy(*loc, buf.buf + pos + 1, 2 + n); /* its length and the bytes */
-          *loclen = 2 + n;
-        }
-      }
-      if (amount != NULL && has_amount && pos + 3 + n + 4 <= buf.len) {
-        const uint8_t *a = buf.buf + pos + 3 + n;
-        *amount =
-            (uint32_t)a[0] | (uint32_t)a[1] << 8 | (uint32_t)a[2] << 16 | (uint32_t)a[3] << 24;
-      }
-    }
+    if (content != NULL)
+      seer_writer_bytes(content, lm.data.p, lm.data.n);
+    if (loc != NULL && rm.locator.p != NULL)
+      *loc = seer_lobop_reply_locator(&rm, loclen); /* its length and the bytes */
+    if (amount != NULL && has_amount)
+      *amount = (uint32_t)rm.amount;
     if (content != NULL && !seer_writer_ok(content))
       st = SEER_ENOMEM;
   }
+  seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
+  seer_schema_free(SEER_LOBOPS_REPLY_SCHEMA, &rm);
   o8i_status_free(&s);
   seer_writer_free(&buf);
   return st;
@@ -8124,28 +8049,49 @@ static const uint8_t FV2_EMPTY_LOCATOR[86] = {0x00, 0x54};
 static SeerStatus fv2_create_temp(SeerConn *c, uint8_t type, uint8_t loc[86])
 {
   bool blob = type == ORA_TYPE_BLOB;
-  const uint8_t mid[] = {
-      0x00, 0x01, 0x0a, 0x01, blob ? 0x00 : 0x01, 0x01, type, 0x01, 0x01, 0x01, 0x02, 0x01,
-      0x10, 0x00, 0x00, 0x00};
-  SeerWriter tw;
-  if (!seer_writer_init(&tw, 16))
-    return SEER_ENOMEM;
-  seer_enc_sb4(&tw, c->db_charset ? c->db_charset : 873u); /* the database charset */
-  seer_enc_sb4(&tw, 10);                                   /* the duration again */
+  /* As ojdbc14 sends it: the duration (10) in the destination length, the
+   * charset form and the LOB type in the short offsets - each with its length
+   * byte, `01 00` for a BLOB's form - the charset, null-LOB and amount
+   * pointers set; the database charset, then the duration again as the
+   * amount. */
+  SeerLobopMsg m = {
+      .dst_len = 10,
+      .explicit_short = 1,
+      .short_src_off = blob ? 0 : 1,
+      .short_dst_off = type,
+      .charset_ptr = 1,
+      .short_amount_ptr = 1,
+      .null_lob_ptr = 1,
+      .op = LOB_OP_CREATE_TEMP,
+      .charset = c->db_charset ? c->db_charset : 873u,
+      .has_amount = 1,
+      .amount = 10,
+  };
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  SeerStatus st = seer_writer_ok(&tw)
-                      ? fv2_lobop_send_raw(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, mid,
-                                           sizeof mid, tw.buf, tw.len, &resp, &rlen)
-                      : SEER_ENOMEM;
-  seer_writer_free(&tw);
+  SeerStatus st =
+      fv2_lobop_send(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, &m, NULL, 0, &resp, &rlen);
+  /* The reply: the new locator, 84 bytes, as the RPA schema reads it. */
+  SeerLobopReplyMsg rm = {0};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerReader r;
+  if (st == SEER_OK && rlen > 0)
+    seer_reader_init(&r, resp + 1, rlen - 1);
   if (st == SEER_OK &&
-      (rlen < 3 + 84 || resp[0] != TTI_RPA || resp[1] != 0x00 || resp[2] != 0x54)) {
+      (rlen < 1 || resp[0] != TTI_RPA ||
+       !seer_schema_decode(SEER_LOBOPS_REPLY_SCHEMA, &cx, &r, &rm) || rm.locator.n != 84)) {
     fv2_set_error(c, resp, rlen);
     st = SEER_EDB;
   }
-  if (st == SEER_OK)
-    memcpy(loc, resp + 1, 86); /* 00 54 and the body */
+  if (st == SEER_OK) {
+    size_t n = 0;
+    uint8_t *full = seer_lobop_reply_locator(&rm, &n); /* 00 54 and the body */
+    if (full == NULL)
+      st = SEER_ENOMEM;
+    else
+      memcpy(loc, full, 86);
+    free(full);
+  }
   free(resp);
   return st;
 }

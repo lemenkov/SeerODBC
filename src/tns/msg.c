@@ -5,6 +5,9 @@
  */
 #include "msg.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "tns_consts.h"
 
 #define THIN SEER_CODEC_THIN
@@ -123,13 +126,48 @@ const SeerField SEER_LOB_DATA_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_LOBOPS_REPLY_SCHEMA[] = {
+    SEER_F(SF_BE2, SeerLobopReplyMsg, loc_len),
+    {.kind = SF_RAW,
+     .off = offsetof(SeerLobopReplyMsg, locator),
+     .arg = offsetof(SeerLobopReplyMsg, loc_len)},
+    IF_SET(SF_N4, SeerLobopReplyMsg, amount, has_amount),
+    SEER_END,
+};
+
+uint8_t *seer_lobop_reply_locator(const SeerLobopReplyMsg *m, size_t *n)
+{
+  uint8_t *loc = malloc(2 + m->locator.n);
+  if (loc == NULL)
+    return NULL;
+  loc[0] = (uint8_t)(m->locator.n >> 8);
+  loc[1] = (uint8_t)m->locator.n;
+  memcpy(loc + 2, m->locator.p, m->locator.n);
+  *n = 2 + m->locator.n;
+  return loc;
+}
+
 const SeerField SEER_LOBOPS_SCHEMA[] = {
     SEER_F(SF_U8, SeerLobopMsg, src_ptr),
     SEER_F(SF_N4, SeerLobopMsg, src_len),
     SEER_F(SF_U8, SeerLobopMsg, dst_ptr),
     SEER_F(SF_N4, SeerLobopMsg, dst_len),
-    SEER_F(SF_N4, SeerLobopMsg, short_src_off),
-    SEER_F(SF_N4, SeerLobopMsg, short_dst_off),
+    {.kind = SF_N4,
+     .flags = SG_IF_CLEAR,
+     .off = offsetof(SeerLobopMsg, short_src_off),
+     .if_off = offsetof(SeerLobopMsg, explicit_short)},
+    {.kind = SF_U8L,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerLobopMsg, short_src_off),
+     .if_off = offsetof(SeerLobopMsg, explicit_short)},
+    {.kind = SF_N4,
+     .flags = SG_IF_CLEAR,
+     .off = offsetof(SeerLobopMsg, short_dst_off),
+     .if_off = offsetof(SeerLobopMsg, explicit_short)},
+    {.kind = SF_U8L,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerLobopMsg, short_dst_off),
+     .if_off = offsetof(SeerLobopMsg, explicit_short)},
     SEER_F(SF_U8, SeerLobopMsg, charset_ptr),
     SEER_F(SF_U8, SeerLobopMsg, short_amount_ptr),
     SEER_F(SF_U8, SeerLobopMsg, null_lob_ptr),

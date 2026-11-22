@@ -98,7 +98,9 @@ static SeerStatus accumulate_lob_content(const uint8_t *resp, size_t rlen, bool 
       break;
     (void)seer_reader_u8(&r); /* TTI_LOB token */
     SeerLobDataMsg m = {0};
-    SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN, .wide_chunks = sb4_chunks};
+    SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                        .fv = TTC_FIELD_VERSION_10_2,
+                        .wide_chunks = sb4_chunks};               /* 10g+ only */
     if (!seer_schema_decode(SEER_LOB_DATA_SCHEMA, &cx, &r, &m)) { /* #395 */
       seer_schema_free(SEER_LOB_DATA_SCHEMA, &m);
       truncated = true;

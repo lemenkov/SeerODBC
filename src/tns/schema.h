@@ -27,15 +27,17 @@ typedef enum { SEER_CODEC_THIN = 1, SEER_CODEC_O8I = 2 } SeerCodecId;
 
 typedef enum {
   SF_END,
-  SF_U8,     /* one byte, every codec */
-  SF_N1,     /* a small integer: thin variable-width, 8i one byte */
-  SF_N2,     /* thin variable-width, 8i a ub2 little-endian */
-  SF_N4,     /* thin variable-width, 8i a ub4 little-endian */
-  SF_BE2,    /* a big-endian ub2 whatever the codec */
-  SF_PAD,    /* `arg` bytes nobody reads: zeros written, skipped read */
-  SF_VALUE,  /* bytes with their length: thin ub1 / 0xFE chunks, 8i the same at ub1 */
-  SF_RAW,    /* bytes as they are, as many as the member at `arg` (an int64_t) says */
-  SF_COUNTED /* a count, then (when > 0) a SF_VALUE: thin's bytes-with-length */
+  SF_U8,      /* one byte, every codec */
+  SF_N1,      /* a small integer: thin variable-width, 8i one byte */
+  SF_N2,      /* thin variable-width, 8i a ub2 little-endian */
+  SF_N4,      /* thin variable-width, 8i a ub4 little-endian */
+  SF_BE2,     /* a big-endian ub2 whatever the codec */
+  SF_PAD,     /* `arg` bytes nobody reads: zeros written, skipped read */
+  SF_VALUE,   /* bytes with their length: thin ub1 / 0xFE chunks, 8i the same at ub1 */
+  SF_RAW,     /* bytes as they are, as many as the member at `arg` (an int64_t) says */
+  SF_COUNTED, /* a count, then (when > 0) a SF_VALUE: thin's bytes-with-length */
+  SF_U8L      /* a byte, written by thin with its length byte even when 0 (`01 00`,
+               * as ojdbc14 writes it), one byte on 8i */
 } SeerFieldKind;
 
 /* Guards: which codecs carry the field (0 = all); the field-version range it
@@ -46,6 +48,7 @@ typedef enum {
  * reply that hasn't brought it yet is short). */
 #define SG_IF_SET 0x02
 #define SG_IF_MORE 0x04
+#define SG_IF_CLEAR 0x08 /* the member at `if_off` must be zero */
 
 typedef struct {
   uint8_t kind;
@@ -80,7 +83,14 @@ typedef struct {
 void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const void *msg,
                         SeerWriter *w);
 
-/* Read `msg` by `schema`; false when the bytes ran out (the reader latches). */
+/* How a decode ended: whole, short (the bytes ran out - a reply still
+ * arriving), or bad (bytes no message has). */
+typedef enum { SCH_OK, SCH_SHORT, SCH_BAD } SeerSchemaResult;
+
+SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchemaCtx *cx,
+                                       SeerReader *r, void *msg);
+
+/* Read `msg` by `schema`; false when it didn't decode whole. */
 bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerReader *r, void *msg);
 
 /* Free the owned SeerBytes members a decode left in `msg`. */

@@ -36,14 +36,31 @@ typedef struct {
   int64_t loc_prefixed, loc_len;        /* thin: a ub2-prefixed locator */
   SeerBytes locator;
   int64_t charset, has_amount, amount;
+  /* 9i's CREATE_TEMP: the short offsets each with its length byte, `01 00`
+   * for a 0 (ojdbc14) */
+  int64_t explicit_short;
 } SeerLobopMsg;
 
 extern const SeerField SEER_LOBOPS_SCHEMA[];
 
+/* A LOBOPS reply's RPA, after its token: the locator as the server now has it
+ * (a big-endian ub2 length and the bytes), then the amount when the call
+ * asked for one - GETLEN's and READ's length, FILE_OPEN's mode. The same on
+ * every path (seerdb _O7_LOBOPS_REPLY), only the amount's width per codec. */
+typedef struct {
+  int64_t loc_len;
+  SeerBytes locator;
+  int64_t has_amount, amount;
+} SeerLobopReplyMsg;
+
+extern const SeerField SEER_LOBOPS_REPLY_SCHEMA[];
+
+/* The locator as 8i / 9i keep it: its ub2 length and the bytes, malloc'd. */
+uint8_t *seer_lobop_reply_locator(const SeerLobopReplyMsg *m, size_t *n);
+
 /* A LOB data message's content (TTI_LOB, after its token): a value, chunked
- * past 252 bytes - on thin. 8i and 9i frame it as ub1 chunks to a zero
- * whether or not it starts with 0xFE (#395 spike finding: their readers
- * keep that form). */
+ * past 252 bytes - by ub1 chunks on 8i and 9i (whose servers always chunk it:
+ * 963 of 963 in the replay corpus) and by sb4 ones from 12.1. */
 typedef struct {
   SeerBytes data;
 } SeerLobDataMsg;
