@@ -253,30 +253,40 @@ static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b, bool
     b->n = b->p != NULL ? lb : 0;
     return b->p != NULL;
   }
-  SeerWriter acc;
-  if (!seer_writer_init(&acc, 256))
-    return false;
+  /* Two passes. The first hops over the chunks for the value's length and
+   * copies nothing, so a reply still arriving - read again from its start
+   * as each packet comes - costs no more than the hops; the second copies
+   * the chunks into one buffer of that length. */
   bool wide = cx->codec == SEER_CODEC_THIN && cx->wide_chunks;
+  size_t start = r->pos;
+  size_t total = 0;
   for (;;) {
     int64_t cl = wide ? seer_dec_sb4(r) : seer_reader_u8(r);
     if (cl < 0) { /* a negative chunk length: no value */
-      seer_writer_free(&acc);
       *bad = true;
       return false;
     }
     if (!seer_reader_ok(r) || cl == 0)
       break;
-    const uint8_t *p = seer_reader_bytes(r, (size_t)cl);
-    if (p == NULL)
+    if (seer_reader_bytes(r, (size_t)cl) == NULL)
       break;
-    seer_writer_bytes(&acc, p, (size_t)cl);
+    total += (size_t)cl;
   }
-  if (!seer_reader_ok(r) || !seer_writer_ok(&acc)) {
-    seer_writer_free(&acc);
+  if (!seer_reader_ok(r))
     return false;
+  uint8_t *out = malloc(total > 0 ? total : 1);
+  if (out == NULL)
+    return false;
+  r->pos = start;
+  for (size_t got = 0;;) {
+    size_t cl = (size_t)(wide ? seer_dec_sb4(r) : seer_reader_u8(r));
+    if (cl == 0)
+      break;
+    memcpy(out + got, seer_reader_bytes(r, cl), cl);
+    got += cl;
   }
-  b->p = acc.buf;
-  b->n = acc.len;
+  b->p = out;
+  b->n = total;
   b->owned = 1;
   return true;
 }
