@@ -165,6 +165,23 @@ typedef struct {
 
 extern const SeerField SEER_RXH_SCHEMA[];
 
+/* The return parameters (TTI_RPA, after its token) ahead of a status: a
+ * count (a ub2 on 8i) and that many ub4 parameters, then the transaction id
+ * (a ub2 length and the bytes), the session's changed settings as keyword
+ * pairs (a count; each a text and a binary value, counted, and a ub2
+ * keyword - an ALTER SESSION returns its NLS values), and on thin a
+ * registration (a length and the bytes). The same on 10g+ and 8i
+ * (seerdb _O8I_RPA); 9i's count grows with the instance, so it reads its own. */
+typedef struct {
+  int64_t nparams, txn_len;
+  SeerBytes txn;
+  int64_t npairs, reg_len;
+  SeerBytes reg;
+} SeerRpaMsg;
+
+extern const SeerField SEER_RPA_HEAD_SCHEMA[]; /* the count and the parameters */
+extern const SeerField SEER_RPA_TAIL_SCHEMA[]; /* the transaction id to the end */
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

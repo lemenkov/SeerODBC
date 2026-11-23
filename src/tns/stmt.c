@@ -1295,30 +1295,16 @@ static void skip_capability_block(SeerReader *r)
  * back to skipping zero bytes. Mirrors seerdb's _skip_rpa_tail_fields. */
 static bool skip_rpa_tail_fields(SeerReader *r, const SeerStmt *stmt)
 {
+  /* SEER_RPA_TAIL_SCHEMA (#398), on a copy */
   SeerReader t = *r;
-  int64_t txl = seer_dec_sb4(&t);
-  if (txl < 0 || (txl > 0 && seer_reader_bytes(&t, (size_t)txl) == NULL))
-    return false;
-  int64_t npairs = seer_dec_sb4(&t);
-  if (npairs < 0 || npairs > 1024)
-    return false;
-  for (int64_t i = 0; i < npairs && seer_reader_ok(&t); i++) {
-    for (int part = 0; part < 2; part++) { /* text value, then binary value */
-      if (seer_dec_sb4(&t) > 0) {
-        uint8_t *v = NULL;
-        size_t vl = 0;
-        SeerStatus st = seer_dec_dalc(&t, &v, &vl);
-        free(v);
-        if (st != SEER_OK)
-          return false;
-      }
-    }
-    (void)seer_dec_sb4(&t); /* keyword number */
-  }
-  int64_t reglen = seer_dec_sb4(&t);
-  if (reglen < 0 || (reglen > 0 && seer_reader_bytes(&t, (size_t)reglen) == NULL))
-    return false;
-  if (!seer_reader_ok(&t))
+  SeerSchemaCtx cx =
+      stmt != NULL ? seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version)
+                   : seer_msg_ctx(0, TTC_FIELD_VERSION_10_2, TTC_FIELD_VERSION_10_2);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerRpaMsg m = {0};
+  bool whole = seer_schema_decode(SEER_RPA_TAIL_SCHEMA, &cx, &t, &m);
+  seer_schema_free(SEER_RPA_TAIL_SCHEMA, &m);
+  if (!whole || m.txn_len < 0 || m.npairs < 0 || m.npairs > 1024 || m.reg_len < 0)
     return false;
   bool rowcount_tail = stmt != NULL && stmt->want_dml_rowcounts && stmt->dml_rowcounts == NULL;
   if (seer_reader_remaining(&t) > 0 && !is_known_token(t.buf[t.pos]) && !rowcount_tail)
@@ -1338,13 +1324,17 @@ static SeerStatus skip_rpa(SeerReader *r, SeerStmt *stmt)
    * would stop short and decode the OER off by those bytes. Mirrors seerdb's
    * decode_token_rpa_piggyback (#181). */
   bool break_on_token = (stmt == NULL) || stmt->conn->field_version < TTC_FIELD_VERSION_10_2;
-  int64_t num = seer_dec_sb4(r);
-  for (int64_t i = 0; i < num && seer_reader_ok(r); i++) {
-    if (seer_reader_remaining(r) == 0)
-      break;
-    if (break_on_token && is_known_token(r->buf[r->pos]))
-      break;
-    (void)seer_dec_sb4(r);
+  if (break_on_token) {
+    int64_t num = seer_dec_sb4(r);
+    for (int64_t i = 0; i < num && seer_reader_ok(r); i++) {
+      if (seer_reader_remaining(r) == 0 || is_known_token(r->buf[r->pos]))
+        break;
+      (void)seer_dec_sb4(r);
+    }
+  } else { /* SEER_RPA_HEAD_SCHEMA (#398) */
+    SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+    SeerRpaMsg m = {0};
+    (void)seer_schema_decode(SEER_RPA_HEAD_SCHEMA, &cx, r, &m);
   }
   if (break_on_token || !skip_rpa_tail_fields(r, stmt))
     while (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0)
@@ -5939,26 +5929,27 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
   memset(s, 0, sizeof *s);
   if (o8r_has(r, 1) && r->b[r->pos] == TTI_RPA) {
     r->pos++;
-    uint32_t cnt = o8r_le16(r);
-    for (uint32_t i = 0; i < cnt && !r->cut; i++)
-      (void)o8r_le32(r);
-    /* Two ub2 counts, zero after a DML, where seerdb's _O8I_RPA has four
-     * zero bytes: a transaction id's length (0 in every reply seen), and the
-     * session's changed settings as keyword pairs - an ALTER SESSION returns
-     * its 16 NLS values (8.1.7, 2026-11-14). A pair is a ub4 key length and
-     * the key, a ub4 value length and the value (each a ub1 length and the
-     * bytes, none when the length is 0), and the ub2 keyword: 16 AMERICAN, 9
-     * AMERICA, ..., 7 the date format. Read as four bytes, the status behind
-     * an ALTER SESSION was not found. */
-    o8r_skip(r, o8r_le16(r));
-    uint32_t pairs = o8r_le16(r);
-    for (uint32_t i = 0; i < pairs && !r->cut && !r->bad; i++) {
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-      (void)o8r_le16(r);
+    /* SEER_RPA_HEAD / _TAIL_SCHEMA at 8i's widths (#398): the parameters,
+     * the transaction id (0 in every reply seen) and the changed settings -
+     * an ALTER SESSION returns its 16 NLS values (8.1.7, 2026-11-14); read as
+     * four zero bytes, the status behind one was not found. */
+    SeerReader rr;
+    seer_reader_init(&rr, r->b + r->pos, r->n - r->pos);
+    SeerSchemaCtx rcx = seer_msg_ctx(1, 0, 0);
+    SeerRpaMsg rm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_RPA_HEAD_SCHEMA, &rcx, &rr, &rm);
+    if (res == SCH_OK)
+      res = seer_schema_decode_ex(SEER_RPA_TAIL_SCHEMA, &rcx, &rr, &rm);
+    seer_schema_free(SEER_RPA_TAIL_SCHEMA, &rm);
+    if (res == SCH_SHORT) {
+      r->cut = true;
+      return;
     }
+    if (res == SCH_BAD) {
+      r->bad = true;
+      return;
+    }
+    r->pos += rr.pos;
   }
   if (!o8r_has(r, 1))
     return; /* cut: the caller reads on until the status arrives */

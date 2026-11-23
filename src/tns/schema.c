@@ -124,6 +124,8 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
         seer_writer_u8(w, 1);
       seer_writer_u8(w, (uint8_t)*cnum(msg, f->off));
       break;
+    case SF_EACH: /* decode only */
+      break;
     case SF_INTS: {
       const int *v = *(const int *const *)((const char *)msg + f->off);
       int64_t n = *cnum(msg, f->arg);
@@ -256,6 +258,22 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
     case SF_INTS: /* encode only: nothing the client reads has one */
       bad = true;
       break;
+    case SF_EACH: {
+      int64_t n = *num(msg, f->arg);
+      unsigned char scratch[256];
+      if (n < 0 || n > 1000000 || f->subsize > sizeof scratch) {
+        bad = true;
+        break;
+      }
+      for (int64_t i = 0; i < n && !bad && seer_reader_ok(r); i++) {
+        memset(scratch, 0, f->subsize);
+        SeerSchemaResult res = seer_schema_decode_ex(f->sub, cx, r, scratch);
+        seer_schema_free(f->sub, scratch);
+        if (res == SCH_BAD)
+          bad = true;
+      }
+      break;
+    }
     case SF_RAW: {
       SeerBytes *b = (SeerBytes *)((char *)msg + f->off);
       size_t n = (size_t)*num(msg, f->arg);

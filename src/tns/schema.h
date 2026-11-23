@@ -38,8 +38,11 @@ typedef enum {
   SF_COUNTED, /* a count, then (when > 0) a SF_VALUE: thin's bytes-with-length */
   SF_U8L,     /* a byte, written by thin with its length byte even when 0 (`01 00`,
                * as ojdbc14 writes it), one byte on 8i */
-  SF_INTS     /* an N4 count, then that many N4s: the member is a `const int *`,
+  SF_INTS,    /* an N4 count, then that many N4s: the member is a `const int *`,
                * `arg` the offsetof its int64_t count; encode only */
+  SF_EACH     /* the sub-schema `sub` as many times as the int64_t member at
+               * `arg` says, each item read into a scratch message of `subsize`
+               * bytes and dropped: what the client passes over; decode only */
 } SeerFieldKind;
 
 /* Guards: which codecs carry the field (0 = all); the field-version range it
@@ -53,16 +56,18 @@ typedef enum {
 #define SG_IF_CLEAR 0x08 /* the member at `if_off` must be zero */
 #define SG_FF_NULL 0x10  /* SF_U8: 0xFF reads as 0, a NULL marker */
 
-typedef struct {
+typedef struct SeerField {
   uint8_t kind;
   uint8_t codecs;
   uint8_t fv_min, fv_max;
   uint8_t sfv_min;
   uint8_t flags;
-  uint16_t off;    /* the member, offsetof the message struct */
-  uint16_t arg;    /* SF_PAD: bytes; SF_RAW: offsetof its length member;
-                    * SF_COUNTED: the count's kind (SF_N2 / SF_N4, 0 = N4) */
-  uint16_t if_off; /* SG_IF_SET: offsetof the member that must be non-zero */
+  uint16_t off;                /* the member, offsetof the message struct */
+  uint16_t arg;                /* SF_PAD: bytes; SF_RAW: offsetof its length member;
+                                * SF_COUNTED: the count's kind (SF_N2 / SF_N4, 0 = N4) */
+  uint16_t if_off;             /* SG_IF_SET: offsetof the member that must be non-zero */
+  const struct SeerField *sub; /* SF_EACH: the item's schema */
+  uint16_t subsize;            /* SF_EACH: the item's message size */
 } SeerField;
 
 /* A byte string a decode points into the message for (owned = 0), or one it

@@ -201,6 +201,48 @@ const SeerField SEER_RXH_SCHEMA[] = {
     SEER_F(SF_COUNTED, SeerRxhMsg, rowid), SEER_END,
 };
 
+/* An RPA's parameter, and one of its keyword pairs: read and passed over. */
+typedef struct {
+  int64_t v;
+} SeerN4Item;
+static const SeerField N4_ITEM[] = {SEER_F(SF_N4, SeerN4Item, v), SEER_END};
+
+typedef struct {
+  SeerBytes text, binary;
+  int64_t keyword;
+} SeerRpaPair;
+static const SeerField RPA_PAIR[] = {
+    SEER_F(SF_COUNTED, SeerRpaPair, text),
+    SEER_F(SF_COUNTED, SeerRpaPair, binary),
+    SEER_F(SF_N2, SeerRpaPair, keyword),
+    SEER_END,
+};
+
+const SeerField SEER_RPA_HEAD_SCHEMA[] = {
+    SEER_F(SF_N2, SeerRpaMsg, nparams),
+    {.kind = SF_EACH,
+     .arg = offsetof(SeerRpaMsg, nparams),
+     .sub = N4_ITEM,
+     .subsize = sizeof(SeerN4Item)},
+    SEER_END,
+};
+
+const SeerField SEER_RPA_TAIL_SCHEMA[] = {
+    SEER_F(SF_N2, SeerRpaMsg, txn_len),
+    {.kind = SF_RAW, .off = offsetof(SeerRpaMsg, txn), .arg = offsetof(SeerRpaMsg, txn_len)},
+    SEER_F(SF_N2, SeerRpaMsg, npairs),
+    {.kind = SF_EACH,
+     .arg = offsetof(SeerRpaMsg, npairs),
+     .sub = RPA_PAIR,
+     .subsize = sizeof(SeerRpaPair)},
+    SEER_FC(SF_N4, THIN, SeerRpaMsg, reg_len),
+    {.kind = SF_RAW,
+     .codecs = THIN,
+     .off = offsetof(SeerRpaMsg, reg),
+     .arg = offsetof(SeerRpaMsg, reg_len)},
+    SEER_END,
+};
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),
