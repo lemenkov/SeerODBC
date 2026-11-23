@@ -1119,21 +1119,29 @@ static SeerStatus record_pending_lob(SeerStmt *stmt, size_t row, int col, uint8_
  * byte string. On a non-NULL value *img is a malloc'd image (caller owns). */
 static SeerStatus read_object_image(SeerReader *r, uint8_t **img, size_t *imglen)
 {
+  /* SEER_OBJECT_SCHEMA (#398); thin, 9i's included - the chunk width the
+   * reader's */
   *img = NULL;
   *imglen = 0;
-  for (int k = 0; k < 3; k++) { /* type OID, object OID, snapshot */
-    int64_t n = seer_dec_sb4(r);
-    if (n > 0)
-      seer_skip_chunked(r);
-  }
-  (void)seer_dec_sb4(r);             /* version */
-  int64_t present = seer_dec_sb4(r); /* image length (gate) */
-  (void)seer_dec_sb4(r);             /* flags */
-  if (!seer_reader_ok(r))
+  SeerSchemaCtx cx = {
+      .codec = SEER_CODEC_THIN, .fv = TTC_FIELD_VERSION_10_2, .wide_chunks = r->sb4_chunks};
+  SeerObjectMsg m = {0};
+  if (!seer_schema_decode(SEER_OBJECT_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_OBJECT_SCHEMA, &m);
     return SEER_EPROTO;
-  if (present == 0)
-    return SEER_OK; /* NULL object */
-  return seer_dec_dalc(r, img, imglen);
+  }
+  SeerStatus st = SEER_OK;
+  if (m.image_len != 0 && m.image.n > 0) { /* 0: a NULL object */
+    *img = malloc(m.image.n);
+    if (*img == NULL)
+      st = SEER_ENOMEM;
+    else {
+      memcpy(*img, m.image.p, m.image.n);
+      *imglen = m.image.n;
+    }
+  }
+  seer_schema_free(SEER_OBJECT_SCHEMA, &m);
+  return st;
 }
 
 /* Record an ADT cell to decode after the result set is fully fetched (its
@@ -6182,23 +6190,27 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell,
      * PROTOCOL.md §19.17c, #168). Read as a plain value it came back as raw
      * framing bytes and the rows after it were lost. The image is kept for
      * o8i_resolve_lobs to decode by the type's layout. */
-    for (int k = 0; k < 3; k++)
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-    (void)o8r_le16(r); /* version */
-    uint32_t imglen = o8r_le32(r);
-    (void)o8r_le16(r); /* flags */
-    SeerWriter img;
-    if (!seer_writer_init(&img, 64))
-      return SEER_ENOMEM;
-    if (imglen > 0)
-      o8r_value(r, &img);
+    /* SEER_OBJECT_SCHEMA at 8i's widths, then the cell's trailer (#398) */
+    SeerReader sr;
+    seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    SeerObjectMsg om = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_OBJECT_SCHEMA, &cx, &sr, &om);
+    r->pos += sr.pos;
+    if (res != SCH_OK) {
+      seer_schema_free(SEER_OBJECT_SCHEMA, &om);
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else
+        r->bad = true;
+      return SEER_OK;
+    }
     bool null = o8r_le16(r) == 0xFFFF;
     o8r_skip(r, 2); /* return code */
     SeerStatus st = SEER_OK;
-    if (!r->cut && !r->bad && !null && imglen > 0 && seer_writer_ok(&img))
-      st = cell_set_bytes(cell, img.buf, img.len, true);
-    seer_writer_free(&img);
+    if (!r->cut && !r->bad && !null && om.image_len > 0 && om.image.n > 0)
+      st = cell_set_bytes(cell, om.image.p, om.image.n, true);
+    seer_schema_free(SEER_OBJECT_SCHEMA, &om);
     return st;
   }
   if (t == ORA_TYPE_REFCURSOR) {
@@ -7217,28 +7229,30 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
      * without its trailer (§19.17c, #172). The image is decoded by the
      * type's layout once the reply is in. Read as a plain value it left the
      * status misaligned and the block's cursor id wrong. */
-    for (int k = 0; k < 3; k++)
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-    (void)o8r_le16(r); /* version */
-    uint32_t imglen = o8r_le32(r);
-    (void)o8r_le16(r); /* flags */
-    SeerWriter img;
-    if (!seer_writer_init(&img, 64)) {
-      r->bad = true;
-      return;
-    }
-    if (imglen > 0)
-      o8r_value(r, &img);
+    /* SEER_OBJECT_SCHEMA at 8i's widths, no trailer (#398) */
+    SeerReader sr;
+    seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    SeerObjectMsg om = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_OBJECT_SCHEMA, &cx, &sr, &om);
     free(b->out_image);
     b->out_image = NULL;
     b->out_imagelen = 0;
-    if (!r->cut && !r->bad && imglen > 0 && seer_writer_ok(&img)) {
-      b->out_image = img.buf;
-      b->out_imagelen = img.len;
+    if (res == SCH_OK) {
+      r->pos += sr.pos;
+      if (om.image_len > 0 && om.image.n > 0) {
+        b->out_image = malloc(om.image.n);
+        if (b->out_image != NULL) {
+          memcpy(b->out_image, om.image.p, om.image.n);
+          b->out_imagelen = om.image.n;
+        }
+      }
+    } else if (res == SCH_SHORT) {
+      r->cut = true;
     } else {
-      seer_writer_free(&img);
+      r->bad = true;
     }
+    seer_schema_free(SEER_OBJECT_SCHEMA, &om);
     return;
   }
   if (b->oac_type == ORA_TYPE_REF && b->oac_override != NULL) {

@@ -243,6 +243,20 @@ const SeerField SEER_RPA_TAIL_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_OBJECT_SCHEMA[] = {
+    SEER_F(SF_COUNTED, SeerObjectMsg, type_oid),
+    SEER_F(SF_COUNTED, SeerObjectMsg, oid),
+    SEER_F(SF_COUNTED, SeerObjectMsg, snapshot),
+    SEER_F(SF_N2, SeerObjectMsg, version),
+    SEER_F(SF_N4, SeerObjectMsg, image_len),
+    SEER_F(SF_N2, SeerObjectMsg, flags),
+    {.kind = SF_VALUE,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerObjectMsg, image),
+     .if_off = offsetof(SeerObjectMsg, image_len)},
+    SEER_END,
+};
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),

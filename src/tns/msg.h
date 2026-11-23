@@ -182,6 +182,20 @@ typedef struct {
 extern const SeerField SEER_RPA_HEAD_SCHEMA[]; /* the count and the parameters */
 extern const SeerField SEER_RPA_TAIL_SCHEMA[]; /* the transaction id to the end */
 
+/* An object or collection value's frame (python-oracledb read_dbobject;
+ * seerdb _OBJECT_FRAME): the type OID (on 9i a 36-byte type block), the
+ * object OID and the snapshot, each counted; a ub2 version, the image's
+ * length (0 for a NULL object), ub2 flags, then the image as a value. The
+ * same on every path; what follows it - a row cell's trailer, an OUT's
+ * return code - is the caller's. */
+typedef struct {
+  SeerBytes type_oid, oid, snapshot;
+  int64_t version, image_len, flags;
+  SeerBytes image;
+} SeerObjectMsg;
+
+extern const SeerField SEER_OBJECT_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 
