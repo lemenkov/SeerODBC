@@ -169,6 +169,18 @@ typedef struct {
 
 extern const SeerField SEER_FUN_HEAD_SCHEMA[];
 
+/* The bodies after a function header of three thin-only calls: the
+ * begin-pipeline piggyback (func 199, §32) - the error set's id and mode,
+ * then the pipeline's mode; the pipeline end (func 200) - the pipeline's id;
+ * the session-state piggyback (func 176, §35) - the state. */
+typedef struct {
+  int64_t error_set_id, error_set_mode, mode, pipeline_id, state;
+} SeerThinCallMsg;
+
+extern const SeerField SEER_PIPELINE_BEGIN_SCHEMA[];
+extern const SeerField SEER_PIPELINE_END_SCHEMA[];
+extern const SeerField SEER_SESSION_STATE_SCHEMA[];
+
 /* Two-phase commit (seerdb PROTOCOL.md §28): TXN_SWITCH (begin/end) and
  * TXN_CHANGE_STATE (prepare/commit/abort) share a head - the operation, the
  * stored context's pointer and length, and the xid's descriptor (format id,

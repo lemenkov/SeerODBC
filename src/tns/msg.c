@@ -435,6 +435,23 @@ const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_PIPELINE_BEGIN_SCHEMA[] = {
+    SEER_F(SF_N4, SeerThinCallMsg, error_set_id),
+    SEER_F(SF_U8, SeerThinCallMsg, error_set_mode),
+    SEER_F(SF_U8, SeerThinCallMsg, mode),
+    SEER_END,
+};
+
+const SeerField SEER_PIPELINE_END_SCHEMA[] = {
+    SEER_F(SF_N4, SeerThinCallMsg, pipeline_id),
+    SEER_END,
+};
+
+const SeerField SEER_SESSION_STATE_SCHEMA[] = {
+    SEER_F(SF_N4, SeerThinCallMsg, state),
+    SEER_END,
+};
+
 #define T SeerTpcMsg
 #define TPC_HEAD                                                                                   \
   SEER_F(SF_N4, T, op), SEER_F(SF_U8, T, ctx_ptr), SEER_F(SF_N4, T, ctx_len),                      \

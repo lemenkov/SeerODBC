@@ -503,6 +503,16 @@ SeerStatus seer_ttc_recv(SeerConn *c, uint8_t **out, size_t *outlen)
   }
 }
 
+/* A function call's header by SEER_FUN_HEAD_SCHEMA: the message type (TTI_FUN
+ * or the piggyback), the function, the sequence number, and from fv24 the
+ * call's token. */
+static void fun_head(SeerWriter *w, const SeerSchemaCtx *cx, uint8_t type, uint8_t function,
+                     uint8_t seq, uint32_t token)
+{
+  SeerFunHeadMsg h = {.type = type, .function = function, .seq = seq, .call_token = token};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, cx, &h, w);
+}
+
 /* -------------------------------------------------- request pipelining (§32) */
 
 /* Build the begin-pipeline piggyback (func 199) into `w`: it rides the first
@@ -510,14 +520,10 @@ SeerStatus seer_ttc_recv(SeerConn *c, uint8_t **out, size_t *outlen)
  * mode. Consumes a sequence number. */
 void seer_ttc_pipeline_begin(SeerConn *c, SeerWriter *w, uint32_t token, uint8_t mode)
 {
-  seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-  seer_writer_u8(w, TNS_FUNC_PIPELINE_BEGIN);
-  seer_writer_u8(w, seer_ttc_next_seq(c));
-  if (c->field_version > TTC_FIELD_VERSION_23_1)
-    seer_enc_sb4(w, token);
-  seer_enc_sb4(w, 0);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, mode);
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  fun_head(w, &cx, TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_PIPELINE_BEGIN, seer_ttc_next_seq(c), token);
+  SeerThinCallMsg m = {.mode = mode};
+  seer_schema_encode(SEER_PIPELINE_BEGIN_SCHEMA, &cx, &m, w);
 }
 
 /* Build the pipeline-end message (func 200) into `w`, closing the burst. Uses an
@@ -528,7 +534,9 @@ void seer_ttc_pipeline_end(SeerConn *c, SeerWriter *w)
   c->pipeline_token = 0;
   seer_ttc_fun_header(c, w, TNS_FUNC_PIPELINE_END);
   c->pipeline_token = saved;
-  seer_enc_sb4(w, 0);
+  SeerThinCallMsg m = {0};
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_PIPELINE_END_SCHEMA, &cx, &m, w);
 }
 
 /* Send one pipelined op's request as DATA packet(s) with explicit data flags: an
@@ -699,12 +707,8 @@ void seer_ttc_fun_header(SeerConn *c, SeerWriter *w, uint8_t opcode)
    * number on every function message (seerdb _fun_header, PROTOCOL.md §20) -
    * 0 for an ordinary call, 1..N for a pipelined op (§32/#158), so the server
    * can correlate each burst response. */
-  SeerFunHeadMsg h = {.type = TTI_FUN,
-                      .function = opcode,
-                      .seq = seer_ttc_next_seq(c),
-                      .call_token = c->pipeline_token};
   SeerSchemaCtx cx = seer_msg_ctx(c->is_8i, c->field_version, c->server_field_version);
-  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+  fun_head(w, &cx, TTI_FUN, opcode, seer_ttc_next_seq(c), c->pipeline_token);
 }
 
 /* ------------------------------------------------------------- TTI_PRO/DTY */
@@ -2053,12 +2057,12 @@ void seer_release_fields(uint32_t r, int v[5])
 void seer_ttc_session_state_piggyback(SeerWriter *w, uint8_t seq, uint8_t field_version,
                                       uint8_t state)
 {
-  seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-  seer_writer_u8(w, TNS_FUNC_SESSION_STATE);
-  seer_writer_u8(w, seq);
-  if (field_version > TTC_FIELD_VERSION_23_1)
-    seer_enc_sb4(w, 0); /* ub8 token (fv24) */
-  seer_enc_sb4(w, (uint32_t)(state | TNS_SESSION_STATE_EXPLICIT_BOUNDARY));
+  /* The header's token is 0 (fv24); the state is a ub8, small enough to
+   * encode as a ub4 does. */
+  SeerSchemaCtx cx = seer_msg_ctx(0, field_version, field_version);
+  fun_head(w, &cx, TTI_MSG_TYPE_PIGGYBACK, TNS_FUNC_SESSION_STATE, seq, 0);
+  SeerThinCallMsg m = {.state = state | TNS_SESSION_STATE_EXPLICIT_BOUNDARY};
+  seer_schema_encode(SEER_SESSION_STATE_SCHEMA, &cx, &m, w);
 }
 
 void seer_ttc_flush_session_state(SeerConn *c, SeerWriter *w)
@@ -2077,27 +2081,21 @@ static SeerStatus seer_ttc_tran(SeerConn *conn, uint8_t func)
   if (conn == NULL || conn->t == NULL || !conn->authenticated)
     return SEER_EPARAM;
   SeerStatus st;
-  if (conn->session_state != 0) {
-    /* A request-boundary marker (§35) rides in front of this call. */
+  {
+    /* Any armed request-boundary marker (§35) rides in front of this call,
+     * whose header carries token 0. */
     SeerWriter w;
     if (!seer_writer_init(&w, 16))
       return SEER_ENOMEM;
     seer_ttc_flush_session_state(conn, &w);
-    seer_writer_u8(&w, TTI_FUN);
-    seer_writer_u8(&w, func);
-    seer_writer_u8(&w, seer_ttc_next_seq(conn));
-    if (conn->field_version > TTC_FIELD_VERSION_23_1)
-      seer_writer_u8(&w, 0);
+    SeerSchemaCtx cx = seer_msg_ctx(conn->is_8i, conn->field_version, conn->server_field_version);
+    fun_head(&w, &cx, TTI_FUN, func, seer_ttc_next_seq(conn), 0);
     if (!seer_writer_ok(&w)) {
       seer_writer_free(&w);
       return SEER_ENOMEM;
     }
     st = seer_ttc_send(conn, w.buf, w.len);
     seer_writer_free(&w);
-  } else {
-    uint8_t msg[4] = {TTI_FUN, func, seer_ttc_next_seq(conn), 0};
-    size_t msglen = (conn->field_version > TTC_FIELD_VERSION_23_1) ? 4 : 3;
-    st = seer_ttc_send(conn, msg, msglen);
   }
   if (st != SEER_OK)
     return st;
