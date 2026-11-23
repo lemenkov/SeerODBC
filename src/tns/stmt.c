@@ -3044,35 +3044,28 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     size_t total = 0;
     for (int i = 0; i < c->n_free_lobs; i++)
       total += 2 + c->free_lob_lens[i];
-    seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-    seer_writer_u8(w, TTI_LOBOPS);
-    seer_writer_u8(w, seer_ttc_next_seq(c));
-    if (c->field_version > TTC_FIELD_VERSION_23_1)
-      seer_enc_sb4(w, 0);             /* ub8 token (fv24) */
-    seer_writer_u8(w, 1);             /* source pointer */
-    seer_enc_sb4(w, (uint32_t)total); /* the locators' total length */
-    seer_writer_u8(w, 0);             /* dest pointer */
-    seer_enc_sb4(w, 0);               /* dest length */
-    seer_enc_sb4(w, 0);               /* short source offset */
-    seer_enc_sb4(w, 0);               /* short dest offset */
-    for (int i = 0; i < 3; i++)       /* charset / short amount / null-LOB */
-      seer_writer_u8(w, 0);
-    seer_enc_sb4(w, LOB_OP_FREE_TEMP | LOB_OP_ARRAY);
-    seer_writer_u8(w, 0);         /* scn array pointer */
-    seer_enc_sb4(w, 0);           /* scn array length */
-    seer_enc_sb4(w, 0);           /* source offset (ub8) */
-    seer_enc_sb4(w, 0);           /* dest offset (ub8) */
-    seer_writer_u8(w, 0);         /* amount pointer */
-    for (int i = 0; i < 3; i++) { /* array-LOB slots: pointer + ub4 */
-      seer_writer_u8(w, 0);
-      seer_enc_sb4(w, 0);
-    }
+    /* SEER_LOBOPS_SCHEMA (#398): FREE_TEMP with the ARRAY bit, the source
+     * length the locators' total, the locators each ub2-prefixed. */
+    SeerWriter locs;
+    if (!seer_writer_init(&locs, total + 1))
+      return SEER_ENOMEM;
     for (int i = 0; i < c->n_free_lobs; i++) {
-      seer_writer_u16(w, (uint16_t)c->free_lob_lens[i]);
-      seer_writer_bytes(w, c->free_lobs[i], c->free_lob_lens[i]);
+      seer_writer_u16(&locs, (uint16_t)c->free_lob_lens[i]);
+      seer_writer_bytes(&locs, c->free_lobs[i], c->free_lob_lens[i]);
       free(c->free_lobs[i]);
     }
     c->n_free_lobs = 0;
+    SeerSchemaCtx lcx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    SeerFunHeadMsg lh = {
+        .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_LOBOPS, .seq = seer_ttc_next_seq(c)};
+    SeerLobopMsg lm = {.src_ptr = 1,
+                       .src_len = (int64_t)total,
+                       .op = LOB_OP_FREE_TEMP | LOB_OP_ARRAY,
+                       .loc_len = (int64_t)locs.len,
+                       .locator = {.p = locs.buf, .n = locs.len}};
+    seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &lcx, &lh, w);
+    seer_schema_encode(SEER_LOBOPS_SCHEMA, &lcx, &lm, w);
+    seer_writer_free(&locs);
   }
 
   /* Statement-cache reuse: re-execute a parsed cursor with no re-parse - send
@@ -3081,74 +3074,57 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   if (reuse)
     opt &= ~0x0001u; /* PARSE off                    */
 
-  seer_ttc_fun_header(stmt->conn, w, TTI_ALL8);
-  seer_enc_sb4(w, opt);
-  seer_enc_sb4(w, reuse ? (uint32_t)stmt->reuse_cursor : 0); /* cursor    */
-  seer_writer_u8(w, reuse ? 0 : 1);                          /* query present                */
-  seer_enc_sb4(w, reuse ? 0 : (uint32_t)qlen);               /* query length         */
-  seer_writer_u8(w, 1);                                      /* all8 present                 */
-  seer_enc_sb4(w, 13);                                       /* all8 length                  */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, lmax); /* long max value               */
-  seer_enc_sb4(w, stmt->describe_only
-                      ? 1u
-                      : (stmt->prefetch ? stmt->prefetch : PREFETCH_ROWS)); /* prefetch */
-  seer_enc_sb4(w, 0x7FFFFFFF);       /* max value                    */
-  seer_writer_u8(w, nb > 0 ? 1 : 0); /* bind present                 */
-  seer_enc_sb4(w, (uint32_t)nb);     /* bind count                   */
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0); /* define present               */
-  seer_enc_sb4(w, 0);   /* define length                */
-
-  seer_writer_u8(w, 0); /* OALL8 header: register 0,0,1 ..*/
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);
-  if ((stmt->conn->server_release >> 24) != 10)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0); /* .. reg_lsb..msb */
-
-  /* 12c+ OALL8 carries the al8pidmlrc block (12.1+), the al8sqlsig / SQL-id
-   * slot (12.2+), and (12.2_EXT1+) chunk-id pointers - all null for us - and
-   * length-prefixes the SQL (12.1+). Without these the server reads the al8i4
-   * array at the wrong offset and rejects the call (ORA-03120); gating the
-   * whole tail on 12.2 sent a 12.1 session the 11g shape
-   * (seerdb/seerdb@50f0a83). */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    if (dml_rowcounts) {
-      /* al8pidmlrc: pointer(1) + ub4 (1 + iteration count) + 1. */
-      seer_writer_u8(w, 1);
-      seer_enc_sb4(w, (uint32_t)(1 + iters));
-      seer_writer_u8(w, 1);
+  /* The SQL as 10g+ frames it: raw before 12.1; from 12.1 a ub1 length,
+   * or past 252 bytes 254, an sb4 length, the bytes and a zero; none at all
+   * on a no-parse re-execute, where even a zero length would shift the
+   * server's read of the al8i4 array. */
+  SeerWriter sqlw;
+  if (!seer_writer_init(&sqlw, qlen + 16))
+    return SEER_ENOMEM;
+  if (!reuse && stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
+    if (qlen <= 252) {
+      seer_writer_u8(&sqlw, (uint8_t)qlen);
+      seer_writer_bytes(&sqlw, stmt->sql, qlen);
     } else {
-      for (int i = 0; i < 3; i++)
-        seer_writer_u8(w, 0); /* al8pidmlrc    */
-    }
-    if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 5; i++)
-        seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
-    if (stmt->conn->field_version > TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 2; i++)
-        seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
-    /* On a no-parse re-execute the SQL bytes are omitted entirely - even a
-     * zero-length prefix would shift the server's read of the al8i4 array. */
-    if (!reuse) {
-      if (qlen <= 252) { /* length-prefixed SQL (253+ would read as a marker) */
-        seer_writer_u8(w, (uint8_t)qlen);
-        seer_writer_bytes(w, stmt->sql, qlen);
-      } else {
-        seer_writer_u8(w, 254); /* LONG chunked form */
-        seer_enc_sb4(w, (uint32_t)qlen);
-        seer_writer_bytes(w, stmt->sql, qlen);
-        seer_enc_sb4(w, 0); /* zero-length terminator */
-      }
+      seer_writer_u8(&sqlw, 254); /* LONG chunked form */
+      seer_enc_sb4(&sqlw, (uint32_t)qlen);
+      seer_writer_bytes(&sqlw, stmt->sql, qlen);
+      seer_enc_sb4(&sqlw, 0);
     }
   } else if (!reuse) {
-    seer_writer_bytes(w, stmt->sql, qlen); /* raw SQL text (11g) */
+    seer_writer_bytes(&sqlw, stmt->sql, qlen);
   }
-  for (int i = 0; i < 13; i++)
-    seer_enc_sb4(w, all8[i]); /* All8 array    */
+  /* SEER_ALL8_SCHEMA (#398). 12c+ carries al8pidmlrc (12.1+), the SQL-id
+   * slot (12.2+) and the 12.2_EXT1 chunk ids - all null for us; without them
+   * the server reads al8i4 at the wrong offset (ORA-03120; gating the tail
+   * on 12.2 sent a 12.1 session the 11g shape, seerdb/seerdb@50f0a83). A
+   * server but 10g takes five more register bytes. */
+  seer_ttc_fun_header(stmt->conn, w, TTI_ALL8);
+  SeerAll8Msg am = {
+      .options = opt,
+      .cursor = reuse ? stmt->reuse_cursor : 0,
+      .sql_ptr = reuse ? 0 : 1,
+      .sql_len = reuse ? 0 : (int64_t)qlen,
+      .al8i4_ptr = 1,
+      .al8i4_len = 13,
+      .prefetch_size = lmax,
+      .prefetch_rows = stmt->describe_only ? 1 : (stmt->prefetch ? stmt->prefetch : PREFETCH_ROWS),
+      .max_long = 0x7FFFFFFF,
+      .binds_ptr = nb > 0,
+      .bind_count = nb,
+      .reg2 = 1,
+      .register_tail = (stmt->conn->server_release >> 24) != 10,
+      .pidmlrc_ptr = dml_rowcounts,
+      .pidmlrc_len = dml_rowcounts ? 1 + iters : 0, /* al8pidmlrc: 1 + the iterations */
+      .pidmlrc_ptr2 = dml_rowcounts,
+      .sql = {.p = sqlw.buf, .n = sqlw.len},
+      .sql_bytes = (int64_t)sqlw.len,
+      .al8i4 = all8,
+      .al8i4_n = 13,
+  };
+  SeerSchemaCtx acx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &acx, &am, w);
+  seer_writer_free(&sqlw);
 
   /* Bind section: one OAC descriptor per bind position (sized to the widest
    * value across iterations), then one RXD token per iteration carrying that
@@ -5788,26 +5764,36 @@ static void o8i_all8(SeerConn *c, SeerWriter *w, uint32_t options, uint32_t curs
                      uint32_t max_long, uint32_t bind_count, uint32_t i0, uint32_t i1, uint32_t i7)
 {
   seer_ttc_fun_header(c, w, TTI_ALL8);
-  o8w_le32(w, options);
-  o8w_le32(w, cursor);
-  seer_writer_u8(w, has_sql ? 1 : 0);
-  o8w_le32(w, has_sql ? (uint32_t)sqllen : 0);
-  seer_writer_u8(w, 1); /* al8i4 */
-  o8w_le32(w, 12);
-  seer_writer_u8(w, 0); /* al8o4  */
-  seer_writer_u8(w, 1); /* al8o4l */
-  o8w_le32(w, 0);       /* prefetch size */
-  o8w_le32(w, prefetch_rows);
-  o8w_le32(w, max_long);
-  seer_writer_u8(w, bind_count ? 1 : 0);
-  o8w_le32(w, bind_count);
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, 0); /* al8app, al8txn, al8txl, al8kv */
-  seer_writer_u8(w, 1);   /* al8kvl */
+  /* SEER_ALL8_SCHEMA at 8i's widths (#398): al8o4l and al8kvl set, no
+   * defines or register; the SQL as the pre-10g chunked string. */
+  SeerWriter sqlw;
+  if (!seer_writer_init(&sqlw, sqllen + sqllen / 64 + 4))
+    return;
   if (has_sql)
-    o8w_chr(w, sql, sqllen);
-  for (int i = 0; i < 12; i++)
-    o8w_le32(w, i == 0 ? i0 : i == 1 ? i1 : i == 7 ? i7 : 0);
+    o8w_chr(&sqlw, sql, sqllen);
+  uint32_t i4[12] = {0};
+  i4[0] = i0, i4[1] = i1, i4[7] = i7;
+  SeerAll8Msg am = {
+      .options = options,
+      .cursor = cursor,
+      .sql_ptr = has_sql,
+      .sql_len = has_sql ? (int64_t)sqllen : 0,
+      .al8i4_ptr = 1,
+      .al8i4_len = 12,
+      .al8o4l = 1,
+      .prefetch_rows = prefetch_rows,
+      .max_long = max_long,
+      .binds_ptr = bind_count != 0,
+      .bind_count = bind_count,
+      .al8kvl = 1,
+      .sql = {.p = sqlw.buf, .n = sqlw.len},
+      .sql_bytes = (int64_t)sqlw.len,
+      .al8i4 = i4,
+      .al8i4_n = 12,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
+  seer_writer_free(&sqlw);
 }
 
 /* The close of the finished cursors, piggybacked ahead of the next call

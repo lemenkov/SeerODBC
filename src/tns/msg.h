@@ -230,6 +230,29 @@ typedef struct {
 
 extern const SeerField SEER_DCB_TRAILER_SCHEMA[];
 
+/* An OALL8 execute / fetch call's body, after the function header (seerdb
+ * _ALL8_HEAD / _O8I_ALL8): the options, the cursor, the SQL's pointer and
+ * length, al8i4's pointer and count, al8o4 / al8o4l, the prefetch size and
+ * rows, the LONG size, the binds' pointer and count, the al8app .. al8kvl
+ * pointers - the same on 10g+ and 8i, 8i's widths fixed - then on thin the
+ * defines' pointer and count, the register bytes (five more but on a 10g
+ * server), 12.1's al8pidmlrc, 12.2's SQL-signature slot and 12.2_EXT1's
+ * chunk ids; then the SQL (caller-framed: raw before 12.1, one sb4 chunk
+ * from 12.1, 64-byte chunks on 8i) and the al8i4 words. */
+typedef struct {
+  int64_t options, cursor, sql_ptr, sql_len, al8i4_ptr, al8i4_len, al8o4, al8o4l;
+  int64_t prefetch_size, prefetch_rows, max_long, binds_ptr, bind_count;
+  int64_t al8app, al8txn, al8txl, al8kv, al8kvl, defines_ptr, define_count;
+  int64_t reg0, reg1, reg2, register_tail;
+  int64_t pidmlrc_ptr, pidmlrc_len, pidmlrc_ptr2;
+  SeerBytes sql;
+  int64_t sql_bytes;
+  const uint32_t *al8i4;
+  int64_t al8i4_n;
+} SeerAll8Msg;
+
+extern const SeerField SEER_ALL8_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

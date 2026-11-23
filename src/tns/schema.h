@@ -40,6 +40,8 @@ typedef enum {
                * as ojdbc14 writes it), one byte on 8i */
   SF_INTS,    /* an N4 count, then that many N4s: the member is a `const int *`,
                * `arg` the offsetof its int64_t count; encode only */
+  SF_N4S,     /* N4s, as many as the int64_t member at `arg` says, from a
+               * `const uint32_t *` member, no count written; encode only */
   SF_EACH     /* the sub-schema `sub` as many times as the int64_t member at
                * `arg` says, each item read into a scratch message of `subsize`
                * bytes and dropped: what the client passes over; decode only */

@@ -289,6 +289,50 @@ const SeerField SEER_OBJECT_SCHEMA[] = {
     SEER_END,
 };
 
+#define A SeerAll8Msg
+const SeerField SEER_ALL8_SCHEMA[] = {
+    SEER_F(SF_N4, A, options),
+    SEER_F(SF_N4, A, cursor),
+    SEER_F(SF_U8, A, sql_ptr),
+    SEER_F(SF_N4, A, sql_len),
+    SEER_F(SF_U8, A, al8i4_ptr),
+    SEER_F(SF_N4, A, al8i4_len),
+    SEER_F(SF_U8, A, al8o4),
+    SEER_F(SF_U8, A, al8o4l),
+    SEER_F(SF_N4, A, prefetch_size),
+    SEER_F(SF_N4, A, prefetch_rows),
+    SEER_F(SF_N4, A, max_long),
+    SEER_F(SF_U8, A, binds_ptr),
+    SEER_F(SF_N4, A, bind_count),
+    SEER_F(SF_U8, A, al8app),
+    SEER_F(SF_U8, A, al8txn),
+    SEER_F(SF_U8, A, al8txl),
+    SEER_F(SF_U8, A, al8kv),
+    SEER_F(SF_U8, A, al8kvl),
+    SEER_FC(SF_U8, THIN, A, defines_ptr),
+    SEER_FC(SF_N4, THIN, A, define_count),
+    SEER_FC(SF_U8, THIN, A, reg0),
+    SEER_FC(SF_U8, THIN, A, reg1),
+    SEER_FC(SF_U8, THIN, A, reg2),
+    {.kind = SF_PAD,
+     .codecs = THIN,
+     .flags = SG_IF_SET,
+     .arg = 5,
+     .if_off = offsetof(A, register_tail)},
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_12_1, 0, A, pidmlrc_ptr),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_1, 0, A, pidmlrc_len),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_12_1, 0, A, pidmlrc_ptr2),
+    {.kind = SF_PAD, .codecs = THIN, .fv_min = TTC_FIELD_VERSION_12_2, .arg = 5}, /* SQL id */
+    {.kind = SF_PAD,
+     .codecs = THIN,
+     .fv_min = TTC_FIELD_VERSION_12_2 + 1,
+     .arg = 2}, /* chunk ids */
+    {.kind = SF_RAW, .off = offsetof(A, sql), .arg = offsetof(A, sql_bytes)},
+    {.kind = SF_N4S, .off = offsetof(A, al8i4), .arg = offsetof(A, al8i4_n)},
+    SEER_END,
+};
+#undef A
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),
