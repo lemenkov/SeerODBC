@@ -458,7 +458,7 @@ const SeerField SEER_RPA_TAIL_SCHEMA[] = {
 
 const SeerField SEER_OBJECT_SCHEMA[] = {
     OBJECT_HEAD,
-    {.kind = SF_VALUE,
+    {.kind = SF_CHR,
      .flags = SG_IF_SET,
      .off = offsetof(SeerObjectMsg, image),
      .if_off = offsetof(SeerObjectMsg, image_len)},

@@ -9771,30 +9771,41 @@ static SeerStatus obj_encode_field(SeerWriter *body, uint8_t ora_type, const cha
   return SEER_OK;
 }
 
-/* Object bind-value framing (oracledb write_dbobject), shared by SQL object
- * binds and AQ object payloads: a 36-byte TOID (prefix + the 16-byte type OID +
- * extent OID), empty object OID, zero snapshot/version, the image length, the
- * TOP_LEVEL flag, then the image - each length-framed. */
-static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], const uint8_t *img,
-                                        size_t imglen, uint8_t fv)
+/* An object value's frame, written by SEER_OBJECT_SCHEMA (#398): the type
+ * block `tb` (36 bytes, or none on 9i), an empty object OID, a zero snapshot
+ * and version, the image's length, the TOP_LEVEL flag and the image. */
+static SeerStatus obj_frame_write(SeerWriter *bv, const SeerSchemaCtx *cx, const uint8_t *tb,
+                                  size_t tblen, const uint8_t *img, size_t imglen)
+{
+  SeerObjectMsg m = {.type_oid = {.p = tb, .n = tblen},
+                     .image_len = (int64_t)imglen,
+                     .flags = 1, /* TOP_LEVEL */
+                     .image = {.p = img, .n = imglen}};
+  seer_schema_encode(SEER_OBJECT_SCHEMA, cx, &m, bv);
+  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+}
+
+/* The 36-byte type block an object value names its type by, on 10g+ and on
+ * 8i (oracledb write_dbobject): 00 22 02 08, the 16-byte type OID, then the
+ * extent OID - 16 bytes ending 00 01 00 01. */
+static void obj_type_block(const uint8_t oid[16], uint8_t tb[36])
 {
   static const uint8_t PFX[4] = {0x00, 0x22, 0x02, 0x08};
   static const uint8_t EXT[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1};
-  uint8_t toid[36];
-  memcpy(toid, PFX, 4);
-  memcpy(toid + 4, oid, 16);
-  memcpy(toid + 20, EXT, 16);
-  seer_enc_sb4(bv, 36);
-  if (obj_append_chr(bv, toid, sizeof toid, fv) != SEER_OK)
-    return SEER_ENOMEM;
-  seer_enc_sb4(bv, 0);                /* object OID (empty) */
-  seer_enc_sb4(bv, 0);                /* snapshot */
-  seer_enc_sb4(bv, 0);                /* version */
-  seer_enc_sb4(bv, (uint32_t)imglen); /* image length */
-  seer_enc_sb4(bv, 1);                /* flags: TOP_LEVEL */
-  if (obj_append_chr(bv, img, imglen, fv) != SEER_OK)
-    return SEER_ENOMEM;
-  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+  memcpy(tb, PFX, 4);
+  memcpy(tb + 4, oid, 16);
+  memcpy(tb + 20, EXT, 16);
+}
+
+/* Object bind-value framing (oracledb write_dbobject), shared by SQL object
+ * binds and AQ object payloads: the frame with the type block. */
+static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], const uint8_t *img,
+                                        size_t imglen, uint8_t fv)
+{
+  uint8_t tb[36];
+  obj_type_block(oid, tb);
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  return obj_frame_write(bv, &cx, tb, sizeof tb, img, imglen);
 }
 
 /* The object frame of a NULL object of the type `oid`: the frame an object
@@ -9802,21 +9813,7 @@ static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], c
  * object / collection bind sends (seerdb encode_object_column_value). */
 static SeerStatus obj_encode_null_value(SeerWriter *bv, const uint8_t oid[16], uint8_t fv)
 {
-  static const uint8_t PFX[4] = {0x00, 0x22, 0x02, 0x08};
-  static const uint8_t EXT[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1};
-  uint8_t toid[36];
-  memcpy(toid, PFX, 4);
-  memcpy(toid + 4, oid, 16);
-  memcpy(toid + 20, EXT, 16);
-  seer_enc_sb4(bv, 36);
-  if (obj_append_chr(bv, toid, sizeof toid, fv) != SEER_OK)
-    return SEER_ENOMEM;
-  seer_enc_sb4(bv, 0); /* object OID (empty) */
-  seer_enc_sb4(bv, 0); /* snapshot */
-  seer_enc_sb4(bv, 0); /* version */
-  seer_enc_sb4(bv, 0); /* image gate: 0 = NULL, no image */
-  seer_enc_sb4(bv, 1); /* flags: TOP_LEVEL */
-  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+  return obj_encode_bind_value(bv, oid, NULL, 0, fv); /* image length 0: no image */
 }
 
 /* Store an object / collection bind of type (schema, type_name), OID `oid`:
@@ -9852,33 +9849,21 @@ static SeerStatus obj_legacy_bind(SeerConn *c, const uint8_t oid[16], const uint
     m.max_length = 2000;
     oac_write(oac, true, 0, &m);
 
-    uint8_t block[36] = {0x00, 0x22, 0x02, 0x08};
-    memcpy(block + 4, oid, 16);
-    block[33] = 0x01;
-    block[35] = 0x01;
-    o8w_le32(bv, 36);
-    o8w_chr(bv, block, sizeof block);
-    o8w_le32(bv, 0);          /* object OID */
-    o8w_le32(bv, 0);          /* snapshot */
-    seer_writer_u8(bv, 0x00); /* version (ub2) */
-    seer_writer_u8(bv, 0x00);
-    o8w_le32(bv, (uint32_t)imglen);
-    seer_writer_u8(bv, 0x01); /* flags 01 00 */
-    seer_writer_u8(bv, 0x00);
-    if (imglen > 0)
-      o8w_chr(bv, img, imglen);
+    /* The frame at 8i's widths, with 10g+'s type block (#398). */
+    uint8_t tb[36];
+    obj_type_block(oid, tb);
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    if (obj_frame_write(bv, &cx, tb, sizeof tb, img, imglen) != SEER_OK)
+      return SEER_ENOMEM;
   } else {
     m.flags = 0x01;
     m.max_length = imglen > 0 && !is_out ? (int64_t)imglen : 0x7FFFFFFF;
     m.charset = 31;
     oac_write(oac, false, TTC_FIELD_VERSION_9_2, &m);
 
-    for (int k = 0; k < 4; k++) /* type OID, object OID, snapshot, version: empty */
-      seer_writer_u8(bv, 0x00);
-    seer_enc_sb4(bv, (uint32_t)imglen);
-    seer_writer_u8(bv, 0x01); /* flags 01 01 */
-    seer_writer_u8(bv, 0x01);
-    if (imglen > 0 && obj_append_chr(bv, img, imglen, c->field_version) != SEER_OK)
+    /* The frame with no type block: the type is the descriptor's (#398). */
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    if (obj_frame_write(bv, &cx, NULL, 0, img, imglen) != SEER_OK)
       return SEER_ENOMEM;
   }
   return seer_writer_ok(oac) && seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
