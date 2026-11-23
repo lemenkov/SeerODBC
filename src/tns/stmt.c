@@ -4415,10 +4415,11 @@ static void fv2_close_cursor(SeerConn *c, uint32_t cursor)
   SeerWriter w;
   if (!seer_writer_init(&w, 16))
     return;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_CLOSE);
-  seer_writer_u8(&w, 0);
-  seer_enc_sb4(&w, cursor);
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerFunHeadMsg h = {.type = TTI_FUN, .function = O7_CLOSE};
+  SeerCursorCallMsg m = {.cursor = cursor};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, &w); /* #398 */
+  seer_schema_encode(SEER_CURSOR_CALL_SCHEMA, &cx, &m, &w);
   uint8_t *resp = NULL;
   size_t rlen = 0;
   if (seer_writer_ok(&w) && fv2_txn(c, w.buf, w.len, &resp, &rlen) == SEER_OK)
@@ -4435,10 +4436,11 @@ static void fv2_free_cursor(SeerConn *c, uint32_t cursor)
   SeerWriter w;
   if (!seer_writer_init(&w, 16))
     return;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_FREE);
-  seer_writer_u8(&w, 0);
-  seer_enc_sb4(&w, cursor);
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerFunHeadMsg h = {.type = TTI_FUN, .function = O7_FREE};
+  SeerCursorCallMsg m = {.cursor = cursor};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, &w); /* #398 */
+  seer_schema_encode(SEER_CURSOR_CALL_SCHEMA, &cx, &m, &w);
   uint8_t *resp = NULL;
   size_t rlen = 0;
   if (seer_writer_ok(&w) && fv2_txn(c, w.buf, w.len, &resp, &rlen) == SEER_OK)
@@ -5225,15 +5227,28 @@ static uint32_t fv2_sql_chars(const char *sql)
   return n;
 }
 
+/* A 9i call's head and body by their schemas (#398): the function header
+ * (sequence 0, as ojdbc14 sends it) and SEER_O7_ALL7_SCHEMA. */
+static void fv2_call_head(SeerWriter *w, uint8_t function)
+{
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerFunHeadMsg h = {.type = TTI_FUN, .function = function};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+}
+
+static void fv2_all7(SeerWriter *w, const SeerO7All7Msg *m)
+{
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  fv2_call_head(w, TTI_ALL7);
+  seer_schema_encode(SEER_O7_ALL7_SCHEMA, &cx, m, w);
+}
+
 static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
 {
   size_t qlen = strlen(stmt->sql);
   int nb = stmt->npbinds;
   if (!seer_writer_init(w, 64 + qlen + (size_t)nb * 48))
     return SEER_ENOMEM;
-  seer_writer_u8(w, TTI_FUN);
-  seer_writer_u8(w, TTI_ALL7);
-  seer_writer_u8(w, 0);
   /* The option word: NOT_PLSQL | EXECUTE | PARSE, + BIND with binds. The
    * EXECUTE bit makes this call run the statement as well, so a describe
    * (seer_stmt_describe) drops it: a parse alone needs no bind values, where
@@ -5245,29 +5260,19 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
     opt &= ~0x20u;
   if (stmt->batch_errors && stmt->n_iters > 1)
     opt |= 0x80000u;
-  seer_enc_sb4(w, opt);
-  seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
-  seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, fv2_sql_chars(stmt->sql));
-  {
-    static const uint8_t mid[] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0};
-    seer_writer_bytes(w, mid, sizeof mid);
-  }
-  if (nb > 0) {
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, (uint8_t)nb);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-  }
-  seer_writer_bytes(w, (const uint8_t *)stmt->sql, qlen);
   int rows = (nb > 0 && stmt->n_iters > 1) ? stmt->n_iters : 1;
-  seer_writer_u8(w, 0x01);
-  seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, (uint32_t)rows); /* the rows: 1, or an array DML's */
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
+  SeerO7All7Msg m = {
+      .options = opt,
+      .cursor = stmt->conn->fv2_cursor,
+      .sql_ptr = 1,
+      .sql_len = (int64_t)fv2_sql_chars(stmt->sql),
+      .binds_ptr = nb > 0,
+      .bind_count = nb,
+      .sql = {.p = (const uint8_t *)stmt->sql, .n = qlen},
+      .sql_bytes = (int64_t)qlen,
+      .rows = rows, /* 1, or an array DML's */
+  };
+  fv2_all7(w, &m);
   if (nb > 0) {
     for (int i = 0; i < nb; i++)
       fv2_bind_oac(w, &stmt->pbinds[i]);
@@ -5296,37 +5301,19 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
   int nb = stmt->npbinds;
   if (!seer_writer_init(w, 64 + qlen + (size_t)nb * 32))
     return SEER_ENOMEM;
-  seer_writer_u8(w, TTI_FUN);
-  seer_writer_u8(w, TTI_ALL7);
-  seer_writer_u8(w, 0);
-  if (nb > 0) {
-    seer_writer_u8(w, 0x02);
-    seer_writer_u8(w, 0x04);
-    seer_writer_u8(w, 0x29);
-  } else {
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0x21);
-  }
-  seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
-  seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, fv2_sql_chars(stmt->sql));
-  {
-    static const uint8_t mid[] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0};
-    seer_writer_bytes(w, mid, sizeof mid);
-  }
-  if (nb > 0) {
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, (uint8_t)nb);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-  }
-  seer_writer_bytes(w, (const uint8_t *)stmt->sql, qlen);
-  {
-    static const uint8_t tl[] = {0x01, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0};
-    seer_writer_bytes(w, tl, sizeof tl);
-  }
+  /* EXECUTE | PARSE, + BIND and PL/SQL's 0x400 with binds */
+  SeerO7All7Msg m = {
+      .options = nb > 0 ? 0x0429 : 0x21,
+      .cursor = stmt->conn->fv2_cursor,
+      .sql_ptr = 1,
+      .sql_len = (int64_t)fv2_sql_chars(stmt->sql),
+      .binds_ptr = nb > 0,
+      .bind_count = nb,
+      .sql = {.p = (const uint8_t *)stmt->sql, .n = qlen},
+      .sql_bytes = (int64_t)qlen,
+      .rows = 1,
+  };
+  fv2_all7(w, &m);
   for (int i = 0; i < nb; i++)
     fv2_bind_oac(w, &stmt->pbinds[i]); /* OACs only, no inline values */
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
@@ -7824,22 +7811,16 @@ static SeerStatus fv2_fetch_cursor(SeerStmt *stmt, uint32_t cursor, int64_t *err
   for (;;) {
     if (!seer_writer_init(&w, 48 + (size_t)ncols * 24))
       return SEER_ENOMEM;
-    seer_writer_u8(&w, TTI_FUN);
-    seer_writer_u8(&w, TTI_ALL7);
-    seer_writer_u8(&w, 0);
-    {
-      static const uint8_t opt[] = {0x02, 0x80, 0x50}; /* execute + fetch */
-      static const uint8_t h[] = {0, 0, 0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0};
-      seer_writer_bytes(&w, opt, sizeof opt);
-      seer_enc_sb4(&w, cursor);
-      seer_writer_bytes(&w, h, sizeof h);
-    }
-    seer_writer_u8(&w, 0x01); /* defines pointer present */
-    seer_enc_sb4(&w, ncols);  /* define count, a ub4: 300 is `02 01 2c` */
-    {
-      static const uint8_t h2[] = {0, 0, 0x01, 0x01, 0x01, 0x0a, 0, 0, 0, 0, 0};
-      seer_writer_bytes(&w, h2, sizeof h2);
-    }
+    /* execute + fetch: no SQL, a define a column (a ub4 count: 300 is
+     * `02 01 2c`), 10 rows */
+    SeerO7All7Msg m = {
+        .options = 0x8050,
+        .cursor = cursor,
+        .defines_ptr = 1,
+        .define_count = ncols,
+        .rows = 10,
+    };
+    fv2_all7(&w, &m);
     for (int i = 0; i < ncols; i++)
       fv2_define_entry(&w, &stmt->cols[i]);
     if (!seer_writer_ok(&w)) {

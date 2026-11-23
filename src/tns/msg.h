@@ -261,6 +261,29 @@ typedef struct {
 
 extern const SeerField SEER_FETCH_SCHEMA[];
 
+/* A 9i TTI_ALL7 call's body, after the function header (seerdb _O7_ALL7):
+ * one layout for a parse, a PL/SQL block and an execute - the options, the
+ * cursor, the SQL's pointer and length (in characters, #2275), nine bytes
+ * every ALL7 call carries (their fields not known: captured from ojdbc14),
+ * the defines' pointer and count, the binds' pointer and count, the SQL,
+ * `01 01`, the rows (1, an array DML's, or a fetch's 10) and five zero
+ * bytes. The binds' descriptors and values, or the defines, follow. */
+typedef struct {
+  int64_t options, cursor, sql_ptr, sql_len, defines_ptr, define_count, binds_ptr, bind_count;
+  SeerBytes sql;
+  int64_t sql_bytes, rows;
+} SeerO7All7Msg;
+
+extern const SeerField SEER_O7_ALL7_SCHEMA[];
+
+/* A call on a cursor by its id (seerdb _O7_CURSOR_CALL): 9i's close (03 14)
+ * and free (03 08), after the function header. */
+typedef struct {
+  int64_t cursor;
+} SeerCursorCallMsg;
+
+extern const SeerField SEER_CURSOR_CALL_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

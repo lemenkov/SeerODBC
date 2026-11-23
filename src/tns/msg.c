@@ -339,6 +339,33 @@ const SeerField SEER_FETCH_SCHEMA[] = {
     SEER_END,
 };
 
+static const uint8_t O7_ALL7_MID[9] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0};
+static const uint8_t O7_ALL7_ROWS_LEAD[2] = {0x01, 0x01};
+
+#define S SeerO7All7Msg
+const SeerField SEER_O7_ALL7_SCHEMA[] = {
+    SEER_F(SF_N4, S, options),
+    SEER_F(SF_N4, S, cursor),
+    SEER_F(SF_U8, S, sql_ptr),
+    SEER_F(SF_N4, S, sql_len),
+    {.kind = SF_CONST, .arg = sizeof O7_ALL7_MID, .lit = O7_ALL7_MID},
+    SEER_F(SF_U8, S, defines_ptr),
+    SEER_F(SF_N4, S, define_count),
+    SEER_F(SF_U8, S, binds_ptr),
+    SEER_F(SF_N4, S, bind_count),
+    {.kind = SF_RAW, .off = offsetof(S, sql), .arg = offsetof(S, sql_bytes)},
+    {.kind = SF_CONST, .arg = sizeof O7_ALL7_ROWS_LEAD, .lit = O7_ALL7_ROWS_LEAD},
+    SEER_F(SF_N4, S, rows),
+    SEER_PAD(5),
+    SEER_END,
+};
+#undef S
+
+const SeerField SEER_CURSOR_CALL_SCHEMA[] = {
+    SEER_F(SF_N4, SeerCursorCallMsg, cursor),
+    SEER_END,
+};
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),

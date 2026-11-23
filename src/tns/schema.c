@@ -116,6 +116,9 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
       for (uint16_t i = 0; i < f->arg; i++)
         seer_writer_u8(w, 0);
       break;
+    case SF_CONST:
+      seer_writer_bytes(w, f->lit, f->arg);
+      break;
     case SF_VALUE:
       put_value(w, cx, (const SeerBytes *)((const char *)msg + f->off));
       break;
@@ -256,6 +259,12 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
     case SF_PAD:
       (void)seer_reader_bytes(r, f->arg);
       break;
+    case SF_CONST: {
+      const uint8_t *p = seer_reader_bytes(r, f->arg);
+      if (p != NULL && memcmp(p, f->lit, f->arg) != 0)
+        bad = true;
+      break;
+    }
     case SF_VALUE:
       get_value(r, cx, (SeerBytes *)((char *)msg + f->off), &bad);
       break;

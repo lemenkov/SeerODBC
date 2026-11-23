@@ -42,6 +42,8 @@ typedef enum {
                * `arg` the offsetof its int64_t count; encode only */
   SF_N4S,     /* N4s, as many as the int64_t member at `arg` says, from a
                * `const uint32_t *` member, no count written; encode only */
+  SF_CONST,   /* `arg` literal bytes at `lit`, the same in every message: captured
+               * ground truth whose fields aren't known; checked when read */
   SF_EACH     /* the sub-schema `sub` as many times as the int64_t member at
                * `arg` says, each item read into a scratch message of `subsize`
                * bytes and dropped: what the client passes over; decode only */
@@ -69,6 +71,7 @@ typedef struct SeerField {
                                 * SF_COUNTED: the count's kind (SF_N2 / SF_N4, 0 = N4) */
   uint16_t if_off;             /* SG_IF_SET: offsetof the member that must be non-zero */
   const struct SeerField *sub; /* SF_EACH: the item's schema */
+  const void *lit;             /* SF_CONST: the bytes */
   uint16_t subsize;            /* SF_EACH: the item's message size */
 } SeerField;
 
