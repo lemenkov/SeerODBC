@@ -116,8 +116,53 @@ const SeerField SEER_OER_TAIL_SCHEMA[] = {
 };
 #undef O
 
+/* The trailer's guards: the indicator on 8i and 9i (fv 2), the return code
+ * on 8i. */
+#define CELL_INDICATOR SEER_FV(SF_N2, 0, 0, TTC_FIELD_VERSION_10_2, SeerCellMsg, indicator)
+#define CELL_RETURN_CODE SEER_FC(SF_N2, SEER_CODEC_O8I, SeerCellMsg, return_code)
+
 const SeerField SEER_CELL_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerCellMsg, value),
+    CELL_INDICATOR,
+    CELL_RETURN_CODE,
+    SEER_END,
+};
+
+const SeerField SEER_LONG_CELL_SCHEMA[] = {
+    SEER_F(SF_VALUE, SeerCellMsg, value),
+    SEER_F(SF_N2, SeerCellMsg, indicator),
+    SEER_F(SF_N2, SeerCellMsg, return_code),
+    SEER_END,
+};
+
+const SeerField SEER_LOB_CELL_SCHEMA[] = {
+    SEER_F(SF_COUNTED, SeerCellMsg, value),
+    CELL_INDICATOR,
+    CELL_RETURN_CODE,
+    SEER_END,
+};
+
+const SeerField SEER_UROWID_CELL_SCHEMA[] = {
+    {.kind = SF_COUNTED, .off = offsetof(SeerCellMsg, value), .arg = SF_N2},
+    CELL_INDICATOR,
+    CELL_RETURN_CODE,
+    SEER_END,
+};
+
+#define IF_ROWID(kind_, member_)                                                                   \
+  {.kind = (kind_),                                                                                \
+   .flags = SG_IF_SET,                                                                             \
+   .off = offsetof(SeerCellMsg, member_),                                                          \
+   .if_off = offsetof(SeerCellMsg, rowid_size)}
+const SeerField SEER_ROWID_CELL_SCHEMA[] = {
+    {.kind = SF_U8, .flags = SG_FF_NULL, .off = offsetof(SeerCellMsg, rowid_size)},
+    IF_ROWID(SF_N4, rowid_obj),
+    IF_ROWID(SF_N2, rowid_file),
+    IF_ROWID(SF_N1, rowid_res),
+    IF_ROWID(SF_N4, rowid_block),
+    IF_ROWID(SF_N2, rowid_slot),
+    CELL_INDICATOR,
+    CELL_RETURN_CODE,
     SEER_END,
 };
 
@@ -165,7 +210,8 @@ uint8_t *seer_lobop_reply_locator(const SeerLobopReplyMsg *m, size_t *n)
     return NULL;
   loc[0] = (uint8_t)(m->locator.n >> 8);
   loc[1] = (uint8_t)m->locator.n;
-  memcpy(loc + 2, m->locator.p, m->locator.n);
+  if (m->locator.n > 0)
+    memcpy(loc + 2, m->locator.p, m->locator.n);
   *n = 2 + m->locator.n;
   return loc;
 }

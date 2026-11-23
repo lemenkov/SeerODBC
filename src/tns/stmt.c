@@ -315,45 +315,18 @@ static void cell_set_text(SeerCell *c, char *owned)
  * ub1 length) then content, followed by two trailing ub4 indicators (§11.10). */
 static SeerStatus decode_long(SeerReader *r, bool is_raw, SeerCell *cell)
 {
-  SeerWriter acc;
-  if (!seer_writer_init(&acc, 64))
-    return SEER_ENOMEM;
-
-  uint8_t marker = seer_reader_u8(r);
-  if (!seer_reader_ok(r)) {
-    seer_writer_free(&acc);
+  /* SEER_LONG_CELL_SCHEMA (#398): the value, then the two trailing
+   * indicators; a 00 is NULL, a 0xFE run with no chunks an empty value. */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_LONG_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_LONG_CELL_SCHEMA, &m);
     return SEER_EPROTO;
   }
-  bool is_null = (marker == 0x00);
-  if (marker == 0xFE) {
-    for (;;) {
-      /* Each chunk's length: an sb4 on 12c+, a bare ub1 before (§6.4). */
-      int64_t clen = r->sb4_chunks ? seer_dec_sb4(r) : (int64_t)seer_reader_u8(r);
-      if (!seer_reader_ok(r) || clen <= 0)
-        break;
-      const uint8_t *p = seer_reader_bytes(r, (size_t)clen);
-      if (p == NULL)
-        break;
-      seer_writer_bytes(&acc, p, (size_t)clen);
-    }
-  } else if (!is_null) {
-    const uint8_t *p = seer_reader_bytes(r, marker);
-    if (p != NULL)
-      seer_writer_bytes(&acc, p, marker);
-  }
-  (void)seer_dec_sb4(r); /* trailing indicator 1 */
-  (void)seer_dec_sb4(r); /* trailing indicator 2 */
-
-  if (!seer_reader_ok(r) || !seer_writer_ok(&acc)) {
-    seer_writer_free(&acc);
-    return SEER_EPROTO;
-  }
-  if (is_null) {
-    seer_writer_free(&acc);
-    return SEER_OK; /* leaves the cell as SQL NULL */
-  }
-  SeerStatus st = cell_set_bytes(cell, acc.buf, acc.len, is_raw);
-  seer_writer_free(&acc);
+  SeerStatus st = m.value.p == NULL ? SEER_OK : cell_set_bytes(cell, m.value.p, m.value.n, is_raw);
+  seer_schema_free(SEER_LONG_CELL_SCHEMA, &m);
   return st;
 }
 
@@ -374,24 +347,22 @@ static void rowid_b64(uint32_t v, int nchars, char *out)
  * "OOOOOOFFFBBBBBBRRR". */
 static SeerStatus decode_rowid(SeerReader *r, SeerCell *cell)
 {
-  uint8_t ind = seer_reader_u8(r);
-  if (!seer_reader_ok(r))
+  /* SEER_ROWID_CELL_SCHEMA (#398): a size (0 or 0xFF NULL), then the object,
+   * file, block and slot, rendered as the 18-character rowid. */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_ROWID_CELL_SCHEMA, &cx, r, &m))
     return SEER_EPROTO;
-  if (ind == 0 || ind == 0xFF)
+  if (m.rowid_size == 0)
     return SEER_OK; /* SQL NULL */
-  uint32_t obj = (uint32_t)seer_dec_sb4(r);
-  uint32_t file = (uint32_t)seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* unused */
-  uint32_t blk = (uint32_t)seer_dec_sb4(r);
-  uint32_t slot = (uint32_t)seer_dec_sb4(r);
-  if (!seer_reader_ok(r))
-    return SEER_EPROTO;
-  char s[18];
-  rowid_b64(obj, 6, s);
-  rowid_b64(file, 3, s + 6);
-  rowid_b64(blk, 6, s + 9);
-  rowid_b64(slot, 3, s + 15);
-  return cell_set_bytes(cell, s, sizeof s, false);
+  char rid[18];
+  rowid_b64((uint32_t)m.rowid_obj, 6, rid);
+  rowid_b64((uint32_t)m.rowid_file, 3, rid + 6);
+  rowid_b64((uint32_t)m.rowid_block, 6, rid + 9);
+  rowid_b64((uint32_t)m.rowid_slot, 3, rid + 15);
+  return cell_set_bytes(cell, rid, sizeof rid, false);
 }
 
 /* Standard-alphabet base64 (no padding) of `n` bytes, into the writer. */
@@ -456,20 +427,19 @@ static SeerStatus urowid_cell(const uint8_t *p, size_t nbytes, SeerCell *cell)
 
 static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
 {
-  int64_t nbytes = seer_dec_sb4(r);
-  if (nbytes <= 0)
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO; /* NULL */
-  /* The rowid as a value, as a LOB's locator is: a ub1 length, or past 252
-   * bytes 0xFE and chunks - an index-organized table's logical rowid grows
-   * with its key. Read as one length byte and num_bytes raw bytes, a rowid
-   * past 252 bytes desynced the reply, and the query failed with a bogus
-   * ORA-01403 (#144). */
-  uint8_t *p = NULL;
-  size_t n = 0;
-  SeerStatus st = seer_dec_dalc(r, &p, &n);
-  if (st == SEER_OK)
-    st = urowid_cell(p, n, cell);
-  free(p);
+  /* SEER_UROWID_CELL_SCHEMA (#398): a count (0 NULL), then the rowid as a
+   * value - chunked past 252 bytes, as an index-organized table's logical
+   * rowid can be (#144). */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_UROWID_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_UROWID_CELL_SCHEMA, &m);
+    return SEER_EPROTO;
+  }
+  SeerStatus st = m.value.p == NULL ? SEER_OK : urowid_cell(m.value.p, m.value.n, cell);
+  seer_schema_free(SEER_UROWID_CELL_SCHEMA, &m);
   return st;
 }
 
@@ -693,7 +663,9 @@ static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *ce
   }
 
   /* SEER_CELL_SCHEMA (#395 spike): the value read in place. */
-  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN, .wide_chunks = r->sb4_chunks};
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
   SeerCellMsg m;
   if (!seer_schema_decode(SEER_CELL_SCHEMA, &cx, r, &m)) {
     seer_schema_free(SEER_CELL_SCHEMA, &m);
@@ -1097,18 +1069,30 @@ static SeerStatus append_row(SeerStmt *stmt, SeerCell *row)
  * LOB, otherwise a ub4 size then the locator as a DALC. */
 static SeerStatus read_lob_locator(SeerReader *r, uint8_t **loc, size_t *loclen)
 {
+  /* SEER_LOB_CELL_SCHEMA (#398): the locator's length (0 NULL) and the
+   * locator as a value. */
   *loc = NULL;
   *loclen = 0;
-  if (seer_reader_remaining(r) == 0)
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_LOB_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_LOB_CELL_SCHEMA, &m);
     return SEER_EPROTO;
-  if (r->buf[r->pos] == 0x00) {
-    (void)seer_reader_u8(r); /* NULL LOB */
-    return SEER_OK;
   }
-  int64_t num_bytes = seer_dec_sb4(r);
-  if (num_bytes <= 0 || !seer_reader_ok(r))
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
-  return seer_dec_dalc(r, loc, loclen);
+  SeerStatus st = SEER_OK;
+  if (m.value.n > 0) {
+    *loc = malloc(m.value.n);
+    if (*loc == NULL)
+      st = SEER_ENOMEM;
+    else {
+      memcpy(*loc, m.value.p, m.value.n);
+      *loclen = m.value.n;
+    }
+  }
+  seer_schema_free(SEER_LOB_CELL_SCHEMA, &m);
+  return st;
 }
 
 /* Record a LOB cell to resolve after the result set is fully fetched. Takes
@@ -5125,32 +5109,27 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
       for (int ci = 0; ci < ncols; ci++) {
         uint8_t ct = stmt->cols[ci].ora_type;
         if (ct == ORA_TYPE_CLOB || ct == ORA_TYPE_BLOB || ct == ORA_TYPE_BFILE) {
-          /* LOB column: a locator (ub4 num_bytes + DALC) then an indicator,
-           * or a bare 0x00 = NULL LOB. Capture the locator to resolve via
-           * TTI_LOBOPS after the fetch; the cell is left NULL for now. */
-          if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x00) {
-            r.pos += 1;
-            if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
-              r.pos += 2;
-          } else {
-            (void)seer_dec_sb4(&r); /* ub4 num_bytes */
-            uint8_t *locv = NULL;
-            size_t loclen = 0;
-            if (seer_dec_dalc(&r, &locv, &loclen) != SEER_OK) {
-              free(locv);
-              for (int k = 0; k < ci; k++)
-                free(row[k].data);
-              free(row);
-              return SEER_EPROTO;
-            }
-            if (seer_reader_remaining(&r) > 0)
-              r.pos += 1; /* present indicator */
-            if (locv != NULL && loclen > 0 &&
-                record_pending_lob(stmt, stmt->nrows, ci, ct, locv, loclen) != SEER_OK)
-              free(locv);
-            else if (locv == NULL || loclen == 0)
-              free(locv);
+          /* SEER_LOB_CELL_SCHEMA at field version 2 (#398): the locator's
+           * length (0 NULL) and the locator, then the indicator. Captured to
+           * resolve via TTI_LOBOPS after the fetch; the cell stays NULL now. */
+          SeerSchemaCtx lcx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+          SeerCellMsg lm = {0};
+          if (!seer_schema_decode(SEER_LOB_CELL_SCHEMA, &lcx, &r, &lm)) {
+            seer_schema_free(SEER_LOB_CELL_SCHEMA, &lm);
+            for (int k = 0; k < ci; k++)
+              free(row[k].data);
+            free(row);
+            return SEER_EPROTO;
           }
+          if (lm.value.n > 0) {
+            uint8_t *locv = malloc(lm.value.n);
+            if (locv != NULL) {
+              memcpy(locv, lm.value.p, lm.value.n);
+              if (record_pending_lob(stmt, stmt->nrows, ci, ct, locv, lm.value.n) != SEER_OK)
+                free(locv);
+            }
+          }
+          seer_schema_free(SEER_LOB_CELL_SCHEMA, &lm);
           continue;
         }
         if (ct == ORA_TYPE_ADT) {
@@ -5181,25 +5160,27 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
             r.pos += 2;
           continue; /* cell stays NULL */
         }
-        uint8_t *val = NULL;
-        size_t vlen = 0;
-        if (seer_dec_dalc(&r, &val, &vlen) != SEER_OK) {
-          free(val);
+        /* SEER_CELL_SCHEMA at field version 2 (#398): the value and its
+         * indicator, 00 or 81 01 for NULL */
+        SeerSchemaCtx ccx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+        SeerCellMsg cm = {0};
+        if (!seer_schema_decode(SEER_CELL_SCHEMA, &ccx, &r, &cm)) {
+          seer_schema_free(SEER_CELL_SCHEMA, &cm);
           for (int k = 0; k < ci; k++)
             free(row[k].data);
           free(row);
           return SEER_EPROTO;
         }
-        if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81) {
-          r.pos += 2; /* 81 01 = NULL (leave cell zeroed) */
+        const uint8_t *val = cm.value.p;
+        size_t vlen = cm.value.n;
+        if (cm.indicator == -1) {
+          /* NULL: the cell stays zeroed */
         } else if (ct == ORA_TYPE_REFCURSOR) {
           /* A CURSOR() cell: the nested cursor's id. ODBC has no nested-cursor
            * type, so the cell is NULL, as on 10g+; the cursor is closed and
            * freed before the next batch (#166, #196). */
-          (void)seer_reader_u8(&r); /* present indicator */
           fv2_note_nested(stmt, fv2_cursor_id(val, vlen));
         } else {
-          (void)seer_reader_u8(&r); /* present indicator (0x00) */
           if (vlen > 0) {
             /* A rowid column was defined as VARCHAR (fv2_define_entry): its
              * value is the rowid's text, not the native form. A LONG is text
@@ -5215,7 +5196,7 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
               national_to_utf8(&stmt->cols[ci], &row[ci]);
           }
         }
-        free(val);
+        seer_schema_free(SEER_CELL_SCHEMA, &cm);
       }
       if (!seer_reader_ok(&r) || append_row(stmt, row) != SEER_OK) {
         for (int k = 0; k < ncols; k++)
@@ -6246,65 +6227,56 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell,
     o8i_read_cursor_cell(r, true, NULL, NULL, nested);
     return SEER_OK;
   }
+  /* The cell by its kind's schema, at 8i's widths (#398): a LOB's locator
+   * (its ub4 length - 86 for a CLOB or BLOB, not the content's - and the
+   * value, §19.10, §19.15, seerdb #387), a UROWID (a ub2 length), a ROWID's
+   * fields, a LONG's or any other value; then the trailer, the indicator (-1
+   * for NULL) and the return code. A NULL VARCHAR2 from a table comes as an
+   * empty value and the trailer with the indicator -1, not as the trailer
+   * alone (#153). */
+  const SeerField *sch = SEER_CELL_SCHEMA;
+  if (t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE)
+    sch = SEER_LOB_CELL_SCHEMA;
+  else if (t == ORA_TYPE_UROWID)
+    sch = SEER_UROWID_CELL_SCHEMA;
+  else if (t == ORA_TYPE_RID)
+    sch = SEER_ROWID_CELL_SCHEMA;
+  SeerReader sr;
+  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerCellMsg m = {0};
+  SeerSchemaResult res = seer_schema_decode_ex(sch, &cx, &sr, &m);
+  if (res != SCH_OK) {
+    seer_schema_free(sch, &m);
+    if (res == SCH_SHORT)
+      r->cut = true;
+    else
+      r->bad = true;
+    return SEER_OK;
+  }
+  r->pos += sr.pos;
+  bool null = m.indicator == 0xFFFF;
   if (t == ORA_TYPE_RID) {
-    uint8_t size = o8r_u8(r);
-    uint32_t obj = 0, file = 0, blk = 0, slot = 0;
-    if (size != 0) {
-      obj = o8r_le32(r);
-      file = o8r_le16(r);
-      o8r_skip(r, 1);
-      blk = o8r_le32(r);
-      slot = o8r_le16(r);
-    }
-    o8r_skip(r, 4); /* trailer */
-    if (r->cut || r->bad || size == 0)
+    if (null || m.rowid_size == 0)
       return SEER_OK;
     char rid[18];
-    rowid_b64(obj, 6, rid);
-    rowid_b64(file, 3, rid + 6);
-    rowid_b64(blk, 6, rid + 9);
-    rowid_b64(slot, 3, rid + 15);
+    rowid_b64((uint32_t)m.rowid_obj, 6, rid);
+    rowid_b64((uint32_t)m.rowid_file, 3, rid + 6);
+    rowid_b64((uint32_t)m.rowid_block, 6, rid + 9);
+    rowid_b64((uint32_t)m.rowid_slot, 3, rid + 15);
     return cell_set_bytes(cell, rid, sizeof rid, false);
   }
-  SeerWriter v;
-  if (!seer_writer_init(&v, 32))
-    return SEER_ENOMEM;
-  bool null = false;
-  bool lob = t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE;
-  if (lob) {
-    /* A ub4 length - the locator's, 86 for a CLOB or BLOB, not the content's -
-     * then the locator as a value; NULL is a zero length and the trailer
-     * alone, no locator (§19.10, §19.15, seerdb #387). */
-    if (o8r_le32(r) > 0)
-      o8r_value(r, &v);
-    else
-      null = true;
-  } else if (t == ORA_TYPE_UROWID) {
-    if (o8r_le16(r) > 0)
-      o8r_value(r, &v);
-    else
-      null = true;
-  } else if (t == ORA_TYPE_LONG || t == ORA_TYPE_LONGRAW) {
-    if (o8r_has(r, 1) && r->b[r->pos] == 0) {
-      r->pos++;
-      null = true;
-    } else {
-      o8r_value(r, &v);
-    }
-  } else if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
-    null = true; /* the trailer alone */
-  } else {
-    o8r_value(r, &v);
-  }
-  /* The trailer: the sb2 indicator, -1 for NULL, and the ub2 return code. A
-   * NULL VARCHAR2 from a table comes as an empty value and the trailer with
-   * the indicator -1, not as the trailer alone: read only by its first
-   * byte, it came back an empty string (#153). */
-  if (o8r_le16(r) == 0xFFFF)
+  if (m.value.p == NULL)
     null = true;
-  o8r_skip(r, 2);
+  SeerWriter v;
+  if (!seer_writer_init(&v, m.value.n + 1)) {
+    seer_schema_free(sch, &m);
+    return SEER_ENOMEM;
+  }
+  seer_writer_bytes(&v, m.value.p, m.value.n);
+  seer_schema_free(sch, &m);
   SeerStatus st = SEER_OK;
-  if (!r->cut && !r->bad && !null && seer_writer_ok(&v)) {
+  if (!null && seer_writer_ok(&v)) {
     switch (t) {
     case ORA_TYPE_CLOB:
     case ORA_TYPE_BLOB:
@@ -6353,7 +6325,7 @@ static SeerStatus o8i_read_rows(O8iRd *r, SeerStmt *stmt, SeerCell ***rows, size
       SeerRxhMsg m = {0};
       SeerSchemaResult res = seer_schema_decode_ex(SEER_RXH_SCHEMA, &cx, &sr, &m);
       veclen = 0;
-      if (res == SCH_OK && m.bit_vector.n <= sizeof vec) {
+      if (res == SCH_OK && m.bit_vector.n > 0 && m.bit_vector.n <= sizeof vec) {
         memcpy(vec, m.bit_vector.p, m.bit_vector.n);
         veclen = m.bit_vector.n;
       }

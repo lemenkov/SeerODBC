@@ -5,6 +5,7 @@
  */
 #include "schema.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,6 +33,10 @@ static const int64_t *cnum(const void *msg, uint16_t off)
 /* Whether `f` is on the wire for this codec, version and message. */
 static bool present(const SeerField *f, const SeerSchemaCtx *cx, const void *msg)
 {
+  /* A thin context must say its field version: 0 would read as 9i's (2) and
+   * below, and pick the pre-10g fields - a context built by hand without it
+   * did, twice. */
+  assert(cx->codec != SEER_CODEC_THIN || cx->fv != 0);
   if (f->codecs != 0 && (f->codecs & cx->codec) == 0)
     return false;
   if (cx->codec == SEER_CODEC_THIN) { /* 8i has no field version */
@@ -177,6 +182,10 @@ static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b, bool
   uint8_t lb = seer_reader_u8(r);
   if (!seer_reader_ok(r))
     return false;
+  if (lb == 0xFF && cx->codec == SEER_CODEC_O8I) {
+    r->pos--; /* 8i: a NULL cell is its trailer alone, whose indicator starts ff */
+    return true;
+  }
   if (lb == 0 || lb == 0xFF)
     return true;
   if (lb != 0xFE) {
@@ -222,9 +231,11 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
     if ((f->flags & SG_IF_MORE) && cx->codec == SEER_CODEC_THIN && seer_reader_remaining(r) == 0)
       continue; /* thin only: an 8i reply may simply not have it yet */
     switch (f->kind) {
-    case SF_U8:
-      *num(msg, f->off) = seer_reader_u8(r);
+    case SF_U8: {
+      uint8_t v = seer_reader_u8(r);
+      *num(msg, f->off) = (f->flags & SG_FF_NULL) && v == 0xFF ? 0 : v;
       break;
+    }
     case SF_N1:
     case SF_N2:
     case SF_N4:

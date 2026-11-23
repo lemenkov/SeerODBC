@@ -51,6 +51,7 @@ typedef enum {
 #define SG_IF_SET 0x02
 #define SG_IF_MORE 0x04
 #define SG_IF_CLEAR 0x08 /* the member at `if_off` must be zero */
+#define SG_FF_NULL 0x10  /* SF_U8: 0xFF reads as 0, a NULL marker */
 
 typedef struct {
   uint8_t kind;

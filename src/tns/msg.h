@@ -93,13 +93,25 @@ extern const SeerField SEER_OER_FLAGS_SCHEMA[];
 extern const SeerField SEER_OER_BATCH_SCHEMA[];
 extern const SeerField SEER_OER_TAIL_SCHEMA[];
 
-/* A row's plain cell: its value (a ub1 length, or 0xFE and chunks; 0 and
- * 0xFF are empty / NULL). Read in place - only a chunked value is copied. */
+/* A row's cells. Every kind ends, where the path has one, in the cell's
+ * trailer: on 8i an indicator (-1 NULL) and a return code, ub2s, after every
+ * cell; on 9i the indicator alone, a compressed integer (00, or 81 01 for
+ * NULL); from 10g a LONG's two, and no other cell's. A value is a ub1 length,
+ * or 0xFE and chunks (0 and 0xFF NULL; on 8i a NULL is the trailer alone),
+ * read in place - only a chunked one is copied. A NULL value has no pointer;
+ * an empty one a pointer and no length. */
 typedef struct {
   SeerBytes value;
+  int64_t indicator, return_code;
+  /* ROWID */
+  int64_t rowid_size, rowid_obj, rowid_file, rowid_res, rowid_block, rowid_slot;
 } SeerCellMsg;
 
-extern const SeerField SEER_CELL_SCHEMA[];
+extern const SeerField SEER_CELL_SCHEMA[];        /* a plain value */
+extern const SeerField SEER_LONG_CELL_SCHEMA[];   /* LONG / LONG RAW */
+extern const SeerField SEER_LOB_CELL_SCHEMA[];    /* a LOB's locator, counted */
+extern const SeerField SEER_UROWID_CELL_SCHEMA[]; /* a UROWID, counted */
+extern const SeerField SEER_ROWID_CELL_SCHEMA[];  /* a ROWID's five fields */
 
 /* A function call's header: the message type (TTI_FUN, or the piggyback
  * 0x11), the function, the sequence number, and from field version 24 the
