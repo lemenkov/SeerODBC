@@ -124,6 +124,20 @@ extern const SeerField SEER_ROWID_CELL_SCHEMA[];  /* a ROWID's five fields */
  * 8i / 9i bind the block never assigned - keep their own readers. */
 extern const SeerField SEER_OUT_CELL_SCHEMA[];
 
+/* The special OUT forms on 8i (§19.17b / §19.17c), each in a SeerCellMsg but
+ * the array's count:
+ * - a LOB: its locator, counted, then the indicator; no return code;
+ * - a bind the block never assigned: ff, then the indicator (3105);
+ * - an associative array: a count, then each element as
+ *   SEER_OUT_CELL_SCHEMA (the REF OUT the same, without the count). */
+typedef struct {
+  int64_t count;
+} SeerOutArrayMsg;
+
+extern const SeerField SEER_LOB_OUT_SCHEMA[];
+extern const SeerField SEER_OUT_UNSET_SCHEMA[];
+extern const SeerField SEER_OUT_ARRAY_SCHEMA[];
+
 /* The I/O vector (TTI_IOV, after its token; seerdb _O7_IOV / _O8I_IOV), a
  * block's bind prompt: flags, the requests and iterations - the binds are
  * iterations * 256 + requests - the iterations this time, on thin the

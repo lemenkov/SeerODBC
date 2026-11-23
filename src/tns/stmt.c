@@ -6988,46 +6988,60 @@ static SeerStatus o8i_resolve_lobs(SeerStmt *stmt)
 /* One OUT value of an 8i block reply into `b->out` (§19.14, _O8I_OUT_CELL):
  * a value and an sb2 indicator, -1 for NULL; `ff` and the indicator 3105
  * for one the block never assigned. Text comes in WE8ISO8859P1. */
+/* Decode `schema` at 8i's widths from where `r` stands: past it when whole,
+ * `cut` when the reply hasn't brought it all yet, `bad` otherwise. */
+static SeerSchemaResult o8i_decode(O8iRd *r, const SeerField *schema, void *msg)
+{
+  SeerReader sr;
+  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerSchemaResult res = seer_schema_decode_ex(schema, &cx, &sr, msg);
+  if (res == SCH_OK)
+    r->pos += sr.pos;
+  else if (res == SCH_SHORT)
+    r->cut = true;
+  else
+    r->bad = true;
+  return res;
+}
+
 static void o8i_out_cell(O8iRd *r, SeerBind *b)
 {
   free(b->out.data);
   b->out = (SeerCell){0};
   if (b->is_array) {
-    /* An associative array (§19.17c, #172): a LE ub4 count, then each
-     * element as a value and an sb2 indicator, -1 for NULL; no return code,
-     * as the OAC doesn't ask for one (flag 0x04). Text in WE8ISO8859P1. */
+    /* An associative array (§19.17c, #172) by SEER_OUT_ARRAY_SCHEMA: a
+     * count, then each element by SEER_OUT_CELL_SCHEMA, a value and an
+     * indicator (-1 NULL); no return code, as the OAC doesn't ask for one
+     * (flag 0x04). Text in WE8ISO8859P1. */
     for (int k = 0; k < b->out_arr_n; k++)
       free(b->out_arr[k].data);
     free(b->out_arr);
     b->out_arr = NULL;
     b->out_arr_n = 0;
-    uint32_t count = o8r_le32(r);
-    if (r->cut || r->bad)
+    SeerOutArrayMsg am = {0};
+    if (o8i_decode(r, SEER_OUT_ARRAY_SCHEMA, &am) != SCH_OK)
       return;
-    if (count > 65535) {
+    if (am.count < 0 || am.count > 65535) {
       r->bad = true;
       return;
     }
+    uint32_t count = (uint32_t)am.count;
     SeerCell *cells = calloc(count ? count : 1, sizeof *cells);
     if (cells == NULL) {
       r->bad = true;
       return;
     }
     for (uint32_t e = 0; e < count && !r->cut && !r->bad; e++) {
-      SeerWriter v;
-      if (!seer_writer_init(&v, 32)) {
-        r->bad = true;
-        break;
-      }
-      o8r_value(r, &v);
-      uint16_t ind = (uint16_t)o8r_le16(r);
-      if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v)) {
+      SeerCellMsg em = {0};
+      if (o8i_decode(r, SEER_OUT_CELL_SCHEMA, &em) == SCH_OK && em.indicator != 0xFFFF &&
+          em.value.n > 0) {
         if (b->oac_type == ORA_TYPE_NUMBER)
-          (void)decode_scalar(ORA_TYPE_NUMBER, v.buf, v.len, &cells[e]);
+          (void)decode_scalar(ORA_TYPE_NUMBER, em.value.p, em.value.n, &cells[e]);
         else
-          (void)o8i_text_cell(&cells[e], v.buf, v.len);
+          (void)o8i_text_cell(&cells[e], em.value.p, em.value.n);
       }
-      seer_writer_free(&v);
+      seer_schema_free(SEER_OUT_CELL_SCHEMA, &em);
     }
     if (r->cut || r->bad) {
       for (uint32_t e = 0; e < count; e++)
@@ -7041,99 +7055,69 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
   }
   if (b->oac_type == ORA_TYPE_ADT && b->obj_type != NULL) {
     /* An object or collection: the bind value's form - the 8i row cell
-     * without its trailer (§19.17c, #172). The image is decoded by the
-     * type's layout once the reply is in. Read as a plain value it left the
-     * status misaligned and the block's cursor id wrong. */
-    /* SEER_OBJECT_SCHEMA at 8i's widths, no trailer (#398) */
-    SeerReader sr;
-    seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
-    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+     * without its trailer (§19.17c, #172), SEER_OBJECT_SCHEMA at 8i's widths
+     * (#398). The image is decoded by the type's layout once the reply is
+     * in. Read as a plain value it left the status misaligned and the
+     * block's cursor id wrong. */
     SeerObjectMsg om = {0};
-    SeerSchemaResult res = seer_schema_decode_ex(SEER_OBJECT_SCHEMA, &cx, &sr, &om);
+    SeerSchemaResult res = o8i_decode(r, SEER_OBJECT_SCHEMA, &om);
     free(b->out_image);
     b->out_image = NULL;
     b->out_imagelen = 0;
-    if (res == SCH_OK) {
-      r->pos += sr.pos;
-      if (om.image_len > 0 && om.image.n > 0) {
-        b->out_image = malloc(om.image.n);
-        if (b->out_image != NULL) {
-          memcpy(b->out_image, om.image.p, om.image.n);
-          b->out_imagelen = om.image.n;
-        }
+    if (res == SCH_OK && om.image_len > 0 && om.image.n > 0) {
+      b->out_image = malloc(om.image.n);
+      if (b->out_image != NULL) {
+        memcpy(b->out_image, om.image.p, om.image.n);
+        b->out_imagelen = om.image.n;
       }
-    } else if (res == SCH_SHORT) {
-      r->cut = true;
-    } else {
-      r->bad = true;
     }
     seer_schema_free(SEER_OBJECT_SCHEMA, &om);
     return;
   }
   if (b->oac_type == ORA_TYPE_REF && b->oac_override != NULL) {
     /* A REF: `2a` + its 42 bytes as a value, then - as ref_bind's OUT
-     * descriptor sets flag 0x01 - a ub2 indicator; no return code. A NULL is
-     * an empty value and ff ff (bus 91, #325). Without the flag there is no
-     * indicator and a NULL is ORA-01405 (bus 85, #241). */
-    SeerWriter v;
-    if (!seer_writer_init(&v, 48)) {
-      r->bad = true;
-      return;
-    }
-    o8r_value(r, &v);
-    uint16_t ind = (uint16_t)o8r_le16(r);
-    if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v))
-      (void)decode_scalar(ORA_TYPE_REF, v.buf, v.len, &b->out);
-    seer_writer_free(&v);
+     * descriptor sets flag 0x01 - the indicator, SEER_OUT_CELL_SCHEMA's
+     * form; no return code. A NULL is an empty value and ff ff (bus 91,
+     * #325). Without the flag there is no indicator and a NULL is ORA-01405
+     * (bus 85, #241). */
+    SeerCellMsg om = {0};
+    if (o8i_decode(r, SEER_OUT_CELL_SCHEMA, &om) == SCH_OK && om.indicator != 0xFFFF &&
+        om.value.n > 0)
+      (void)decode_scalar(ORA_TYPE_REF, om.value.p, om.value.n, &b->out);
+    seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
     return;
   }
   if (b->ret_lob != 0) {
-    /* A LOB: a LE ub4 length, the locator as a value, a ub2 indicator, and
-     * no return code; NULL is a zero length and ff ff (§19.17b, #167). The
-     * content is read by the locator once the reply is in. */
+    /* A LOB by SEER_LOB_OUT_SCHEMA: the locator, counted, then the
+     * indicator; no return code; NULL is a zero count and ff ff (§19.17b,
+     * #167). The content is read by the locator once the reply is in. */
     free(b->ret_locator);
     b->ret_locator = NULL;
     b->ret_loclen = 0;
-    SeerWriter loc;
-    if (!seer_writer_init(&loc, 96)) {
-      r->bad = true;
-      return;
+    SeerCellMsg lm = {0};
+    if (o8i_decode(r, SEER_LOB_OUT_SCHEMA, &lm) == SCH_OK && lm.indicator != 0xFFFF &&
+        lm.value.n > 2) {
+      bool blank = true;
+      for (size_t i = 2; i < lm.value.n; i++)
+        blank &= lm.value.p[i] == 0;
+      if (!blank && (b->ret_locator = malloc(lm.value.n)) != NULL) {
+        memcpy(b->ret_locator, lm.value.p, lm.value.n);
+        b->ret_loclen = lm.value.n;
+      }
     }
-    if (o8r_le32(r) > 0)
-      o8r_value(r, &loc);
-    uint32_t ind = o8r_le16(r);
-    bool blank = true;
-    for (size_t i = 2; i < loc.len; i++)
-      blank &= loc.buf[i] == 0;
-    if (!r->cut && !r->bad && ind != 0xFFFF && loc.len > 2 && !blank && seer_writer_ok(&loc)) {
-      b->ret_locator = loc.buf;
-      b->ret_loclen = loc.len;
-    } else {
-      seer_writer_free(&loc);
-    }
+    seer_schema_free(SEER_LOB_OUT_SCHEMA, &lm);
     return;
   }
   if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
-    r->pos++;
-    (void)o8r_le16(r); /* 3105: never assigned */
+    /* SEER_OUT_UNSET_SCHEMA: a bind the block never assigned */
+    SeerCellMsg um = {0};
+    (void)o8i_decode(r, SEER_OUT_UNSET_SCHEMA, &um);
     return;
   }
   /* SEER_OUT_CELL_SCHEMA at 8i's widths: the value and its indicator */
-  SeerReader sr;
-  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
-  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
   SeerCellMsg om = {0};
-  SeerSchemaResult res = seer_schema_decode_ex(SEER_OUT_CELL_SCHEMA, &cx, &sr, &om);
-  if (res != SCH_OK) {
-    seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
-    if (res == SCH_SHORT)
-      r->cut = true;
-    else
-      r->bad = true;
-    return;
-  }
-  r->pos += sr.pos;
-  if (om.indicator != 0xFFFF && om.value.n > 0) {
+  if (o8i_decode(r, SEER_OUT_CELL_SCHEMA, &om) == SCH_OK && om.indicator != 0xFFFF &&
+      om.value.n > 0) {
     bool text = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
                 b->oac_type == ORA_TYPE_LONG || b->oac_type == 0;
     if (text)

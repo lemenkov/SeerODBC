@@ -188,6 +188,24 @@ const SeerField SEER_OUT_CELL_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_LOB_OUT_SCHEMA[] = {
+    SEER_F(SF_COUNTED, SeerCellMsg, value),
+    CELL_INDICATOR,
+    SEER_END,
+};
+
+static const uint8_t UNSET_MARK[1] = {0xFF};
+const SeerField SEER_OUT_UNSET_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = 1, .lit = UNSET_MARK},
+    CELL_INDICATOR,
+    SEER_END,
+};
+
+const SeerField SEER_OUT_ARRAY_SCHEMA[] = {
+    SEER_F(SF_N4, SeerOutArrayMsg, count),
+    SEER_END,
+};
+
 const SeerField SEER_IOV_SCHEMA[] = {
     SEER_F(SF_U8, SeerIovMsg, flags),
     SEER_F(SF_N2, SeerIovMsg, requests),
