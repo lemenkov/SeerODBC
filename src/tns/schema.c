@@ -190,6 +190,9 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
     case SF_BE2:
       seer_writer_u16(w, (uint16_t)*cnum(msg, f->off));
       break;
+    case SF_LE2:
+      put_le(w, (uint64_t)*cnum(msg, f->off), 2);
+      break;
     case SF_PAD:
       for (uint16_t i = 0; i < f->arg; i++)
         seer_writer_u8(w, 0);
@@ -352,6 +355,9 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
       break;
     case SF_BE2:
       *num(msg, f->off) = seer_reader_u16(r);
+      break;
+    case SF_LE2:
+      *num(msg, f->off) = get_le(r, 2);
       break;
     case SF_PAD:
       (void)seer_reader_bytes(r, f->arg);

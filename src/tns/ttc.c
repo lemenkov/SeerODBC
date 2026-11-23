@@ -91,37 +91,37 @@ static const uint16_t DTY_12C_OVERRIDES[][3] = {
     {241, 109, 1},
 };
 
-/* Append the 12c+ datatype table (uniform UB2 entries + UB2 0 terminator). */
-static void write_dty_12c_table(SeerWriter *w)
+/* Append the 12c+ datatype table: SEER_DTY_ENTRY_SCHEMA's two-byte entries,
+ * then SEER_DTY_END_SCHEMA (#398). */
+static void write_dty_12c_table(SeerWriter *w, const SeerSchemaCtx *cx)
 {
   for (size_t i = 0; i < sizeof DTY_12C_TYPES / sizeof DTY_12C_TYPES[0]; i++) {
-    uint16_t type = DTY_12C_TYPES[i], conv = type, repr = 1;
+    SeerDtyEntryMsg e = {.type = DTY_12C_TYPES[i], .conv = DTY_12C_TYPES[i], .rep = 1};
     for (size_t j = 0; j < sizeof DTY_12C_OVERRIDES / sizeof DTY_12C_OVERRIDES[0]; j++)
-      if (DTY_12C_OVERRIDES[j][0] == type) {
-        conv = DTY_12C_OVERRIDES[j][1];
-        repr = DTY_12C_OVERRIDES[j][2];
+      if (DTY_12C_OVERRIDES[j][0] == e.type) {
+        e.conv = DTY_12C_OVERRIDES[j][1];
+        e.rep = DTY_12C_OVERRIDES[j][2];
         break;
       }
-    seer_writer_u16(w, type);
-    seer_writer_u16(w, conv);
-    seer_writer_u16(w, repr);
-    seer_writer_u16(w, 0);
+    seer_schema_encode(SEER_DTY_ENTRY_SCHEMA, cx, &e, w);
   }
-  seer_writer_u16(w, 0);
+  SeerDtyEntryMsg end = {0};
+  seer_schema_encode(SEER_DTY_END_SCHEMA, cx, &end, w);
 }
 
-/* TTI_DTY data-type override table (the identity map for ids 1..245 is
- * generated; this is the override tail), terminated by a 0 type. */
-static const uint8_t TYPE_OVERRIDES[] = {
-    2,   2,  10,  0,   3,   2,  10,  0,   4,   2,  10,  0, 5,   1,  1,   0,   6,   2,  10,  0,
-    7,   2,  10,  0,   9,   1,  1,   0,   12,  12, 10,  0, 13,  0,  14,  0,   15,  23, 1,   0,
-    16,  0,  17,  0,   18,  0,  19,  0,   20,  0,  21,  0, 22,  0,  39,  120, 1,   0,  58,  0,
-    68,  2,  10,  0,   69,  0,  70,  0,   74,  0,  6,   0, 91,  2,  10,  0,   94,  1,  1,   0,
-    95,  23, 1,   0,   96,  96, 1,   0,   97,  96, 1,   0, 104, 11, 1,   0,   105, 0,  108, 109,
-    1,   0,  110, 111, 1,   0,  116, 102, 1,   0,  118, 0, 119, 0,  121, 0,   122, 0,  123, 0,
-    136, 0,  146, 146, 1,   0,  147, 0,   152, 2,  10,  0, 153, 2,  10,  0,   154, 2,  10,  0,
-    155, 1,  1,   0,   156, 12, 10,  0,   172, 2,  10,  0, 209, 0,  3,   0,   0,
-};
+/* The 11g type table's override tail (the identity map for ids 1..245 is
+ * generated): (type, conv, repr), conv 0 an entry that ends after its type
+ * (SEER_DTY_ENTRY_SCHEMA). */
+static const uint8_t DTY_11G_OVERRIDES[][3] = {
+    {2, 2, 10},   {3, 2, 10},   {4, 2, 10},    {5, 1, 1},     {6, 2, 10},    {7, 2, 10},
+    {9, 1, 1},    {12, 12, 10}, {13, 0, 0},    {14, 0, 0},    {15, 23, 1},   {16, 0, 0},
+    {17, 0, 0},   {18, 0, 0},   {19, 0, 0},    {20, 0, 0},    {21, 0, 0},    {22, 0, 0},
+    {39, 120, 1}, {58, 0, 0},   {68, 2, 10},   {69, 0, 0},    {70, 0, 0},    {74, 0, 0},
+    {6, 0, 0},    {91, 2, 10},  {94, 1, 1},    {95, 23, 1},   {96, 96, 1},   {97, 96, 1},
+    {104, 11, 1}, {105, 0, 0},  {108, 109, 1}, {110, 111, 1}, {116, 102, 1}, {118, 0, 0},
+    {119, 0, 0},  {121, 0, 0},  {122, 0, 0},   {123, 0, 0},   {136, 0, 0},   {146, 146, 1},
+    {147, 0, 0},  {152, 2, 10}, {153, 2, 10},  {154, 2, 10},  {155, 1, 1},   {156, 12, 10},
+    {172, 2, 10}, {209, 0, 0},  {3, 0, 0}};
 
 /* TNS_DATA payload = 2-byte data flags + a TTC message-body chunk. The final
  * (or only) packet carries data flags 0x0000; a non-final fragment carries
@@ -831,50 +831,46 @@ static SeerStatus build_dty(SeerWriter *w, uint8_t fv, bool eor)
     return SEER_ENOMEM;
 
   seer_writer_u8(w, TTI_DTY);
-  /* charset_in and charset_out, both AL32UTF8, little-endian. */
-  for (int i = 0; i < 2; i++) {
-    seer_writer_u8(w, (uint8_t)(ORA_CHARSET_AL32UTF8 & 0xFF));
-    seer_writer_u8(w, (uint8_t)(ORA_CHARSET_AL32UTF8 >> 8));
-  }
-  /* The encoding flag follows the table form: 3 (multi-byte/conv-length) for
-   * the 12c+ UB2 table, 1 for the 11g 1-byte table. */
-  seer_writer_u8(w, is12c ? 3 : 1);
-
+  /* SEER_DTY_HEAD_SCHEMA (#398): both charsets AL32UTF8; the flag follows the
+   * table form, 3 (multi-byte/conv-length) for the 12c+ two-byte table, 1
+   * for the 11g one-byte table. */
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  SeerDtyMsg m = {.charset_in = ORA_CHARSET_AL32UTF8,
+                  .charset_out = ORA_CHARSET_AL32UTF8,
+                  .flags = is12c ? 3 : 1};
   if (is12c) {
     uint8_t caps[sizeof COMPILE_CAPS_12C];
     memcpy(caps, COMPILE_CAPS_12C, sizeof caps);
     caps[7] = fv; /* CCAP_FIELD_VERSION */
     if (eor)      /* §32/#155 opt-in */
       caps[TNS_CCAP_TTC4] |= TNS_CCAP_TTC4_END_OF_RESPONSE;
-    seer_writer_u8(w, (uint8_t)sizeof caps);
-    seer_writer_bytes(w, caps, sizeof caps);
-    seer_writer_u8(w, (uint8_t)sizeof RUNTIME_CAPS_12C);
-    seer_writer_bytes(w, RUNTIME_CAPS_12C, sizeof RUNTIME_CAPS_12C);
-    write_dty_12c_table(w);
+    m.ccaps_len = sizeof caps;
+    m.ccaps = (SeerBytes){.p = caps, .n = sizeof caps};
+    m.rcaps_len = sizeof RUNTIME_CAPS_12C;
+    m.rcaps = (SeerBytes){.p = RUNTIME_CAPS_12C, .n = sizeof RUNTIME_CAPS_12C};
+    seer_schema_encode(SEER_DTY_HEAD_SCHEMA, &cx, &m, w);
+    write_dty_12c_table(w, &cx);
   } else {
     /* 9i (fv2) advertises the minimal pre-10g caps (no O5LOGON); 10g/11g use
      * the 11.2 vector. The charset flag + type table are shared. */
-    const uint8_t *cc = COMPILE_CAPS;
-    size_t ccl = sizeof COMPILE_CAPS;
-    const uint8_t *rc = RUNTIME_CAPS;
-    size_t rcl = sizeof RUNTIME_CAPS;
-    if (fv < TTC_FIELD_VERSION_10_2) {
-      cc = O3_COMPILE_CAPS;
-      ccl = sizeof O3_COMPILE_CAPS;
-      rc = O3_RUNTIME_CAPS;
-      rcl = sizeof O3_RUNTIME_CAPS;
-    }
-    seer_writer_u8(w, (uint8_t)ccl);
-    seer_writer_bytes(w, cc, ccl);
-    seer_writer_u8(w, (uint8_t)rcl);
-    seer_writer_bytes(w, rc, rcl);
+    bool o3 = fv < TTC_FIELD_VERSION_10_2;
+    m.ccaps_len = o3 ? sizeof O3_COMPILE_CAPS : sizeof COMPILE_CAPS;
+    m.ccaps = (SeerBytes){.p = o3 ? O3_COMPILE_CAPS : COMPILE_CAPS, .n = (size_t)m.ccaps_len};
+    m.rcaps_len = o3 ? sizeof O3_RUNTIME_CAPS : sizeof RUNTIME_CAPS;
+    m.rcaps = (SeerBytes){.p = o3 ? O3_RUNTIME_CAPS : RUNTIME_CAPS, .n = (size_t)m.rcaps_len};
+    seer_schema_encode(SEER_DTY_HEAD_SCHEMA, &cx, &m, w);
     for (int x = 1; x <= 245; x++) { /* identity map */
-      seer_writer_u8(w, (uint8_t)x);
-      seer_writer_u8(w, (uint8_t)x);
-      seer_writer_u8(w, 1);
-      seer_writer_u8(w, 0);
+      SeerDtyEntryMsg e = {.type = x, .conv = x, .rep = 1};
+      seer_schema_encode(SEER_DTY_ENTRY_SCHEMA, &cx, &e, w);
     }
-    seer_writer_bytes(w, TYPE_OVERRIDES, sizeof TYPE_OVERRIDES);
+    for (size_t i = 0; i < sizeof DTY_11G_OVERRIDES / sizeof DTY_11G_OVERRIDES[0]; i++) {
+      SeerDtyEntryMsg e = {.type = DTY_11G_OVERRIDES[i][0],
+                           .conv = DTY_11G_OVERRIDES[i][1],
+                           .rep = DTY_11G_OVERRIDES[i][2]};
+      seer_schema_encode(SEER_DTY_ENTRY_SCHEMA, &cx, &e, w);
+    }
+    SeerDtyEntryMsg end = {0};
+    seer_schema_encode(SEER_DTY_END_SCHEMA, &cx, &end, w);
   }
 
   if (!seer_writer_ok(w)) {

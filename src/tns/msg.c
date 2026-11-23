@@ -70,6 +70,47 @@ const SeerField SEER_O7_DESCRIBE_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_DTY_HEAD_SCHEMA[] = {
+    SEER_F(SF_LE2, SeerDtyMsg, charset_in),
+    SEER_F(SF_LE2, SeerDtyMsg, charset_out),
+    SEER_F(SF_U8, SeerDtyMsg, flags),
+    SEER_F(SF_U8, SeerDtyMsg, ccaps_len),
+    {.kind = SF_RAW, .off = offsetof(SeerDtyMsg, ccaps), .arg = offsetof(SeerDtyMsg, ccaps_len)},
+    SEER_F(SF_U8, SeerDtyMsg, rcaps_len),
+    {.kind = SF_RAW, .off = offsetof(SeerDtyMsg, rcaps), .arg = offsetof(SeerDtyMsg, rcaps_len)},
+    SEER_END,
+};
+
+#define E SeerDtyEntryMsg
+#define DTY_WIDE(member_) SEER_FV(SF_BE2, THIN, TTC_FIELD_VERSION_12_1, 0, E, member_)
+#define DTY_NARROW_IF_CONV(member_)                                                                \
+  {.kind = SF_U8,                                                                                  \
+   .codecs = THIN,                                                                                 \
+   .fv_max = TTC_FIELD_VERSION_12_1,                                                               \
+   .flags = SG_IF_SET,                                                                             \
+   .off = offsetof(E, member_),                                                                    \
+   .if_off = offsetof(E, conv)}
+const SeerField SEER_DTY_ENTRY_SCHEMA[] = {
+    DTY_WIDE(type),
+    DTY_WIDE(conv),
+    DTY_WIDE(rep),
+    DTY_WIDE(reserved),
+    SEER_FV(SF_U8, THIN, 0, TTC_FIELD_VERSION_12_1, E, type),
+    SEER_FV(SF_U8, THIN, 0, TTC_FIELD_VERSION_12_1, E, conv),
+    DTY_NARROW_IF_CONV(rep),
+    DTY_NARROW_IF_CONV(reserved),
+    SEER_END,
+};
+
+const SeerField SEER_DTY_END_SCHEMA[] = {
+    DTY_WIDE(type),
+    SEER_FV(SF_U8, THIN, 0, TTC_FIELD_VERSION_12_1, E, type),
+    SEER_END,
+};
+#undef DTY_NARROW_IF_CONV
+#undef DTY_WIDE
+#undef E
+
 const SeerField SEER_VALUE_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerChrMsg, value),
     SEER_END,

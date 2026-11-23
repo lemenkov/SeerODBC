@@ -56,6 +56,7 @@ typedef enum {
                * 64 bytes - 252 on thin from 12.1 - else 0xFE, chunks of 64,
                * a 0; each chunk's length a ub1, on thin from 12.1 an sb4.
                * Read as SF_VALUE */
+  SF_LE2,     /* a little-endian ub2 on every path: TTI_DTY's charsets */
   SF_LOB      /* a SeerBytes of LOB content as a LOB write sends it: a ub1
                * length and the bytes up to 252 bytes, else 0xFE, chunks to a
                * 0 - on thin from 10.2 of up to 0x7FFF bytes each with an sb4

@@ -36,6 +36,30 @@ typedef struct {
 
 extern const SeerField SEER_CHR_SCHEMA[];
 
+/* TTI_DTY, the data-type negotiation (after its token): the charsets in and
+ * out, little-endian; a flags byte - 3 with 12c's two-byte type table, 1
+ * with the one-byte one; the compile and runtime capabilities, each a length
+ * byte and the bytes; then the type table. */
+typedef struct {
+  int64_t charset_in, charset_out, flags, ccaps_len;
+  SeerBytes ccaps;
+  int64_t rcaps_len;
+  SeerBytes rcaps;
+} SeerDtyMsg;
+
+extern const SeerField SEER_DTY_HEAD_SCHEMA[];
+
+/* One type table entry: the type, the type it converts to, its
+ * representation and a 0. From 12.1 a big-endian ub2 each; before, a byte
+ * each, and an entry with no conversion ends after it. The table ends with a
+ * 0 type, SEER_DTY_END_SCHEMA. */
+typedef struct {
+  int64_t type, conv, rep, reserved;
+} SeerDtyEntryMsg;
+
+extern const SeerField SEER_DTY_ENTRY_SCHEMA[];
+extern const SeerField SEER_DTY_END_SCHEMA[];
+
 /* Opening a server cursor (OOPEN, function 2: 8i's TTI_OOPEN, 9i's
  * O7_OPEN), after the function header: a pointer byte for the cursor
  * returned, then the cursor - 0, a new one. The reply's RPA is the new
