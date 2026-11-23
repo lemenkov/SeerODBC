@@ -36,6 +36,26 @@ typedef struct {
 
 extern const SeerField SEER_CHR_SCHEMA[];
 
+/* Opening a server cursor (OOPEN, function 2: 8i's TTI_OOPEN, 9i's
+ * O7_OPEN), after the function header: a pointer byte for the cursor
+ * returned, then the cursor - 0, a new one. The reply's RPA is the new
+ * cursor's id. */
+typedef struct {
+  int64_t cursor_ptr, cursor;
+} SeerOpenMsg;
+
+extern const SeerField SEER_OPEN_SCHEMA[];
+extern const SeerField SEER_OPEN_REPLY_SCHEMA[];
+
+/* 9i's describe of an open cursor (O7_DESCRIBE), after the function header:
+ * 07, the cursor, then 00 00 01 02 01 01 - as ojdbc14 sends them, the
+ * fields not known. */
+typedef struct {
+  int64_t cursor;
+} SeerO7DescribeMsg;
+
+extern const SeerField SEER_O7_DESCRIBE_SCHEMA[];
+
 /* A value alone, read: the DCB's describe-info preamble. */
 extern const SeerField SEER_VALUE_SCHEMA[];
 

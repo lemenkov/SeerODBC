@@ -4311,6 +4311,8 @@ static SeerStatus fv2_txn(SeerConn *c, const uint8_t *msg, size_t mlen, uint8_t 
   return seer_ttc_recv(c, resp, rlen);
 }
 
+static void fv2_call_head(SeerWriter *w, uint8_t function);
+
 /* The server cursor every 9i statement runs on, opened by the first one that
  * needs it. Each OOPEN allocates a cursor; one per statement, all parsed on
  * cursor 1, left one open a statement until the session hit open_cursors
@@ -4319,19 +4321,27 @@ static SeerStatus fv2_txn(SeerConn *c, const uint8_t *msg, size_t mlen, uint8_t 
 static SeerStatus fv2_shared_cursor(SeerConn *c, uint32_t *out)
 {
   if (c->fv2_cursor == 0) {
-    static const uint8_t open[] = {TTI_FUN, O7_OPEN, 0, 0x01, 0x00};
+    /* SEER_OPEN_SCHEMA, and its reply's SEER_OPEN_REPLY_SCHEMA (#398) */
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    SeerWriter w;
+    if (!seer_writer_init(&w, 8))
+      return SEER_ENOMEM;
+    fv2_call_head(&w, O7_OPEN);
+    SeerOpenMsg om = {.cursor_ptr = 1};
+    seer_schema_encode(SEER_OPEN_SCHEMA, &cx, &om, &w);
     uint8_t *resp = NULL;
     size_t rlen = 0;
-    SeerStatus st = fv2_txn(c, open, sizeof open, &resp, &rlen);
+    SeerStatus st = seer_writer_ok(&w) ? fv2_txn(c, w.buf, w.len, &resp, &rlen) : SEER_ENOMEM;
+    seer_writer_free(&w);
     if (st != SEER_OK)
       return st;
     int64_t id = 0;
     if (rlen > 1 && resp[0] == TTI_RPA) {
       SeerReader r;
       seer_reader_init(&r, resp + 1, rlen - 1);
-      id = seer_dec_sb4(&r);
-      if (!seer_reader_ok(&r))
-        id = 0;
+      SeerOpenMsg rm = {0};
+      if (seer_schema_decode(SEER_OPEN_REPLY_SCHEMA, &cx, &r, &rm))
+        id = rm.cursor;
     }
     free(resp);
     if (id <= 0) {
@@ -5244,9 +5254,7 @@ static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen,
   SeerWriter w;
   if (!seer_writer_init(&w, 64 + loclen + taillen))
     return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, TTI_LOBOPS);
-  seer_writer_u8(&w, 0);
+  fv2_call_head(&w, TTI_LOBOPS);
   m->src_ptr = 1;
   m->src_len = (int64_t)loclen;
   m->loc_len = loclen > 1 ? (int64_t)loclen - 1 : 0; /* its first byte goes as 00 */
@@ -7332,8 +7340,9 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
     return SEER_ENOMEM;
   o8i_closing(c, &w);
   seer_ttc_fun_header(c, &w, TTI_OOPEN);
-  seer_writer_u8(&w, 1);
-  o8w_le32(&w, 0);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0); /* SEER_OPEN_SCHEMA (#398) */
+  SeerOpenMsg om = {.cursor_ptr = 1};
+  seer_schema_encode(SEER_OPEN_SCHEMA, &cx, &om, &w);
   SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   if (st != SEER_OK)
@@ -7344,9 +7353,12 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
   if (st != SEER_OK)
     return st;
   uint32_t cursor = 0;
-  if (rlen >= 5 && resp[0] == TTI_RPA) {
-    O8iRd r = {resp, rlen, 1, false, false};
-    cursor = o8r_le32(&r);
+  if (rlen > 1 && resp[0] == TTI_RPA) {
+    SeerReader r;
+    seer_reader_init(&r, resp + 1, rlen - 1);
+    SeerOpenMsg rm = {0};
+    if (seer_schema_decode(SEER_OPEN_REPLY_SCHEMA, &cx, &r, &rm))
+      cursor = (uint32_t)rm.cursor;
   }
   free(resp);
   if (cursor == 0) {
@@ -7367,12 +7379,9 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
   o8i_all8(c, &w, nmarkers > 0 ? 0x00028009 : 0x00028001, cursor, sql, sqllen, true, 1, 0,
            (uint32_t)nmarkers, 1, 0, O8I_STMT_SELECT);
   free(sql);
-  for (int i = 0; i < nmarkers; i++) {
-    seer_writer_u8(&w, ORA_TYPE_VARCHAR);
-    seer_writer_u8(&w, 0x80);
-    for (int k = 0; k < 23; k++)
-      seer_writer_u8(&w, 0);
-  }
+  SeerOacMsg mm = {.data_type = ORA_TYPE_VARCHAR, .flags = 0x80}; /* the rest 0 */
+  for (int i = 0; i < nmarkers; i++)
+    oac_write(&w, true, 0, &mm);
   st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   if (st != SEER_OK) {
@@ -7625,15 +7634,10 @@ static SeerStatus fv2_describe_cursor(SeerStmt *stmt, uint32_t cursor)
   SeerStatus st;
   if (!seer_writer_init(&w, 16))
     return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_DESCRIBE);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x07);
-  seer_enc_sb4(&w, cursor);
-  {
-    static const uint8_t d[] = {0, 0, 0x01, 0x02, 0x01, 0x01};
-    seer_writer_bytes(&w, d, sizeof d);
-  }
+  fv2_call_head(&w, O7_DESCRIBE); /* and SEER_O7_DESCRIBE_SCHEMA (#398) */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerO7DescribeMsg dm = {.cursor = cursor};
+  seer_schema_encode(SEER_O7_DESCRIBE_SCHEMA, &cx, &dm, &w);
   st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
   seer_writer_free(&w);
   if (st != SEER_OK)

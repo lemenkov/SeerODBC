@@ -969,10 +969,11 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
   /* The function header with no call token, even at fv24, as the corpus
    * recorded it (seerdb _AUTH_HEAD has none either); then the head, mode 1
    * (basic). 12c+ sends 5 pairs, AUTH_TERMINAL leading, 11g and 9i 4. */
-  seer_writer_u8(w, TTI_FUN);
-  seer_writer_u8(w, TTI_SESS);
-  seer_writer_u8(w, seer_ttc_next_seq(c));
   SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  SeerSchemaCtx hcx = cx; /* SEER_FUN_HEAD_SCHEMA at 23.1's widths: no token */
+  if (hcx.fv > TTC_FIELD_VERSION_23_1)
+    hcx.fv = TTC_FIELD_VERSION_23_1;
+  fun_head(w, &hcx, TTI_FUN, TTI_SESS, seer_ttc_next_seq(c), 0);
   auth_head(w, &cx, user, ulen, 1, is12c ? 5 : 4);
   if (is12c)
     auth_pair(w, &cx, "AUTH_TERMINAL", 13, "unknown", 7, 0);

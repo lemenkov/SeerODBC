@@ -50,6 +50,26 @@ const SeerField SEER_CHR_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_OPEN_SCHEMA[] = {
+    SEER_F(SF_U8, SeerOpenMsg, cursor_ptr),
+    SEER_F(SF_N4, SeerOpenMsg, cursor),
+    SEER_END,
+};
+
+const SeerField SEER_OPEN_REPLY_SCHEMA[] = {
+    SEER_F(SF_N4, SeerOpenMsg, cursor),
+    SEER_END,
+};
+
+static const uint8_t O7_DESCRIBE_HEAD[1] = {0x07};
+static const uint8_t O7_DESCRIBE_TAIL[6] = {0x00, 0x00, 0x01, 0x02, 0x01, 0x01};
+const SeerField SEER_O7_DESCRIBE_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = sizeof O7_DESCRIBE_HEAD, .lit = O7_DESCRIBE_HEAD},
+    SEER_F(SF_N4, SeerO7DescribeMsg, cursor),
+    {.kind = SF_CONST, .arg = sizeof O7_DESCRIBE_TAIL, .lit = O7_DESCRIBE_TAIL},
+    SEER_END,
+};
+
 const SeerField SEER_VALUE_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerChrMsg, value),
     SEER_END,
