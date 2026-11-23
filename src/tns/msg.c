@@ -260,6 +260,37 @@ const SeerField SEER_LOB_DATA_SCHEMA[] = {
     SEER_END,
 };
 
+static const uint8_t LOB_BIND_PREFIX[3] = {0x01, 0x28, 0x28};
+const SeerField SEER_LOB_BIND_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = sizeof LOB_BIND_PREFIX, .lit = LOB_BIND_PREFIX},
+    SEER_F(SF_BE2, SeerLobBindMsg, loc_len),
+    {.kind = SF_RAW,
+     .off = offsetof(SeerLobBindMsg, locator),
+     .arg = offsetof(SeerLobBindMsg, loc_len)},
+    {.kind = SF_CHR,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerLobBindMsg, image),
+     .if_off = offsetof(SeerLobBindMsg, has_image)},
+    SEER_END,
+};
+
+static const uint8_t VALUE_LOCATOR_HEAD[13] = {0x00, 0x04, 0x61, 0x08, 0x00, 0x00, 0x00,
+                                               0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
+const SeerField SEER_VALUE_LOCATOR_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = sizeof VALUE_LOCATOR_HEAD, .lit = VALUE_LOCATOR_HEAD},
+    SEER_F(SF_U8, SeerValueLocatorMsg, len_hi),
+    SEER_F(SF_BE2, SeerValueLocatorMsg, len_lo),
+    SEER_PAD(22),
+    SEER_END,
+};
+
+const SeerField SEER_LEGACY_LOB_BIND_SCHEMA[] = {
+    SEER_F(SF_N4, SeerLegacyLobBindMsg, loc_len),
+    SEER_FC(SF_VALUE, SEER_CODEC_O8I, SeerLegacyLobBindMsg, locator),
+    SEER_FC(SF_CHR, THIN, SeerLegacyLobBindMsg, locator),
+    SEER_END,
+};
+
 const SeerField SEER_RXH_SCHEMA[] = {
     SEER_F(SF_U8, SeerRxhMsg, flags),      SEER_F(SF_N2, SeerRxhMsg, requests),
     SEER_F(SF_N2, SeerRxhMsg, iteration),  SEER_F(SF_N2, SeerRxhMsg, iterations),

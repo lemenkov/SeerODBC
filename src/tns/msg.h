@@ -81,6 +81,40 @@ typedef struct {
 
 extern const SeerField SEER_LOB_DATA_SCHEMA[];
 
+/* A LOB bound by its locator on 10g+ (seerdb PROTOCOL.md §14.4): the prefix
+ * 01 28 28, the locator's big-endian ub2 length and its bytes; a value LOB
+ * (JSON, VECTOR) then its image, as a bind value. */
+typedef struct {
+  int64_t loc_len;
+  SeerBytes locator;
+  int64_t has_image;
+  SeerBytes image;
+} SeerLobBindMsg;
+
+extern const SeerField SEER_LOB_BIND_SCHEMA[];
+
+/* The 38-byte locator a value LOB is bound with (JSON #70, VECTOR #62):
+ * fixed fields, the image's length in three big-endian bytes - a ub1 and a
+ * ub2, so an image past 64 KiB fits (seerdb/seerdb@d15e421) - and 22
+ * zeros. */
+typedef struct {
+  int64_t len_hi, len_lo;
+} SeerValueLocatorMsg;
+
+extern const SeerField SEER_VALUE_LOCATOR_SCHEMA[];
+
+#define SEER_VALUE_LOCATOR_LEN 38
+
+/* A LOB locator as a bind value before 10g: its N4 length, then the locator
+ * as a value - inline at 8i's widths, as SF_CHR writes one on 9i (§19.3.1,
+ * §19.17b). */
+typedef struct {
+  int64_t loc_len;
+  SeerBytes locator;
+} SeerLegacyLobBindMsg;
+
+extern const SeerField SEER_LEGACY_LOB_BIND_SCHEMA[];
+
 /* The end-of-call status (TTI_OER, after its token). One field list on every
  * path, where three readers had it (#395 spike): 10g+ leads with the call
  * status and sequence number, which 9i and 8i don't send; the flags and

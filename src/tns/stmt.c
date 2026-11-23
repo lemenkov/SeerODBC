@@ -2148,11 +2148,9 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
   SeerWriter v, oac;
   bool ok = seer_writer_init(&v, loclen + 8);
   if (ok) {
-    seer_writer_u8(&v, 0x01);
-    seer_writer_u8(&v, 0x28);
-    seer_writer_u8(&v, 0x28);
-    seer_writer_u16(&v, (uint16_t)loclen);
-    seer_writer_bytes(&v, loc, loclen);
+    SeerLobBindMsg lm = {.loc_len = (int64_t)loclen, .locator = {.p = loc, .n = loclen}};
+    SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    seer_schema_encode(SEER_LOB_BIND_SCHEMA, &cx, &lm, &v); /* #398 */
     ok = seer_writer_ok(&v);
   }
   if (!ok || !seer_writer_init(&oac, 64)) {
@@ -6404,12 +6402,11 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
     /* A LOB sends a locator even as a pure OUT: an empty one, a LE ub4 86,
      * the ub1 length 86, 00 54 and 84 zeros. With the OUT placeholder fd 01,
      * 8.1.7 waits for the value and the call hangs (§19.17b, #167). */
-    o8w_le32(val, 86);
-    seer_writer_u8(val, 86);
-    seer_writer_u8(val, 0x00);
-    seer_writer_u8(val, 0x54);
-    for (int i = 0; i < 84; i++)
-      seer_writer_u8(val, 0);
+    static const uint8_t EMPTY_LOCATOR[86] = {0x00, 0x54};
+    SeerLegacyLobBindMsg lm = {.loc_len = sizeof EMPTY_LOCATOR,
+                               .locator = {.p = EMPTY_LOCATOR, .n = sizeof EMPTY_LOCATOR}};
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    seer_schema_encode(SEER_LEGACY_LOB_BIND_SCHEMA, &cx, &lm, val); /* #398 */
     *size = 32;
     return SEER_OK;
   }
@@ -7982,13 +7979,9 @@ static SeerStatus fv2_temp_lobs_begin(SeerStmt *stmt, bool query, Fv2TempLob **o
         if (!seer_writer_init(&bv, 96)) {
           st = SEER_ENOMEM;
         } else {
-          seer_enc_sb4(&bv, 86);
-          seer_writer_u8(&bv, 0xFE);
-          seer_writer_u8(&bv, 64);
-          seer_writer_bytes(&bv, t->loc, 64);
-          seer_writer_u8(&bv, 22);
-          seer_writer_bytes(&bv, t->loc + 64, 22);
-          seer_writer_u8(&bv, 0);
+          SeerLegacyLobBindMsg lm = {.loc_len = 86, .locator = {.p = t->loc, .n = 86}};
+          SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+          seer_schema_encode(SEER_LEGACY_LOB_BIND_SCHEMA, &cx, &lm, &bv); /* #398 */
           if (!seer_writer_ok(&bv)) {
             seer_writer_free(&bv);
             st = SEER_ENOMEM;
@@ -10205,21 +10198,27 @@ static SeerStatus native_lob_bind(SeerStmt *stmt, int param, uint8_t ora_type, c
    * vector past ~8190 dimensions (seerdb/seerdb@d15e421). */
   if (imagelen > 0xFFFFFF)
     return SEER_EPARAM;
-  uint8_t fv = stmt->conn->field_version;
-  static const uint8_t DESC[18] = {
-      0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08,
-      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-  };
-  SeerWriter v;
-  if (!seer_writer_init(&v, 64 + imagelen))
+  SeerConn *c = stmt->conn;
+  /* SEER_LOB_BIND_SCHEMA with the value LOB's 38-byte locator, then the
+   * image (#398). */
+  SeerWriter loc;
+  if (!seer_writer_init(&loc, SEER_VALUE_LOCATOR_LEN))
     return SEER_ENOMEM;
-  seer_writer_bytes(&v, DESC, sizeof DESC);
-  seer_writer_u8(&v, (uint8_t)(imagelen >> 16));
-  seer_writer_u8(&v, (uint8_t)(imagelen >> 8));
-  seer_writer_u8(&v, (uint8_t)(imagelen & 0xFF));
-  for (int i = 0; i < 22; i++)
-    seer_writer_u8(&v, 0);
-  obj_append_chr(&v, image, imagelen, fv);
+  SeerValueLocatorMsg vl = {.len_hi = (int64_t)(imagelen >> 16),
+                            .len_lo = (int64_t)(imagelen & 0xFFFF)};
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_VALUE_LOCATOR_SCHEMA, &cx, &vl, &loc);
+  SeerWriter v;
+  if (!seer_writer_ok(&loc) || !seer_writer_init(&v, 64 + imagelen)) {
+    seer_writer_free(&loc);
+    return SEER_ENOMEM;
+  }
+  SeerLobBindMsg lm = {.loc_len = (int64_t)loc.len,
+                       .locator = {.p = loc.buf, .n = loc.len},
+                       .has_image = 1,
+                       .image = {.p = image, .n = imagelen}};
+  seer_schema_encode(SEER_LOB_BIND_SCHEMA, &cx, &lm, &v);
+  seer_writer_free(&loc);
   if (!seer_writer_ok(&v)) {
     seer_writer_free(&v);
     return SEER_ENOMEM;
