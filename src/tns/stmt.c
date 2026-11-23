@@ -1576,73 +1576,58 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
   return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
 }
 
-/* DML RETURNING ... INTO return data (§5.6): for each OUT (return) bind, in bind
- * order, a ub4 affected-row count then per row a DALC value and an sb4 truncation
- * length. We capture the first affected row's value into pbinds[i].out (one ODBC
- * OUT parameter holds one value). */
+/* DML RETURNING ... INTO return data (§5.6), by SEER_RETURNING_COUNT_SCHEMA
+ * and per row SEER_RETURNING_VALUE_SCHEMA, or _LOB_SCHEMA for a LOB target
+ * (#398). We capture the first affected row's value into pbinds[i].out (one
+ * ODBC OUT parameter holds one value); a LOB's content is read through its
+ * locator once the response is parsed. */
 static SeerStatus parse_returning_rxd(SeerReader *r, SeerStmt *stmt)
 {
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
   for (int i = 0; i < stmt->npbinds; i++) {
     SeerBind *b = &stmt->pbinds[i];
     if (!b->is_out)
       continue;
     b->out_full_len = 0;
-    int64_t num_rows = seer_dec_sb4(r);
-    if (num_rows < 0 || num_rows > 1000000 || !seer_reader_ok(r))
+    SeerReturningMsg cm = {0};
+    if (!seer_schema_decode(SEER_RETURNING_COUNT_SCHEMA, &cx, r, &cm) || cm.nrows < 0 ||
+        cm.nrows > 1000000)
       return SEER_EPROTO;
-    for (int64_t row = 0; row < num_rows; row++) {
-      if (b->ret_lob != 0) {
-        /* A LOB return value is the LOB block (§22.1d): from 12.1 a lone 0x00
-         * for NULL, else ub4 block length, ub8 size, ub4 chunk size and the
-         * locator as a DALC; before 12.1 (measured on 10g / 11g) a ub4 size and
-         * the locator, as a fetched LOB column. Then the usual sb4 length. The
-         * content is read through the locator once the response is parsed. */
-        uint8_t *loc = NULL;
-        size_t ll = 0;
-        if (stmt->conn->field_version < TTC_FIELD_VERSION_12_1) {
-          if (read_lob_locator(r, &loc, &ll) != SEER_OK) { /* 11g: ub4 + locator */
-            free(loc);
-            return SEER_EPROTO;
-          }
-        } else if (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0x00) {
-          (void)seer_reader_u8(r);
-        } else {
-          (void)seer_dec_sb4(r); /* block length */
-          (void)seer_dec_sb4(r); /* LOB size (ub8) */
-          (void)seer_dec_sb4(r); /* chunk size */
-          if (seer_dec_dalc(r, &loc, &ll) != SEER_OK) {
-            free(loc);
-            return SEER_EPROTO;
-          }
-        }
-        (void)seer_dec_sb4(r); /* sb4 length */
-        if (row == 0) {
-          free(b->out.data);
-          b->out = (SeerCell){0};
-          free(b->ret_locator);
-          b->ret_locator = loc;
-          b->ret_loclen = ll;
-        } else {
-          free(loc);
-        }
-        continue;
-      }
-      uint8_t *v = NULL;
-      size_t vl = 0;
-      if (seer_dec_dalc(r, &v, &vl) != SEER_OK) {
-        free(v);
+    const SeerField *row_schema =
+        b->ret_lob != 0 ? SEER_RETURNING_LOB_SCHEMA : SEER_RETURNING_VALUE_SCHEMA;
+    for (int64_t row = 0; row < cm.nrows; row++) {
+      SeerReturningMsg m = {0};
+      if (!seer_schema_decode(row_schema, &cx, r, &m)) {
+        seer_schema_free(row_schema, &m);
         return SEER_EPROTO;
       }
-      /* The value's real length: larger than what arrived when the server
-       * cut it to the bind's declared size (seerdb/seerdb@1812615). */
-      int64_t actual = seer_dec_sb4(r);
+      SeerStatus st = SEER_OK;
       if (row == 0) { /* keep the first row's value */
         free(b->out.data);
         b->out = (SeerCell){0};
-        decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, v, vl, &b->out);
-        b->out_full_len = actual > (int64_t)vl ? actual : 0;
+        if (b->ret_lob != 0) {
+          free(b->ret_locator);
+          b->ret_locator = NULL;
+          b->ret_loclen = 0;
+          if (m.locator.n > 0) {
+            b->ret_locator = malloc(m.locator.n);
+            if (b->ret_locator == NULL)
+              st = SEER_ENOMEM;
+            else {
+              memcpy(b->ret_locator, m.locator.p, m.locator.n);
+              b->ret_loclen = m.locator.n;
+            }
+          }
+        } else {
+          decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, m.value.p, m.value.n,
+                        &b->out);
+          b->out_full_len = m.actual_len > (int64_t)m.value.n ? m.actual_len : 0;
+        }
       }
-      free(v);
+      seer_schema_free(row_schema, &m);
+      if (st != SEER_OK)
+        return st;
     }
   }
   return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;

@@ -211,6 +211,25 @@ extern const SeerField SEER_ROWID_CELL_SCHEMA[];  /* a ROWID's five fields */
  * 8i / 9i bind the block never assigned - keep their own readers. */
 extern const SeerField SEER_OUT_CELL_SCHEMA[];
 
+/* DML RETURNING's return data (§5.6, an RXD after a RETURNING execute): per
+ * OUT bind the affected-row count, then per row its value and real length -
+ * larger than what arrived when the server cut the value to the bind's size
+ * (seerdb/seerdb@1812615). A CLOB / BLOB target's value is the LOB block
+ * (§22.1d): from 12.1 the block's length (0 for a NULL, and nothing more),
+ * the LOB's size, the chunk size and the locator as a value; before 12.1
+ * (measured on 10g / 11g) the locator counted, as a fetched LOB column. */
+typedef struct {
+  int64_t nrows;
+  SeerBytes value;
+  int64_t block_len, lob_size, chunk_size;
+  SeerBytes locator;
+  int64_t actual_len;
+} SeerReturningMsg;
+
+extern const SeerField SEER_RETURNING_COUNT_SCHEMA[];
+extern const SeerField SEER_RETURNING_VALUE_SCHEMA[];
+extern const SeerField SEER_RETURNING_LOB_SCHEMA[];
+
 /* The special OUT forms on 8i (§19.17b / §19.17c), each in a SeerCellMsg but
  * the array's count:
  * - a LOB: its locator, counted, then the indicator; no return code;

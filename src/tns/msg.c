@@ -255,6 +255,37 @@ const SeerField SEER_OUT_CELL_SCHEMA[] = {
     SEER_END,
 };
 
+#define R SeerReturningMsg
+const SeerField SEER_RETURNING_COUNT_SCHEMA[] = {
+    SEER_F(SF_N4, R, nrows),
+    SEER_END,
+};
+
+const SeerField SEER_RETURNING_VALUE_SCHEMA[] = {
+    SEER_F(SF_VALUE, R, value),
+    SEER_F(SF_N4, R, actual_len),
+    SEER_END,
+};
+
+#define IF_BLOCK(kind_, member_)                                                                   \
+  {.kind = (kind_),                                                                                \
+   .codecs = THIN,                                                                                 \
+   .fv_min = TTC_FIELD_VERSION_12_1,                                                               \
+   .flags = SG_IF_SET,                                                                             \
+   .off = offsetof(R, member_),                                                                    \
+   .if_off = offsetof(R, block_len)}
+const SeerField SEER_RETURNING_LOB_SCHEMA[] = {
+    SEER_FV(SF_COUNTED, THIN, 0, TTC_FIELD_VERSION_12_1, R, locator),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_1, 0, R, block_len),
+    IF_BLOCK(SF_N4, lob_size),
+    IF_BLOCK(SF_N4, chunk_size),
+    IF_BLOCK(SF_VALUE, locator),
+    SEER_F(SF_N4, R, actual_len),
+    SEER_END,
+};
+#undef IF_BLOCK
+#undef R
+
 const SeerField SEER_LOB_OUT_SCHEMA[] = {
     SEER_F(SF_COUNTED, SeerCellMsg, value),
     CELL_INDICATOR,
