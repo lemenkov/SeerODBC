@@ -410,6 +410,23 @@ const SeerField SEER_OUT_CELL_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_CELL_TRAILER_SCHEMA[] = {
+    CELL_INDICATOR,
+    CELL_RETURN_CODE,
+    SEER_END,
+};
+
+const SeerField SEER_BVC_SCHEMA[] = {
+    SEER_F(SF_N4, SeerBvcMsg, nsent),
+    {.kind = SF_RAW, .off = offsetof(SeerBvcMsg, bits), .arg = offsetof(SeerBvcMsg, bits_len)},
+    SEER_END,
+};
+
+const SeerField SEER_COUNT_SCHEMA[] = {
+    SEER_F(SF_N4, SeerCountMsg, n),
+    SEER_END,
+};
+
 const SeerField SEER_OUT_TAIL_SCHEMA[] = {
     OUT_TAIL,
     SEER_END,

@@ -972,11 +972,13 @@ static SeerStatus parse_bvc(SeerReader *r, int ncols, uint8_t **bv, size_t *bvle
   free(*bv);
   *bv = NULL;
   *bvlen = 0;
-  (void)seer_dec_sb4(r); /* num columns sent */
+  /* SEER_BVC_SCHEMA (#398): the count sent, then a bit per column */
   size_t veclen = (size_t)((ncols + 7) / 8);
-  const uint8_t *p = seer_reader_bytes(r, veclen);
-  if (p == NULL)
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN, .fv = TTC_FIELD_VERSION_10_2}; /* 10g+ only */
+  SeerBvcMsg m = {.bits_len = (int64_t)veclen};
+  if (!seer_schema_decode(SEER_BVC_SCHEMA, &cx, r, &m))
     return SEER_EPROTO;
+  const uint8_t *p = m.bits.p;
   uint8_t *copy = malloc(veclen ? veclen : 1);
   if (copy == NULL)
     return SEER_ENOMEM;
@@ -1845,7 +1847,12 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       /* Pipelining (§32/#158): a response-correlation marker leading a
        * pipelined op's response — a ub8 token number. Consume it and keep
        * decoding the op body (which ends on its own OER/EOR). */
-      (void)seer_dec_sb4(&r);
+      {
+        SeerCountMsg tm = {0}; /* SEER_COUNT_SCHEMA (#398) */
+        SeerSchemaCtx tcx =
+            seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+        (void)seer_schema_decode(SEER_COUNT_SCHEMA, &tcx, &r, &tm);
+      }
       break;
     default:
       seer_log(SEER_LOG_ERROR, "stmt: unexpected response token %u", tok);
@@ -4472,11 +4479,12 @@ static int64_t fv2_oer_code(const uint8_t *resp, size_t rlen)
 {
   if (rlen < 1 || resp[0] != TTI_OER)
     return 0;
+  /* SEER_OER_HEAD_SCHEMA at 9.2 (#398): the row count, then the code */
   SeerReader r;
   seer_reader_init(&r, resp + 1, rlen - 1);
-  (void)seer_dec_sb4(&r); /* rows-this-fetch / rowcount */
-  int64_t code = seer_dec_sb4(&r);
-  return seer_reader_ok(&r) ? code : -1;
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerOerMsg m = {0};
+  return seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, &r, &m) ? m.code : -1;
 }
 
 /* The message of a 9i status as a chunked run starting at resp[i]: 0xFE, then
@@ -4858,9 +4866,11 @@ static SeerStatus fv2_decode_describe(const uint8_t *data, size_t dlen, SeerColu
     return SEER_EPROTO;
   SeerReader r;
   seer_reader_init(&r, data + 1, dlen - 1);
-  int64_t n = seer_dec_sb4(&r);
-  if (!seer_reader_ok(&r) || n <= 0 || n > 4096)
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerCountMsg cm = {0}; /* the column count: SEER_COUNT_SCHEMA (#398) */
+  if (!seer_schema_decode(SEER_COUNT_SCHEMA, &cx, &r, &cm) || cm.n <= 0 || cm.n > 4096)
     return SEER_EPROTO;
+  int64_t n = cm.n;
   int ncols = (int)n;
   SeerColumn *cols = calloc((size_t)ncols, sizeof *cols);
   if (cols == NULL)
@@ -5530,30 +5540,6 @@ static uint8_t o8r_u8(O8iRd *r)
   return o8r_has(r, 1) ? r->b[r->pos++] : 0;
 }
 
-static uint32_t o8r_le16(O8iRd *r)
-{
-  if (!o8r_has(r, 2))
-    return 0;
-  uint32_t v = (uint32_t)r->b[r->pos] | (uint32_t)r->b[r->pos + 1] << 8;
-  r->pos += 2;
-  return v;
-}
-
-static uint32_t o8r_le32(O8iRd *r)
-{
-  if (!o8r_has(r, 4))
-    return 0;
-  const uint8_t *p = r->b + r->pos;
-  r->pos += 4;
-  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
-static void o8r_skip(O8iRd *r, size_t k)
-{
-  if (o8r_has(r, k))
-    r->pos += k;
-}
-
 static void o8w_le32(SeerWriter *w, uint32_t v)
 {
   for (int i = 0; i < 4; i++)
@@ -5925,8 +5911,15 @@ static void o8i_read_cursor_cell(O8iRd *r, bool row_cell, SeerColumn **cols, int
                                  uint32_t *cursor)
 {
   o8i_read_columns(r, true, cols, ncols);
-  *cursor = o8r_le32(r);
-  o8r_skip(r, row_cell ? 4 : 2);
+  /* The cursor id, SEER_COUNT_SCHEMA, then a row cell's trailer or an OUT
+   * value's indicator (#398). */
+  SeerCountMsg cm = {0};
+  SeerCellMsg tm = {0};
+  *cursor = 0;
+  if (!r->cut && !r->bad && o8i_decode(r, SEER_COUNT_SCHEMA, &cm) == SCH_OK) {
+    *cursor = (uint32_t)cm.n;
+    (void)o8i_decode(r, row_cell ? SEER_CELL_TRAILER_SCHEMA : SEER_OUT_TAIL_SCHEMA, &tm);
+  }
   if ((r->cut || r->bad) && cols != NULL && *cols != NULL) {
     free_columns(*cols, *ncols);
     *cols = NULL;
@@ -5964,8 +5957,9 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell,
         r->bad = true;
       return SEER_OK;
     }
-    bool null = o8r_le16(r) == 0xFFFF;
-    o8r_skip(r, 2); /* return code */
+    SeerCellMsg tm = {0}; /* SEER_CELL_TRAILER_SCHEMA: indicator, return code */
+    (void)o8i_decode(r, SEER_CELL_TRAILER_SCHEMA, &tm);
+    bool null = tm.indicator == 0xFFFF;
     SeerStatus st = SEER_OK;
     if (!r->cut && !r->bad && !null && om.image_len > 0 && om.image.n > 0)
       st = cell_set_bytes(cell, om.image.p, om.image.n, true);
@@ -7077,9 +7071,9 @@ static void o8i_refcursor_cell(O8iRd *r, SeerStmt *stmt)
   stmt->refcursor_cols = NULL;
   stmt->refcursor_ncols = 0;
   stmt->refcursor_present = false;
-  if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
-    r->pos++;
-    (void)o8r_le16(r);
+  if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) { /* NULL: ff, the indicator */
+    SeerCellMsg um = {0};
+    (void)o8i_decode(r, SEER_OUT_UNSET_SCHEMA, &um);
     return;
   }
   SeerColumn *cols = NULL;
@@ -10090,7 +10084,7 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
     m.charset = 31;
     oac_write(&oac, false, TTC_FIELD_VERSION_9_2, &m);
     if (out)
-      seer_writer_u8(&v, 0x00);
+      chr_write(&v, false, fv, NULL, 0); /* the empty value */
     else if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   } else { /* 10g+, a JDBC thin capture (seerdb #139; 10g / 11g bus 106) */
@@ -10099,7 +10093,7 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
     m.charset = 2;
     oac_write(&oac, false, fv, &m); /* oaccolid from 12.2; 12.1 refuses it (seerdb #1144) */
     if (out)
-      seer_writer_u8(&v, 0x00); /* an empty value, as JDBC sends */
+      chr_write(&v, false, fv, NULL, 0); /* an empty value, as JDBC sends */
     else if (st == SEER_OK && obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   }

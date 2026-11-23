@@ -323,6 +323,27 @@ extern const SeerField SEER_OUT_CELL_SCHEMA[];
  * follows an OUT object's image. */
 extern const SeerField SEER_OUT_TAIL_SCHEMA[];
 
+/* A row cell's trailer alone (8i: the indicator and the return code; 9i: the
+ * indicator; 10g+: nothing), after a value read by another schema. */
+extern const SeerField SEER_CELL_TRAILER_SCHEMA[];
+
+/* The bit vector of columns sent (TTI_BVC, after its token): how many were
+ * sent, then a bit per column, `bits_len` bytes - from the describe. */
+typedef struct {
+  int64_t nsent, bits_len;
+  SeerBytes bits;
+} SeerBvcMsg;
+
+extern const SeerField SEER_BVC_SCHEMA[];
+
+/* A count alone, an N4: 9i's describe reply's columns, 8i's cursor cell's
+ * cursor id, a pipelined reply's correlation token (TTI_TOKEN, a ub8). */
+typedef struct {
+  int64_t n;
+} SeerCountMsg;
+
+extern const SeerField SEER_COUNT_SCHEMA[];
+
 /* DML RETURNING's return data (§5.6, an RXD after a RETURNING execute): per
  * OUT bind the affected-row count, then per row its value and real length -
  * larger than what arrived when the server cut the value to the bind's size
