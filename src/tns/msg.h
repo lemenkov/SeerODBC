@@ -36,6 +36,21 @@ typedef struct {
 
 extern const SeerField SEER_CHR_SCHEMA[];
 
+/* 8i's fixed bind slots (§19.14, §19.17a): fd 01, a pure OUT's slot and a
+ * NULL array element's; 01 00, a REF CURSOR's. Nothing of the message is
+ * read. */
+extern const SeerField SEER_O8I_OUT_SLOT_SCHEMA[];
+extern const SeerField SEER_O8I_CURSOR_SLOT_SCHEMA[];
+
+/* One locator in a list (the FREE_TEMP piggyback's, seerdb PROTOCOL.md
+ * §14.5): its big-endian ub2 length and the bytes. */
+typedef struct {
+  int64_t len;
+  SeerBytes locator;
+} SeerLocatorItemMsg;
+
+extern const SeerField SEER_LOCATOR_ITEM_SCHEMA[];
+
 /* TTI_PRO, the protocol negotiation (after its token). Both ways it starts
  * with the protocol versions, highest first, and a 0, then a banner and a
  * NUL - the client's the versions it takes, the server's the one it chose.

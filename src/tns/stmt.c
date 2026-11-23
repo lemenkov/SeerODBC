@@ -2847,6 +2847,31 @@ static void oac_write(SeerWriter *w, bool is_8i, uint8_t fv, const SeerOacMsg *m
   seer_schema_encode(SEER_OAC_SCHEMA, &cx, m, w);
 }
 
+/* A bind value by SEER_CHR_SCHEMA (#398): at 8i's widths, or thin's at
+ * field version `fv`. No bytes is the empty value, a NULL. */
+static void chr_write(SeerWriter *w, bool is_8i, uint8_t fv, const uint8_t *p, size_t n)
+{
+  SeerSchemaCtx cx = is_8i ? seer_msg_ctx(1, 0, 0) : seer_msg_ctx(0, fv, fv);
+  SeerChrMsg m = {.value = {.p = p, .n = n}};
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, w);
+}
+
+/* One of 8i's fixed slots (SEER_O8I_OUT_SLOT_SCHEMA, _CURSOR_SLOT_SCHEMA). */
+static void o8i_slot(SeerWriter *w, const SeerField *schema)
+{
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerChrMsg none = {0};
+  seer_schema_encode(schema, &cx, &none, w);
+}
+
+/* An associative array's element count, as SEER_OUT_ARRAY_SCHEMA reads it. */
+static void aa_count(SeerWriter *w, bool is_8i, uint8_t fv, int n)
+{
+  SeerSchemaCtx cx = is_8i ? seer_msg_ctx(1, 0, 0) : seer_msg_ctx(0, fv, fv);
+  SeerOutArrayMsg m = {.count = n};
+  seer_schema_encode(SEER_OUT_ARRAY_SCHEMA, &cx, &m, w);
+}
+
 static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint32_t flag,
                      uint32_t charset)
 {
@@ -3007,13 +3032,14 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     SeerWriter locs;
     if (!seer_writer_init(&locs, total + 1))
       return SEER_ENOMEM;
-    for (int i = 0; i < c->n_free_lobs; i++) {
-      seer_writer_u16(&locs, (uint16_t)c->free_lob_lens[i]);
-      seer_writer_bytes(&locs, c->free_lobs[i], c->free_lob_lens[i]);
+    SeerSchemaCtx lcx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    for (int i = 0; i < c->n_free_lobs; i++) { /* SEER_LOCATOR_ITEM_SCHEMA each */
+      SeerLocatorItemMsg li = {.len = (int64_t)c->free_lob_lens[i],
+                               .locator = {.p = c->free_lobs[i], .n = c->free_lob_lens[i]}};
+      seer_schema_encode(SEER_LOCATOR_ITEM_SCHEMA, &lcx, &li, &locs);
       free(c->free_lobs[i]);
     }
     c->n_free_lobs = 0;
-    SeerSchemaCtx lcx = seer_msg_ctx(0, c->field_version, c->server_field_version);
     SeerFunHeadMsg lh = {
         .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_LOBOPS, .seq = seer_ttc_next_seq(c)};
     SeerLobopMsg lm = {.src_ptr = 1,
@@ -3116,7 +3142,7 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
           if (rxd != NULL)
             seer_writer_bytes(w, rxd, b->rxd_len[it]);
           else
-            seer_writer_u8(w, 0); /* unbound/NULL -> 0 */
+            chr_write(w, false, c->field_version, NULL, 0); /* unbound: NULL */
         }
       }
     }
@@ -5211,7 +5237,7 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
         if (rxd != NULL)
           seer_writer_bytes(w, rxd, b->rxd_len[row]);
         else
-          seer_writer_u8(w, 0); /* unbound -> NULL value */
+          chr_write(w, false, TTC_FIELD_VERSION_9_2, NULL, 0); /* unbound: NULL */
       }
     }
   }
@@ -6374,21 +6400,19 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
   }
   if (b->oac_type == ORA_TYPE_REFCURSOR) {
     /* A REF CURSOR sends an empty slot, 01 00 (§19.17a). */
-    seer_writer_u8(val, 0x01);
-    seer_writer_u8(val, 0x00);
+    o8i_slot(val, SEER_O8I_CURSOR_SLOT_SCHEMA);
     *size = 1;
     return SEER_OK;
   }
   if (b->is_out && b->out_only) {
     /* A pure OUT bind sends the fixed placeholder fd 01 in its slot, and
      * declares its return buffer (§19.14). */
-    seer_writer_u8(val, 0xFD);
-    seer_writer_u8(val, 0x01);
+    o8i_slot(val, SEER_O8I_OUT_SLOT_SCHEMA);
     *size = o8i_out_buffer(b, b->oac_size);
     return SEER_OK;
   }
   if (v == NULL || vn == 0 || (vn == 1 && v[0] == 0)) {
-    seer_writer_u8(val, 0);
+    chr_write(val, true, 0, NULL, 0); /* the empty value */
     *size = b->oac_size ? b->oac_size : 1;
     return SEER_OK;
   }
@@ -8406,7 +8430,7 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
       if (rxd != NULL)
         seer_writer_bytes(&w, rxd, b->rxd_len[0]);
       else
-        seer_writer_u8(&w, 0);
+        chr_write(&w, false, TTC_FIELD_VERSION_9_2, NULL, 0); /* unbound: NULL */
     }
     if (!seer_writer_ok(&w)) {
       seer_writer_free(&w);
@@ -10507,12 +10531,10 @@ static uint8_t *o8i_aa_oac(uint8_t dtype, uint32_t length, uint32_t capacity, si
 
 static void o8i_aa_elem(SeerWriter *v, const uint8_t *p, size_t n)
 {
-  if (p == NULL) {
-    seer_writer_u8(v, 0xFD); /* a NULL element */
-    seer_writer_u8(v, 0x01);
-  } else {
-    o8w_chr(v, p, n);
-  }
+  if (p == NULL)
+    o8i_slot(v, SEER_O8I_OUT_SLOT_SCHEMA); /* a NULL element */
+  else
+    chr_write(v, true, 0, p, n);
 }
 
 /* Attach a prebuilt array OAC + RXD to a bind position (a single PL/SQL
@@ -10631,7 +10653,7 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
     SeerWriter v;
     if (!seer_writer_init(&v, 8 + (size_t)n * 24))
       return SEER_ENOMEM;
-    o8w_le32(&v, (uint32_t)n);
+    aa_count(&v, true, 0, n);
     for (int i = 0; i < n; i++) {
       uint8_t num[24];
       size_t nn = seer_encode_number_int(values[i], num);
@@ -10648,16 +10670,15 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
     return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
-  /* RXD: ub4 element count, then each element <ub1 len><NUMBER bytes>. */
+  /* RXD: the element count, then each element a bind value (#398). */
   SeerWriter rxd;
   if (!seer_writer_init(&rxd, 16 + (size_t)n * 12))
     return SEER_ENOMEM;
-  seer_enc_sb4(&rxd, (uint32_t)n);
+  aa_count(&rxd, false, stmt->conn->field_version, n);
   for (int i = 0; i < n; i++) {
     uint8_t num[24];
     size_t nn = seer_encode_number_int(values[i], num);
-    seer_writer_u8(&rxd, (uint8_t)nn);
-    seer_writer_bytes(&rxd, num, nn);
+    chr_write(&rxd, false, stmt->conn->field_version, num, nn);
   }
   if (!seer_writer_ok(&rxd)) {
     seer_writer_free(&rxd);
@@ -10683,7 +10704,7 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
     SeerWriter v;
     if (!seer_writer_init(&v, 8 + (size_t)n * 16))
       return SEER_ENOMEM;
-    o8w_le32(&v, (uint32_t)n);
+    aa_count(&v, true, 0, n);
     for (int i = 0; i < n; i++) {
       if (values[i] == NULL) {
         o8i_aa_elem(&v, NULL, 0);
@@ -10711,22 +10732,15 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
     return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
-  /* RXD: ub4 count, then each element as a length-framed CHR value. */
+  /* RXD: the count, then each element a bind value, a NULL one empty
+   * (#398). */
   SeerWriter rxd;
   if (!seer_writer_init(&rxd, 32 + (size_t)n * 16))
     return SEER_ENOMEM;
-  seer_enc_sb4(&rxd, (uint32_t)n);
-  for (int i = 0; i < n; i++) {
-    if (values[i] == NULL) {
-      seer_writer_u8(&rxd, 0); /* NULL element (zero-length) */
-      continue;
-    }
-    if (obj_append_chr(&rxd, (const uint8_t *)values[i], strlen(values[i]),
-                       stmt->conn->field_version) != SEER_OK) {
-      seer_writer_free(&rxd);
-      return SEER_ENOMEM;
-    }
-  }
+  aa_count(&rxd, false, stmt->conn->field_version, n);
+  for (int i = 0; i < n; i++)
+    chr_write(&rxd, false, stmt->conn->field_version, (const uint8_t *)values[i],
+              values[i] != NULL ? strlen(values[i]) : 0);
   if (!seer_writer_ok(&rxd)) {
     seer_writer_free(&rxd);
     return SEER_ENOMEM;

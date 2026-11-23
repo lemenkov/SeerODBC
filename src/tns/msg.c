@@ -158,6 +158,26 @@ const SeerField SEER_FAST_AUTH_TAIL_SCHEMA[] = {
     SEER_END,
 };
 
+static const uint8_t O8I_OUT_SLOT[2] = {0xFD, 0x01};
+const SeerField SEER_O8I_OUT_SLOT_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = sizeof O8I_OUT_SLOT, .lit = O8I_OUT_SLOT},
+    SEER_END,
+};
+
+static const uint8_t O8I_CURSOR_SLOT[2] = {0x01, 0x00};
+const SeerField SEER_O8I_CURSOR_SLOT_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = sizeof O8I_CURSOR_SLOT, .lit = O8I_CURSOR_SLOT},
+    SEER_END,
+};
+
+const SeerField SEER_LOCATOR_ITEM_SCHEMA[] = {
+    SEER_F(SF_BE2, SeerLocatorItemMsg, len),
+    {.kind = SF_RAW,
+     .off = offsetof(SeerLocatorItemMsg, locator),
+     .arg = offsetof(SeerLocatorItemMsg, len)},
+    SEER_END,
+};
+
 const SeerField SEER_VALUE_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerChrMsg, value),
     SEER_END,
