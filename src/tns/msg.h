@@ -561,6 +561,24 @@ typedef struct {
 
 extern const SeerField SEER_AUTH_PAIR_SCHEMA[];
 
+/* A server piggyback (TTI_SVR_PIGGYBACK, after its opcode; python-oracledb's
+ * _process_server_side_piggyback), passed over:
+ * - SESS_RET (DRCP #130): the DTYs' count and length, the pairs' count, a
+ *   length byte when there are pairs, the pairs (each as an AUTH_ pair), the
+ *   session flags, id and serial;
+ * - OS_PID_MTS: a ub2 and the pid as a value;
+ * - SYNC (sessionless transactions, §31): as SESS_RET with the length byte
+ *   always there and the overall flags after the pairs. */
+typedef struct {
+  int64_t ndtys, dtys_len, npairs, pairs_len;
+  int64_t flags, session_id, serial;
+  SeerBytes pid;
+} SeerSvrPiggybackMsg;
+
+extern const SeerField SEER_SVR_PIG_SESS_RET_SCHEMA[];
+extern const SeerField SEER_SVR_PIG_MTS_SCHEMA[];
+extern const SeerField SEER_SVR_PIG_SYNC_SCHEMA[];
+
 /* A login reply after its TTI_RPA token (seerdb _PRE10_AUTH_REPLY; the thin
  * one the same way): the pairs' count - thin variable-width, 8i a ub2 - then
  * that many SEER_AUTH_PAIR_SCHEMA pairs. On thin the last pair's flags may be

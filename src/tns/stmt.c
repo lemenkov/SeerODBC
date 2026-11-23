@@ -1678,55 +1678,25 @@ static SeerStatus resolve_returned_lobs(SeerStmt *stmt)
   return SEER_OK;
 }
 
-/* Consume a server-side piggyback (TTI_SVR_PIGGYBACK, DRCP #130) the server
- * prepends to a pooled session's response. The values (assigned session id /
- * serial, session-state pairs, MTS pid) aren't needed - skip the block
- * byte-for-byte so the real response tokens follow. Mirrors python-oracledb. */
-static SeerStatus skip_server_piggyback(SeerReader *r)
+/* Consume a server-side piggyback (TTI_SVR_PIGGYBACK) the server prepends to
+ * a response: a pooled session's (DRCP #130), an MTS pid, or a sessionless
+ * transaction's sync state (§31, keyword 201 the transaction id). The values
+ * aren't needed: the block is read by its schema and dropped, so the real
+ * response tokens follow (#398). */
+static SeerStatus skip_server_piggyback(SeerReader *r, const SeerConn *c)
 {
   uint8_t opcode = seer_reader_u8(r);
-  if (opcode == TNS_SVR_PIG_SESS_RET) {
-    (void)seer_dec_sb4(r);            /* number of DTYs (ub2)   */
-    (void)seer_reader_u8(r);          /* length of DTYs (ub1)   */
-    int64_t npairs = seer_dec_sb4(r); /* number of pairs (ub2)  */
-    if (npairs > 0) {
-      (void)seer_reader_u8(r);
-      for (int64_t i = 0; i < npairs && seer_reader_ok(r); i++) {
-        if (seer_dec_sb4(r) > 0)
-          seer_skip_chunked(r); /* key   */
-        if (seer_dec_sb4(r) > 0)
-          seer_skip_chunked(r); /* value */
-        (void)seer_dec_sb4(r);  /* pair flags (ub2)       */
-      }
-    }
-    (void)seer_dec_sb4(r); /* session flags (ub4)    */
-    (void)seer_dec_sb4(r); /* session id (ub4)       */
-    (void)seer_dec_sb4(r); /* serial number (ub2)    */
-  } else if (opcode == TNS_SVR_PIG_OS_PID_MTS) {
-    (void)seer_dec_sb4(r); /* ub2                    */
-    seer_skip_chunked(r);  /* pid bytes              */
-  } else if (opcode == TNS_SVR_PIG_SYNC) {
-    /* Sessionless-txn sync state (§31): keyword-value pairs (keyword 201 =
-     * the transaction id) the server piggybacks on the next call's response
-     * while a sessionless txn is active. The values aren't needed - consume
-     * the block byte-for-byte so the real tokens follow. The pair loop is
-     * framed like SESS_RET but the length ub1 is always present. */
-    (void)seer_dec_sb4(r);            /* number of DTYs (ub2)   */
-    (void)seer_reader_u8(r);          /* length of DTYs (ub1)   */
-    int64_t npairs = seer_dec_sb4(r); /* number of pairs (ub2)  */
-    (void)seer_reader_u8(r);          /* length (ub1)           */
-    for (int64_t i = 0; i < npairs && seer_reader_ok(r); i++) {
-      if (seer_dec_sb4(r) > 0)
-        seer_skip_chunked(r); /* text value   */
-      if (seer_dec_sb4(r) > 0)
-        seer_skip_chunked(r); /* binary value */
-      (void)seer_dec_sb4(r);  /* keyword num (ub2)      */
-    }
-    (void)seer_dec_sb4(r); /* overall flags (ub4)    */
-  } else {
+  const SeerField *schema = opcode == TNS_SVR_PIG_SESS_RET     ? SEER_SVR_PIG_SESS_RET_SCHEMA
+                            : opcode == TNS_SVR_PIG_OS_PID_MTS ? SEER_SVR_PIG_MTS_SCHEMA
+                            : opcode == TNS_SVR_PIG_SYNC       ? SEER_SVR_PIG_SYNC_SCHEMA
+                                                               : NULL;
+  if (schema == NULL)
     return SEER_EPROTO; /* unknown piggyback opcode */
-  }
-  return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  SeerSvrPiggybackMsg m = {0};
+  bool ok = seer_schema_decode(schema, &cx, r, &m);
+  seer_schema_free(schema, &m);
+  return ok ? SEER_OK : SEER_EPROTO;
 }
 
 /* Walk one response message, appending rows and capturing the OER outcome. */
@@ -1829,7 +1799,7 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       st = skip_rpa(&r, stmt);
       break;
     case TTI_SVR_PIGGYBACK:
-      st = skip_server_piggyback(&r);
+      st = skip_server_piggyback(&r, stmt->conn);
       break;
     case TTI_OER:
       st = parse_oer(&r, stmt, oer);

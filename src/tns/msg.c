@@ -469,6 +469,45 @@ const SeerField SEER_AUTH_PAIR_SCHEMA[] = {
     SEER_END,
 };
 
+#define P SeerSvrPiggybackMsg
+#define PIG_PAIRS                                                                                  \
+  {.kind = SF_EACH,                                                                                \
+   .arg = offsetof(P, npairs),                                                                     \
+   .sub = SEER_AUTH_PAIR_SCHEMA,                                                                   \
+   .subsize = sizeof(SeerAuthPairMsg)}
+const SeerField SEER_SVR_PIG_SESS_RET_SCHEMA[] = {
+    SEER_F(SF_N2, P, ndtys),
+    SEER_F(SF_U8, P, dtys_len),
+    SEER_F(SF_N2, P, npairs),
+    {.kind = SF_U8,
+     .flags = SG_IF_SET,
+     .off = offsetof(P, pairs_len),
+     .if_off = offsetof(P, npairs)},
+    PIG_PAIRS,
+    SEER_F(SF_N4, P, flags),
+    SEER_F(SF_N4, P, session_id),
+    SEER_F(SF_N2, P, serial),
+    SEER_END,
+};
+
+const SeerField SEER_SVR_PIG_MTS_SCHEMA[] = {
+    SEER_F(SF_N2, P, ndtys),
+    SEER_F(SF_VALUE, P, pid),
+    SEER_END,
+};
+
+const SeerField SEER_SVR_PIG_SYNC_SCHEMA[] = {
+    SEER_F(SF_N2, P, ndtys),
+    SEER_F(SF_U8, P, dtys_len),
+    SEER_F(SF_N2, P, npairs),
+    SEER_F(SF_U8, P, pairs_len),
+    PIG_PAIRS,
+    SEER_F(SF_N4, P, flags),
+    SEER_END,
+};
+#undef PIG_PAIRS
+#undef P
+
 const SeerField SEER_AUTH_REPLY_SCHEMA[] = {
     SEER_F(SF_N2, SeerAuthReplyMsg, npairs),
     SEER_END,
