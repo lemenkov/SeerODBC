@@ -305,6 +305,16 @@ typedef struct {
 
 extern const SeerField SEER_AUTH_PAIR_SCHEMA[];
 
+/* A login reply after its TTI_RPA token (seerdb _PRE10_AUTH_REPLY; the thin
+ * one the same way): the pairs' count - thin variable-width, 8i a ub2 - then
+ * that many SEER_AUTH_PAIR_SCHEMA pairs. On thin the last pair's flags may be
+ * missing when the reply ends there. */
+typedef struct {
+  int64_t npairs;
+} SeerAuthReplyMsg;
+
+extern const SeerField SEER_AUTH_REPLY_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

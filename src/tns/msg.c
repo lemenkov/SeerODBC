@@ -388,7 +388,13 @@ const SeerField SEER_AUTH_HEAD_SCHEMA[] = {
 const SeerField SEER_AUTH_PAIR_SCHEMA[] = {
     SEER_F(SF_COUNTED, SeerAuthPairMsg, key),
     SEER_F(SF_COUNTED, SeerAuthPairMsg, value),
-    SEER_F(SF_N4, SeerAuthPairMsg, flags),
+    /* written always; read on thin only while bytes remain */
+    {.kind = SF_N4, .flags = SG_IF_MORE, .off = offsetof(SeerAuthPairMsg, flags)},
+    SEER_END,
+};
+
+const SeerField SEER_AUTH_REPLY_SCHEMA[] = {
+    SEER_F(SF_N2, SeerAuthReplyMsg, npairs),
     SEER_END,
 };
 

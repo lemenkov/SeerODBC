@@ -1028,10 +1028,61 @@ static bool key_is(const uint8_t *k, size_t kl, const char *name)
   return kl == strlen(name) && memcmp(k, name, kl) == 0;
 }
 
-/* Parse the TTI_RPA auth challenge: a count followed by KV pairs. The hex
- * AUTH_SESSKEY / AUTH_VFR_DATA / AUTH_PBKDF2_CSK_SALT values are decoded to
- * raw bytes into *ch. */
-static SeerStatus parse_challenge(const uint8_t *b, size_t n, SeerAuthChallenge *ch)
+/* One AUTH_ pair of a login reply, handed to an auth_pairs callback. */
+typedef SeerStatus (*AuthPairFn)(void *arg, const SeerBytes *key, const SeerBytes *val);
+
+/* Walk a login reply's AUTH_ pairs by SEER_AUTH_REPLY_SCHEMA and
+ * SEER_AUTH_PAIR_SCHEMA (#398), `b` just past the TTI_RPA token: each pair to
+ * `fn`, a NUL its key or value counts (8.1.7's AUTH_NLS_ keys) dropped. A
+ * value's chunks are read at ub1 whatever the field version, as login replies
+ * always were; none has been seen chunked. */
+static SeerStatus auth_pairs(SeerSchemaCtx cx, const uint8_t *b, size_t n, AuthPairFn fn, void *arg)
+{
+  cx.wide_chunks = false;
+  SeerReader r;
+  seer_reader_init(&r, b, n);
+  SeerAuthReplyMsg head = {0};
+  if (!seer_schema_decode(SEER_AUTH_REPLY_SCHEMA, &cx, &r, &head) || head.npairs < 0 ||
+      head.npairs > 256)
+    return SEER_EPROTO;
+  for (int64_t i = 0; i < head.npairs; i++) {
+    SeerAuthPairMsg m;
+    memset(&m, 0, sizeof m);
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_AUTH_PAIR_SCHEMA, &cx, &r, &m);
+    SeerStatus st = SEER_EPROTO;
+    if (res == SCH_OK) {
+      SeerBytes k = m.key, v = m.value;
+      while (k.n > 0 && k.p[k.n - 1] == '\0')
+        k.n--;
+      while (v.n > 0 && v.p[v.n - 1] == '\0')
+        v.n--;
+      st = fn(arg, &k, &v);
+    }
+    seer_schema_free(SEER_AUTH_PAIR_SCHEMA, &m);
+    if (st != SEER_OK)
+      return st;
+  }
+  return SEER_OK;
+}
+
+/* parse_challenge's pairs: the hex AUTH_SESSKEY / AUTH_VFR_DATA /
+ * AUTH_PBKDF2_CSK_SALT decoded to bytes. */
+static SeerStatus challenge_pair(void *arg, const SeerBytes *k, const SeerBytes *v)
+{
+  SeerAuthChallenge *ch = arg;
+  if (key_is(k->p, k->n, "AUTH_SESSKEY"))
+    return hex_decode(v->p, v->n, &ch->sesskey, &ch->sesskey_len);
+  if (key_is(k->p, k->n, "AUTH_VFR_DATA"))
+    return hex_decode(v->p, v->n, &ch->salt, &ch->salt_len);
+  if (key_is(k->p, k->n, "AUTH_PBKDF2_CSK_SALT"))
+    return hex_decode(v->p, v->n, &ch->csk_salt, &ch->csk_salt_len);
+  return SEER_OK;
+}
+
+/* Parse the TTI_RPA auth challenge: its AUTH_ pairs, the hex AUTH_SESSKEY /
+ * AUTH_VFR_DATA / AUTH_PBKDF2_CSK_SALT values decoded to raw bytes into *ch. */
+static SeerStatus parse_challenge(SeerSchemaCtx cx, const uint8_t *b, size_t n,
+                                  SeerAuthChallenge *ch)
 {
   memset(ch, 0, sizeof *ch);
 
@@ -1047,53 +1098,9 @@ static SeerStatus parse_challenge(const uint8_t *b, size_t n, SeerAuthChallenge 
     return SEER_EPROTO;
   }
 
-  SeerReader r;
-  seer_reader_init(&r, b + 1, n - 1);
-  int64_t num = seer_dec_sb4(&r);
-  if (num < 0 || num > 256 || !seer_reader_ok(&r))
-    return SEER_EPROTO;
-
-  SeerStatus st = SEER_OK;
-  for (int64_t i = 0; i < num; i++) {
-    uint8_t *k = NULL, *v = NULL;
-    size_t kl = 0, vl = 0;
-
-    st = seer_dec_field(&r, &k, &kl);
-    if (st != SEER_OK) {
-      free(k);
-      goto out;
-    }
-    st = seer_dec_field(&r, &v, &vl);
-    if (st != SEER_OK) {
-      free(k);
-      free(v);
-      goto out;
-    }
-
-    /* Skip the inter-pair trailer (flag byte + that many bytes). */
-    if (seer_reader_remaining(&r) > 0) {
-      uint8_t flag = seer_reader_u8(&r);
-      if (flag > 0)
-        seer_reader_bytes(&r, flag);
-    }
-
-    if (key_is(k, kl, "AUTH_SESSKEY"))
-      st = hex_decode(v, vl, &ch->sesskey, &ch->sesskey_len);
-    else if (key_is(k, kl, "AUTH_VFR_DATA"))
-      st = hex_decode(v, vl, &ch->salt, &ch->salt_len);
-    else if (key_is(k, kl, "AUTH_PBKDF2_CSK_SALT"))
-      st = hex_decode(v, vl, &ch->csk_salt, &ch->csk_salt_len);
-
-    free(k);
-    free(v);
-    if (st != SEER_OK)
-      goto out;
-  }
-
-  if (!seer_reader_ok(&r)) {
-    st = SEER_EPROTO;
+  SeerStatus st = auth_pairs(cx, b + 1, n - 1, challenge_pair, ch);
+  if (st != SEER_OK)
     goto out;
-  }
   if (ch->sesskey == NULL) {
     seer_log(SEER_LOG_DEBUG, "ttc: an RPA without AUTH_SESSKEY: not the challenge");
     st = SEER_EPROTO;
@@ -1180,7 +1187,9 @@ static SeerStatus fast_auth_login(SeerConn *conn, const SeerConnParams *params,
     if (resp[off] != TTI_RPA)
       continue;
     SeerAuthChallenge tmp;
-    if (parse_challenge(resp + off, rlen - off, &tmp) == SEER_OK && tmp.sesskey_len > 0) {
+    if (parse_challenge(seer_msg_ctx(0, conn->field_version, conn->server_field_version),
+                        resp + off, rlen - off, &tmp) == SEER_OK &&
+        tmp.sesskey_len > 0) {
       *ch = tmp; /* move ownership   */
       st = SEER_OK;
       break;
@@ -1374,7 +1383,8 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   st = seer_ttc_recv(conn, &resp, &rlen);
   if (st != SEER_OK)
     return st;
-  st = parse_challenge(resp, rlen, out_challenge);
+  st = parse_challenge(seer_msg_ctx(0, conn->field_version, conn->server_field_version), resp, rlen,
+                       out_challenge);
   if (st != SEER_OK)
     seer_conn_error_from_reply(conn, resp, rlen, 0);
   free(resp);
@@ -1536,7 +1546,8 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
   if (st != SEER_OK)
     return st;
   SeerAuthChallenge ch;
-  st = parse_challenge(resp, rlen, &ch);
+  st = parse_challenge(seer_msg_ctx(0, conn->field_version, conn->server_field_version), resp, rlen,
+                       &ch);
   if (st != SEER_OK) {
     /* A user the server refuses at once (ORA-01017) gets a status alone. */
     seer_conn_error_from_reply(conn, resp, rlen, 1);
@@ -1663,98 +1674,42 @@ static SeerStatus o8i_login_call(SeerConn *conn, uint8_t op, const char *user, u
   return st;
 }
 
-/* Read an 8i login value: a ub1 length and the bytes, or 0xFE then ub1-length
- * chunks to a zero length. Returns the bytes (malloc'd, NUL-terminated). */
-static SeerStatus o8i_read_value(const uint8_t *b, size_t n, size_t *pos, char **out)
+/* seer_o8i_auth_value's pairs: the first value under the key asked for. */
+typedef struct {
+  const char *key;
+  char *val;
+} O8iAuthFind;
+
+static SeerStatus o8i_find_pair(void *arg, const SeerBytes *k, const SeerBytes *v)
 {
-  *out = NULL;
-  if (*pos >= n)
-    return SEER_EPROTO;
-  SeerWriter acc;
-  if (!seer_writer_init(&acc, 32))
-    return SEER_ENOMEM;
-  uint8_t len = b[(*pos)++];
-  if (len != 0xFE) {
-    if (*pos + len > n) {
-      seer_writer_free(&acc);
-      return SEER_EPROTO;
-    }
-    seer_writer_bytes(&acc, b + *pos, len);
-    *pos += len;
-  } else {
-    for (;;) {
-      if (*pos >= n) {
-        seer_writer_free(&acc);
-        return SEER_EPROTO;
-      }
-      uint8_t cl = b[(*pos)++];
-      if (cl == 0)
-        break;
-      if (*pos + cl > n) {
-        seer_writer_free(&acc);
-        return SEER_EPROTO;
-      }
-      seer_writer_bytes(&acc, b + *pos, cl);
-      *pos += cl;
-    }
+  O8iAuthFind *f = arg;
+  if (f->val == NULL && key_is(k->p, k->n, f->key)) {
+    f->val = malloc(v->n + 1);
+    if (f->val == NULL)
+      return SEER_ENOMEM;
+    if (v->n > 0)
+      memcpy(f->val, v->p, v->n);
+    f->val[v->n] = '\0';
   }
-  seer_writer_u8(&acc, 0);
-  if (!seer_writer_ok(&acc)) {
-    seer_writer_free(&acc);
-    return SEER_ENOMEM;
-  }
-  *out = (char *)acc.buf;
   return SEER_OK;
 }
 
-static uint32_t o8i_rd32(const uint8_t *p)
-{
-  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
 /* The value of `key` in an 8i login reply (seerdb _PRE10_AUTH_REPLY): TTI_RPA,
- * a ub2 pair count, the pairs at _AUTH_PAIR's 8i widths. A key's length may
- * count a NUL terminator (8.1.7's AUTH_NLS_ keys), so it is compared without
- * one. SEER_OK with *val NULL when the reply is pairs but lacks the key. */
+ * then the pairs by SEER_AUTH_REPLY_SCHEMA at the 8i codec's widths (#398). A
+ * key's length may count a NUL terminator (8.1.7's AUTH_NLS_ keys); auth_pairs
+ * drops it. SEER_OK with *val NULL when the reply is pairs but lacks the key. */
 SeerStatus seer_o8i_auth_value(const uint8_t *b, size_t n, const char *key, char **val)
 {
   *val = NULL;
   if (n < 3 || b[0] != TTI_RPA)
     return SEER_EPROTO;
-  size_t pos = 1;
-  unsigned count = (unsigned)(b[pos] | b[pos + 1] << 8);
-  pos += 2;
-  for (unsigned i = 0; i < count; i++) {
-    char *k = NULL, *v = NULL;
-    if (pos + 4 > n)
-      return SEER_EPROTO;
-    uint32_t kl = o8i_rd32(b + pos);
-    pos += 4;
-    if (kl > 0 && o8i_read_value(b, n, &pos, &k) != SEER_OK)
-      return SEER_EPROTO;
-    if (pos + 4 > n) {
-      free(k);
-      return SEER_EPROTO;
-    }
-    uint32_t vl = o8i_rd32(b + pos);
-    pos += 4;
-    if (vl > 0 && o8i_read_value(b, n, &pos, &v) != SEER_OK) {
-      free(k);
-      return SEER_EPROTO;
-    }
-    if (pos + 4 > n) {
-      free(k);
-      free(v);
-      return SEER_EPROTO;
-    }
-    pos += 4; /* flags */
-    if (*val == NULL && k != NULL && strcmp(k, key) == 0) {
-      *val = v != NULL ? v : strdup("");
-      v = NULL;
-    }
-    free(k);
-    free(v);
+  O8iAuthFind f = {.key = key, .val = NULL};
+  SeerStatus st = auth_pairs(seer_msg_ctx(1, 0, 0), b + 1, n - 1, o8i_find_pair, &f);
+  if (st != SEER_OK) {
+    free(f.val);
+    return st;
   }
+  *val = f.val;
   return SEER_OK;
 }
 
@@ -1947,14 +1902,42 @@ out:
   return st;
 }
 
+/* parse_auth_result's pairs. */
+typedef struct {
+  uint8_t *resp;
+  size_t resp_len;
+  bool have_resp;
+  char verbuf[32];
+  uint32_t max_iden;
+} AuthResult;
+
+static SeerStatus result_pair(void *arg, const SeerBytes *k, const SeerBytes *v)
+{
+  AuthResult *a = arg;
+  if (key_is(k->p, k->n, "AUTH_SVR_RESPONSE")) {
+    a->have_resp = true;
+    return hex_decode(v->p, v->n, &a->resp, &a->resp_len);
+  }
+  if (key_is(k->p, k->n, "AUTH_VERSION_NO") && v->n > 0 && v->n < sizeof a->verbuf) {
+    memcpy(a->verbuf, v->p, v->n);
+    a->verbuf[v->n] = '\0';
+  } else if (key_is(k->p, k->n, "AUTH_MAX_IDEN_LENGTH") && v->n > 0 && v->n < 8) {
+    char digits[8];
+    memcpy(digits, v->p, v->n);
+    digits[v->n] = '\0';
+    a->max_iden = (uint32_t)strtoul(digits, NULL, 10);
+  }
+  return SEER_OK;
+}
+
 /* Parse the auth result RPA: validate AUTH_SVR_RESPONSE, decode the packed
  * AUTH_VERSION_NO, and take AUTH_MAX_IDEN_LENGTH, the longest identifier the
  * server takes. That one comes from a session at field version 12.2 or later
  * (128 on 18c, 21c and 23ai); 10g and 11g never send it (seerdb PROTOCOL.md
  * §4.6), and it stays 0. */
-static SeerStatus parse_auth_result(const uint8_t *b, size_t n, const uint8_t *conn_key,
-                                    size_t conn_key_len, uint32_t *server_release,
-                                    uint32_t *max_iden_len)
+static SeerStatus parse_auth_result(SeerSchemaCtx cx, const uint8_t *b, size_t n,
+                                    const uint8_t *conn_key, size_t conn_key_len,
+                                    uint32_t *server_release, uint32_t *max_iden_len)
 {
   *server_release = 0;
   *max_iden_len = 0;
@@ -1969,79 +1952,28 @@ static SeerStatus parse_auth_result(const uint8_t *b, size_t n, const uint8_t *c
     return SEER_EPROTO;
   }
 
-  SeerReader r;
-  seer_reader_init(&r, b + 1, n - 1);
-  int64_t num = seer_dec_sb4(&r);
-  if (num < 0 || num > 256 || !seer_reader_ok(&r))
-    return SEER_EPROTO;
-
-  uint8_t *resp = NULL;
-  size_t resp_len = 0;
-  bool have_resp = false;
-  char verbuf[32] = {0};
-
-  SeerStatus st = SEER_OK;
-  for (int64_t i = 0; i < num; i++) {
-    uint8_t *k = NULL, *v = NULL;
-    size_t kl = 0, vl = 0;
-
-    st = seer_dec_field(&r, &k, &kl);
-    if (st != SEER_OK) {
-      free(k);
-      goto out;
-    }
-    st = seer_dec_field(&r, &v, &vl);
-    if (st != SEER_OK) {
-      free(k);
-      free(v);
-      goto out;
-    }
-
-    if (seer_reader_remaining(&r) > 0) {
-      uint8_t flag = seer_reader_u8(&r);
-      if (flag > 0)
-        seer_reader_bytes(&r, flag);
-    }
-
-    if (key_is(k, kl, "AUTH_SVR_RESPONSE")) {
-      st = hex_decode(v, vl, &resp, &resp_len);
-      have_resp = true;
-    } else if (key_is(k, kl, "AUTH_VERSION_NO") && vl > 0 && vl < sizeof verbuf) {
-      memcpy(verbuf, v, vl);
-      verbuf[vl] = '\0';
-    } else if (key_is(k, kl, "AUTH_MAX_IDEN_LENGTH") && vl > 0 && vl < 8) {
-      char digits[8];
-      memcpy(digits, v, vl);
-      digits[vl] = '\0';
-      *max_iden_len = (uint32_t)strtoul(digits, NULL, 10);
-    }
-
-    free(k);
-    free(v);
-    if (st != SEER_OK)
-      goto out;
-  }
-
-  if (!seer_reader_ok(&r)) {
-    st = SEER_EPROTO;
+  AuthResult a;
+  memset(&a, 0, sizeof a);
+  SeerStatus st = auth_pairs(cx, b + 1, n - 1, result_pair, &a);
+  *max_iden_len = a.max_iden;
+  if (st != SEER_OK)
     goto out;
-  }
-  if (!have_resp || resp == NULL) {
+  if (!a.have_resp || a.resp == NULL) {
     seer_log(SEER_LOG_ERROR, "auth: no AUTH_SVR_RESPONSE - authentication failed");
     st = SEER_EAUTH;
     goto out;
   }
-  if (!seer_o5logon_validate(resp, resp_len, conn_key, conn_key_len)) {
+  if (!seer_o5logon_validate(a.resp, a.resp_len, conn_key, conn_key_len)) {
     seer_log(SEER_LOG_ERROR, "auth: server response failed validation");
     st = SEER_EAUTH;
     goto out;
   }
-  if (verbuf[0] != '\0')
-    *server_release = (uint32_t)strtoul(verbuf, NULL, 10);
+  if (a.verbuf[0] != '\0')
+    *server_release = (uint32_t)strtoul(a.verbuf, NULL, 10);
   st = SEER_OK;
 
 out:
-  free(resp);
+  free(a.resp);
   return st;
 }
 
@@ -2076,7 +2008,8 @@ SeerStatus seer_ttc_authenticate(SeerConn *conn, const SeerConnParams *params,
   }
 
   uint32_t release = 0, max_iden = 0;
-  st = parse_auth_result(resp, rlen, conn_key, conn_key_len, &release, &max_iden);
+  st = parse_auth_result(seer_msg_ctx(0, conn->field_version, conn->server_field_version), resp,
+                         rlen, conn_key, conn_key_len, &release, &max_iden);
   if (st != SEER_OK)
     seer_conn_error_from_reply(conn, resp, rlen, 0);
   free(resp);
