@@ -118,12 +118,16 @@ extern const SeerField SEER_O7_DESCRIBE_SCHEMA[];
 extern const SeerField SEER_VALUE_SCHEMA[];
 
 /* A describe's head, before its columns: the maximum row size, the column
- * count and, when there are columns, a reserved byte. */
+ * count and, when there are columns, a reserved byte. In two parts as well,
+ * the row size and the count: 8i's cursor cell puts the preamble between
+ * them. */
 typedef struct {
   int64_t max_row_size, ncols, reserved;
 } SeerDescribeHeadMsg;
 
 extern const SeerField SEER_DESCRIBE_HEAD_SCHEMA[];
+extern const SeerField SEER_DESCRIBE_ROWSIZE_SCHEMA[];
+extern const SeerField SEER_DESCRIBE_COUNT_SCHEMA[];
 
 /* A column's annotation map on 23ai (fv24, #89): the count, and when there
  * are annotations a pointer byte, the count again and a pointer byte; then

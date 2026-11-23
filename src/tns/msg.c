@@ -163,15 +163,30 @@ const SeerField SEER_VALUE_SCHEMA[] = {
     SEER_END,
 };
 
+#define DESC_ROWSIZE SEER_F(SF_N4, SeerDescribeHeadMsg, max_row_size)
+#define DESC_COUNT                                                                                 \
+  SEER_F(SF_N4, SeerDescribeHeadMsg, ncols),                                                       \
+  {                                                                                                \
+    .kind = SF_U8, .flags = SG_IF_SET, .off = offsetof(SeerDescribeHeadMsg, reserved),             \
+    .if_off = offsetof(SeerDescribeHeadMsg, ncols)                                                 \
+  }
 const SeerField SEER_DESCRIBE_HEAD_SCHEMA[] = {
-    SEER_F(SF_N4, SeerDescribeHeadMsg, max_row_size),
-    SEER_F(SF_N4, SeerDescribeHeadMsg, ncols),
-    {.kind = SF_U8,
-     .flags = SG_IF_SET,
-     .off = offsetof(SeerDescribeHeadMsg, reserved),
-     .if_off = offsetof(SeerDescribeHeadMsg, ncols)},
+    DESC_ROWSIZE,
+    DESC_COUNT,
     SEER_END,
 };
+
+const SeerField SEER_DESCRIBE_ROWSIZE_SCHEMA[] = {
+    DESC_ROWSIZE,
+    SEER_END,
+};
+
+const SeerField SEER_DESCRIBE_COUNT_SCHEMA[] = {
+    DESC_COUNT,
+    SEER_END,
+};
+#undef DESC_COUNT
+#undef DESC_ROWSIZE
 
 #define A SeerDcbAnnotationsMsg
 #define IF_ANN(kind_, member_)                                                                     \

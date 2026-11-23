@@ -5524,31 +5524,6 @@ static void o8r_skip(O8iRd *r, size_t k)
     r->pos += k;
 }
 
-/* A value: a ub1 length and the bytes, or 0xFE then ub1-length chunks to a
- * zero length. Appended to `out` when non-NULL. */
-static void o8r_value(O8iRd *r, SeerWriter *out)
-{
-  uint8_t len = o8r_u8(r);
-  if (len != 0xFE) {
-    if (o8r_has(r, len)) {
-      if (out != NULL)
-        seer_writer_bytes(out, r->b + r->pos, len);
-      r->pos += len;
-    }
-    return;
-  }
-  for (;;) {
-    uint8_t cl = o8r_u8(r);
-    if (r->cut || r->bad || cl == 0)
-      return;
-    if (!o8r_has(r, cl))
-      return;
-    if (out != NULL)
-      seer_writer_bytes(out, r->b + r->pos, cl);
-    r->pos += cl;
-  }
-}
-
 static void o8w_le32(SeerWriter *w, uint32_t v)
 {
   for (int i = 0; i < 4; i++)
@@ -5818,6 +5793,8 @@ static void o8i_read_describe(O8iRd *r, SeerColumn **out, int *ncols)
   o8i_read_columns(r, false, out, ncols);
 }
 
+static SeerSchemaResult o8i_decode(O8iRd *r, const SeerField *schema, void *msg);
+
 /* The describe's body. A cursor's cell - a REF CURSOR OUT value, a CURSOR()
  * column - carries it too, with the max row size ahead of the preamble, which
  * is empty there (seerdb §19.17a, from sqlplus 9.2 against 8.1.7). `out` may
@@ -5828,20 +5805,25 @@ static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *
     *out = NULL;
     *ncols = 0;
   }
+  /* The preamble, a value, and the describe head about it (#398): before it
+   * the row size in a cursor cell, after it otherwise. */
+  SeerDescribeHeadMsg hm = {0};
+  SeerChrMsg pm = {0};
   if (cursor_cell)
-    (void)o8r_le32(r); /* max row size */
-  o8r_value(r, NULL);  /* preamble */
-  if (!cursor_cell)
-    (void)o8r_le32(r); /* max row size */
-  uint32_t n = o8r_le32(r);
-  if (r->cut)
+    (void)o8i_decode(r, SEER_DESCRIBE_ROWSIZE_SCHEMA, &hm);
+  if (!r->cut && !r->bad) {
+    (void)o8i_decode(r, SEER_VALUE_SCHEMA, &pm);
+    seer_schema_free(SEER_VALUE_SCHEMA, &pm);
+  }
+  if (!r->cut && !r->bad)
+    (void)o8i_decode(r, cursor_cell ? SEER_DESCRIBE_COUNT_SCHEMA : SEER_DESCRIBE_HEAD_SCHEMA, &hm);
+  if (r->cut || r->bad)
     return;
-  if (n > 4096) {
+  if (hm.ncols < 0 || hm.ncols > 4096) {
     r->bad = true;
     return;
   }
-  if (n > 0)
-    (void)o8r_u8(r);
+  uint32_t n = (uint32_t)hm.ncols;
   SeerColumn *cols = calloc(n ? n : 1, sizeof *cols);
   if (cols == NULL) {
     r->bad = true;
