@@ -113,6 +113,28 @@ extern const SeerField SEER_LOB_CELL_SCHEMA[];    /* a LOB's locator, counted */
 extern const SeerField SEER_UROWID_CELL_SCHEMA[]; /* a UROWID, counted */
 extern const SeerField SEER_ROWID_CELL_SCHEMA[];  /* a ROWID's five fields */
 
+/* An OUT value (after a block's IOV, in its RXD): the value, then from 10g
+ * its return code (a ub4: 0, or 1405 for a NULL); on 8i and 9i the cell's
+ * indicator instead (-1 NULL). The special OUTs - arrays, objects, LOBs, an
+ * 8i / 9i bind the block never assigned - keep their own readers. */
+extern const SeerField SEER_OUT_CELL_SCHEMA[];
+
+/* The I/O vector (TTI_IOV, after its token; seerdb _O7_IOV / _O8I_IOV), a
+ * block's bind prompt: flags, the requests and iterations - the binds are
+ * iterations * 256 + requests - the iterations this time, on thin the
+ * buffer length, then the bit vector and the rowid, each counted (on 8i the
+ * eight zero bytes there). One direction byte per bind follows
+ * (SEER_IOV_DIRS_SCHEMA): 0x10 OUT, 0x20 IN, 0x30 IN OUT. */
+typedef struct {
+  int64_t flags, requests, iterations, iterations_now, buffer_len;
+  SeerBytes bit_vector, rowid;
+  int64_t nbinds;
+  SeerBytes directions;
+} SeerIovMsg;
+
+extern const SeerField SEER_IOV_SCHEMA[];
+extern const SeerField SEER_IOV_DIRS_SCHEMA[];
+
 /* A function call's header: the message type (TTI_FUN, or the piggyback
  * 0x11), the function, the sequence number, and from field version 24 the
  * call's token - 0 for an ordinary call, a pipelined op's own (#158). */

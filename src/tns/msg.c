@@ -149,6 +149,29 @@ const SeerField SEER_UROWID_CELL_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_OUT_CELL_SCHEMA[] = {
+    SEER_F(SF_VALUE, SeerCellMsg, value),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, SeerCellMsg, return_code),
+    CELL_INDICATOR,
+    SEER_END,
+};
+
+const SeerField SEER_IOV_SCHEMA[] = {
+    SEER_F(SF_U8, SeerIovMsg, flags),
+    SEER_F(SF_N2, SeerIovMsg, requests),
+    SEER_F(SF_N2, SeerIovMsg, iterations),
+    SEER_F(SF_N4, SeerIovMsg, iterations_now),
+    SEER_FC(SF_N2, THIN, SeerIovMsg, buffer_len),
+    SEER_F(SF_COUNTED, SeerIovMsg, bit_vector),
+    SEER_F(SF_COUNTED, SeerIovMsg, rowid),
+    SEER_END,
+};
+
+const SeerField SEER_IOV_DIRS_SCHEMA[] = {
+    {.kind = SF_RAW, .off = offsetof(SeerIovMsg, directions), .arg = offsetof(SeerIovMsg, nbinds)},
+    SEER_END,
+};
+
 #define IF_ROWID(kind_, member_)                                                                   \
   {.kind = (kind_),                                                                                \
    .flags = SG_IF_SET,                                                                             \
