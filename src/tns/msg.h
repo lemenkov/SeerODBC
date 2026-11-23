@@ -266,6 +266,75 @@ extern const SeerField SEER_AQ_ARRAY_ENQ_ROW_SCHEMA[];
 extern const SeerField SEER_AQ_ARRAY_ENQ_ROW_TAIL_SCHEMA[];
 extern const SeerField SEER_AQ_ARRAY_ENQ_END_SCHEMA[];
 
+/* A dequeue (func 122) after its header: the queue name's pointer and
+ * length, the pointers of the message properties and recipient list and
+ * their lengths, the consumer name's pointer and length, the mode, the
+ * navigation, the visibility, the wait, the selector message id's and the
+ * correlation's pointers and lengths, the payload TOID's, the message
+ * version, the payload's pointer, the returned message id's, the dequeue
+ * flags, the condition's and the extensions' pointers and lengths, from 20.1
+ * the JSON payload's pointer and from 21.1 the shard id. Its data section:
+ * the queue name, the consumer name and the correlation when given - each
+ * raw below 12.1, a bind value from (as the enqueue's) - and the TOID. */
+typedef struct {
+  int64_t qname_ptr, qname_len, props_ptr, props_len_ptr, recip_ptr, recip_len_ptr;
+  int64_t consumer_ptr, consumer_len, mode, navigation, visibility, wait;
+  int64_t selector_ptr, selector_len, corr_ptr, corr_len, toid_ptr, toid_len, msg_version;
+  int64_t payload_ptr, msgid_ptr, msgid_len, deq_flags, cond_ptr, cond_len, ext_ptr, ext_n;
+  int64_t json_ptr, shard_id;
+  SeerBytes qname, consumer, correlation, toid;
+} SeerAqDeqMsg;
+
+extern const SeerField SEER_AQ_DEQ_SCHEMA[];
+
+/* An array dequeue's row (func 145, after SEER_AQ_ARRAY_HEAD_SCHEMA): the
+ * queue name, counted, the message properties, then the recipients, the
+ * consumer name, the mode, the navigation, the visibility, the wait, the
+ * selector message id, the correlation, the condition and the extensions -
+ * each string counted - the relative message id, the sequence deviation, the
+ * TOID, counted, the message version, the payload's and RAW payload's
+ * lengths, a ub4 oracledb leaves unnamed, the flags, and the extensions' and
+ * source sequence's lengths. */
+typedef struct {
+  int64_t qname_len;
+  SeerBytes qname;
+  int64_t recipients, consumer_len;
+  SeerBytes consumer;
+  int64_t mode, navigation, visibility, wait, selector_len;
+  SeerBytes selector;
+  int64_t corr_len;
+  SeerBytes correlation;
+  int64_t cond_len;
+  SeerBytes condition;
+  int64_t ext_n, relmsgid, seq_deviation, toid_len;
+  SeerBytes toid;
+  int64_t msg_version, payload_len, raw_len, unnamed, flags, ext_len, srcseq_len;
+} SeerAqArrayDeqRowMsg;
+
+extern const SeerField SEER_AQ_ARRAY_DEQ_ROW_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_ARRAY_DEQ_ROW_TAIL_SCHEMA[];
+
+/* AQ replies, after the RPA token. A dequeue's: the properties' length (0:
+ * no message), the properties, the recipients, the payload (an object's
+ * form, SEER_OBJECT_HEAD_SCHEMA) and the 16-byte message id; an enqueue's is
+ * the message id alone. An array call's: the iteration count, then per
+ * iteration the properties' length and, when > 0, a byte and the
+ * properties; the recipients; the payload's presence and the payload; the
+ * message ids, counted; the extensions' length and the output ack. */
+typedef struct {
+  int64_t iters, props_len, props_lead, recipients, payload_n, msgid_len;
+  SeerBytes msgid;
+  int64_t ext_len, ack;
+} SeerAqReplyMsg;
+
+extern const SeerField SEER_AQ_DEQ_REPLY_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_DEQ_REPLY_MID_SCHEMA[];
+extern const SeerField SEER_AQ_MSGID_SCHEMA[];
+extern const SeerField SEER_AQ_ARRAY_REPLY_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_ITER_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_ITER_MID_SCHEMA[];
+extern const SeerField SEER_AQ_ITER_TAIL_SCHEMA[];
+
 /* Two-phase commit (seerdb PROTOCOL.md §28): TXN_SWITCH (begin/end) and
  * TXN_CHANGE_STATE (prepare/commit/abort) share a head - the operation, the
  * stored context's pointer and length, and the xid's descriptor (format id,
@@ -341,6 +410,10 @@ typedef struct {
 } SeerObjectMsg;
 
 extern const SeerField SEER_OBJECT_SCHEMA[];
+/* The same, split: everything up to the image, then the image alone - for
+ * an AQ payload, whose image a reader takes only past its 4-byte header. */
+extern const SeerField SEER_OBJECT_HEAD_SCHEMA[];
+extern const SeerField SEER_OBJECT_IMAGE_SCHEMA[];
 
 /* A describe's column (seerdb _DCB_COLUMN / _O8I_DESCRIBE / _O7_DESCRIBE_COLUMN):
  * the OAC's fields, then nullable, the name's length in bytes, the name and
