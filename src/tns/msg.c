@@ -206,6 +206,17 @@ const SeerField SEER_OUT_ARRAY_SCHEMA[] = {
     SEER_END,
 };
 
+static const uint8_t O7_UNSET_MARK[4] = {0xFF, 0x02, 0x0C, 0x21};
+const SeerField SEER_O7_OUT_UNSET_SCHEMA[] = {
+    {.kind = SF_CONST, .arg = sizeof O7_UNSET_MARK, .lit = O7_UNSET_MARK},
+    SEER_END,
+};
+
+const SeerField SEER_OUT_IND_SCHEMA[] = {
+    {.kind = SF_N2, .flags = SG_IF_MORE, .off = offsetof(SeerCellMsg, indicator)},
+    SEER_END,
+};
+
 const SeerField SEER_IOV_SCHEMA[] = {
     SEER_F(SF_U8, SeerIovMsg, flags),
     SEER_F(SF_N2, SeerIovMsg, requests),

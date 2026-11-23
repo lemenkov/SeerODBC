@@ -138,6 +138,12 @@ extern const SeerField SEER_LOB_OUT_SCHEMA[];
 extern const SeerField SEER_OUT_UNSET_SCHEMA[];
 extern const SeerField SEER_OUT_ARRAY_SCHEMA[];
 
+/* On 9i: an OUT bind the block never assigned is four fixed bytes
+ * (seerdb #801), and an OUT object's image is followed by the indicator
+ * alone, when the reply has one. The LOB form is SEER_LOB_OUT_SCHEMA's. */
+extern const SeerField SEER_O7_OUT_UNSET_SCHEMA[];
+extern const SeerField SEER_OUT_IND_SCHEMA[];
+
 /* The I/O vector (TTI_IOV, after its token; seerdb _O7_IOV / _O8I_IOV), a
  * block's bind prompt: flags, the requests and iterations - the binds are
  * iterations * 256 + requests - the iterations this time, on thin the

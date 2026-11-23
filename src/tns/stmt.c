@@ -8237,12 +8237,13 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
         continue;
       /* An OUT bind the block never assigned - what a RETURNING ... INTO that
        * matched no row leaves - is four fixed bytes, neither a value with its
-       * indicator nor an assigned NULL (empty value + 81 01). Read as a value,
+       * indicator nor an assigned NULL (empty value + 81 01): tried as
+       * SEER_O7_OUT_UNSET_SCHEMA on a copy of the reader. Read as a value,
        * it desynced every OUT bind after it (seerdb #801). */
-      static const uint8_t UNASSIGNED[] = {0xFF, 0x02, 0x0C, 0x21};
-      if (seer_reader_remaining(&r) >= sizeof UNASSIGNED &&
-          memcmp(r.buf + r.pos, UNASSIGNED, sizeof UNASSIGNED) == 0) {
-        r.pos += sizeof UNASSIGNED;
+      SeerReader t = r;
+      SeerCellMsg um = {0};
+      if (seer_schema_decode_ex(SEER_O7_OUT_UNSET_SCHEMA, &cx, &t, &um) == SCH_OK) {
+        r = t;
         free(b->out.data);
         b->out = (SeerCell){0}; /* NULL */
         continue;
@@ -8261,44 +8262,33 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
           free(img);
           break;
         }
-        if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
-          r.pos += 2;
-        else if (seer_reader_remaining(&r) > 0)
-          r.pos += 1;
+        SeerCellMsg im = {0};
+        (void)seer_schema_decode(SEER_OUT_IND_SCHEMA, &cx, &r, &im);
         free(b->out_image);
         b->out_image = img;
         b->out_imagelen = il;
         continue;
       }
       if (b->ret_lob != 0) {
-        /* A LOB: a column's LOB cell (§19.5) - a ub4 length, the locator as a
-         * value and a ub4 indicator; NULL is a zero length and 81 01. A NULL
-         * LOB from a RETURNING comes as a locator all zero past its first two
-         * bytes, which no real one is (§19.17b, #167). */
+        /* A LOB by SEER_LOB_OUT_SCHEMA, as 8i's: the locator, counted, then
+         * the indicator; NULL is a zero count and 81 01. A NULL LOB from a
+         * RETURNING comes as a locator all zero past its first two bytes,
+         * which no real one is (§19.17b, #167). */
         free(b->out.data);
         b->out = (SeerCell){0};
-        int64_t llen = seer_dec_sb4(&r);
-        if (llen <= 0) {
-          if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
-            r.pos += 2;
-          continue;
-        }
-        uint8_t *loc = NULL;
-        size_t loclen = 0;
-        if (seer_dec_dalc(&r, &loc, &loclen) != SEER_OK) {
-          free(loc);
+        SeerCellMsg lm = {0};
+        if (!seer_schema_decode(SEER_LOB_OUT_SCHEMA, &cx, &r, &lm)) {
+          seer_schema_free(SEER_LOB_OUT_SCHEMA, &lm);
           break;
         }
-        (void)seer_dec_sb4(&r); /* indicator */
         bool blank = true;
-        for (size_t i = 2; i < loclen; i++)
-          blank &= loc[i] == 0;
-        if (loclen <= 2 || blank) {
-          free(loc);
-          continue;
+        for (size_t i = 2; i < lm.value.n; i++)
+          blank &= lm.value.p[i] == 0;
+        if (lm.value.n > 2 && !blank && (b->ret_locator = malloc(lm.value.n)) != NULL) {
+          memcpy(b->ret_locator, lm.value.p, lm.value.n);
+          b->ret_loclen = lm.value.n;
         }
-        b->ret_locator = loc;
-        b->ret_loclen = loclen;
+        seer_schema_free(SEER_LOB_OUT_SCHEMA, &lm);
         continue;
       }
       /* SEER_OUT_CELL_SCHEMA: the value and its indicator, 81 01 NULL */
