@@ -169,6 +169,30 @@ typedef struct {
 
 extern const SeerField SEER_FUN_HEAD_SCHEMA[];
 
+/* Two-phase commit (seerdb PROTOCOL.md §28): TXN_SWITCH (begin/end) and
+ * TXN_CHANGE_STATE (prepare/commit/abort) share a head - the operation, the
+ * stored context's pointer and length, and the xid's descriptor (format id,
+ * gtrid and bqual lengths, the payload's pointer and length). SWITCH goes on
+ * with the flags, the timeout, three out pointers and from 11.2 the internal
+ * and external names' pointers and lengths; CHANGE_STATE with the timeout,
+ * the state, the out-state pointer and from 10.2 the flags. Both end with
+ * the context's bytes and the 128-byte xid, SWITCH with an app value too.
+ * The reply's RPA carries an app value and the begin context, counted, or
+ * the state. */
+typedef struct {
+  int64_t op, ctx_ptr, ctx_len;
+  int64_t format_id, gtrid_len, bqual_len, xid_ptr, xid_len;
+  int64_t flags, timeout, state, out_ptr;
+  int64_t int_name_ptr, int_name_len, ext_name_ptr, ext_name_len;
+  SeerBytes ctx, xid;
+  int64_t app_value;
+} SeerTpcMsg;
+
+extern const SeerField SEER_TPC_SWITCH_SCHEMA[];
+extern const SeerField SEER_TPC_CHANGE_STATE_SCHEMA[];
+extern const SeerField SEER_TPC_CONTEXT_REPLY_SCHEMA[];
+extern const SeerField SEER_TPC_STATE_REPLY_SCHEMA[];
+
 /* Close cursors (TTI_OCCA, a piggyback ahead of the next call; seerdb
  * _CLOSE_CURSORS): the list's pointer, then the cursor ids, counted. */
 typedef struct {

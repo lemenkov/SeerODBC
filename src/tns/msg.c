@@ -435,6 +435,58 @@ const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_END,
 };
 
+#define T SeerTpcMsg
+#define TPC_HEAD                                                                                   \
+  SEER_F(SF_N4, T, op), SEER_F(SF_U8, T, ctx_ptr), SEER_F(SF_N4, T, ctx_len),                      \
+      SEER_F(SF_N4, T, format_id), SEER_F(SF_N4, T, gtrid_len), SEER_F(SF_N4, T, bqual_len),       \
+      SEER_F(SF_U8, T, xid_ptr), SEER_F(SF_N4, T, xid_len)
+#define TPC_TAIL                                                                                   \
+  {.kind = SF_RAW, .off = offsetof(T, ctx), .arg = offsetof(T, ctx_len)},                          \
+  {                                                                                                \
+    .kind = SF_RAW, .off = offsetof(T, xid), .arg = offsetof(T, xid_len)                           \
+  }
+
+static const uint8_t TPC_OUT_PTRS[3] = {1, 1, 1};
+
+const SeerField SEER_TPC_SWITCH_SCHEMA[] = {
+    TPC_HEAD,
+    SEER_F(SF_N4, T, flags),
+    SEER_F(SF_N4, T, timeout),
+    {.kind = SF_CONST, .arg = sizeof TPC_OUT_PTRS, .lit = TPC_OUT_PTRS},
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_11_2, 0, T, int_name_ptr),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_11_2, 0, T, int_name_len),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_11_2, 0, T, ext_name_ptr),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_11_2, 0, T, ext_name_len),
+    TPC_TAIL,
+    SEER_F(SF_N4, T, app_value),
+    SEER_END,
+};
+
+const SeerField SEER_TPC_CHANGE_STATE_SCHEMA[] = {
+    TPC_HEAD,
+    SEER_F(SF_N4, T, timeout),
+    SEER_F(SF_N4, T, state),
+    SEER_F(SF_U8, T, out_ptr),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, T, flags),
+    TPC_TAIL,
+    SEER_END,
+};
+
+const SeerField SEER_TPC_CONTEXT_REPLY_SCHEMA[] = {
+    SEER_F(SF_N4, T, app_value),
+    SEER_F(SF_N4, T, ctx_len),
+    {.kind = SF_RAW, .off = offsetof(T, ctx), .arg = offsetof(T, ctx_len)},
+    SEER_END,
+};
+
+const SeerField SEER_TPC_STATE_REPLY_SCHEMA[] = {
+    SEER_F(SF_N4, T, state),
+    SEER_END,
+};
+#undef TPC_TAIL
+#undef TPC_HEAD
+#undef T
+
 const SeerField SEER_CLOSE_CURSORS_SCHEMA[] = {
     SEER_F(SF_U8, SeerCloseCursorsMsg, list_ptr),
     {.kind = SF_INTS,

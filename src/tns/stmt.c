@@ -10968,100 +10968,68 @@ static bool xid_valid(const SeerXid *xid)
          xid->bqual_len <= 64 && (xid->gtrid_len + xid->bqual_len) <= TNS_TPC_XID_WIRE_LEN;
 }
 
-/* The format-id / gtrid-len / bqual-len / xid-pointer descriptor block shared by
- * both TPC messages (the 128-byte xid payload follows later in the body). */
-static void tpc_xid_descriptor(SeerWriter *w, const SeerXid *xid)
+/* A TPC message's head and tail from the connection and the xid: the stored
+ * context, replayed, and the xid's descriptor and 128-byte payload - gtrid
+ * then bqual, zero-padded - into `xbuf`. */
+static void tpc_msg(const SeerConn *c, const SeerXid *xid, uint32_t op,
+                    uint8_t xbuf[TNS_TPC_XID_WIRE_LEN], SeerTpcMsg *m)
 {
+  *m = (SeerTpcMsg){.op = op};
+  if (c->tpc_context != NULL) {
+    m->ctx_ptr = 1;
+    m->ctx_len = (int64_t)c->tpc_context_len;
+    m->ctx = (SeerBytes){c->tpc_context, c->tpc_context_len, 0};
+  }
   if (xid != NULL) {
-    seer_enc_sb4(w, (uint32_t)xid->format_id);
-    seer_enc_sb4(w, (uint32_t)xid->gtrid_len);
-    seer_enc_sb4(w, (uint32_t)xid->bqual_len);
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, TNS_TPC_XID_WIRE_LEN);
-  } else {
-    seer_enc_sb4(w, 0);
-    seer_enc_sb4(w, 0);
-    seer_enc_sb4(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0);
+    memset(xbuf, 0, TNS_TPC_XID_WIRE_LEN);
+    if (xid->gtrid_len > 0)
+      memcpy(xbuf, xid->gtrid, (size_t)xid->gtrid_len);
+    if (xid->bqual_len > 0)
+      memcpy(xbuf + xid->gtrid_len, xid->bqual, (size_t)xid->bqual_len);
+    m->format_id = (uint32_t)xid->format_id;
+    m->gtrid_len = xid->gtrid_len;
+    m->bqual_len = xid->bqual_len;
+    m->xid_ptr = 1;
+    m->xid_len = TNS_TPC_XID_WIRE_LEN;
+    m->xid = (SeerBytes){xbuf, TNS_TPC_XID_WIRE_LEN, 0};
   }
 }
 
-/* The 128-byte wire xid: gtrid then bqual, zero-padded. */
-static void tpc_xid_payload(SeerWriter *w, const SeerXid *xid)
-{
-  uint8_t buf[TNS_TPC_XID_WIRE_LEN] = {0};
-  int g = xid->gtrid_len, b = xid->bqual_len;
-  if (g > 0)
-    memcpy(buf, xid->gtrid, (size_t)g);
-  if (b > 0)
-    memcpy(buf + g, xid->bqual, (size_t)b);
-  seer_writer_bytes(w, buf, sizeof buf);
-}
-
-/* Build a TXN_SWITCH (begin/end) message, replaying any stored context. Before
- * 11g the internal and external names are absent: their pointers, lengths and
- * bytes (seerdb PROTOCOL.md §28, "Before 12c"). */
+/* Build a TXN_SWITCH (begin/end) message by SEER_TPC_SWITCH_SCHEMA, replaying
+ * any stored context. Before 11g the internal and external names are absent:
+ * their pointers, lengths and bytes (seerdb PROTOCOL.md §28, "Before 12c"). */
 SeerStatus seer_tpc_build_switch(SeerConn *c, SeerWriter *w, uint32_t op, const SeerXid *xid,
                                  uint32_t flags, uint32_t timeout)
 {
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_TPC_TXN_SWITCH);
-  seer_enc_sb4(w, op);
-  if (c->tpc_context != NULL) {
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, (uint32_t)c->tpc_context_len);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0);
-  }
-  tpc_xid_descriptor(w, xid);
-  seer_enc_sb4(w, flags);
-  seer_enc_sb4(w, timeout);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1); /* ptrs */
-  if (c->field_version >= TTC_FIELD_VERSION_11_2) {
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* internal name: none */
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* external name: none */
-  }
-  if (c->tpc_context != NULL)
-    seer_writer_bytes(w, c->tpc_context, c->tpc_context_len);
-  if (xid != NULL)
-    tpc_xid_payload(w, xid);
-  seer_enc_sb4(w, 0); /* app value */
+  uint8_t xbuf[TNS_TPC_XID_WIRE_LEN];
+  SeerTpcMsg m;
+  tpc_msg(c, xid, op, xbuf, &m);
+  m.flags = flags;
+  m.timeout = timeout;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_TPC_SWITCH_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
-/* Build a TXN_CHANGE_STATE (prepare/commit/abort) message. 9i has no flags:
- * the context follows the out-state pointer (PROTOCOL.md §28). */
+/* Build a TXN_CHANGE_STATE (prepare/commit/abort) message by
+ * SEER_TPC_CHANGE_STATE_SCHEMA. 9i has no flags: the context follows the
+ * out-state pointer (PROTOCOL.md §28). */
 static SeerStatus tpc_build_change_state(SeerConn *c, SeerWriter *w, uint32_t op, uint32_t state,
                                          const SeerXid *xid)
 {
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_TPC_TXN_CHANGE_STATE);
-  seer_enc_sb4(w, op);
-  if (c->tpc_context != NULL) {
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, (uint32_t)c->tpc_context_len);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0);
-  }
-  tpc_xid_descriptor(w, xid);
-  seer_enc_sb4(w, 0); /* timeout */
-  seer_enc_sb4(w, state);
-  seer_writer_u8(w, 1); /* out-state pointer */
-  if (c->field_version >= TTC_FIELD_VERSION_10_2)
-    seer_enc_sb4(w, 0); /* flags */
-  if (c->tpc_context != NULL)
-    seer_writer_bytes(w, c->tpc_context, c->tpc_context_len);
-  if (xid != NULL)
-    tpc_xid_payload(w, xid);
+  uint8_t xbuf[TNS_TPC_XID_WIRE_LEN];
+  SeerTpcMsg m;
+  tpc_msg(c, xid, op, xbuf, &m);
+  m.state = state;
+  m.out_ptr = 1;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_TPC_CHANGE_STATE_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
@@ -11091,25 +11059,25 @@ static SeerStatus tpc_call(SeerConn *c, SeerWriter *w, bool want_context, uint8_
   uint8_t tok = seer_reader_u8(&r);
 
   if (tok == TTI_RPA) {
+    SeerSchemaCtx scx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    SeerTpcMsg m = {0};
     if (want_context) {
-      (void)seer_dec_sb4(&r); /* app value */
-      int64_t clen = seer_dec_sb4(&r);
-      if (clen < 0 || (size_t)clen > seer_reader_remaining(&r)) {
+      if (!seer_schema_decode(SEER_TPC_CONTEXT_REPLY_SCHEMA, &scx, &r, &m)) {
         free(resp);
         return SEER_EPROTO;
       }
-      uint8_t *cx = malloc((size_t)clen ? (size_t)clen : 1);
+      uint8_t *cx = malloc(m.ctx.n ? m.ctx.n : 1);
       if (cx == NULL) {
         free(resp);
         return SEER_ENOMEM;
       }
-      const uint8_t *p = seer_reader_bytes(&r, (size_t)clen);
-      if (p != NULL && clen > 0)
-        memcpy(cx, p, (size_t)clen);
+      if (m.ctx.n > 0)
+        memcpy(cx, m.ctx.p, m.ctx.n);
       *ctx = cx;
-      *ctxlen = (size_t)clen;
+      *ctxlen = m.ctx.n;
     } else if (state != NULL) {
-      *state = (uint32_t)seer_dec_sb4(&r);
+      (void)seer_schema_decode(SEER_TPC_STATE_REPLY_SCHEMA, &scx, &r, &m);
+      *state = (uint32_t)m.state;
     }
     if (seer_reader_remaining(&r) > 0 && seer_reader_u8(&r) == TTI_OER) {
       if (fv2) {
