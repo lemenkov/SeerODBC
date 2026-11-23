@@ -3243,43 +3243,29 @@ static SeerStatus build_define(SeerStmt *stmt, SeerWriter *w)
   int fv = c->field_version;
   if (!seer_writer_init(w, 96 + (size_t)stmt->ncols * 24))
     return SEER_ENOMEM;
+  /* SEER_ALL8_SCHEMA with the DEFINE option alone (#398): no SQL, no binds,
+   * a define a column */
   seer_ttc_fun_header(c, w, TTI_ALL8);
-  seer_enc_sb4(w, 0x8010u);                   /* NOT_PLSQL | DEFINE */
-  seer_enc_sb4(w, (uint32_t)stmt->cursor_id); /* cursor */
-  seer_writer_u8(w, 0);                       /* query absent */
-  seer_enc_sb4(w, 0);                         /* query length */
-  seer_writer_u8(w, 1);                       /* all8 present */
-  seer_enc_sb4(w, 13);                        /* all8 length */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, fv > TTC_FIELD_VERSION_23_1 ? 0u : 0xFFFFFFFFu); /* long max */
-  seer_enc_sb4(w, PREFETCH_ROWS);                                  /* rows */
-  seer_enc_sb4(w, 0x7FFFFFFF);                                     /* max value */
-  seer_writer_u8(w, 0);                                            /* binds absent */
-  seer_enc_sb4(w, 0);
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);                   /* defines present */
-  seer_enc_sb4(w, (uint32_t)stmt->ncols); /* define count */
-  seer_writer_u8(w, 0);                   /* registration 0,0,1 .. */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);
-  if ((c->server_release >> 24) != 10)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0);
-  for (int i = 0; i < 3; i++)
-    seer_writer_u8(w, 0); /* al8pidmlrc */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
-  if (fv > TTC_FIELD_VERSION_12_2)
-    for (int i = 0; i < 2; i++)
-      seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
   uint32_t all8[13] = {0};
   all8[1] = PREFETCH_ROWS; /* rows to return */
   all8[7] = 1;             /* a query */
-  for (int i = 0; i < 13; i++)
-    seer_enc_sb4(w, all8[i]);
+  SeerAll8Msg am = {
+      .options = 0x8010u, /* NOT_PLSQL | DEFINE */
+      .cursor = stmt->cursor_id,
+      .al8i4_ptr = 1,
+      .al8i4_len = 13,
+      .prefetch_size = fv > TTC_FIELD_VERSION_23_1 ? 0 : 0xFFFFFFFFu,
+      .prefetch_rows = PREFETCH_ROWS,
+      .max_long = 0x7FFFFFFF,
+      .defines_ptr = 1,
+      .define_count = stmt->ncols,
+      .reg2 = 1,
+      .register_tail = (c->server_release >> 24) != 10,
+      .al8i4 = all8,
+      .al8i4_n = 13,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
   for (int i = 0; i < stmt->ncols; i++) {
     const SeerColumn *col = &stmt->cols[i];
     if (col->ora_type == ORA_TYPE_CLOB) /* as LONG, in the database charset */
@@ -3302,8 +3288,9 @@ static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
   if (!seer_writer_init(w, 16))
     return SEER_ENOMEM;
   seer_ttc_fun_header(stmt->conn, w, TTI_FETCH);
-  seer_enc_sb4(w, (uint32_t)stmt->cursor_id);
-  seer_enc_sb4(w, PREFETCH_ROWS);
+  SeerFetchMsg m = {.cursor = stmt->cursor_id, .rows = PREFETCH_ROWS}; /* #398 */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  seer_schema_encode(SEER_FETCH_SCHEMA, &cx, &m, w);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
     return SEER_ENOMEM;
@@ -3322,48 +3309,28 @@ static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
 static SeerStatus build_fetch_only(SeerStmt *stmt, SeerWriter *w)
 {
   SeerConn *c = stmt->conn;
-  int fv = c->field_version;
   if (!seer_writer_init(w, 64))
     return SEER_ENOMEM;
+  /* SEER_ALL8_SCHEMA with the FETCH option alone (#398): no SQL, no binds,
+   * a query's rows */
   seer_ttc_fun_header(c, w, TTI_ALL8);
-  seer_enc_sb4(w, 0x8040u);                   /* NOT_PLSQL | FETCH */
-  seer_enc_sb4(w, (uint32_t)stmt->cursor_id); /* cursor */
-  seer_writer_u8(w, 0);                       /* query absent */
-  seer_enc_sb4(w, 0);                         /* query length */
-  seer_writer_u8(w, 1);                       /* all8 present */
-  seer_enc_sb4(w, 13);                        /* all8 length */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);             /* long max */
-  seer_enc_sb4(w, PREFETCH_ROWS); /* rows */
-  seer_enc_sb4(w, 0x7FFFFFFF);    /* max value */
-  seer_writer_u8(w, 0);           /* binds absent */
-  seer_enc_sb4(w, 0);
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0); /* defines absent */
-  seer_enc_sb4(w, 0);
-  seer_writer_u8(w, 0); /* registration 0,0,1 .. */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);
-  if ((c->server_release >> 24) != 10)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0);
-  if (fv >= TTC_FIELD_VERSION_12_1) {
-    for (int i = 0; i < 3; i++)
-      seer_writer_u8(w, 0); /* al8pidmlrc */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 5; i++)
-        seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
-    if (fv > TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 2; i++)
-        seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
-  }
   uint32_t all8[13] = {0};
   all8[1] = PREFETCH_ROWS; /* rows to return */
   all8[7] = 1;             /* a query */
-  for (int i = 0; i < 13; i++)
-    seer_enc_sb4(w, all8[i]);
+  SeerAll8Msg am = {
+      .options = 0x8040u, /* NOT_PLSQL | FETCH */
+      .cursor = stmt->cursor_id,
+      .al8i4_ptr = 1,
+      .al8i4_len = 13,
+      .prefetch_rows = PREFETCH_ROWS,
+      .max_long = 0x7FFFFFFF,
+      .reg2 = 1,
+      .register_tail = (c->server_release >> 24) != 10,
+      .al8i4 = all8,
+      .al8i4_n = 13,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
     return SEER_ENOMEM;

@@ -333,6 +333,12 @@ const SeerField SEER_ALL8_SCHEMA[] = {
 };
 #undef A
 
+const SeerField SEER_FETCH_SCHEMA[] = {
+    SEER_F(SF_N4, SeerFetchMsg, cursor),
+    SEER_F(SF_N4, SeerFetchMsg, rows),
+    SEER_END,
+};
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),

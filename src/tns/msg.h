@@ -253,6 +253,14 @@ typedef struct {
 
 extern const SeerField SEER_ALL8_SCHEMA[];
 
+/* A FETCH call's body (TTI_FETCH, after the function header; seerdb _FETCH):
+ * the cursor and the rows to return. */
+typedef struct {
+  int64_t cursor, rows;
+} SeerFetchMsg;
+
+extern const SeerField SEER_FETCH_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 
