@@ -1369,6 +1369,33 @@ static uint32_t *oer_ub4s(const SeerBytes *b, size_t *n)
   return arr;
 }
 
+/* The batch errors' messages (§6.7), after SEER_OER_BATCH_SCHEMA counted `n`:
+ * SEER_OER_MSGS_HEAD_SCHEMA, then each as SEER_OER_MSG_SCHEMA - the same on
+ * 10g+ and 9i (#398). Each text NUL-terminated and malloc'd; an empty one ""
+ * with `blank` (10g+), else NULL (9i). NULL when the array can't be had. */
+static char **oer_batch_msgs(SeerReader *r, const SeerSchemaCtx *cx, int64_t n, bool blank)
+{
+  char **msgs = calloc((size_t)n, sizeof *msgs);
+  SeerOerTextMsg hm = {0};
+  (void)seer_schema_decode(SEER_OER_MSGS_HEAD_SCHEMA, cx, r, &hm);
+  for (int64_t i = 0; i < n && seer_reader_ok(r); i++) {
+    SeerOerTextMsg tm = {0};
+    bool ok = seer_schema_decode(SEER_OER_MSG_SCHEMA, cx, r, &tm);
+    if (ok && msgs != NULL && (tm.text.n > 0 || blank)) {
+      msgs[i] = malloc(tm.text.n + 1);
+      if (msgs[i] != NULL) {
+        if (tm.text.n > 0)
+          memcpy(msgs[i], tm.text.p, tm.text.n);
+        msgs[i][tm.text.n] = '\0';
+      }
+    }
+    seer_schema_free(SEER_OER_MSG_SCHEMA, &tm);
+    if (!ok)
+      break;
+  }
+  return msgs;
+}
+
 /* The end-of-call status, by SEER_OER_HEAD_SCHEMA / _TAIL_SCHEMA (#395
  * spike): the batch errors' messages between them stay code. */
 static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
@@ -1399,17 +1426,7 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
   char **msgs = NULL;
   size_t nmsgs = 0;
   if (m.nmsgs > 0 && m.nmsgs < 65536) {
-    msgs = calloc((size_t)m.nmsgs, sizeof *msgs);
-    seer_reader_bytes(r, 1); /* indicator byte */
-    for (int64_t i = 0; i < m.nmsgs && seer_reader_ok(r); i++) {
-      char *t = NULL;
-      seer_read_str(r, &t);
-      if (msgs != NULL)
-        msgs[i] = t; /* takes ownership */
-      else
-        free(t);
-      seer_reader_bytes(r, 2); /* per-message trailer */
-    }
+    msgs = oer_batch_msgs(r, &cx, m.nmsgs, true);
     if (msgs != NULL)
       nmsgs = (size_t)m.nmsgs;
   }
@@ -4566,25 +4583,9 @@ static void fv2_read_batch_errors(SeerReader *r, SeerStmt *stmt)
   seer_schema_free(SEER_OER_BATCH_SCHEMA, &bm);
   int64_t nmsgs = bm.nmsgs;
   char **msgs = NULL;
-  if (nmsgs > 0 && nmsgs <= 65536 && seer_reader_ok(r)) {
-    (void)seer_reader_u8(r); /* indicator */
-    msgs = calloc((size_t)nmsgs, sizeof *msgs);
-    for (int64_t i = 0; msgs != NULL && i < nmsgs && seer_reader_ok(r); i++) {
-      if (seer_dec_sb4(r) > 0) {
-        uint8_t *t = NULL;
-        size_t tl = 0;
-        if (seer_dec_dalc(r, &t, &tl) != SEER_OK)
-          break;
-        msgs[i] = malloc(tl + 1);
-        if (msgs[i] != NULL) {
-          memcpy(msgs[i], t, tl);
-          msgs[i][tl] = '\0';
-        }
-        free(t);
-      }
-      (void)seer_reader_bytes(r, 2);
-    }
-  } else
+  if (nmsgs > 0 && nmsgs <= 65536 && seer_reader_ok(r))
+    msgs = oer_batch_msgs(r, &cx, nmsgs, false);
+  else
     nmsgs = 0;
   size_t nb = 0;
   if (codes != NULL)

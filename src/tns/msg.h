@@ -185,6 +185,17 @@ extern const SeerField SEER_OER_FLAGS_SCHEMA[];
 extern const SeerField SEER_OER_BATCH_SCHEMA[];
 extern const SeerField SEER_OER_TAIL_SCHEMA[];
 
+/* The batch errors' messages, after SEER_OER_BATCH_SCHEMA when it counts
+ * some (§6.7): an indicator byte, then each message counted and two
+ * trailing bytes. The same on 10g+ and 9i. */
+typedef struct {
+  int64_t indicator;
+  SeerBytes text;
+} SeerOerTextMsg;
+
+extern const SeerField SEER_OER_MSGS_HEAD_SCHEMA[];
+extern const SeerField SEER_OER_MSG_SCHEMA[];
+
 /* A row's cells. Every kind ends, where the path has one, in the cell's
  * trailer: on 8i an indicator (-1 NULL) and a return code, ub2s, after every
  * cell; on 9i the indicator alone, a compressed integer (00, or 81 01 for

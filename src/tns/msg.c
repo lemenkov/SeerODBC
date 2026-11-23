@@ -194,6 +194,17 @@ const SeerField SEER_OER_BATCH_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_OER_MSGS_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, SeerOerTextMsg, indicator),
+    SEER_END,
+};
+
+const SeerField SEER_OER_MSG_SCHEMA[] = {
+    SEER_F(SF_COUNTED, SeerOerTextMsg, text),
+    SEER_PAD(2),
+    SEER_END,
+};
+
 const SeerField SEER_OER_TAIL_SCHEMA[] = {
     SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_1, 0, O, ext_error),
     SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_1, 0, O, ext_rows),
