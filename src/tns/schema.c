@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "marshal.h"
+#include "tns_consts.h" /* TTC_FIELD_VERSION_* */
 
 void seer_bytes_free(SeerBytes *b)
 {
@@ -71,6 +72,42 @@ static void put_num(SeerWriter *w, const SeerSchemaCtx *cx, uint8_t kind, int64_
   put_le(w, (uint64_t)v, kind == SF_N1 ? 1 : kind == SF_N2 ? 2 : 4);
 }
 
+/* SF_SQL: the SQL text (seerdb _ALL8_HEAD's sql; 8i o8w_chr). */
+static void put_sql(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
+{
+  if (cx->codec == SEER_CODEC_O8I) {
+    if (b->n <= 64) {
+      seer_writer_u8(w, (uint8_t)b->n);
+      if (b->n > 0)
+        seer_writer_bytes(w, b->p, b->n);
+      return;
+    }
+    seer_writer_u8(w, 0xFE);
+    for (size_t off = 0; off < b->n; off += 64) {
+      size_t k = b->n - off < 64 ? b->n - off : 64;
+      seer_writer_u8(w, (uint8_t)k);
+      seer_writer_bytes(w, b->p + off, k);
+    }
+    seer_writer_u8(w, 0);
+    return;
+  }
+  if (cx->fv < TTC_FIELD_VERSION_12_1) {
+    if (b->n > 0)
+      seer_writer_bytes(w, b->p, b->n);
+    return;
+  }
+  if (b->n <= 252) {
+    seer_writer_u8(w, (uint8_t)b->n);
+  } else {
+    seer_writer_u8(w, 254); /* LONG chunked form */
+    seer_enc_sb4(w, (uint32_t)b->n);
+  }
+  if (b->n > 0)
+    seer_writer_bytes(w, b->p, b->n);
+  if (b->n > 252)
+    seer_enc_sb4(w, 0);
+}
+
 static void put_value(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
 {
   if (b->n == 0) {
@@ -125,6 +162,9 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
       break;
     case SF_VALUE:
       put_value(w, cx, (const SeerBytes *)((const char *)msg + f->off));
+      break;
+    case SF_SQL:
+      put_sql(w, cx, (const SeerBytes *)((const char *)msg + f->off));
       break;
     case SF_U8L:
       if (cx->codec == SEER_CODEC_THIN)
@@ -277,6 +317,7 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
       break;
     case SF_INTS: /* encode only: nothing the client reads has one */
     case SF_N4S:
+    case SF_SQL:
       bad = true;
       break;
     case SF_EACH: {

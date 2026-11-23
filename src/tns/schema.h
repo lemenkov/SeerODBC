@@ -44,6 +44,10 @@ typedef enum {
                * `const uint32_t *` member, no count written; encode only */
   SF_CONST,   /* `arg` literal bytes at `lit`, the same in every message: captured
                * ground truth whose fields aren't known; checked when read */
+  SF_SQL,     /* a SeerBytes of SQL text as each dialect frames it: thin raw
+               * below 12.1, from 12.1 a ub1 length or, past 252 bytes, 254,
+               * an sb4 length, the bytes and an sb4 0; 8i ub1-length chunks
+               * of 64 (0xFE first, a 0 last) past 64 bytes; encode only */
   SF_EACH     /* the sub-schema `sub` as many times as the int64_t member at
                * `arg` says, each item read into a scratch message of `subsize`
                * bytes and dropped: what the client passes over; decode only */

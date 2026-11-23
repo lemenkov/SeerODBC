@@ -327,7 +327,7 @@ const SeerField SEER_ALL8_SCHEMA[] = {
      .codecs = THIN,
      .fv_min = TTC_FIELD_VERSION_12_2 + 1,
      .arg = 2}, /* chunk ids */
-    {.kind = SF_RAW, .off = offsetof(A, sql), .arg = offsetof(A, sql_bytes)},
+    {.kind = SF_SQL, .flags = SG_IF_SET, .if_off = offsetof(A, sql_ptr), .off = offsetof(A, sql)},
     {.kind = SF_N4S, .off = offsetof(A, al8i4), .arg = offsetof(A, al8i4_n)},
     SEER_END,
 };
@@ -353,7 +353,7 @@ const SeerField SEER_O7_ALL7_SCHEMA[] = {
     SEER_F(SF_N4, S, define_count),
     SEER_F(SF_U8, S, binds_ptr),
     SEER_F(SF_N4, S, bind_count),
-    {.kind = SF_RAW, .off = offsetof(S, sql), .arg = offsetof(S, sql_bytes)},
+    {.kind = SF_SQL, .flags = SG_IF_SET, .if_off = offsetof(S, sql_ptr), .off = offsetof(S, sql)},
     {.kind = SF_CONST, .arg = sizeof O7_ALL7_ROWS_LEAD, .lit = O7_ALL7_ROWS_LEAD},
     SEER_F(SF_N4, S, rows),
     SEER_PAD(5),

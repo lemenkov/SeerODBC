@@ -3074,26 +3074,9 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   if (reuse)
     opt &= ~0x0001u; /* PARSE off                    */
 
-  /* The SQL as 10g+ frames it: raw before 12.1; from 12.1 a ub1 length,
-   * or past 252 bytes 254, an sb4 length, the bytes and a zero; none at all
-   * on a no-parse re-execute, where even a zero length would shift the
-   * server's read of the al8i4 array. */
-  SeerWriter sqlw;
-  if (!seer_writer_init(&sqlw, qlen + 16))
-    return SEER_ENOMEM;
-  if (!reuse && stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    if (qlen <= 252) {
-      seer_writer_u8(&sqlw, (uint8_t)qlen);
-      seer_writer_bytes(&sqlw, stmt->sql, qlen);
-    } else {
-      seer_writer_u8(&sqlw, 254); /* LONG chunked form */
-      seer_enc_sb4(&sqlw, (uint32_t)qlen);
-      seer_writer_bytes(&sqlw, stmt->sql, qlen);
-      seer_enc_sb4(&sqlw, 0);
-    }
-  } else if (!reuse) {
-    seer_writer_bytes(&sqlw, stmt->sql, qlen);
-  }
+  /* The SQL text goes by SF_SQL (#398), framed as the field version wants;
+   * a no-parse re-execute has no sql_ptr and sends none, where even a zero
+   * length would shift the server's read of the al8i4 array. */
   /* SEER_ALL8_SCHEMA (#398). 12c+ carries al8pidmlrc (12.1+), the SQL-id
    * slot (12.2+) and the 12.2_EXT1 chunk ids - all null for us; without them
    * the server reads al8i4 at the wrong offset (ORA-03120; gating the tail
@@ -3117,14 +3100,12 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
       .pidmlrc_ptr = dml_rowcounts,
       .pidmlrc_len = dml_rowcounts ? 1 + iters : 0, /* al8pidmlrc: 1 + the iterations */
       .pidmlrc_ptr2 = dml_rowcounts,
-      .sql = {.p = sqlw.buf, .n = sqlw.len},
-      .sql_bytes = (int64_t)sqlw.len,
+      .sql = {.p = (const uint8_t *)stmt->sql, .n = reuse ? 0 : qlen},
       .al8i4 = all8,
       .al8i4_n = 13,
   };
   SeerSchemaCtx acx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
   seer_schema_encode(SEER_ALL8_SCHEMA, &acx, &am, w);
-  seer_writer_free(&sqlw);
 
   /* Bind section: one OAC descriptor per bind position (sized to the widest
    * value across iterations), then one RXD token per iteration carrying that
@@ -5269,7 +5250,6 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
       .binds_ptr = nb > 0,
       .bind_count = nb,
       .sql = {.p = (const uint8_t *)stmt->sql, .n = qlen},
-      .sql_bytes = (int64_t)qlen,
       .rows = rows, /* 1, or an array DML's */
   };
   fv2_all7(w, &m);
@@ -5310,7 +5290,6 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
       .binds_ptr = nb > 0,
       .bind_count = nb,
       .sql = {.p = (const uint8_t *)stmt->sql, .n = qlen},
-      .sql_bytes = (int64_t)qlen,
       .rows = 1,
   };
   fv2_all7(w, &m);
@@ -5719,12 +5698,7 @@ static void o8i_all8(SeerConn *c, SeerWriter *w, uint32_t options, uint32_t curs
 {
   seer_ttc_fun_header(c, w, TTI_ALL8);
   /* SEER_ALL8_SCHEMA at 8i's widths (#398): al8o4l and al8kvl set, no
-   * defines or register; the SQL as the pre-10g chunked string. */
-  SeerWriter sqlw;
-  if (!seer_writer_init(&sqlw, sqllen + sqllen / 64 + 4))
-    return;
-  if (has_sql)
-    o8w_chr(&sqlw, sql, sqllen);
+   * defines or register; the SQL by SF_SQL, the pre-10g chunked string. */
   uint32_t i4[12] = {0};
   i4[0] = i0, i4[1] = i1, i4[7] = i7;
   SeerAll8Msg am = {
@@ -5740,14 +5714,12 @@ static void o8i_all8(SeerConn *c, SeerWriter *w, uint32_t options, uint32_t curs
       .binds_ptr = bind_count != 0,
       .bind_count = bind_count,
       .al8kvl = 1,
-      .sql = {.p = sqlw.buf, .n = sqlw.len},
-      .sql_bytes = (int64_t)sqlw.len,
+      .sql = {.p = sql, .n = has_sql ? sqllen : 0},
       .al8i4 = i4,
       .al8i4_n = 12,
   };
   SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
   seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
-  seer_writer_free(&sqlw);
 }
 
 /* The close of the finished cursors, piggybacked ahead of the next call

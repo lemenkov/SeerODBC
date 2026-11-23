@@ -245,8 +245,7 @@ typedef struct {
   int64_t al8app, al8txn, al8txl, al8kv, al8kvl, defines_ptr, define_count;
   int64_t reg0, reg1, reg2, register_tail;
   int64_t pidmlrc_ptr, pidmlrc_len, pidmlrc_ptr2;
-  SeerBytes sql;
-  int64_t sql_bytes;
+  SeerBytes sql; /* SF_SQL: the text itself */
   const uint32_t *al8i4;
   int64_t al8i4_n;
 } SeerAll8Msg;
@@ -270,8 +269,8 @@ extern const SeerField SEER_FETCH_SCHEMA[];
  * bytes. The binds' descriptors and values, or the defines, follow. */
 typedef struct {
   int64_t options, cursor, sql_ptr, sql_len, defines_ptr, define_count, binds_ptr, bind_count;
-  SeerBytes sql;
-  int64_t sql_bytes, rows;
+  SeerBytes sql; /* SF_SQL: the text itself */
+  int64_t rows;
 } SeerO7All7Msg;
 
 extern const SeerField SEER_O7_ALL7_SCHEMA[];
