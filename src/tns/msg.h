@@ -120,6 +120,17 @@ typedef struct {
 
 extern const SeerField SEER_CLOSE_CURSORS_SCHEMA[];
 
+/* A row header (TTI_RXH, after its token; seerdb _O7_RXH): flags, four
+ * counts (ub2s on 8i), then the bit vector naming the columns the next row
+ * sends - a clear bit repeats the previous row's value - and the rowid, each
+ * counted. The same on every path. */
+typedef struct {
+  int64_t flags, requests, iteration, iterations, buffer_len;
+  SeerBytes bit_vector, rowid;
+} SeerRxhMsg;
+
+extern const SeerField SEER_RXH_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

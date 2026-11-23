@@ -997,27 +997,29 @@ static SeerStatus parse_implicit(SeerReader *r, SeerStmt *stmt)
  * the previous batch's last row, and that column is then not sent. Ignoring
  * the vector read the next column's bytes in its place (seerdb tns.py's RXH
  * handling; python-oracledb _process_row_header). */
-static SeerStatus parse_rxh(SeerReader *r, uint8_t **bv, size_t *bvlen)
+static SeerStatus parse_rxh(SeerReader *r, int fv, uint8_t **bv, size_t *bvlen)
 {
-  (void)seer_reader_u8(r); /* flags */
-  for (int i = 0; i < 4; i++)
-    (void)seer_dec_sb4(r); /* num requests/iter/iters/buffer len */
-  int64_t n = seer_dec_sb4(r);
-  if (n > 0) {
-    (void)seer_reader_u8(r); /* repeated length */
-    const uint8_t *p = seer_reader_bytes(r, (size_t)n);
-    if (p != NULL) {
-      uint8_t *copy = malloc((size_t)n);
-      if (copy == NULL)
-        return SEER_ENOMEM;
-      memcpy(copy, p, (size_t)n);
-      free(*bv);
-      *bv = copy;
-      *bvlen = (size_t)n;
-    }
+  /* SEER_RXH_SCHEMA (#398); the bit vector is kept for the rows after it. */
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerRxhMsg m = {0};
+  if (!seer_schema_decode(SEER_RXH_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_RXH_SCHEMA, &m);
+    return SEER_EPROTO;
   }
-  seer_skip_bytes_with_length(r); /* rxhrid */
-  return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
+  if (m.bit_vector.n > 0) {
+    uint8_t *copy = malloc(m.bit_vector.n);
+    if (copy == NULL) {
+      seer_schema_free(SEER_RXH_SCHEMA, &m);
+      return SEER_ENOMEM;
+    }
+    memcpy(copy, m.bit_vector.p, m.bit_vector.n);
+    free(*bv);
+    *bv = copy;
+    *bvlen = m.bit_vector.n;
+  }
+  seer_schema_free(SEER_RXH_SCHEMA, &m);
+  return SEER_OK;
 }
 
 static SeerStatus parse_bvc(SeerReader *r, int ncols, uint8_t **bv, size_t *bvlen)
@@ -1861,7 +1863,7 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       }
       break;
     case TTI_RXH:
-      st = parse_rxh(&r, &bv, &bvlen);
+      st = parse_rxh(&r, stmt->conn->field_version, &bv, &bvlen);
       break;
     case TTI_BVC:
       st = parse_bvc(&r, stmt->ncols, &bv, &bvlen);
@@ -5107,13 +5109,14 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
     uint8_t token = r.buf[r.pos];
     if (token == TTI_RXH) {
       r.pos += 1;
-      (void)seer_reader_u8(&r); /* flags */
-      while (seer_reader_remaining(&r) > 0) {
-        uint8_t t = r.buf[r.pos];
-        if (t == TTI_RXD || t == TTI_OER || t == TTI_RXH)
-          break;
-        (void)seer_dec_sb4(&r); /* a small RXH count field */
-      }
+      /* SEER_RXH_SCHEMA at field version 2, as 10g+'s (#398) - where the
+       * counts were skipped up to the next token byte */
+      SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+      SeerRxhMsg m = {0};
+      bool whole = seer_schema_decode(SEER_RXH_SCHEMA, &cx, &r, &m);
+      seer_schema_free(SEER_RXH_SCHEMA, &m);
+      if (!whole)
+        break;
     } else if (token == TTI_RXD) {
       r.pos += 1;
       SeerCell *row = calloc(ncols ? (size_t)ncols : 1, sizeof *row);
@@ -6343,22 +6346,24 @@ static SeerStatus o8i_read_rows(O8iRd *r, SeerStmt *stmt, SeerCell ***rows, size
     uint8_t tok = r->b[r->pos];
     if (tok == TTI_RXH) {
       r->pos++;
-      o8r_skip(r, 1 + 8); /* flags, ub2 requests, iteration, iterations, buffer len */
-      uint32_t bl = o8r_le32(r);
+      /* SEER_RXH_SCHEMA at 8i's widths: the counts ub2s (#398) */
+      SeerReader sr;
+      seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+      SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+      SeerRxhMsg m = {0};
+      SeerSchemaResult res = seer_schema_decode_ex(SEER_RXH_SCHEMA, &cx, &sr, &m);
       veclen = 0;
-      if (bl > 0) {
-        SeerWriter bv;
-        if (!seer_writer_init(&bv, 16))
-          return SEER_ENOMEM;
-        o8r_value(r, &bv);
-        if (seer_writer_ok(&bv) && bv.len <= sizeof vec) {
-          memcpy(vec, bv.buf, bv.len);
-          veclen = bv.len;
-        }
-        seer_writer_free(&bv);
+      if (res == SCH_OK && m.bit_vector.n <= sizeof vec) {
+        memcpy(vec, m.bit_vector.p, m.bit_vector.n);
+        veclen = m.bit_vector.n;
       }
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL); /* rowid */
+      seer_schema_free(SEER_RXH_SCHEMA, &m);
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else if (res == SCH_BAD)
+        r->bad = true;
+      else
+        r->pos += sr.pos;
     } else if (tok == TTI_RXD) {
       r->pos++;
       SeerCell *row = calloc(ncols ? (size_t)ncols : 1, sizeof *row);

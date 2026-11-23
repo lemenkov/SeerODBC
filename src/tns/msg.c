@@ -126,6 +126,13 @@ const SeerField SEER_LOB_DATA_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_RXH_SCHEMA[] = {
+    SEER_F(SF_U8, SeerRxhMsg, flags),      SEER_F(SF_N2, SeerRxhMsg, requests),
+    SEER_F(SF_N2, SeerRxhMsg, iteration),  SEER_F(SF_N2, SeerRxhMsg, iterations),
+    SEER_F(SF_N2, SeerRxhMsg, buffer_len), SEER_F(SF_COUNTED, SeerRxhMsg, bit_vector),
+    SEER_F(SF_COUNTED, SeerRxhMsg, rowid), SEER_END,
+};
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),
