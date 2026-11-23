@@ -907,6 +907,32 @@ static const char *proxy_split(const char *raw, char *ubuf, size_t bufsz, size_t
   return NULL;
 }
 
+/* A login call's head and its pairs by their schemas (#398): the same on
+ * 10g+, 9i and 8i, at each codec's widths. */
+static void auth_head(SeerWriter *w, const SeerSchemaCtx *cx, const char *user, size_t ulen,
+                      uint32_t mode, uint32_t npairs)
+{
+  SeerAuthHeadMsg h = {.user_ptr = 1,
+                       .user_len = (int64_t)ulen,
+                       .mode = mode,
+                       .pairs_ptr = 1,
+                       .npairs = npairs,
+                       .ptr3 = 1,
+                       .ptr4 = 1,
+                       .user = {.p = (const uint8_t *)user, .n = ulen},
+                       .user_bytes = (int64_t)ulen};
+  seer_schema_encode(SEER_AUTH_HEAD_SCHEMA, cx, &h, w);
+}
+
+static void auth_pair(SeerWriter *w, const SeerSchemaCtx *cx, const char *key, size_t klen,
+                      const void *val, size_t vlen, int64_t flags)
+{
+  SeerAuthPairMsg m = {.key = {.p = (const uint8_t *)key, .n = klen},
+                       .value = {.p = (const uint8_t *)val, .n = vlen},
+                       .flags = flags};
+  seer_schema_encode(SEER_AUTH_PAIR_SCHEMA, cx, &m, w);
+}
+
 static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w)
 {
   char ubuf[256];
@@ -936,33 +962,20 @@ static SeerStatus build_sess(SeerConn *c, const SeerConnParams *p, SeerWriter *w
     return SEER_ENOMEM;
 
   bool is12c = c->field_version >= TTC_FIELD_VERSION_12_1;
+  /* The function header with no call token, even at fv24, as the corpus
+   * recorded it (seerdb _AUTH_HEAD has none either); then the head, mode 1
+   * (basic). 12c+ sends 5 pairs, AUTH_TERMINAL leading, 11g and 9i 4. */
   seer_writer_u8(w, TTI_FUN);
   seer_writer_u8(w, TTI_SESS);
   seer_writer_u8(w, seer_ttc_next_seq(c));
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)ulen); /* user length          */
-  seer_enc_sb4(w, 1);              /* logon mode (basic)   */
-  seer_writer_u8(w, 1);
-  /* 12c+ sends 5 pairs (leading AUTH_TERMINAL) and a length-prefixed
-   * username; 11g sends 4 pairs and the raw username (read via UserLen). */
-  seer_enc_sb4(w, is12c ? 5 : 4); /* key/value pairs      */
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  if (is12c) {
-    seer_writer_u8(w, (uint8_t)ulen); /* length-prefixed username */
-    seer_writer_bytes(w, user, ulen);
-    seer_enc_kv(w, "AUTH_TERMINAL", 13, "unknown", 7, 0,
-                c->field_version >= TTC_FIELD_VERSION_12_1);
-  } else {
-    seer_writer_bytes(w, user, ulen); /* raw username (11g) */
-  }
-  seer_enc_kv(w, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0,
-              c->field_version >= TTC_FIELD_VERSION_12_1);
-  seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0,
-              c->field_version >= TTC_FIELD_VERSION_12_1);
-  seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0, c->field_version >= TTC_FIELD_VERSION_12_1);
-  seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0,
-              c->field_version >= TTC_FIELD_VERSION_12_1);
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  auth_head(w, &cx, user, ulen, 1, is12c ? 5 : 4);
+  if (is12c)
+    auth_pair(w, &cx, "AUTH_TERMINAL", 13, "unknown", 7, 0);
+  auth_pair(w, &cx, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0);
+  auth_pair(w, &cx, "AUTH_MACHINE", 12, host, strlen(host), 0);
+  auth_pair(w, &cx, "AUTH_PID", 8, pid, strlen(pid), 0);
+  auth_pair(w, &cx, "AUTH_SID", 8, osuser, strlen(osuser), 0);
 
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
@@ -1471,22 +1484,17 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
 
   if (!seer_writer_init(w, 256 + ulen + strlen(pwdfield)))
     return SEER_ENOMEM;
-  seer_ttc_fun_header(c, w, TTI_AUTH);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)ulen); /* user length               */
-  seer_enc_sb4(w, 0x101);          /* logon mode, with the proof */
-  seer_writer_u8(w, 1);
   char tz[96];
   size_t tzlen = session_tz_value(tz, sizeof tz);
-  seer_enc_sb4(w, (uint32_t)((c->xa ? 8 : 6) + (tzlen ? 1 : 0))); /* key/value pairs */
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  seer_writer_bytes(w, user, ulen); /* raw, as below 12.1 */
-  seer_enc_kv(w, "AUTH_PASSWORD", 13, pwdfield, strlen(pwdfield), 0, false);
-  seer_enc_kv(w, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0, false);
-  seer_enc_kv(w, "AUTH_MACHINE", 12, host, strlen(host), 0, false);
-  seer_enc_kv(w, "AUTH_PID", 8, pid, strlen(pid), 0, false);
-  seer_enc_kv(w, "AUTH_SID", 8, osuser, strlen(osuser), 0, false);
+  /* mode 0x101, with the proof; the user raw, as below 12.1 */
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_ttc_fun_header(c, w, TTI_AUTH);
+  auth_head(w, &cx, user, ulen, 0x101, (uint32_t)((c->xa ? 8 : 6) + (tzlen ? 1 : 0)));
+  auth_pair(w, &cx, "AUTH_PASSWORD", 13, pwdfield, strlen(pwdfield), 0);
+  auth_pair(w, &cx, "AUTH_PROGRAM_NM", 15, APP, sizeof APP - 1, 0);
+  auth_pair(w, &cx, "AUTH_MACHINE", 12, host, strlen(host), 0);
+  auth_pair(w, &cx, "AUTH_PID", 8, pid, strlen(pid), 0);
+  auth_pair(w, &cx, "AUTH_SID", 8, osuser, strlen(osuser), 0);
   /* 9i takes a distributed transaction only on a session that logged on with
    * these names (ORA-02048 otherwise). The keys carry their NUL, as JDBC thin's
    * XA connection sends them (#171). Such a session keeps a refused commit's
@@ -1494,12 +1502,12 @@ static SeerStatus o9i_build_oauth(SeerConn *c, const char *user, const char *pwd
    * a connection that asks for two-phase commit, as JDBC gives them only to
    * its XA connection (#183). */
   if (c->xa) {
-    seer_enc_kv(w, "AUTH_INTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
-    seer_enc_kv(w, "AUTH_EXTERNALNAME\0", 18, APP, sizeof APP - 1, 0, false);
+    auth_pair(w, &cx, "AUTH_INTERNALNAME\0", 18, APP, sizeof APP - 1, 0);
+    auth_pair(w, &cx, "AUTH_EXTERNALNAME\0", 18, APP, sizeof APP - 1, 0);
   }
   if (tzlen)
-    seer_enc_kv(w, "AUTH_ALTER_SESSION", 18, tz, tzlen, 1, false);
-  seer_enc_kv(w, "AUTH_ACL", 8, ACL, sizeof ACL - 1, 0, false);
+    auth_pair(w, &cx, "AUTH_ALTER_SESSION", 18, tz, tzlen, 1);
+  auth_pair(w, &cx, "AUTH_ACL", 8, ACL, sizeof ACL - 1, 0);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
     return SEER_ENOMEM;
@@ -1588,14 +1596,6 @@ static SeerStatus o3logon_login(SeerConn *conn, const SeerConnParams *params)
 
 /* ------------------------------------------------------- Oracle 8i login */
 
-/* 8i's login integers are fixed-width little-endian (8i is x86), not the
- * variable-width TTC form. */
-static void o8i_le32(SeerWriter *w, uint32_t v)
-{
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, (uint8_t)(v >> (8 * i)));
-}
-
 /* The longest informational value an 8i key-value field carries: its ub1
  * length stops at 252 - 253..255 are TTC markers, and 8.1.7 fails the login
  * on them (seerdb #1773). */
@@ -1609,15 +1609,8 @@ static void o8i_pair(SeerWriter *w, const char *key, const char *val)
   size_t kl = strlen(key), vl = strlen(val);
   if (vl > O8I_INFO_VALUE_MAX)
     vl = O8I_INFO_VALUE_MAX;
-  o8i_le32(w, (uint32_t)kl);
-  seer_writer_u8(w, (uint8_t)kl);
-  seer_writer_bytes(w, (const uint8_t *)key, kl);
-  o8i_le32(w, (uint32_t)vl);
-  if (vl > 0) {
-    seer_writer_u8(w, (uint8_t)vl);
-    seer_writer_bytes(w, (const uint8_t *)val, vl);
-  }
-  o8i_le32(w, 0);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  auth_pair(w, &cx, key, kl, val, vl, 0);
 }
 
 /* Build one 8i login call (seerdb _AUTH_HEAD at the 8i codec's widths):
@@ -1636,15 +1629,8 @@ SeerStatus seer_o8i_build_login(SeerConn *conn, SeerWriter *w, uint8_t op, const
   if (!seer_writer_init(w, 256 + ulen + strlen(host)))
     return SEER_ENOMEM;
   seer_ttc_fun_header(conn, w, op);
-  seer_writer_u8(w, 1); /* pointer */
-  o8i_le32(w, (uint32_t)ulen);
-  o8i_le32(w, mode);
-  seer_writer_u8(w, 1); /* pointer */
-  o8i_le32(w, npairs);
-  seer_writer_u8(w, 1); /* pointers */
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, (uint8_t)ulen);
-  seer_writer_bytes(w, (const uint8_t *)user, ulen);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  auth_head(w, &cx, user, ulen, mode, npairs);
   if (password_field != NULL)
     o8i_pair(w, "AUTH_PASSWORD", password_field);
   o8i_pair(w, "AUTH_PROGRAM_NM", "seerodbc");
@@ -1912,13 +1898,10 @@ static SeerStatus build_auth(SeerConn *c, const SeerConnParams *p, const SeerAut
     goto out;
 
   seer_ttc_fun_header(c, w, TTI_AUTH);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)ulen); /* user length              */
   /* fv24 phase-two auth adds the 0x20000 logon-mode flag (else ORA-03120). */
   uint32_t logon_mode = 1 | 256; /* password | O5LOGON       */
   if (c->field_version > TTC_FIELD_VERSION_23_1)
     logon_mode |= 0x20000;
-  seer_enc_sb4(w, logon_mode);
   /* DRCP (#130): a connection class and/or session purity request a pooled
    * session. When DRCP is requested without an explicit purity, a standalone
    * connection defaults to NEW (matching python-oracledb). */
@@ -1929,41 +1912,27 @@ static SeerStatus build_auth(SeerConn *c, const SeerConnParams *p, const SeerAut
 
   char tz[96];
   size_t tzlen = session_tz_value(tz, sizeof tz);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)((has_speedy ? 3 : 2) + (proxy_schema ? 1 : 0) + (cclass ? 1 : 0) +
-                             (purity ? 1 : 0) + (tzlen ? 1 : 0))); /* KV count */
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  if (c->field_version >= TTC_FIELD_VERSION_12_1) {
-    seer_writer_u8(w, (uint8_t)ulen); /* 12c+: length-prefixed username */
-    seer_writer_bytes(w, user, ulen);
-  } else {
-    seer_writer_bytes(w, user, ulen); /* 11g: raw (read via UserLen) */
-  }
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  auth_head(w, &cx, user, ulen, logon_mode,
+            (uint32_t)((has_speedy ? 3 : 2) + (proxy_schema ? 1 : 0) + (cclass ? 1 : 0) +
+                       (purity ? 1 : 0) + (tzlen ? 1 : 0)));
   /* Order matters: AUTH_PASSWORD, then AUTH_PBKDF2_SPEEDY_KEY (12c), then
    * AUTH_SESSKEY (the last pair carries the trailing flag). */
-  seer_enc_kv(w, "AUTH_PASSWORD", 13, passhex, strlen(passhex), 0,
-              c->field_version >= TTC_FIELD_VERSION_12_1);
+  auth_pair(w, &cx, "AUTH_PASSWORD", 13, passhex, strlen(passhex), 0);
   if (has_speedy)
-    seer_enc_kv(w, "AUTH_PBKDF2_SPEEDY_KEY", 22, speedyhex, strlen(speedyhex), 0,
-                c->field_version >= TTC_FIELD_VERSION_12_1);
+    auth_pair(w, &cx, "AUTH_PBKDF2_SPEEDY_KEY", 22, speedyhex, strlen(speedyhex), 0);
   if (proxy_schema)
-    seer_enc_kv(w, "PROXY_CLIENT_NAME", 17, proxy_schema, schema_len, 0,
-                c->field_version >= TTC_FIELD_VERSION_12_1);
-  seer_enc_kv(w, "AUTH_SESSKEY", 12, sesshex, strlen(sesshex), 1,
-              c->field_version >= TTC_FIELD_VERSION_12_1);
+    auth_pair(w, &cx, "PROXY_CLIENT_NAME", 17, proxy_schema, schema_len, 0);
+  auth_pair(w, &cx, "AUTH_SESSKEY", 12, sesshex, strlen(sesshex), 1);
   if (cclass)
-    seer_enc_kv(w, "AUTH_KPPL_CONN_CLASS", 20, cclass, strlen(cclass), 0,
-                c->field_version >= TTC_FIELD_VERSION_12_1);
+    auth_pair(w, &cx, "AUTH_KPPL_CONN_CLASS", 20, cclass, strlen(cclass), 0);
   if (purity) {
     char ps[16];
     int pl = snprintf(ps, sizeof ps, "%d", purity);
-    seer_enc_kv(w, "AUTH_KPPL_PURITY", 16, ps, (size_t)pl, 1,
-                c->field_version >= TTC_FIELD_VERSION_12_1);
+    auth_pair(w, &cx, "AUTH_KPPL_PURITY", 16, ps, (size_t)pl, 1);
   }
   if (tzlen) /* the session time zone (#358) */
-    seer_enc_kv(w, "AUTH_ALTER_SESSION", 18, tz, tzlen, 1,
-                c->field_version >= TTC_FIELD_VERSION_12_1);
+    auth_pair(w, &cx, "AUTH_ALTER_SESSION", 18, tz, tzlen, 1);
 
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);

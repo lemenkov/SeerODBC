@@ -82,9 +82,13 @@ static void put_value(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b
     seer_writer_bytes(w, b->p, b->n);
     return;
   }
+  /* Past 252 bytes, 0xFE and chunks to a zero length: thin's of 64 bytes,
+   * each length a ub4 from 12.1 and a byte before; 8i's of OCI's 255, a
+   * byte each (seerdb _ThinCodec.value / _OciCodec.value). */
+  size_t cmax = cx->codec == SEER_CODEC_THIN ? 0x40 : 0xFF;
   seer_writer_u8(w, 0xFE);
-  for (size_t i = 0; i < b->n; i += 252) {
-    size_t c = b->n - i < 252 ? b->n - i : 252;
+  for (size_t i = 0; i < b->n; i += cmax) {
+    size_t c = b->n - i < cmax ? b->n - i : cmax;
     if (cx->codec == SEER_CODEC_THIN && cx->wide_chunks)
       seer_enc_sb4(w, (uint32_t)c);
     else

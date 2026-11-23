@@ -284,6 +284,27 @@ typedef struct {
 
 extern const SeerField SEER_CURSOR_CALL_SCHEMA[];
 
+/* A login call's head after the function header (seerdb _AUTH_HEAD): OSESSKEY
+ * (TTI_SESS) or OAUTH (TTI_AUTH) - a pointer, the user's length, the logon
+ * mode, a pointer, the pairs' count, two pointers, then the user: with its
+ * length from 12.1 and on 8i, raw before (read by its length). */
+typedef struct {
+  int64_t user_ptr, user_len, mode, pairs_ptr, npairs, ptr3, ptr4;
+  SeerBytes user;
+  int64_t user_bytes;
+} SeerAuthHeadMsg;
+
+extern const SeerField SEER_AUTH_HEAD_SCHEMA[];
+
+/* One AUTH_ key / value pair (seerdb _AUTH_PAIR): the key's length and, when
+ * not empty, the key; the value's the same way; a flags word. */
+typedef struct {
+  SeerBytes key, value;
+  int64_t flags;
+} SeerAuthPairMsg;
+
+extern const SeerField SEER_AUTH_PAIR_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

@@ -366,6 +366,32 @@ const SeerField SEER_CURSOR_CALL_SCHEMA[] = {
     SEER_END,
 };
 
+#define H SeerAuthHeadMsg
+const SeerField SEER_AUTH_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, H, user_ptr),
+    SEER_F(SF_N4, H, user_len),
+    SEER_F(SF_N4, H, mode),
+    SEER_F(SF_U8, H, pairs_ptr),
+    SEER_F(SF_N4, H, npairs),
+    SEER_F(SF_U8, H, ptr3),
+    SEER_F(SF_U8, H, ptr4),
+    SEER_FV(SF_VALUE, 0, TTC_FIELD_VERSION_12_1, 0, H, user),
+    {.kind = SF_RAW,
+     .codecs = THIN,
+     .fv_max = TTC_FIELD_VERSION_12_1,
+     .off = offsetof(H, user),
+     .arg = offsetof(H, user_bytes)},
+    SEER_END,
+};
+#undef H
+
+const SeerField SEER_AUTH_PAIR_SCHEMA[] = {
+    SEER_F(SF_COUNTED, SeerAuthPairMsg, key),
+    SEER_F(SF_COUNTED, SeerAuthPairMsg, value),
+    SEER_F(SF_N4, SeerAuthPairMsg, flags),
+    SEER_END,
+};
+
 const SeerField SEER_FUN_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFunHeadMsg, type),
     SEER_F(SF_U8, SeerFunHeadMsg, function),
