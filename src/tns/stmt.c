@@ -2881,6 +2881,14 @@ static bool sql_is_cacheable(const char *sql)
  * a 12c server is rejected (ORA-03115). The 12c shape starts at 12.1; only the
  * oaccolid waits for 12.2: a 12.1 session sent it answers ORA-03106, one sent
  * the 11g shape ORA-03120 (seerdb/seerdb@50f0a83). */
+/* One bind or define descriptor by SEER_OAC_SCHEMA (#398): at 8i's widths, or
+ * thin's at field version `fv`. The values are the caller's. */
+static void oac_write(SeerWriter *w, bool is_8i, uint8_t fv, const SeerOacMsg *m)
+{
+  SeerSchemaCtx cx = is_8i ? seer_msg_ctx(1, 0, 0) : seer_msg_ctx(0, fv, fv);
+  seer_schema_encode(SEER_OAC_SCHEMA, &cx, m, w);
+}
+
 static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint32_t flag,
                      uint32_t charset)
 {
@@ -2899,8 +2907,7 @@ static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint
     m.charset = charset;
     m.csfrm = charset == 2000 ? 2 : 1;
   }
-  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
-  seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w);
+  oac_write(w, false, (uint8_t)fv, &m);
 }
 
 /* The LOB type a DML RETURNING target is declared as, or 0. A VARCHAR / RAW
@@ -2929,20 +2936,13 @@ static void emit_lob_oac(SeerWriter *w, int fv, uint8_t lob_type)
     emit_oac(w, fv, lob_type, 112, 0, clob ? 873 : 0);
     return;
   }
-  seer_writer_u8(w, lob_type);
-  seer_writer_u8(w, 1); /* TNS_BIND_USE_INDICATORS */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 112);        /* max data length: the LOB buffer-size factor */
-  seer_enc_sb4(w, 0);          /* max number of array elements */
-  seer_enc_sb4(w, 0x02000000); /* cont flag (ub8): LOB */
-  seer_enc_sb4(w, 0);          /* OID */
-  seer_enc_sb4(w, 0);          /* version */
-  seer_enc_sb4(w, clob ? 873 : 0);
-  seer_writer_u8(w, clob ? 1 : 0); /* character set form */
-  seer_enc_sb4(w, 0);              /* LOB prefetch length */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    seer_enc_sb4(w, 0); /* oaccolid */
+  SeerOacMsg m = {.data_type = lob_type,
+                  .flags = 1, /* TNS_BIND_USE_INDICATORS */
+                  .max_length = 112,
+                  .cont_flags = 0x02000000, /* LOB */
+                  .charset = clob ? 873 : 0,
+                  .csfrm = clob ? 1 : 0};
+  oac_write(w, false, (uint8_t)fv, &m);
 }
 
 static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
@@ -4736,7 +4736,8 @@ static void fv2_set_error(SeerConn *c, const uint8_t *resp, size_t rlen)
   }
 }
 
-/* Append one fv2 define entry: the client's requested return type for a column. */
+/* Append one fv2 define entry: the client's requested return type for a
+ * column, an OAC (SEER_OAC_SCHEMA at 9.2). */
 /* The define sizes of a rowid fetched as text on 9i (fv2_define_entry). */
 #define FV2_MAX_ROWID_TEXT 128
 #define FV2_MAX_UROWID_TEXT 5267
@@ -4784,33 +4785,25 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
      * 9.2 failed the fetch with ORA-00600 [kkdogty01] (#168); so it did for
      * an XMLType column, whose describe gives an all-zero OID and version
      * 256, defined with version 1. */
-    seer_writer_u8(w, deftype);
-    seer_writer_u8(w, flag);
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0x7FFFFFFFu);
-    seer_writer_u8(w, 0); /* max array */
-    seer_writer_u8(w, 0); /* cont flags */
-    seer_enc_sb4(w, (uint32_t)col->toidlen);
-    seer_writer_u8(w, (uint8_t)col->toidlen);
-    seer_writer_bytes(w, col->toid, col->toidlen);
-    seer_enc_sb4(w, col->type_version ? col->type_version : 1); /* version */
-    seer_enc_sb4(w, charset);
-    seer_writer_u8(w, 0);
+    SeerOacMsg m = {.data_type = deftype,
+                    .flags = flag,
+                    .max_length = 0x7FFFFFFF,
+                    .toid_length = (int64_t)col->toidlen,
+                    .toid = {.p = col->toid, .n = col->toidlen},
+                    .version = col->type_version ? col->type_version : 1,
+                    .charset = charset};
+    oac_write(w, false, TTC_FIELD_VERSION_9_2, &m);
     return;
   }
-  seer_writer_u8(w, deftype);
-  seer_writer_u8(w, flag);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, maxsize);
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, 0);
-  seer_enc_sb4(w, charset);
   /* The charset form: a national column (described in AL16UTF16) must be
    * defined in the national form, 2. Form 0 makes 9i convert its value to the
    * database charset - lossy, and not the UTF-16BE the decoder expects. */
-  seer_writer_u8(w, charset == ORA_CHARSET_AL16UTF16 ? 2 : 0);
+  SeerOacMsg m = {.data_type = deftype,
+                  .flags = flag,
+                  .max_length = maxsize,
+                  .charset = charset,
+                  .csfrm = charset == ORA_CHARSET_AL16UTF16 ? 2 : 0};
+  oac_write(w, false, TTC_FIELD_VERSION_9_2, &m);
 }
 
 /* Decode one fv2 column descriptor (OAC-fv2 + name) into `col`. */
@@ -5189,8 +5182,7 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
   }
   SeerOacMsg m = {
       .data_type = type, .flags = 0x01, .max_length = maxsize, .charset = charset, .csfrm = csfrm};
-  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
-  seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w); /* #395 */
+  oac_write(w, false, TTC_FIELD_VERSION_9_2, &m); /* #395 */
 }
 
 /* Build the TTI_ALL7 parse message (shared by SELECT and DML). With input binds
@@ -6527,8 +6519,7 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
                     .max_length = 32,
                     .charset = clob ? 31 : 0,
                     .csfrm = clob ? 1 : 0};
-    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
-    seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w); /* #395 */
+    oac_write(w, true, 0, &m); /* #395 */
     return;
   }
   switch (b->oac_type) {
@@ -6552,8 +6543,7 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
     size = 0xFFFF;
   SeerOacMsg m = {
       .data_type = type, .flags = flag, .max_length = size, .charset = charset, .csfrm = csfrm};
-  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
-  seer_schema_encode(SEER_OAC_SCHEMA, &cx, &m, w); /* #395 */
+  oac_write(w, true, 0, &m); /* #395 */
 }
 
 /* The statement's binds, refused before anything is sent when 8i can't take
@@ -9942,22 +9932,13 @@ static void o8w_chr(SeerWriter *w, const uint8_t *p, size_t n);
 static SeerStatus obj_legacy_bind(SeerConn *c, const uint8_t oid[16], const uint8_t *img,
                                   size_t imglen, bool is_out, SeerWriter *oac, SeerWriter *bv)
 {
+  SeerOacMsg m = {.data_type = ORA_TYPE_ADT,
+                  .toid_length = 16,
+                  .toid = {.p = oid, .n = 16},
+                  .version = 1}; /* SEER_OAC_SCHEMA (#398) */
   if (c->is_8i) {
-    seer_writer_u8(oac, ORA_TYPE_ADT);
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00);
-    o8w_le32(oac, 2000);
-    o8w_le32(oac, 0); /* max array */
-    o8w_le32(oac, 0); /* cont flags */
-    o8w_le32(oac, 16);
-    seer_writer_u8(oac, 16);
-    seer_writer_bytes(oac, oid, 16);
-    seer_writer_u8(oac, 0x01); /* version 1, LE */
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00); /* charset */
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00); /* form */
+    m.max_length = 2000;
+    oac_write(oac, true, 0, &m);
 
     uint8_t block[36] = {0x00, 0x22, 0x02, 0x08};
     memcpy(block + 4, oid, 16);
@@ -9975,19 +9956,10 @@ static SeerStatus obj_legacy_bind(SeerConn *c, const uint8_t oid[16], const uint
     if (imglen > 0)
       o8w_chr(bv, img, imglen);
   } else {
-    seer_writer_u8(oac, ORA_TYPE_ADT);
-    seer_writer_u8(oac, 0x01);
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00);
-    seer_enc_sb4(oac, imglen > 0 && !is_out ? (uint32_t)imglen : 0x7FFFFFFFu);
-    seer_writer_u8(oac, 0x00); /* max array */
-    seer_writer_u8(oac, 0x00); /* cont flags */
-    seer_enc_sb4(oac, 16);
-    seer_writer_u8(oac, 16);
-    seer_writer_bytes(oac, oid, 16);
-    seer_enc_sb4(oac, 1);  /* version */
-    seer_enc_sb4(oac, 31); /* charset */
-    seer_writer_u8(oac, 0x00);
+    m.flags = 0x01;
+    m.max_length = imglen > 0 && !is_out ? (int64_t)imglen : 0x7FFFFFFF;
+    m.charset = 31;
+    oac_write(oac, false, TTC_FIELD_VERSION_9_2, &m);
 
     for (int k = 0; k < 4; k++) /* type OID, object OID, snapshot, version: empty */
       seer_writer_u8(bv, 0x00);
@@ -10031,26 +10003,16 @@ static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
 
   if (!seer_writer_init(&oac, 64))
     goto fail;
-  seer_writer_u8(&oac, ORA_TYPE_ADT);
-  seer_writer_u8(&oac, 1); /* USE_INDICATORS */
-  seer_writer_u8(&oac, 0);
-  seer_writer_u8(&oac, 0);
-  seer_enc_sb4(&oac, (uint32_t)(imglen > 2000 ? imglen : 2000)); /* buffer size */
-  seer_enc_sb4(&oac, 0);                                         /* max array elements */
-  seer_enc_sb4(&oac, 0);                                         /* cont flag */
-  seer_enc_sb4(&oac, 16);
-  if (obj_append_chr(&oac, oid, 16, fv) != SEER_OK) {
-    seer_writer_free(&oac);
-    goto fail;
-  }
-  seer_enc_sb4(&oac, 1);   /* type version */
-  seer_enc_sb4(&oac, 0);   /* charset */
-  seer_writer_u8(&oac, 0); /* csfrm */
-  seer_enc_sb4(&oac, 0);   /* LOB prefetch length */
-  /* No oaccolid before 12.2: 11g and 10g answer it with a fatal ORA-03106
+  /* SEER_OAC_SCHEMA (#398): the buffer size, the type's OID and version 1.
+   * No oaccolid before 12.2: 11g and 10g answer it with a fatal ORA-03106
    * (seerdb PROTOCOL.md, measured against JDBC thin 11.2, #172). */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    seer_enc_sb4(&oac, 0); /* oaccolid */
+  SeerOacMsg m = {.data_type = ORA_TYPE_ADT,
+                  .flags = 1, /* USE_INDICATORS */
+                  .max_length = (int64_t)(imglen > 2000 ? imglen : 2000),
+                  .toid_length = 16,
+                  .toid = {.p = oid, .n = 16},
+                  .version = 1};
+  oac_write(&oac, false, fv, &m);
   if (!seer_writer_ok(&oac)) {
     seer_writer_free(&oac);
     goto fail;
@@ -10193,24 +10155,16 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
     seer_writer_free(&oac);
     return SEER_ENOMEM;
   }
+  /* Each path's descriptor is SEER_OAC_SCHEMA with the type's OID and
+   * version 1 (#398). */
+  SeerOacMsg m = {
+      .data_type = ORA_TYPE_REF, .toid_length = 16, .toid = {.p = oid, .n = 16}, .version = 1};
   if (o8i) { /* OCIBindObject (SQLT_REF) on 8.1.7: the 8i object descriptor, type 111 */
-    seer_writer_u8(&oac, ORA_TYPE_REF);
     /* flag 0x01 on an OUT: an indicator comes back, so a NULL is -1, not
      * ORA-01405 (bus 91, #325) */
-    seer_writer_u8(&oac, out ? 0x01 : 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    o8w_le32(&oac, 2000);
-    o8w_le32(&oac, 0);
-    o8w_le32(&oac, 0);
-    o8w_le32(&oac, 16);
-    seer_writer_u8(&oac, 16);
-    seer_writer_bytes(&oac, oid, 16);
-    seer_writer_u8(&oac, 0x01); /* version 1 */
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00); /* charset */
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00); /* form */
+    m.flags = out ? 0x01 : 0x00;
+    m.max_length = 2000;
+    oac_write(&oac, true, 0, &m);
     if (out) {
       /* OCI's image of an empty OCIRef: body length 2, a 2-byte zero body
        * (bus 88, the same on 9.2 native). */
@@ -10220,40 +10174,19 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
       o8w_chr(&v, ref, len);
     }
   } else if (o9i) { /* ojdbc14 9.0.2 on 9.2.0.4 */
-    seer_writer_u8(&oac, ORA_TYPE_REF);
-    seer_writer_u8(&oac, 0x01);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, out ? 4000u : (uint32_t)len);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, 16);
-    seer_writer_u8(&oac, 16);
-    seer_writer_bytes(&oac, oid, 16);
-    seer_enc_sb4(&oac, 1);  /* version */
-    seer_enc_sb4(&oac, 31); /* charset */
-    seer_writer_u8(&oac, 0x00);
+    m.flags = 0x01;
+    m.max_length = out ? 4000 : (int64_t)len;
+    m.charset = 31;
+    oac_write(&oac, false, TTC_FIELD_VERSION_9_2, &m);
     if (out)
       seer_writer_u8(&v, 0x00);
     else if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   } else { /* 10g+, a JDBC thin capture (seerdb #139; 10g / 11g bus 106) */
-    seer_writer_u8(&oac, ORA_TYPE_REF);
-    seer_writer_u8(&oac, 0x03);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, 4000);
-    seer_enc_sb4(&oac, 0); /* max array */
-    seer_enc_sb4(&oac, 0); /* cont flags */
-    seer_enc_sb4(&oac, 16);
-    if (obj_append_chr(&oac, oid, 16, fv) != SEER_OK)
-      st = SEER_ENOMEM;
-    seer_enc_sb4(&oac, 1); /* version */
-    seer_enc_sb4(&oac, 2); /* charset */
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, 0); /* LOB prefetch */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      seer_enc_sb4(&oac, 0); /* oaccolid; 12.1 refuses it (seerdb #1144) */
+    m.flags = 0x03;
+    m.max_length = 4000;
+    m.charset = 2;
+    oac_write(&oac, false, fv, &m); /* oaccolid from 12.2; 12.1 refuses it (seerdb #1144) */
     if (out)
       seer_writer_u8(&v, 0x00); /* an empty value, as JDBC sends */
     else if (st == SEER_OK && obj_append_chr(&v, ref, len, fv) != SEER_OK)
@@ -10635,23 +10568,16 @@ static uint8_t *aa_build_oac(uint8_t fv, uint8_t dtype, uint32_t length, uint32_
   SeerWriter w;
   if (!seer_writer_init(&w, 48))
     return NULL;
-  seer_writer_u8(&w, dtype);
   /* TNS_BIND_USE_INDICATORS | ARRAY; below 12.1 the flags are 03 | ARRAY, as
    * JDBC thin 11.2 sends them, and there is no oaccolid (seerdb, measured on
    * 11g XE and 10.2.0.5; #172). */
-  seer_writer_u8(&w, fv < TTC_FIELD_VERSION_12_1 ? 0x43 : 0x41);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0);
-  seer_enc_sb4(&w, length);                  /* element max length */
-  seer_enc_sb4(&w, capacity ? capacity : 1); /* max number of array elements */
-  seer_enc_sb4(&w, 0);                       /* cont flag (ub8) */
-  seer_enc_sb4(&w, 0);                       /* OID */
-  seer_enc_sb4(&w, 0);                       /* version */
-  seer_enc_sb4(&w, charset);                 /* charset id (ub2) */
-  seer_writer_u8(&w, csfrm);                 /* character set form */
-  seer_enc_sb4(&w, 0);                       /* LOB prefetch length */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    seer_enc_sb4(&w, 0); /* oaccolid */
+  SeerOacMsg m = {.data_type = dtype,
+                  .flags = fv < TTC_FIELD_VERSION_12_1 ? 0x43 : 0x41,
+                  .max_length = length,
+                  .max_array = capacity ? capacity : 1,
+                  .charset = charset,
+                  .csfrm = csfrm};
+  oac_write(&w, false, fv, &m);
   if (!seer_writer_ok(&w)) {
     seer_writer_free(&w);
     return NULL;
@@ -10668,21 +10594,22 @@ static uint8_t *aa_build_oac(uint8_t fv, uint8_t dtype, uint32_t length, uint32_
 static uint8_t *o8i_aa_oac(uint8_t dtype, uint32_t length, uint32_t capacity, size_t *out_len)
 {
   bool text = dtype != ORA_TYPE_NUMBER;
-  uint8_t *o = calloc(1, 25);
-  if (o == NULL)
+  SeerWriter w;
+  if (!seer_writer_init(&w, 32))
     return NULL;
-  o[0] = dtype;
-  o[1] = 0x43;
-  if (length > 0xFFFF)
-    length = 0xFFFF;
-  o[4] = (uint8_t)(length & 0xFF);
-  o[5] = (uint8_t)(length >> 8);
-  for (int i = 0; i < 4; i++)
-    o[8 + i] = (uint8_t)((capacity ? capacity : 1) >> (8 * i));
-  o[22] = text ? 31 : 0; /* charset, big-endian ub4 at +19: WE8ISO8859P1 for text */
-  o[24] = text ? 1 : 0;  /* form */
-  *out_len = 25;
-  return o;
+  SeerOacMsg m = {.data_type = dtype,
+                  .flags = 0x43,
+                  .max_length = length > 0xFFFF ? 0xFFFF : length,
+                  .max_array = capacity ? capacity : 1,
+                  .charset = text ? 31 : 0, /* WE8ISO8859P1 for text */
+                  .csfrm = text ? 1 : 0};
+  oac_write(&w, true, 0, &m);
+  if (!seer_writer_ok(&w)) {
+    seer_writer_free(&w);
+    return NULL;
+  }
+  *out_len = w.len;
+  return w.buf; /* ownership transferred */
 }
 
 static void o8i_aa_elem(SeerWriter *v, const uint8_t *p, size_t n)
