@@ -36,17 +36,26 @@ typedef struct {
 
 extern const SeerField SEER_CHR_SCHEMA[];
 
-/* TTI_PRO, the protocol negotiation (after its token): the protocol versions
- * the client takes, highest first, and a 0; then the client's banner and a
- * NUL. */
+/* TTI_PRO, the protocol negotiation (after its token). Both ways it starts
+ * with the protocol versions, highest first, and a 0, then a banner and a
+ * NUL - the client's the versions it takes, the server's the one it chose.
+ * The reply goes on: the database charset (little-endian), the server's
+ * flags, a little-endian count of 5-byte charset elements and the elements,
+ * a big-endian-counted FDO block, then the compile capabilities (none on 8i)
+ * and the runtime capabilities, each a length byte and the bytes. */
 typedef struct {
-  int64_t versions_len;
-  SeerBytes versions;
-  int64_t banner_len;
-  SeerBytes banner;
+  SeerBytes versions, banner;
+  int64_t db_charset, server_flags, nelem, fdo_len;
+  SeerBytes fdo;
+  int64_t ccaps_len;
+  SeerBytes ccaps;
+  int64_t rcaps_len;
+  SeerBytes rcaps;
 } SeerProMsg;
 
-extern const SeerField SEER_PRO_SCHEMA[];
+extern const SeerField SEER_PRO_SCHEMA[];       /* the request */
+extern const SeerField SEER_PRO_REPLY_SCHEMA[]; /* the reply to the compile caps */
+extern const SeerField SEER_PRO_RCAPS_SCHEMA[]; /* the runtime caps after them */
 
 /* The fast-auth bundle (TNS_MSG_TYPE_FAST_AUTH, after its type; the
  * one-round-trip login from fv24): a version (1), the server-converts-chars

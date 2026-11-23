@@ -111,15 +111,37 @@ const SeerField SEER_DTY_END_SCHEMA[] = {
 #undef DTY_WIDE
 #undef E
 
+#define P SeerProMsg
+#define PRO_HEAD SEER_F(SF_CSTR, P, versions), SEER_F(SF_CSTR, P, banner)
 const SeerField SEER_PRO_SCHEMA[] = {
-    {.kind = SF_RAW,
-     .off = offsetof(SeerProMsg, versions),
-     .arg = offsetof(SeerProMsg, versions_len)},
-    SEER_PAD(1),
-    {.kind = SF_RAW, .off = offsetof(SeerProMsg, banner), .arg = offsetof(SeerProMsg, banner_len)},
-    SEER_PAD(1),
+    PRO_HEAD,
     SEER_END,
 };
+
+typedef struct {
+  int64_t unused;
+} SeerProElem;
+static const SeerField PRO_ELEM[] = {SEER_PAD(5), SEER_END};
+const SeerField SEER_PRO_REPLY_SCHEMA[] = {
+    PRO_HEAD,
+    SEER_F(SF_LE2, P, db_charset),
+    SEER_F(SF_U8, P, server_flags),
+    SEER_F(SF_LE2, P, nelem),
+    {.kind = SF_EACH, .arg = offsetof(P, nelem), .sub = PRO_ELEM, .subsize = sizeof(SeerProElem)},
+    SEER_F(SF_BE2, P, fdo_len),
+    {.kind = SF_RAW, .off = offsetof(P, fdo), .arg = offsetof(P, fdo_len)},
+    SEER_F(SF_U8, P, ccaps_len),
+    {.kind = SF_RAW, .off = offsetof(P, ccaps), .arg = offsetof(P, ccaps_len)},
+    SEER_END,
+};
+
+const SeerField SEER_PRO_RCAPS_SCHEMA[] = {
+    SEER_F(SF_U8, P, rcaps_len),
+    {.kind = SF_RAW, .off = offsetof(P, rcaps), .arg = offsetof(P, rcaps_len)},
+    SEER_END,
+};
+#undef PRO_HEAD
+#undef P
 
 const SeerField SEER_FAST_AUTH_HEAD_SCHEMA[] = {
     SEER_F(SF_U8, SeerFastAuthMsg, version),

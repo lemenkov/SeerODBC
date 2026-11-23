@@ -193,6 +193,13 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
     case SF_LE2:
       put_le(w, (uint64_t)*cnum(msg, f->off), 2);
       break;
+    case SF_CSTR: {
+      const SeerBytes *b = (const SeerBytes *)((const char *)msg + f->off);
+      if (b->n > 0)
+        seer_writer_bytes(w, b->p, b->n);
+      seer_writer_u8(w, 0);
+      break;
+    }
     case SF_PAD:
       for (uint16_t i = 0; i < f->arg; i++)
         seer_writer_u8(w, 0);
@@ -359,6 +366,21 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
     case SF_LE2:
       *num(msg, f->off) = get_le(r, 2);
       break;
+    case SF_CSTR: {
+      SeerBytes *b = (SeerBytes *)((char *)msg + f->off);
+      b->p = NULL, b->n = 0, b->owned = 0;
+      size_t rem = seer_reader_remaining(r);
+      const uint8_t *s = r->buf + r->pos;
+      const uint8_t *z = rem > 0 ? memchr(s, 0, rem) : NULL;
+      if (z == NULL) { /* no NUL yet: short */
+        (void)seer_reader_bytes(r, rem + 1);
+        break;
+      }
+      size_t k = (size_t)(z - s);
+      b->p = seer_reader_bytes(r, k + 1);
+      b->n = b->p != NULL ? k : 0;
+      break;
+    }
     case SF_PAD:
       (void)seer_reader_bytes(r, f->arg);
       break;

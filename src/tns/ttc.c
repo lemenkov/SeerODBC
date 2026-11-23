@@ -35,9 +35,7 @@ static void pro_write(SeerWriter *w)
 {
   static const uint8_t VERSIONS[] = {6, 5, 4, 3, 2, 1};
   static const char BANNER[] = "python";
-  SeerProMsg m = {.versions_len = sizeof VERSIONS,
-                  .versions = {.p = VERSIONS, .n = sizeof VERSIONS},
-                  .banner_len = sizeof BANNER - 1,
+  SeerProMsg m = {.versions = {.p = VERSIONS, .n = sizeof VERSIONS},
                   .banner = {.p = (const uint8_t *)BANNER, .n = sizeof BANNER - 1}};
   /* Sent before any field version is agreed; nothing in it depends on one,
    * so the oldest thin one. */
@@ -768,60 +766,38 @@ static SeerStatus parse_pro(const uint8_t *b, size_t n, uint8_t *server_fv, bool
     *str32k = false;
   if (major != NULL)
     *major = 0;
-  size_t o = 0;
   if (n < 1 || b[0] != TTI_PRO)
     return SEER_EPROTO;
-  o = 1;
-  o += 1; /* server version byte */
-  o += 1; /* trailing zero       */
-  size_t banner = o;
-  while (o < n && b[o] != 0) /* NUL-terminated banner */
-    o++;
+  /* SEER_PRO_REPLY_SCHEMA to the compile caps, then SEER_PRO_RCAPS_SCHEMA
+   * (#398). Received before any field version is agreed: the oldest thin. */
+  SeerReader r;
+  seer_reader_init(&r, b + 1, n - 1);
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerProMsg m = {0};
+  if (!seer_schema_decode(SEER_PRO_REPLY_SCHEMA, &cx, &r, &m))
+    return SEER_EPROTO;
   if (major != NULL)
-    *major = banner_major(b + banner, o - banner);
-  o += 1;                               /* the NUL itself */
-  if (db_charset != NULL && o + 2 <= n) /* the database charset id (LE) */
-    *db_charset = (uint16_t)(b[o] | (b[o + 1] << 8));
-  o += 2;
-  o += 1; /* server flags    */
-  if (o + 2 > n)
-    return SEER_EPROTO;
-  uint16_t numelem = (uint16_t)(b[o] | (b[o + 1] << 8)); /* little-endian */
-  o += 2;
-  o += (size_t)numelem * 5; /* charset element array */
-  if (o + 2 > n)
-    return SEER_EPROTO;
-  uint16_t fdolen = (uint16_t)((b[o] << 8) | b[o + 1]); /* big-endian */
-  o += 2;
-  o += fdolen;
-  if (o + 1 > n)
-    return SEER_EPROTO;
-  uint8_t cclen = b[o];
-  o += 1;
-  if (cclen == 0) { /* no caps to negotiate: 8i */
+    *major = banner_major(m.banner.p, m.banner.n);
+  if (db_charset != NULL)
+    *db_charset = (uint16_t)m.db_charset;
+  if (m.ccaps_len == 0) { /* no caps to negotiate: 8i */
     *server_fv = 0;
     return SEER_OK;
   }
-  if (cclen < 8 || o + cclen > n)
+  if (m.ccaps_len < 8)
     return SEER_EPROTO;
-  *server_fv = b[o + 7]; /* CCAP_FIELD_VERSION */
+  *server_fv = m.ccaps.p[7]; /* CCAP_FIELD_VERSION */
 
   /* Request-boundary caps (best-effort): compile_caps[40] bit 0x40, then the
-   * runtime-cap array (rclen + bytes) that follows the compile caps, and its
-   * index 6 bit 0x10. Any shortfall just leaves the feature off. */
-  uint8_t cc40 = (cclen > TNS_CCAP_TTC4) ? b[o + TNS_CCAP_TTC4] : 0;
-  size_t ro = o + cclen;
-  if (ro + 1 <= n) {
-    uint8_t rclen = b[ro];
-    ro += 1;
-    if (ro + rclen <= n) {
-      uint8_t rc6 = (rclen > TNS_RCAP_TTC) ? b[ro + TNS_RCAP_TTC] : 0;
-      if (req_bnd != NULL)
-        *req_bnd =
-            (cc40 & TNS_CCAP_TTC4_EXPLICIT_BOUNDARY) && (rc6 & TNS_RCAP_TTC_SESSION_STATE_OPS);
-      if (str32k != NULL)
-        *str32k = (rc6 & TNS_RCAP_TTC_32K) != 0;
-    }
+   * runtime caps' index 6 bit 0x10. Runtime caps that don't fully arrive
+   * just leave the features off. */
+  uint8_t cc40 = (m.ccaps_len > TNS_CCAP_TTC4) ? m.ccaps.p[TNS_CCAP_TTC4] : 0;
+  if (seer_schema_decode(SEER_PRO_RCAPS_SCHEMA, &cx, &r, &m)) {
+    uint8_t rc6 = (m.rcaps_len > TNS_RCAP_TTC) ? m.rcaps.p[TNS_RCAP_TTC] : 0;
+    if (req_bnd != NULL)
+      *req_bnd = (cc40 & TNS_CCAP_TTC4_EXPLICIT_BOUNDARY) && (rc6 & TNS_RCAP_TTC_SESSION_STATE_OPS);
+    if (str32k != NULL)
+      *str32k = (rc6 & TNS_RCAP_TTC_32K) != 0;
   }
   return SEER_OK;
 }
