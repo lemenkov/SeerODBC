@@ -4550,21 +4550,24 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
   seer_reader_init(&r, data, dlen);
   if (data[0] == TTI_RPA) { /* skip the RPA piggyback */
     r.pos = 1;
-    int64_t num = seer_dec_sb4(&r);
-    /* The parameters are consumed by count: the first is a counter that grows
-     * with the instance, and once past 2^24 its length byte is 0x04 - the OER
-     * token - so stopping at a token-valued byte took the counter for the
-     * status and made every successful DML/DDL on an aged 9i report a garbled
-     * negative ORA code (seerdb/seerdb@0babf60). Only when the counted walk
-     * doesn't land on the OER is the old token-sniffing walk used. */
-    size_t start = r.pos;
-    for (int64_t i = 0; i < num && i < 100000 && seer_reader_ok(&r); i++)
-      (void)seer_dec_sb4(&r);
-    while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
+    /* The parameters are consumed by count, SEER_RPA_HEAD_SCHEMA as 10g+'s
+     * and 8i's (#398): the first is a counter that grows with the instance,
+     * and once past 2^24 its length byte is 0x04 - the OER token - so
+     * stopping at a token-valued byte took the counter for the status and
+     * made every successful DML/DDL on an aged 9i report a garbled negative
+     * ORA code (seerdb/seerdb@0babf60). Only when the counted walk doesn't
+     * land on the OER is the old token-sniffing walk used - a recovery, not
+     * a message form, so it stays by hand. */
+    SeerSchemaCtx rcx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    SeerRpaMsg rm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_RPA_HEAD_SCHEMA, &rcx, &r, &rm);
+    seer_schema_free(SEER_RPA_HEAD_SCHEMA, &rm);
+    while (res == SCH_OK && seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
       r.pos++;
-    if (!seer_reader_ok(&r) || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
+    if (res != SCH_OK || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
       seer_reader_init(&r, data, dlen);
-      r.pos = start;
+      r.pos = 1;
+      int64_t num = seer_dec_sb4(&r);
       for (int64_t i = 0; i < num && i < 100000 && seer_reader_remaining(&r) > 0; i++) {
         uint8_t t = r.buf[r.pos];
         if (t == TTI_OER || t == TTI_RXH || t == TTI_RXD)
