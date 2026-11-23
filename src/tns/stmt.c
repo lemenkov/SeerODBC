@@ -1320,18 +1320,22 @@ static SeerStatus skip_rpa(SeerReader *r, SeerStmt *stmt)
   if (break_on_token || !skip_rpa_tail_fields(r, stmt))
     while (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0)
       (void)seer_reader_u8(r);
-  /* Array-DML row counts (12c+): when armed, a ub4 count and that many ub4
-   * per-iteration affected-row counts ride here, ahead of the OER. */
+  /* Array-DML row counts (12c+): when armed, SEER_DML_ROWCOUNTS_SCHEMA and
+   * per iteration SEER_DML_ROWCOUNT_SCHEMA ride here, ahead of the OER
+   * (#398). */
   if (stmt != NULL && stmt->want_dml_rowcounts && stmt->dml_rowcounts == NULL &&
       seer_reader_remaining(r) > 0 && !is_known_token(r->buf[r->pos])) {
-    int64_t cnt = seer_dec_sb4(r);
-    if (cnt > 0 && cnt <= 65535 && seer_reader_ok(r)) {
-      uint32_t *arr = malloc((size_t)cnt * sizeof *arr);
+    SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+    SeerDmlRowCountsMsg m = {0};
+    if (seer_schema_decode(SEER_DML_ROWCOUNTS_SCHEMA, &cx, r, &m) && m.count > 0 &&
+        m.count <= 65535) {
+      uint32_t *arr = malloc((size_t)m.count * sizeof *arr);
       if (arr != NULL) {
-        for (int64_t i = 0; i < cnt && seer_reader_ok(r); i++)
-          arr[i] = (uint32_t)seer_dec_sb4(r);
+        for (int64_t i = 0; i < m.count && seer_schema_decode(SEER_DML_ROWCOUNT_SCHEMA, &cx, r, &m);
+             i++)
+          arr[i] = (uint32_t)m.rows;
         stmt->dml_rowcounts = arr;
-        stmt->n_dml_rowcounts = (size_t)cnt;
+        stmt->n_dml_rowcounts = (size_t)m.count;
       }
     }
   }

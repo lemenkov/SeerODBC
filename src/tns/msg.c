@@ -440,6 +440,16 @@ const SeerField SEER_OUT_UNSET_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_DML_ROWCOUNTS_SCHEMA[] = {
+    SEER_F(SF_N4, SeerDmlRowCountsMsg, count),
+    SEER_END,
+};
+
+const SeerField SEER_DML_ROWCOUNT_SCHEMA[] = {
+    SEER_F(SF_N4, SeerDmlRowCountsMsg, rows),
+    SEER_END,
+};
+
 const SeerField SEER_OUT_ARRAY_SCHEMA[] = {
     SEER_F(SF_N4, SeerOutArrayMsg, count),
     SEER_END,

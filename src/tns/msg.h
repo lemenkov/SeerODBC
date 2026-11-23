@@ -598,7 +598,16 @@ typedef struct {
 } SeerRpaMsg;
 
 extern const SeerField SEER_RPA_HEAD_SCHEMA[]; /* the count and the parameters */
-extern const SeerField SEER_RPA_TAIL_SCHEMA[]; /* the transaction id to the end */
+
+/* Array DML's per-iteration row counts (12c+, when asked for), after the
+ * RPA ahead of the status: a ub4 count, then that many ub4s. */
+typedef struct {
+  int64_t count, rows;
+} SeerDmlRowCountsMsg;
+
+extern const SeerField SEER_DML_ROWCOUNTS_SCHEMA[]; /* the count */
+extern const SeerField SEER_DML_ROWCOUNT_SCHEMA[];  /* one iteration's */
+extern const SeerField SEER_RPA_TAIL_SCHEMA[];      /* the transaction id to the end */
 
 /* An object or collection value's frame (python-oracledb read_dbobject;
  * seerdb _OBJECT_FRAME): the type OID (on 9i a 36-byte type block), the
