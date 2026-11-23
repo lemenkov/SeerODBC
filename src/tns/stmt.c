@@ -11445,16 +11445,6 @@ SeerStatus seer_txn_suspend_sessionless(SeerConn *conn)
 
 /* ---- Advanced Queuing (AQ, #128) ---------------------------------------- */
 
-/* Write an AQ value-with-length (write_value_with_length): a ub4 count, then the
- * bytes-with-length form when non-empty; NULL/empty -> just the zero count. */
-static void aq_value_with_length(SeerWriter *w, const char *s, uint8_t fv)
-{
-  size_t n = (s != NULL) ? strlen(s) : 0;
-  seer_enc_sb4(w, (uint32_t)n);
-  if (n > 0)
-    obj_append_chr(w, (const uint8_t *)s, n, fv);
-}
-
 /* Write a pointer+length pair: ptr byte (1 if present) then the sb4 length. The
  * value bytes themselves go in the data section. */
 static void aq_ptr_len(SeerWriter *w, const char *s)
@@ -11488,45 +11478,33 @@ static void aq_data_string(SeerWriter *w, const char *str, size_t n, uint8_t fv)
 }
 
 /* The message-property block (oracledb write_msg_props), shared by single and
- * array enqueue: priority/delay/expiration/correlation, the four agent keyword
- * extensions (AGENT_PROTOCOL carries a one-byte 0x00 binary), the trailing
- * user-property/cscn/dscn/flags, and (at fv >= 21.1) a shard id. */
-static void aq_write_msg_props(SeerWriter *w, unsigned priority, unsigned delay, int expiration,
-                               const char *correlation, uint8_t fv)
+ * array enqueue and the array dequeue: SEER_AQ_PROPS_HEAD_SCHEMA with the
+ * priority, delay, expiration (-1 = forever) and correlation, the four agent
+ * keyword extensions (AGENT_PROTOCOL carries a one-byte 0x00 binary), then
+ * SEER_AQ_PROPS_TAIL_SCHEMA, from 21.1 with no shard (-1). */
+static void aq_write_msg_props(SeerWriter *w, const SeerSchemaCtx *cx, unsigned priority,
+                               unsigned delay, int expiration, const char *correlation)
 {
-  seer_enc_sb4(w, priority);
-  seer_enc_sb4(w, delay);
-  seer_enc_sb4(w, (uint32_t)expiration); /* -1 = forever                   */
-  aq_value_with_length(w, correlation, fv);
-  seer_enc_sb4(w, 0);      /* number of attempts             */
-  seer_enc_sb4(w, 0);      /* exception queue (none)         */
-  seer_enc_sb4(w, 0);      /* message state                  */
-  seer_enc_sb4(w, 0);      /* enqueue time length            */
-  seer_enc_sb4(w, 0);      /* enq txn id (none)              */
-  seer_enc_sb4(w, 4);      /* number of extensions           */
-  seer_writer_u8(w, 0x0e); /* oracledb's fixed extra byte    */
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_AGENT_NAME);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS);
-  seer_enc_sb4(w, 0);
-  {
-    uint8_t z = 0;
-    seer_enc_sb4(w, 1);
-    obj_append_chr(w, &z, 1, fv);
-  }
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_AGENT_PROTOCOL);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_ORIGINAL_MSGID);
-  seer_enc_sb4(w, 0); /* user property                  */
-  seer_enc_sb4(w, 0); /* cscn                           */
-  seer_enc_sb4(w, 0); /* dscn                           */
-  seer_enc_sb4(w, 0); /* flags                          */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_enc_sb4(w, 0xFFFFFFFFu); /* shard id                       */
+  size_t cn = correlation != NULL ? strlen(correlation) : 0;
+  SeerAqPropsMsg p = {.priority = priority,
+                      .delay = delay,
+                      .expiration = (uint32_t)expiration,
+                      .correlation_len = (int64_t)cn,
+                      .correlation = {(const uint8_t *)correlation, cn, 0},
+                      .n_ext = 4,
+                      .ext_lead = 0x0e, /* oracledb's fixed extra byte */
+                      .shard_id = 0xFFFFFFFFu};
+  seer_schema_encode(SEER_AQ_PROPS_HEAD_SCHEMA, cx, &p, w);
+  static const uint8_t zero = 0;
+  const SeerAqExtMsg ext[4] = {
+      {.keyword = TNS_AQ_EXT_KEYWORD_AGENT_NAME},
+      {.keyword = TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS},
+      {.bin_len = 1, .bin = {&zero, 1, 0}, .keyword = TNS_AQ_EXT_KEYWORD_AGENT_PROTOCOL},
+      {.keyword = TNS_AQ_EXT_KEYWORD_ORIGINAL_MSGID},
+  };
+  for (size_t i = 0; i < 4; i++)
+    seer_schema_encode(SEER_AQ_EXT_SCHEMA, cx, &ext[i], w);
+  seer_schema_encode(SEER_AQ_PROPS_TAIL_SCHEMA, cx, &p, w);
 }
 
 enum { AQ_PL_RAW = 0, AQ_PL_OBJECT = 1, AQ_PL_JSON = 2 };
@@ -11541,67 +11519,36 @@ static SeerStatus aq_build_enq(SeerConn *c, SeerWriter *w, const char *qname,
                                unsigned delay, int expiration, const char *correlation,
                                int payload_kind, const uint8_t *toid16)
 {
-  uint8_t fv = c->field_version;
   size_t qn = strlen(qname);
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_AQ_ENQ);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)qn); /* queue name ptr + len */
-
-  aq_write_msg_props(w, priority, delay, expiration, correlation, fv);
-
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);                    /* recipients ptr + count         */
-  seer_enc_sb4(w, TNS_AQ_ENQ_ON_COMMIT); /* visibility                     */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* relative message id ptr + len  */
-  seer_enc_sb4(w, 0); /* sequence deviation             */
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, 16);                     /* payload TOID ptr + len         */
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_VERSION); /* message version (ub2)          */
-  if (payload_kind == AQ_PL_OBJECT) {
-    seer_writer_u8(w, 1);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* payload 1, RAW 0, RAW len 0    */
-  } else if (payload_kind == AQ_PL_JSON) {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* payload 0, RAW 0, RAW len 0    */
-  } else {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, (uint32_t)plen); /* payload 0, RAW 1, RAW len      */
-  }
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_ID_LENGTH); /* return msgid */
-  seer_enc_sb4(w, 0);                        /* enqueue flags (persistent)     */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* extensions 1 ptr + count       */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* extensions 2 ptr + count       */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* source sequence num ptr + len  */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);   /* max sequence num ptr + len     */
-  seer_writer_u8(w, 0); /* output ack length              */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* correlation ptr + len          */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* sender name ptr + len          */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);   /* sender address ptr + len       */
-  seer_writer_u8(w, 0); /* sender charset id ptr          */
-  seer_writer_u8(w, 0); /* sender ncharset id ptr         */
-  if (fv >= TTC_FIELD_VERSION_20_1)
-    seer_writer_u8(w, payload_kind == AQ_PL_JSON ? 1 : 0); /* JSON payload ptr */
-
-  /* data section: queue name, the 16-byte payload TOID (RAW sentinel or the
-   * object type's OID), then the payload (raw bytes / the object bind value). */
-  aq_data_string(w, qname, qn, fv);
-  seer_writer_bytes(w, toid16, 16);
-  if (plen > 0)
-    seer_writer_bytes(w, payload, plen);
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  /* By SEER_AQ_ENQ_HEAD_SCHEMA, the properties and SEER_AQ_ENQ_TAIL_SCHEMA:
+   * no recipients, ON_COMMIT visibility, persistent delivery; the payload
+   * flags by kind - an object's payload pointer, a RAW's pointer and length,
+   * a JSON's own pointer (from 20.1) - and the data section, the queue name,
+   * the 16-byte TOID (the RAW / JSON sentinel or the object type's OID) and
+   * the payload (raw bytes / the object bind value). */
+  SeerAqEnqMsg m = {.qname_ptr = 1,
+                    .qname_len = (int64_t)qn,
+                    .visibility = TNS_AQ_ENQ_ON_COMMIT,
+                    .toid_ptr = 1,
+                    .toid_len = 16,
+                    .msg_version = TNS_AQ_MESSAGE_VERSION,
+                    .payload_ptr = payload_kind == AQ_PL_OBJECT,
+                    .raw_ptr = payload_kind == AQ_PL_RAW,
+                    .raw_len = payload_kind == AQ_PL_RAW ? (int64_t)plen : 0,
+                    .msgid_ptr = 1,
+                    .msgid_len = TNS_AQ_MESSAGE_ID_LENGTH,
+                    .json_ptr = payload_kind == AQ_PL_JSON,
+                    .qname = {(const uint8_t *)qname, qn, 0},
+                    .toid = {toid16, 16, 0},
+                    .payload = {payload, plen, 0},
+                    .payload_len = (int64_t)plen};
+  seer_schema_encode(SEER_AQ_ENQ_HEAD_SCHEMA, &cx, &m, w);
+  aq_write_msg_props(w, &cx, priority, delay, expiration, correlation);
+  seer_schema_encode(SEER_AQ_ENQ_TAIL_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
@@ -12364,43 +12311,42 @@ SeerStatus seer_aq_deq_json(SeerConn *conn, const char *queue_name, uint32_t wai
 static SeerStatus aq_build_array_enq_raw(SeerConn *c, SeerWriter *w, const char *qname, int count,
                                          const uint8_t *const *payloads, const size_t *lens)
 {
-  uint8_t fv = c->field_version;
   size_t qn = strlen(qname);
   uint8_t raw_toid[16] = {0};
   raw_toid[15] = TNS_AQ_RAW_TOID_SENTINEL;
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_ARRAY_AQ);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* input params ptr + len (ENQ) */
-  seer_enc_sb4(w, TNS_AQ_ARRAY_RETURN_MSGID);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 0);              /* output params ptr + len (ENQ) */
-  seer_enc_sb4(w, TNS_AQ_ARRAY_ENQ); /* operation */
-  seer_writer_u8(w, 1);              /* num iters ptr (ENQ) */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_enc_sb4(w, 0xFFFF);        /* shard id */
-  seer_enc_sb4(w, (uint32_t)count); /* num iters */
-
-  seer_enc_sb4(w, 0);         /* relative msgid length */
-  seer_writer_u8(w, TTI_RXH); /* ROW_HEADER */
-  aq_two_lengths(w, (const uint8_t *)qname, qn, fv);
-  seer_writer_bytes(w, raw_toid, 16);
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_VERSION);
-  seer_enc_sb4(w, 0); /* flags */
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  /* SEER_AQ_ARRAY_HEAD_SCHEMA with the enqueue's operands (no input
+   * parameters, the output's pointer, the iteration count's pointer, no
+   * shard), the enqueue's head, then a row per message with default
+   * properties, and the closing status. */
+  SeerAqArrayMsg m = {.ret_flags = TNS_AQ_ARRAY_RETURN_MSGID,
+                      .out_ptr = 1,
+                      .op = TNS_AQ_ARRAY_ENQ,
+                      .iters_ptr = 1,
+                      .shard_id = 0xFFFF,
+                      .iters = count,
+                      .rxh = TTI_RXH,
+                      .qname_len = (int64_t)qn,
+                      .qname = {(const uint8_t *)qname, qn, 0},
+                      .toid = {raw_toid, 16, 0},
+                      .toid_len = 16,
+                      .msg_version = TNS_AQ_MESSAGE_VERSION,
+                      .rxd = TTI_RXD,
+                      .visibility = TNS_AQ_ENQ_ON_COMMIT,
+                      .sta = TTI_STA};
+  seer_schema_encode(SEER_AQ_ARRAY_HEAD_SCHEMA, &cx, &m, w);
+  seer_schema_encode(SEER_AQ_ARRAY_ENQ_HEAD_SCHEMA, &cx, &m, w);
   for (int i = 0; i < count; i++) {
-    seer_writer_u8(w, TTI_RXD); /* ROW_DATA */
-    seer_enc_sb4(w, 0);         /* aqi flags */
-    aq_write_msg_props(w, 0, 0, -1, NULL, fv);
-    seer_enc_sb4(w, 0);                    /* num recipients */
-    seer_enc_sb4(w, TNS_AQ_ENQ_ON_COMMIT); /* visibility */
-    seer_enc_sb4(w, 0);                    /* relative message id */
-    seer_enc_sb4(w, 0);                    /* sequence deviation */
-    seer_enc_sb4(w, (uint32_t)lens[i]);    /* RAW payload length */
-    if (lens[i] > 0)
-      seer_writer_bytes(w, payloads[i], lens[i]);
+    seer_schema_encode(SEER_AQ_ARRAY_ENQ_ROW_SCHEMA, &cx, &m, w);
+    aq_write_msg_props(w, &cx, 0, 0, -1, NULL);
+    m.raw_len = (int64_t)lens[i];
+    m.payload = (SeerBytes){payloads[i], lens[i], 0};
+    seer_schema_encode(SEER_AQ_ARRAY_ENQ_ROW_TAIL_SCHEMA, &cx, &m, w);
   }
-  seer_writer_u8(w, TTI_STA); /* STATUS */
+  seer_schema_encode(SEER_AQ_ARRAY_ENQ_END_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
@@ -12506,6 +12452,7 @@ static SeerStatus aq_build_array_deq_raw(SeerConn *c, SeerWriter *w, const char 
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_ARRAY_AQ);
+  SeerSchemaCtx pcx = seer_msg_ctx(0, c->field_version, c->server_field_version);
   seer_writer_u8(w, 1);
   seer_enc_sb4(w, (uint32_t)count); /* input params ptr + len (DEQ) */
   seer_enc_sb4(w, TNS_AQ_ARRAY_RETURN_MSGID);
@@ -12517,7 +12464,7 @@ static SeerStatus aq_build_array_deq_raw(SeerConn *c, SeerWriter *w, const char 
     seer_enc_sb4(w, 0xFFFF); /* shard id */
   for (int i = 0; i < count; i++) {
     aq_two_lengths(w, (const uint8_t *)qname, qn, fv);
-    aq_write_msg_props(w, 0, 0, -1, NULL, fv);
+    aq_write_msg_props(w, &pcx, 0, 0, -1, NULL);
     seer_enc_sb4(w, 0);                    /* num recipients */
     seer_enc_sb4(w, 0);                    /* consumer name (none) */
     seer_enc_sb4(w, TNS_AQ_DEQ_REMOVE);    /* mode */

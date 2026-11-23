@@ -181,6 +181,91 @@ extern const SeerField SEER_PIPELINE_BEGIN_SCHEMA[];
 extern const SeerField SEER_PIPELINE_END_SCHEMA[];
 extern const SeerField SEER_SESSION_STATE_SCHEMA[];
 
+/* AQ (seerdb PROTOCOL.md §29, oracledb AqEnqMessage / AqDeqMessage /
+ * AqArrayMessage). The message properties: priority, delay, expiration, the
+ * correlation, the attempts, the exception queue, the state, the enqueue
+ * time and transaction - each string a count and, when > 0, the bytes - then
+ * the extensions, counted (a byte leads them when there are any), and the
+ * user property, the commit SCNs, the flags and from 21.1 the shard id. An
+ * extension is its text and binary values, each counted, and its keyword. A
+ * client writes the head, the four agent extensions and the tail; a reply's
+ * block is read whole by SEER_AQ_PROPS_SCHEMA, the extensions passed over. */
+typedef struct {
+  int64_t priority, delay, expiration, correlation_len;
+  SeerBytes correlation;
+  int64_t attempts, exception_queue_len;
+  SeerBytes exception_queue;
+  int64_t state, enq_time_len;
+  SeerBytes enq_time;
+  int64_t enq_txn_len;
+  SeerBytes enq_txn;
+  int64_t n_ext, ext_lead;
+  int64_t user_prop, cscn, dscn, flags, shard_id;
+} SeerAqPropsMsg;
+
+typedef struct {
+  int64_t text_len;
+  SeerBytes text;
+  int64_t bin_len;
+  SeerBytes bin;
+  int64_t keyword;
+} SeerAqExtMsg;
+
+extern const SeerField SEER_AQ_PROPS_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_EXT_SCHEMA[];
+extern const SeerField SEER_AQ_PROPS_TAIL_SCHEMA[];
+extern const SeerField SEER_AQ_PROPS_SCHEMA[];
+
+/* An enqueue (func 121) after its header: the queue name's pointer and
+ * length, the message properties, then the recipients, the visibility, the
+ * relative message id, the sequence deviation, the payload TOID, the message
+ * version, the payload and RAW payload pointers and the RAW length, the
+ * returned message id, the enqueue flags, the extensions, the source and
+ * maximum sequence numbers, the output ack, the correlation, the sender's
+ * name, address and charsets, and from 20.1 the JSON payload's pointer. Its
+ * data section: the queue name - raw below 12.1, a bind value from (11g read
+ * the 12c length byte as part of the name, seerdb §29) - the TOID and the
+ * payload's bytes. */
+typedef struct {
+  int64_t qname_ptr, qname_len;
+  int64_t recipients_ptr, recipients, visibility, relmsgid_ptr, relmsgid_len, seq_deviation;
+  int64_t toid_ptr, toid_len, msg_version, payload_ptr, raw_ptr, raw_len;
+  int64_t msgid_ptr, msgid_len, enq_flags, ext1_ptr, ext1_n, ext2_ptr, ext2_n;
+  int64_t srcseq_ptr, srcseq_len, maxseq_ptr, maxseq_len, ack_len, corr_ptr, corr_len;
+  int64_t sender_name_ptr, sender_name_len, sender_addr_ptr, sender_addr_len;
+  int64_t sender_cs_ptr, sender_ncs_ptr, json_ptr;
+  SeerBytes qname, toid, payload;
+  int64_t payload_len;
+} SeerAqEnqMsg;
+
+extern const SeerField SEER_AQ_ENQ_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_ENQ_TAIL_SCHEMA[];
+
+/* An array AQ call (func 145) after its header: the input parameters'
+ * pointer and length, the flags (return the message ids), the output
+ * parameters' pointer and length, the operation, the iteration count's
+ * pointer and from 21.1 the shard id. An enqueue goes on with the count, the
+ * relative message id, a row header, the queue name (counted, then as a bind
+ * value), the TOID, the message version and the flags; then per message a
+ * row of data - its flags, the properties, the recipients, the visibility,
+ * the relative message id, the sequence deviation and the RAW payload,
+ * counted - and a closing status token. */
+typedef struct {
+  int64_t in_ptr, in_len, ret_flags, out_ptr, out_len, op, iters_ptr, shard_id;
+  int64_t iters, relmsgid_len, rxh, qname_len;
+  SeerBytes qname, toid;
+  int64_t toid_len, msg_version, flags;
+  int64_t rxd, aqi_flags, recipients, visibility, relmsgid, seq_deviation, raw_len;
+  SeerBytes payload;
+  int64_t sta;
+} SeerAqArrayMsg;
+
+extern const SeerField SEER_AQ_ARRAY_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_ARRAY_ENQ_HEAD_SCHEMA[];
+extern const SeerField SEER_AQ_ARRAY_ENQ_ROW_SCHEMA[];
+extern const SeerField SEER_AQ_ARRAY_ENQ_ROW_TAIL_SCHEMA[];
+extern const SeerField SEER_AQ_ARRAY_ENQ_END_SCHEMA[];
+
 /* Two-phase commit (seerdb PROTOCOL.md §28): TXN_SWITCH (begin/end) and
  * TXN_CHANGE_STATE (prepare/commit/abort) share a head - the operation, the
  * stored context's pointer and length, and the xid's descriptor (format id,

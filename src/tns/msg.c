@@ -452,6 +452,164 @@ const SeerField SEER_SESSION_STATE_SCHEMA[] = {
     SEER_END,
 };
 
+#define P SeerAqPropsMsg
+#define AQ_STR(len_, val_)                                                                         \
+  SEER_F(SF_N4, P, len_),                                                                          \
+  {                                                                                                \
+    .kind = SF_CHR, .flags = SG_IF_SET, .off = offsetof(P, val_), .if_off = offsetof(P, len_)      \
+  }
+#define AQ_PROPS_HEAD                                                                              \
+  SEER_F(SF_N4, P, priority), SEER_F(SF_N4, P, delay), SEER_F(SF_N4, P, expiration),               \
+      AQ_STR(correlation_len, correlation), SEER_F(SF_N4, P, attempts),                            \
+      AQ_STR(exception_queue_len, exception_queue), SEER_F(SF_N4, P, state),                       \
+      AQ_STR(enq_time_len, enq_time), AQ_STR(enq_txn_len, enq_txn), SEER_F(SF_N4, P, n_ext),       \
+  {                                                                                                \
+    .kind = SF_U8, .flags = SG_IF_SET, .off = offsetof(P, ext_lead), .if_off = offsetof(P, n_ext)  \
+  }
+#define AQ_PROPS_TAIL                                                                              \
+  SEER_F(SF_N4, P, user_prop), SEER_F(SF_N4, P, cscn), SEER_F(SF_N4, P, dscn),                     \
+      SEER_F(SF_N4, P, flags), SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_21_1, 0, P, shard_id)
+
+const SeerField SEER_AQ_PROPS_HEAD_SCHEMA[] = {
+    AQ_PROPS_HEAD,
+    SEER_END,
+};
+
+const SeerField SEER_AQ_EXT_SCHEMA[] = {
+    SEER_F(SF_N4, SeerAqExtMsg, text_len),
+    {.kind = SF_CHR,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerAqExtMsg, text),
+     .if_off = offsetof(SeerAqExtMsg, text_len)},
+    SEER_F(SF_N4, SeerAqExtMsg, bin_len),
+    {.kind = SF_CHR,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerAqExtMsg, bin),
+     .if_off = offsetof(SeerAqExtMsg, bin_len)},
+    SEER_F(SF_N4, SeerAqExtMsg, keyword),
+    SEER_END,
+};
+
+const SeerField SEER_AQ_PROPS_TAIL_SCHEMA[] = {
+    AQ_PROPS_TAIL,
+    SEER_END,
+};
+
+const SeerField SEER_AQ_PROPS_SCHEMA[] = {
+    AQ_PROPS_HEAD,
+    {.kind = SF_EACH,
+     .arg = offsetof(P, n_ext),
+     .sub = SEER_AQ_EXT_SCHEMA,
+     .subsize = sizeof(SeerAqExtMsg)},
+    AQ_PROPS_TAIL,
+    SEER_END,
+};
+#undef AQ_PROPS_TAIL
+#undef AQ_PROPS_HEAD
+#undef AQ_STR
+#undef P
+
+#define E SeerAqEnqMsg
+const SeerField SEER_AQ_ENQ_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, E, qname_ptr),
+    SEER_F(SF_N4, E, qname_len),
+    SEER_END,
+};
+
+const SeerField SEER_AQ_ENQ_TAIL_SCHEMA[] = {
+    SEER_F(SF_U8, E, recipients_ptr),
+    SEER_F(SF_N4, E, recipients),
+    SEER_F(SF_N4, E, visibility),
+    SEER_F(SF_U8, E, relmsgid_ptr),
+    SEER_F(SF_N4, E, relmsgid_len),
+    SEER_F(SF_N4, E, seq_deviation),
+    SEER_F(SF_U8, E, toid_ptr),
+    SEER_F(SF_N4, E, toid_len),
+    SEER_F(SF_N4, E, msg_version),
+    SEER_F(SF_U8, E, payload_ptr),
+    SEER_F(SF_U8, E, raw_ptr),
+    SEER_F(SF_N4, E, raw_len),
+    SEER_F(SF_U8, E, msgid_ptr),
+    SEER_F(SF_N4, E, msgid_len),
+    SEER_F(SF_N4, E, enq_flags),
+    SEER_F(SF_U8, E, ext1_ptr),
+    SEER_F(SF_N4, E, ext1_n),
+    SEER_F(SF_U8, E, ext2_ptr),
+    SEER_F(SF_N4, E, ext2_n),
+    SEER_F(SF_U8, E, srcseq_ptr),
+    SEER_F(SF_N4, E, srcseq_len),
+    SEER_F(SF_U8, E, maxseq_ptr),
+    SEER_F(SF_N4, E, maxseq_len),
+    SEER_F(SF_U8, E, ack_len),
+    SEER_F(SF_U8, E, corr_ptr),
+    SEER_F(SF_N4, E, corr_len),
+    SEER_F(SF_U8, E, sender_name_ptr),
+    SEER_F(SF_N4, E, sender_name_len),
+    SEER_F(SF_U8, E, sender_addr_ptr),
+    SEER_F(SF_N4, E, sender_addr_len),
+    SEER_F(SF_U8, E, sender_cs_ptr),
+    SEER_F(SF_U8, E, sender_ncs_ptr),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_20_1, 0, E, json_ptr),
+    /* the data section */
+    {.kind = SF_RAW,
+     .codecs = THIN,
+     .fv_max = TTC_FIELD_VERSION_12_1,
+     .off = offsetof(E, qname),
+     .arg = offsetof(E, qname_len)},
+    SEER_FV(SF_CHR, THIN, TTC_FIELD_VERSION_12_1, 0, E, qname),
+    {.kind = SF_RAW, .off = offsetof(E, toid), .arg = offsetof(E, toid_len)},
+    {.kind = SF_RAW, .off = offsetof(E, payload), .arg = offsetof(E, payload_len)},
+    SEER_END,
+};
+#undef E
+
+#define Y SeerAqArrayMsg
+const SeerField SEER_AQ_ARRAY_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, Y, in_ptr),
+    SEER_F(SF_N4, Y, in_len),
+    SEER_F(SF_N4, Y, ret_flags),
+    SEER_F(SF_U8, Y, out_ptr),
+    SEER_F(SF_U8, Y, out_len),
+    SEER_F(SF_N4, Y, op),
+    SEER_F(SF_U8, Y, iters_ptr),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_21_1, 0, Y, shard_id),
+    SEER_END,
+};
+
+const SeerField SEER_AQ_ARRAY_ENQ_HEAD_SCHEMA[] = {
+    SEER_F(SF_N4, Y, iters),
+    SEER_F(SF_N4, Y, relmsgid_len),
+    SEER_F(SF_U8, Y, rxh),
+    SEER_F(SF_N4, Y, qname_len),
+    SEER_F(SF_CHR, Y, qname),
+    {.kind = SF_RAW, .off = offsetof(Y, toid), .arg = offsetof(Y, toid_len)},
+    SEER_F(SF_N4, Y, msg_version),
+    SEER_F(SF_N4, Y, flags),
+    SEER_END,
+};
+
+const SeerField SEER_AQ_ARRAY_ENQ_ROW_SCHEMA[] = {
+    SEER_F(SF_U8, Y, rxd),
+    SEER_F(SF_N4, Y, aqi_flags),
+    SEER_END,
+};
+
+const SeerField SEER_AQ_ARRAY_ENQ_ROW_TAIL_SCHEMA[] = {
+    SEER_F(SF_N4, Y, recipients),
+    SEER_F(SF_N4, Y, visibility),
+    SEER_F(SF_N4, Y, relmsgid),
+    SEER_F(SF_N4, Y, seq_deviation),
+    SEER_F(SF_N4, Y, raw_len),
+    {.kind = SF_RAW, .off = offsetof(Y, payload), .arg = offsetof(Y, raw_len)},
+    SEER_END,
+};
+
+const SeerField SEER_AQ_ARRAY_ENQ_END_SCHEMA[] = {
+    SEER_F(SF_U8, Y, sta),
+    SEER_END,
+};
+#undef Y
+
 #define T SeerTpcMsg
 #define TPC_HEAD                                                                                   \
   SEER_F(SF_N4, T, op), SEER_F(SF_U8, T, ctx_ptr), SEER_F(SF_N4, T, ctx_len),                      \
