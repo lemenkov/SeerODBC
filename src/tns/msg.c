@@ -23,26 +23,58 @@ SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv)
   return cx;
 }
 
-/* seerdb _OAC / _O7_OAC (seerdb#2284), the fields only OCI writes left out. */
+/* seerdb _OAC / _O7_OAC (seerdb#2284), the fields only OCI writes left out.
+ * The scale is a raw signed byte from 12.1 (and on 8i, one byte), a
+ * compressed integer before - the same 00 for the 0 a bind sends, not for a
+ * describe's negative scale. 9.2 and 8i have no max_chars. */
+#define OAC_FIELDS(T)                                                                              \
+  SEER_F(SF_U8, T, data_type), SEER_F(SF_U8, T, flags), SEER_F(SF_U8, T, precision),               \
+      SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_12_1, 0, T, scale),                                   \
+      SEER_FV(SF_N1, 0, 0, TTC_FIELD_VERSION_12_1, T, scale), SEER_F(SF_N4, T, max_length),        \
+      SEER_F(SF_N4, T, max_array), SEER_F(SF_N4, T, cont_flags), SEER_F(SF_N4, T, toid_length),    \
+      {.kind = SF_VALUE,                                                                           \
+       .flags = SG_IF_SET,                                                                         \
+       .off = offsetof(T, toid),                                                                   \
+       .if_off = offsetof(T, toid_length)},                                                        \
+      SEER_F(SF_N2, T, version), SEER_F(SF_N2, T, charset), SEER_F(SF_U8, T, csfrm),               \
+      SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, T, max_chars),                               \
+      SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_2, 0, T, oaccolid)
+
 const SeerField SEER_OAC_SCHEMA[] = {
-    SEER_F(SF_U8, SeerOacMsg, data_type),
-    SEER_F(SF_U8, SeerOacMsg, flags),
-    SEER_F(SF_U8, SeerOacMsg, precision),
-    SEER_F(SF_N1, SeerOacMsg, scale),
-    SEER_F(SF_N4, SeerOacMsg, max_length),
-    SEER_F(SF_N4, SeerOacMsg, max_array),
-    SEER_F(SF_N4, SeerOacMsg, cont_flags),
-    SEER_F(SF_N4, SeerOacMsg, toid_length),
-    {.kind = SF_VALUE,
-     .flags = SG_IF_SET,
-     .off = offsetof(SeerOacMsg, toid),
-     .if_off = offsetof(SeerOacMsg, toid_length)},
-    SEER_F(SF_N2, SeerOacMsg, version),
-    SEER_F(SF_N2, SeerOacMsg, charset),
-    SEER_F(SF_U8, SeerOacMsg, csfrm),
-    /* 9.2 has no max_chars, and 8i none either */
-    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, SeerOacMsg, max_chars),
-    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_12_2, 0, SeerOacMsg, oaccolid),
+    OAC_FIELDS(SeerOacMsg),
+    SEER_END,
+};
+
+#define D SeerDcbColumnMsg
+const SeerField SEER_DCB_COLUMN_SCHEMA[] = {
+    OAC_FIELDS(D),
+    SEER_F(SF_U8, D, null_ok),
+    SEER_F(SF_U8, D, name_bytes),
+    SEER_F(SF_COUNTED, D, name),
+    SEER_F(SF_COUNTED, D, type_schema),
+    SEER_F(SF_COUNTED, D, type_name),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, D, position),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_11_2, 0, D, uds_flags),
+    SEER_FV(SF_COUNTED, THIN, TTC_FIELD_VERSION_23_1, 0, D, domain_schema),
+    SEER_FV(SF_COUNTED, THIN, TTC_FIELD_VERSION_23_1, 0, D, domain_name),
+    SEER_END,
+};
+
+const SeerField SEER_DCB_VECTOR_SCHEMA[] = {
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_23_1 + 1, 0, D, vector_dims),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_23_1 + 1, 0, D, vector_format),
+    SEER_FV(SF_U8, THIN, TTC_FIELD_VERSION_23_1 + 1, 0, D, vector_flags),
+    SEER_END,
+};
+#undef D
+
+const SeerField SEER_DCB_TRAILER_SCHEMA[] = {
+    SEER_F(SF_COUNTED, SeerDcbTrailerMsg, time),
+    SEER_FC(SF_N4, THIN, SeerDcbTrailerMsg, dcbflag),
+    SEER_FC(SF_N4, THIN, SeerDcbTrailerMsg, dcbmdbz),
+    SEER_FC(SF_N4, THIN, SeerDcbTrailerMsg, dcbmnpr),
+    SEER_FC(SF_N4, THIN, SeerDcbTrailerMsg, dcbmxpr),
+    SEER_FV(SF_COUNTED, THIN, TTC_FIELD_VERSION_11_2, 0, SeerDcbTrailerMsg, query_key),
     SEER_END,
 };
 

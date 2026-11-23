@@ -9,16 +9,21 @@
 
 #include "schema.h"
 
+/* The OAC's fields, shared by the bind descriptor and a describe's column:
+ * a struct holding them names these members. */
+#define SEER_OAC_MEMBERS                                                                           \
+  int64_t data_type, flags, precision, scale;                                                      \
+  int64_t max_length, max_array, cont_flags, toid_length;                                          \
+  SeerBytes toid;                                                                                  \
+  int64_t version, charset, csfrm, max_chars, oaccolid
+
 /* The bind descriptor (OAC). One field list on every path; 8i packs its
  * integers little-endian (its "13 zero bytes and a big-endian charset" are
  * the array, continuation, TOID and version fields and an LE ub2 charset),
  * 9i lacks max_chars, 12.2 adds oaccolid. The values each path sends -
  * flags, charsets, 9i's VARNUM - are the caller's: policy, not encoding. */
 typedef struct {
-  int64_t data_type, flags, precision, scale;
-  int64_t max_length, max_array, cont_flags, toid_length;
-  SeerBytes toid;
-  int64_t version, charset, csfrm, max_chars, oaccolid;
+  SEER_OAC_MEMBERS;
 } SeerOacMsg;
 
 extern const SeerField SEER_OAC_SCHEMA[];
@@ -195,6 +200,35 @@ typedef struct {
 } SeerObjectMsg;
 
 extern const SeerField SEER_OBJECT_SCHEMA[];
+
+/* A describe's column (seerdb _DCB_COLUMN / _O8I_DESCRIBE / _O7_DESCRIBE_COLUMN):
+ * the OAC's fields, then nullable, the name's length in bytes, the name and
+ * the type's schema and name, each counted - the same on every path - and on
+ * 10g+ the position, from 11.2 the UDS flags, from 23.1 the SQL domain's
+ * schema and name. 23ai's annotations follow as code, then its vector
+ * fields (SEER_DCB_VECTOR_SCHEMA). The scale is a raw signed byte from 12.1
+ * and on 8i, a compressed integer before. */
+typedef struct {
+  SEER_OAC_MEMBERS;
+  int64_t null_ok, name_bytes;
+  SeerBytes name, type_schema, type_name;
+  int64_t position, uds_flags;
+  SeerBytes domain_schema, domain_name;
+  int64_t vector_dims, vector_format, vector_flags;
+} SeerDcbColumnMsg;
+
+extern const SeerField SEER_DCB_COLUMN_SCHEMA[];
+extern const SeerField SEER_DCB_VECTOR_SCHEMA[];
+
+/* A describe's trailer: the describe time, counted; then on thin four flag
+ * fields and, from 11.2, the query-cache key. */
+typedef struct {
+  SeerBytes time;
+  int64_t dcbflag, dcbmdbz, dcbmnpr, dcbmxpr;
+  SeerBytes query_key;
+} SeerDcbTrailerMsg;
+
+extern const SeerField SEER_DCB_TRAILER_SCHEMA[];
 
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);

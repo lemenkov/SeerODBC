@@ -689,6 +689,18 @@ static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *ce
  * trailer's `dcbqcky` (query-cache key) are 11g additions, absent on a 10g
  * (fv 4) describe, so reading them there would eat the next column / the first
  * row token and desync the whole decode. */
+/* A decoded byte string as a NUL-terminated malloc'd string ("" when empty). */
+static char *bytes_dup_str(const SeerBytes *b)
+{
+  char *s = malloc(b->n + 1);
+  if (s == NULL)
+    return NULL;
+  if (b->n > 0)
+    memcpy(s, b->p, b->n);
+  s[b->n] = '\0';
+  return s;
+}
+
 static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_cols, int *out_ncols)
 {
   (void)seer_dec_sb4(r); /* max row size */
@@ -702,76 +714,36 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
   if (cols == NULL && ncols > 0)
     return SEER_ENOMEM;
 
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  cx.wide_chunks = r->sb4_chunks;
   for (int64_t i = 0; i < ncols; i++) {
-    uint8_t type = seer_reader_u8(r);
-    (void)seer_reader_u8(r);               /* flags     */
-    cols[i].precision = seer_reader_u8(r); /* precision */
-    if (fv >= TTC_FIELD_VERSION_12_1)
-      cols[i].scale = (int8_t)seer_reader_u8(r); /* scale: a raw sb1 from 12.1 */
-    else
-      cols[i].scale = (int)seer_dec_sb4(r); /* scale: variable on 11g */
-    int64_t data_len = seer_dec_sb4(r);     /* buffer size (data length) */
-    (void)seer_dec_sb4(r);                  /* max array elems */
-    (void)seer_dec_sb4(r);                  /* cont flags */
-    int64_t oidlen = seer_dec_sb4(r);
-    if (oidlen > 0)
-      seer_skip_chunked(r);
-    (void)seer_dec_sb4(r); /* version */
-    int64_t charset = seer_dec_sb4(r);
-    (void)seer_reader_u8(r); /* csfrm */
-    int64_t max_size = seer_dec_sb4(r);
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      (void)seer_dec_sb4(r); /* oaccolid (12.2+) */
-    uint8_t null_ok = seer_reader_u8(r);
-    (void)seer_reader_u8(r); /* v7 name length */
-
-    char *name = NULL;
-    SeerStatus st = seer_read_str(r, &name);
-    if (st != SEER_OK) {
-      cols[i].name = NULL;
+    /* SEER_DCB_COLUMN_SCHEMA (#398): the OAC's fields, nullable, the name and
+     * the type's schema and name, the position, 11.2's UDS flags, 23.1's SQL
+     * domain; a raw sb1 scale from 12.1. */
+    SeerDcbColumnMsg dm = {0};
+    if (!seer_schema_decode(SEER_DCB_COLUMN_SCHEMA, &cx, r, &dm)) {
+      seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
       goto fail;
     }
-    char *schema = NULL, *tname = NULL;
-    st = seer_read_str(r, &schema); /* type owner (ADT) */
-    if (st != SEER_OK) {
-      free(name);
+    uint8_t type = (uint8_t)dm.data_type;
+    cols[i].precision = (uint8_t)dm.precision;
+    cols[i].scale = fv >= TTC_FIELD_VERSION_12_1 ? (int8_t)dm.scale : (int)dm.scale;
+    int64_t data_len = dm.max_length; /* buffer size (data length) */
+    int64_t charset = dm.charset;
+    int64_t max_size = dm.max_chars;
+    uint8_t null_ok = (uint8_t)dm.null_ok;
+    char *name = bytes_dup_str(&dm.name);
+    if (name == NULL) {
+      seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
       goto fail;
     }
-    st = seer_read_str(r, &tname); /* type name (ADT)  */
-    if (st != SEER_OK) {
-      free(name);
-      free(schema);
-      goto fail;
-    }
-    if (type == ORA_TYPE_ADT && schema && schema[0] && tname && tname[0]) {
-      cols[i].type_schema = schema;
-      schema = NULL;
-      cols[i].type_name = tname;
-      tname = NULL;
+    if (type == ORA_TYPE_ADT && dm.type_schema.n > 0 && dm.type_name.n > 0) {
+      cols[i].type_schema = bytes_dup_str(&dm.type_schema);
+      cols[i].type_name = bytes_dup_str(&dm.type_name);
       cols[i].n_obj_attrs = -1; /* layout not yet fetched */
     }
-    free(schema);
-    free(tname);
-    char *skip = NULL;
-    (void)seer_dec_sb4(r); /* column position */
-    if (fv >= TTC_FIELD_VERSION_11_2)
-      (void)seer_dec_sb4(r); /* uds flags (11g+ only) */
-    if (fv >= TTC_FIELD_VERSION_23_1) {
-      /* 23c+ (fv>=17): the column's SQL-domain schema and name, each a
-       * DALC string (empty 0x00 for a column with no domain). */
-      st = seer_read_str(r, &skip);
-      free(skip);
-      if (st != SEER_OK) {
-        free(name);
-        goto fail;
-      }
-      st = seer_read_str(r, &skip);
-      free(skip);
-      if (st != SEER_OK) {
-        free(name);
-        goto fail;
-      }
-    }
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
+    SeerStatus st;
     if (fv > TTC_FIELD_VERSION_23_1) {
       /* 23ai (fv24): per-column annotation map + vector descriptor (#89).
        * The count is sent twice around a 1-byte pointer; each key/value
@@ -827,10 +799,10 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
         }
         seer_writer_free(&ann);
       }
-      int64_t vdims = seer_dec_sb4(r); /* vector dimensions */
-      cols[i].vector_dims = (uint32_t)(vdims < 0 ? 0 : vdims);
-      cols[i].vector_format = seer_reader_u8(r); /* vector format */
-      (void)seer_reader_u8(r);                   /* vector flags  */
+      SeerDcbColumnMsg vm = {0}; /* SEER_DCB_VECTOR_SCHEMA */
+      (void)seer_schema_decode(SEER_DCB_VECTOR_SCHEMA, &cx, r, &vm);
+      cols[i].vector_dims = (uint32_t)(vm.vector_dims < 0 ? 0 : vm.vector_dims);
+      cols[i].vector_format = (uint8_t)vm.vector_format;
     }
 
     cols[i].name = name;
@@ -853,11 +825,9 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     return SEER_EPROTO;
   }
 
-  seer_skip_bytes_with_length(r); /* current date */
-  for (int k = 0; k < 4; k++)
-    (void)seer_dec_sb4(r); /* dcbflag/dcbmdbz/dcbmnpr/dcbmxpr */
-  if (fv >= TTC_FIELD_VERSION_11_2)
-    seer_skip_bytes_with_length(r); /* dcbqcky - query-cache key (11g+) */
+  SeerDcbTrailerMsg tm = {0}; /* SEER_DCB_TRAILER_SCHEMA */
+  (void)seer_schema_decode(SEER_DCB_TRAILER_SCHEMA, &cx, r, &tm);
+  seer_schema_free(SEER_DCB_TRAILER_SCHEMA, &tm);
 
   if (!seer_reader_ok(r)) {
     free_columns(cols, (int)ncols);
@@ -4917,60 +4887,42 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
 /* Decode one fv2 column descriptor (OAC-fv2 + name) into `col`. */
 static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
 {
-  uint8_t data_type = seer_reader_u8(r);
-  (void)seer_reader_u8(r);            /* flag       */
-  col->precision = seer_reader_u8(r); /* precision  */
-  col->scale = (int)seer_dec_sb4(r);  /* data_scale */
-  int64_t max_len = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* _mal       */
-  (void)seer_dec_sb4(r); /* _fl2       */
-  /* The type OID: a ub4 length, then - for an object column, 16 bytes - the
-   * value. Read as a bare value it took its length for its first byte, and an
-   * object column's describe failed (#168); other columns send `00`. */
-  int64_t toidlen = seer_dec_sb4(r);
-  if (toidlen > 0) {
-    uint8_t *toid = NULL;
-    size_t tl = 0;
-    if (seer_dec_dalc(r, &toid, &tl) != SEER_OK) {
-      free(toid);
-      return SEER_EPROTO;
-    }
+  /* SEER_DCB_COLUMN_SCHEMA at field version 2 (#398): the OAC's fields (no
+   * max_chars, a compressed-integer scale), nullable - read properly, where
+   * reading it and the name's byte length as one ub4 slipped for a NOT NULL
+   * column (seerdb PROTOCOL.md §19.1) - the name, and the type's schema and
+   * name. The type's OID is kept: the define names the type by it (#168). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerDcbColumnMsg dm = {0};
+  if (!seer_schema_decode(SEER_DCB_COLUMN_SCHEMA, &cx, r, &dm)) {
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
+    return SEER_EPROTO;
+  }
+  uint8_t data_type = (uint8_t)dm.data_type;
+  col->precision = (uint8_t)dm.precision;
+  col->scale = (int)dm.scale;
+  int64_t max_len = dm.max_length;
+  if (dm.toid.n > 0) {
     free(col->toid);
-    col->toid = toid; /* kept: the define names the type by it */
-    col->toidlen = tl;
+    col->toid = malloc(dm.toid.n);
+    if (col->toid != NULL) {
+      memcpy(col->toid, dm.toid.p, dm.toid.n);
+      col->toidlen = dm.toid.n;
+    }
   }
-  col->type_version = (uint32_t)seer_dec_sb4(r); /* _vsn */
-  int64_t charset = seer_dec_sb4(r);
-  (void)seer_reader_u8(r); /* csfrm      */
-  /* Before the name: null_ok(1B) + name-length-in-bytes(1B), then the name length
-   * in chars (a real ub4, always width 1 for a <=255-char name), then the DALC
-   * name (seerdb PROTOCOL.md §19.1). Reading the null_ok + byte-length pair as
-   * one "ub4 namelen" only decodes cleanly for a NULLABLE column (null_ok=1
-   * mimics a width-1 ub4); a NOT-NULL column (null_ok=0) makes that ub4 slip.
-   * Verified live: a NOT NULL vs nullable pair with identical 9-char names differ
-   * only in this first byte (00 vs 01). We read null_ok properly; the two length
-   * fields are redundant with the DALC and discarded. */
-  uint8_t null_ok = seer_reader_u8(r); /* 0 = NOT NULL, 1 = nullable */
-  (void)seer_reader_u8(r);             /* name length in bytes (redundant) */
-  (void)seer_dec_sb4(r);               /* name length in chars (ub4) */
-  uint8_t *name = NULL;
-  size_t namelen = 0;
-  if (seer_dec_dalc(r, &name, &namelen) != SEER_OK) {
-    free(name);
-    return SEER_EPROTO;
-  }
-  if (!seer_reader_ok(r)) {
-    free(name);
-    return SEER_EPROTO;
-  }
-  col->name = malloc(namelen + 1);
+  col->type_version = (uint32_t)dm.version;
+  int64_t charset = dm.charset;
+  uint8_t null_ok = (uint8_t)dm.null_ok;
+  col->name = bytes_dup_str(&dm.name);
   if (col->name == NULL) {
-    free(name);
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
     return SEER_ENOMEM;
   }
-  memcpy(col->name, name, namelen);
-  col->name[namelen] = '\0';
-  free(name);
+  if (data_type == ORA_TYPE_ADT && dm.type_schema.n > 0 && dm.type_name.n > 0) {
+    col->type_schema = bytes_dup_str(&dm.type_schema);
+    col->type_name = bytes_dup_str(&dm.type_name);
+  }
+  seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
   col->ora_type = data_type;
   col->charset = (uint16_t)charset;
   col->max_size = (uint32_t)(max_len < 0 ? 0 : max_len);
@@ -4990,34 +4942,6 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   col->null_ok = null_ok;
   col->n_obj_attrs = 0;
   return SEER_OK;
-}
-
-/* A describe's type schema or type name: a ub4 length, then the DALC name
- * when there is one (only an object column names its type). Into *out as a
- * string when `out` is non-NULL, NULL for none. */
-static SeerStatus fv2_read_type_ident(SeerReader *r, char **out)
-{
-  if (out != NULL)
-    *out = NULL;
-  int64_t len = seer_dec_sb4(r);
-  if (!seer_reader_ok(r) || len < 0)
-    return SEER_EPROTO;
-  if (len == 0)
-    return SEER_OK;
-  uint8_t *v = NULL;
-  size_t vl = 0;
-  SeerStatus st = seer_dec_dalc(r, &v, &vl);
-  if (st == SEER_OK && out != NULL && vl > 0) {
-    *out = malloc(vl + 1);
-    if (*out == NULL) {
-      free(v);
-      return SEER_ENOMEM;
-    }
-    memcpy(*out, v, vl);
-    (*out)[vl] = '\0';
-  }
-  free(v);
-  return st;
 }
 
 /* Decode the describe RPA into a column array:
@@ -5042,24 +4966,14 @@ static SeerStatus fv2_decode_describe(const uint8_t *data, size_t dlen, SeerColu
   if (cols == NULL)
     return SEER_ENOMEM;
   for (int i = 0; i < ncols; i++) {
-    char *schema = NULL, *tname = NULL;
-    if (fv2_decode_column(&r, &cols[i]) != SEER_OK || fv2_read_type_ident(&r, &schema) != SEER_OK ||
-        fv2_read_type_ident(&r, &tname) != SEER_OK) {
-      free(schema);
-      free(tname);
+    if (fv2_decode_column(&r, &cols[i]) != SEER_OK) {
       free_columns(cols, ncols);
       return SEER_EPROTO;
     }
     /* An object or collection column names its type, whose layout the image
      * decode reads from the dictionary, as on 10g+ (#168). */
-    if (cols[i].ora_type == ORA_TYPE_ADT && schema != NULL && tname != NULL) {
-      cols[i].type_schema = schema;
-      cols[i].type_name = tname;
+    if (cols[i].type_schema != NULL && cols[i].type_name != NULL)
       cols[i].n_obj_attrs = -1;
-    } else {
-      free(schema);
-      free(tname);
-    }
   }
   *out_cols = cols;
   *out_n = ncols;
@@ -6089,67 +6003,56 @@ static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *
     r->bad = true;
     return;
   }
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
   for (uint32_t i = 0; i < n && !r->cut && !r->bad; i++) {
+    /* SEER_DCB_COLUMN_SCHEMA at 8i's widths (#398): the OAC's fields (no
+     * max_chars), nullable, the name and the type's schema and name - an
+     * object or collection column's, its layout read by them (#168). */
     SeerColumn *col = &cols[i];
-    col->ora_type = o8r_u8(r);
-    o8r_skip(r, 1); /* flags */
-    col->precision = o8r_u8(r);
-    col->scale = (int8_t)o8r_u8(r);
-    col->max_size = o8r_le32(r);
-    col->char_size = col->byte_size = col->max_size; /* 8i: byte semantics only */
-    (void)o8r_le32(r);                               /* max array */
-    (void)o8r_le32(r);                               /* continuation flags */
-    if (o8r_le32(r) > 0)
-      o8r_value(r, NULL); /* the type's OID */
-    (void)o8r_le16(r);    /* version */
-    col->charset = (uint16_t)o8r_le16(r);
-    (void)o8r_u8(r); /* csfrm */
-    col->null_ok = o8r_u8(r);
-    (void)o8r_u8(r);   /* name length in bytes */
-    (void)o8r_le32(r); /* name length in characters */
-    SeerWriter nm;
-    if (!seer_writer_init(&nm, 32)) {
-      r->bad = true;
+    SeerReader sr;
+    seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+    SeerDcbColumnMsg dm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_DCB_COLUMN_SCHEMA, &cx, &sr, &dm);
+    if (res != SCH_OK) {
+      seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else
+        r->bad = true;
       break;
     }
-    o8r_value(r, &nm);
-    seer_writer_u8(&nm, 0);
-    if (seer_writer_ok(&nm)) {
-      col->name = (char *)nm.buf;
-    } else {
-      seer_writer_free(&nm);
+    r->pos += sr.pos;
+    col->ora_type = (uint8_t)dm.data_type;
+    col->precision = (uint8_t)dm.precision;
+    col->scale = (int8_t)dm.scale;
+    col->max_size = (uint32_t)dm.max_length;
+    col->char_size = col->byte_size = col->max_size; /* 8i: byte semantics only */
+    col->charset = (uint16_t)dm.charset;
+    col->null_ok = (uint8_t)dm.null_ok;
+    col->name = bytes_dup_str(&dm.name);
+    if (col->name == NULL)
       r->bad = true;
-    }
-    /* The type's schema and name: an object or collection column's, which
-     * its image decode reads the layout by (#168). */
-    char *ident[2] = {NULL, NULL};
-    for (int k = 0; k < 2; k++) {
-      if (o8r_le32(r) == 0)
-        continue;
-      SeerWriter v;
-      if (!seer_writer_init(&v, 32)) {
-        r->bad = true;
-        break;
-      }
-      o8r_value(r, &v);
-      seer_writer_u8(&v, 0);
-      if (seer_writer_ok(&v) && col->ora_type == ORA_TYPE_ADT)
-        ident[k] = (char *)v.buf;
-      else
-        seer_writer_free(&v);
-    }
     col->n_obj_attrs = 0;
-    if (ident[0] != NULL && ident[1] != NULL) {
-      col->type_schema = ident[0];
-      col->type_name = ident[1];
+    if (col->ora_type == ORA_TYPE_ADT && dm.type_schema.n > 0 && dm.type_name.n > 0) {
+      col->type_schema = bytes_dup_str(&dm.type_schema);
+      col->type_name = bytes_dup_str(&dm.type_name);
       col->n_obj_attrs = -1; /* layout not yet fetched */
-    } else {
-      free(ident[0]);
-      free(ident[1]);
     }
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
   }
-  if (o8r_le32(r) > 0)
-    o8r_value(r, NULL); /* the describe time */
+  if (!r->cut && !r->bad) { /* SEER_DCB_TRAILER_SCHEMA: the describe time */
+    SeerReader tr;
+    seer_reader_init(&tr, r->b + r->pos, r->n - r->pos);
+    SeerDcbTrailerMsg tm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_DCB_TRAILER_SCHEMA, &cx, &tr, &tm);
+    seer_schema_free(SEER_DCB_TRAILER_SCHEMA, &tm);
+    if (res == SCH_OK)
+      r->pos += tr.pos;
+    else if (res == SCH_SHORT)
+      r->cut = true;
+    else
+      r->bad = true;
+  }
   if (r->cut || r->bad || out == NULL) {
     free_columns(cols, (int)n);
     return;
