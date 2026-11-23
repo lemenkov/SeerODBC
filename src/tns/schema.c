@@ -280,6 +280,61 @@ static int64_t get_num(SeerReader *r, const SeerSchemaCtx *cx, uint8_t kind)
   return get_le(r, kind == SF_N1 ? 1 : kind == SF_N2 ? 2 : 4);
 }
 
+/* A chunked value's chunks, from buf[*pos] (a chunk's length) to the zero
+ * length: SCH_OK with *pos past it and their bytes added to *total;
+ * SCH_SHORT with *pos at the first chunk not yet whole; SCH_BAD on a
+ * negative length. Each a ub1, or on thin from 12.1 an sb4. */
+static SeerSchemaResult chunks_walk(const SeerSchemaCtx *cx, const uint8_t *buf, size_t len,
+                                    size_t *pos, size_t *total)
+{
+  bool wide = cx->codec == SEER_CODEC_THIN && cx->wide_chunks;
+  SeerReader r;
+  seer_reader_init(&r, buf, len);
+  for (;;) {
+    r.pos = *pos;
+    int64_t cl = wide ? seer_dec_sb4(&r) : seer_reader_u8(&r);
+    if (cl < 0) /* a negative chunk length: no value */
+      return SCH_BAD;
+    if (!seer_reader_ok(&r))
+      return SCH_SHORT;
+    if (cl == 0) {
+      *pos = r.pos;
+      return SCH_OK;
+    }
+    if (seer_reader_bytes(&r, (size_t)cl) == NULL)
+      return SCH_SHORT;
+    *total += (size_t)cl;
+    *pos = r.pos;
+  }
+}
+
+SeerSchemaResult seer_schema_value_scan(const SeerSchemaCtx *cx, const uint8_t *buf, size_t len,
+                                        size_t start, size_t *pos)
+{
+  if (*pos == 0) { /* the lead */
+    if (start >= len)
+      return SCH_SHORT;
+    uint8_t lb = buf[start];
+    if (lb == 0xFF && cx->codec == SEER_CODEC_O8I) {
+      *pos = start; /* 8i: a NULL is the trailer alone */
+      return SCH_OK;
+    }
+    if (lb == 0 || lb == 0xFF) {
+      *pos = start + 1;
+      return SCH_OK;
+    }
+    if (lb != 0xFE) {
+      if (len - start - 1 < lb)
+        return SCH_SHORT;
+      *pos = start + 1 + lb;
+      return SCH_OK;
+    }
+    *pos = start + 1;
+  }
+  size_t total = 0;
+  return chunks_walk(cx, buf, len, pos, &total);
+}
+
 /* A value: a ub1 length (0 and 0xFF are empty / NULL) and the bytes, pointed
  * into; or 0xFE then chunks to a zero length - each a ub1, or on thin from
  * 12.1 an sb4 - assembled into an owned buffer. */
@@ -308,21 +363,18 @@ static bool get_value(SeerReader *r, const SeerSchemaCtx *cx, SeerBytes *b, bool
    * the chunks into one buffer of that length. */
   bool wide = cx->codec == SEER_CODEC_THIN && cx->wide_chunks;
   size_t start = r->pos;
+  size_t end = start;
   size_t total = 0;
-  for (;;) {
-    int64_t cl = wide ? seer_dec_sb4(r) : seer_reader_u8(r);
-    if (cl < 0) { /* a negative chunk length: no value */
-      *bad = true;
-      return false;
-    }
-    if (!seer_reader_ok(r) || cl == 0)
-      break;
-    if (seer_reader_bytes(r, (size_t)cl) == NULL)
-      break;
-    total += (size_t)cl;
-  }
-  if (!seer_reader_ok(r))
+  SeerSchemaResult cr = chunks_walk(cx, r->buf, r->len, &end, &total);
+  if (cr == SCH_BAD) {
+    *bad = true;
     return false;
+  }
+  if (cr == SCH_SHORT) { /* read short: latch it on the reader */
+    r->pos = r->len;
+    (void)seer_reader_bytes(r, 1);
+    return false;
+  }
   uint8_t *out = malloc(total > 0 ? total : 1);
   if (out == NULL)
     return false;

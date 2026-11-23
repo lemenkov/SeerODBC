@@ -6754,10 +6754,25 @@ static SeerStatus o8i_lobop_reply(SeerConn *c, bool has_amount, SeerWriter *cont
   SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
   SeerLobDataMsg lm = {0};
   SeerLobopReplyMsg rm = {0};
+  /* How far a READ's content has been found whole: seer_schema_value_scan
+   * goes on from there as each packet comes, so the content is walked once,
+   * not once a packet (#400); it is decoded once it has all arrived. */
+  size_t lob_pos = 0;
+  bool lob_whole = false;
   for (;;) {
     st = o8i_recv_more(c, &buf);
     if (st != SEER_OK)
       break;
+    if (!lob_whole && buf.len > 0 && buf.buf[0] == TTI_LOB) {
+      SeerSchemaResult sr = seer_schema_value_scan(&cx, buf.buf, buf.len, 1, &lob_pos);
+      if (sr == SCH_SHORT)
+        continue;
+      if (sr == SCH_BAD) {
+        st = SEER_EPROTO;
+        break;
+      }
+      lob_whole = true;
+    }
     /* The reply by its schemas, at 8i's widths: the LOB data (a READ's
      * content), the RPA, then the status. A part that hasn't fully arrived
      * reads short: read on (#398). */

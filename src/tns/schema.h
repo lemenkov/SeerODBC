@@ -126,6 +126,14 @@ bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerRe
 /* Free the owned SeerBytes members a decode left in `msg`. */
 void seer_schema_free(const SeerField *schema, void *msg);
 
+/* Where a value (SF_VALUE's form) starting at buf[start] ends, for a reply
+ * still arriving: SCH_OK with *pos just past it; SCH_SHORT with *pos where to
+ * go on from once more has arrived - the next chunk not yet whole, or 0 when
+ * the lead hasn't come; SCH_BAD on a negative chunk length. *pos is 0 on the
+ * first call; each byte is walked once over all the calls (#400). */
+SeerSchemaResult seer_schema_value_scan(const SeerSchemaCtx *cx, const uint8_t *buf, size_t len,
+                                        size_t start, size_t *pos);
+
 /* Field constructors. */
 #define SEER_F(kind_, type_, member_) {.kind = (kind_), .off = offsetof(type_, member_)}
 #define SEER_FC(kind_, codecs_, type_, member_)                                                    \

@@ -152,6 +152,14 @@ test_lob_content = executable('test_lob_content',
 )
 test('lob content', test_lob_content)
 
+# Where a value ends, found by resuming as a reply arrives (#400): every split
+# point of empty, inline and chunked values in 8i's and thin's forms.
+test_value_scan = executable('test_value_scan',
+  'unit/test_value_scan.c',
+  dependencies : [test_dep, seertns_dep],
+)
+test('value scan', test_value_scan)
+
 # The fetch-only OALL8 that drains a REF CURSOR / implicit result, against the
 # frame a live 11g answered (seerdb #1462).
 test_fetch_only = executable('test_fetch_only',
