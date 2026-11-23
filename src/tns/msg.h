@@ -211,6 +211,10 @@ extern const SeerField SEER_ROWID_CELL_SCHEMA[];  /* a ROWID's five fields */
  * 8i / 9i bind the block never assigned - keep their own readers. */
 extern const SeerField SEER_OUT_CELL_SCHEMA[];
 
+/* An OUT value's tail alone, SEER_OUT_CELL_SCHEMA without the value: what
+ * follows an OUT object's image. */
+extern const SeerField SEER_OUT_TAIL_SCHEMA[];
+
 /* DML RETURNING's return data (§5.6, an RXD after a RETURNING execute): per
  * OUT bind the affected-row count, then per row its value and real length -
  * larger than what arrived when the server cut the value to the bind's size

@@ -248,12 +248,19 @@ const SeerField SEER_UROWID_CELL_SCHEMA[] = {
     SEER_END,
 };
 
+#define OUT_TAIL                                                                                   \
+  SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, SeerCellMsg, return_code), CELL_INDICATOR
 const SeerField SEER_OUT_CELL_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerCellMsg, value),
-    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_10_2, 0, SeerCellMsg, return_code),
-    CELL_INDICATOR,
+    OUT_TAIL,
     SEER_END,
 };
+
+const SeerField SEER_OUT_TAIL_SCHEMA[] = {
+    OUT_TAIL,
+    SEER_END,
+};
+#undef OUT_TAIL
 
 #define R SeerReturningMsg
 const SeerField SEER_RETURNING_COUNT_SCHEMA[] = {

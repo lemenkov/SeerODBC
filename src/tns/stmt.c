@@ -1518,7 +1518,8 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
           free(dirs);
           return SEER_EPROTO;
         }
-        (void)seer_dec_sb4(r); /* return code */
+        SeerCellMsg tm = {0}; /* the return code: SEER_OUT_TAIL_SCHEMA (#398) */
+        (void)seer_schema_decode(SEER_OUT_TAIL_SCHEMA, &cx, r, &tm);
         free(b->out.data);
         b->out = (SeerCell){0};
         free(b->out_image);
@@ -1527,30 +1528,32 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
         continue;
       }
       if (b != NULL && b->is_array) {
-        /* OUT assoc array (#122): ub4 count, then each element as a DALC
-         * value + a ub4 per-element return code. */
-        int64_t count = seer_dec_sb4(r);
-        if (count < 0 || count > 1000000 || !seer_reader_ok(r)) {
+        /* OUT assoc array (#122): SEER_OUT_ARRAY_SCHEMA's count, then each
+         * element as SEER_OUT_CELL_SCHEMA - the value and its return code -
+         * as on 8i (#398). */
+        SeerOutArrayMsg am = {0};
+        if (!seer_schema_decode(SEER_OUT_ARRAY_SCHEMA, &cx, r, &am) || am.count < 0 ||
+            am.count > 1000000) {
           free(dirs);
           return SEER_EPROTO;
         }
+        int64_t count = am.count;
         for (int k = 0; k < b->out_arr_n; k++)
           free(b->out_arr[k].data);
         free(b->out_arr);
         b->out_arr = count ? calloc((size_t)count, sizeof *b->out_arr) : NULL;
         b->out_arr_n = 0;
         for (int64_t e = 0; e < count; e++) {
-          uint8_t *ev = NULL;
-          size_t evl = 0;
-          if (seer_dec_dalc(r, &ev, &evl) != SEER_OK) {
-            free(ev);
+          SeerCellMsg em = {0};
+          if (!seer_schema_decode(SEER_OUT_CELL_SCHEMA, &cx, r, &em)) {
+            seer_schema_free(SEER_OUT_CELL_SCHEMA, &em);
             free(dirs);
             return SEER_EPROTO;
           }
-          (void)seer_dec_sb4(r); /* per-element return code (ub4) */
           if (b->out_arr != NULL)
-            decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, ev, evl, &b->out_arr[e]);
-          free(ev);
+            decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, em.value.p, em.value.n,
+                          &b->out_arr[e]);
+          seer_schema_free(SEER_OUT_CELL_SCHEMA, &em);
         }
         b->out_arr_n = (int)count;
         continue;
