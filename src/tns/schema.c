@@ -96,6 +96,31 @@ static void put_chr(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
   seer_writer_u8(w, 0);
 }
 
+/* SF_LOB: a LOB write's content. From 10.2 thin's chunks run to 0x7FFF
+ * bytes, each length an sb4 - at every field version, unlike a value's;
+ * 9i's are of 252 with a ub1 length, as are 8i's (no 8i LOB write is sent). */
+static void put_lob(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
+{
+  if (b->n <= 252) {
+    seer_writer_u8(w, (uint8_t)b->n);
+    if (b->n > 0)
+      seer_writer_bytes(w, b->p, b->n);
+    return;
+  }
+  bool wide = cx->codec == SEER_CODEC_THIN && cx->fv >= TTC_FIELD_VERSION_10_2;
+  size_t cmax = wide ? 0x7FFF : 252;
+  seer_writer_u8(w, 0xFE);
+  for (size_t off = 0; off < b->n; off += cmax) {
+    size_t k = b->n - off < cmax ? b->n - off : cmax;
+    if (wide)
+      seer_enc_sb4(w, (uint32_t)k);
+    else
+      seer_writer_u8(w, (uint8_t)k);
+    seer_writer_bytes(w, b->p + off, k);
+  }
+  seer_writer_u8(w, 0);
+}
+
 /* SF_SQL: the SQL text (seerdb _ALL8_HEAD's sql; 8i as SF_CHR). */
 static void put_sql(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
 {
@@ -177,6 +202,9 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
       break;
     case SF_CHR:
       put_chr(w, cx, (const SeerBytes *)((const char *)msg + f->off));
+      break;
+    case SF_LOB:
+      put_lob(w, cx, (const SeerBytes *)((const char *)msg + f->off));
       break;
     case SF_SQL:
       put_sql(w, cx, (const SeerBytes *)((const char *)msg + f->off));
@@ -336,6 +364,7 @@ SeerSchemaResult seer_schema_decode_ex(const SeerField *schema, const SeerSchema
     }
     case SF_VALUE:
     case SF_CHR:
+    case SF_LOB:
       get_value(r, cx, (SeerBytes *)((char *)msg + f->off), &bad);
       break;
     case SF_U8L:
@@ -394,6 +423,7 @@ bool seer_schema_decode(const SeerField *schema, const SeerSchemaCtx *cx, SeerRe
 void seer_schema_free(const SeerField *schema, void *msg)
 {
   for (const SeerField *f = schema; f->kind != SF_END; f++)
-    if (f->kind == SF_VALUE || f->kind == SF_CHR || f->kind == SF_RAW || f->kind == SF_COUNTED)
+    if (f->kind == SF_VALUE || f->kind == SF_CHR || f->kind == SF_LOB || f->kind == SF_RAW ||
+        f->kind == SF_COUNTED)
       seer_bytes_free((SeerBytes *)((char *)msg + f->off));
 }

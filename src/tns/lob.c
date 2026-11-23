@@ -333,26 +333,17 @@ SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
     return SEER_EPARAM;
 
   /* The READ field block with the WRITE op, the temp locator ub2-prefixed, no
-   * amount, and the data appended behind a 0x0E marker as chunked bytes: a ub1
-   * length for up to 0xFC bytes, else 0xFE + sb4-prefixed chunks of at most
-   * 0x7FFF bytes and a zero-length terminator (PROTOCOL.md §14.2). */
+   * amount, then the data as a LOB data message: TTI_LOB and
+   * SEER_LOB_DATA_SCHEMA's content, chunked past 252 bytes in sb4-length
+   * chunks of up to 0x7FFF (PROTOCOL.md §14.2; #398). */
   SeerWriter req;
   SeerStatus st = build_lobop(conn, locator, loclen, LOB_OP_WRITE, true, 1, false, 0, &req);
   if (st != SEER_OK)
     return st;
-  seer_writer_u8(&req, 0x0E);
-  if (n <= 0xFC) {
-    seer_writer_u8(&req, (uint8_t)n);
-    seer_writer_bytes(&req, data, n);
-  } else {
-    seer_writer_u8(&req, 0xFE);
-    for (size_t i = 0; i < n; i += 0x7FFF) {
-      size_t chunk = n - i < 0x7FFF ? n - i : 0x7FFF;
-      seer_enc_sb4(&req, (uint32_t)chunk);
-      seer_writer_bytes(&req, data + i, chunk);
-    }
-    seer_enc_sb4(&req, 0);
-  }
+  seer_writer_u8(&req, TTI_LOB);
+  SeerLobDataMsg lm = {.data = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  seer_schema_encode(SEER_LOB_DATA_SCHEMA, &cx, &lm, &req);
   if (!seer_writer_ok(&req)) {
     seer_writer_free(&req);
     return SEER_ENOMEM;

@@ -256,7 +256,7 @@ const SeerField SEER_ROWID_CELL_SCHEMA[] = {
 };
 
 const SeerField SEER_LOB_DATA_SCHEMA[] = {
-    SEER_F(SF_VALUE, SeerLobDataMsg, data),
+    SEER_F(SF_LOB, SeerLobDataMsg, data),
     SEER_END,
 };
 

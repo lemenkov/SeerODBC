@@ -71,9 +71,10 @@ extern const SeerField SEER_LOBOPS_REPLY_SCHEMA[];
 /* The locator as 8i / 9i keep it: its ub2 length and the bytes, malloc'd. */
 uint8_t *seer_lobop_reply_locator(const SeerLobopReplyMsg *m, size_t *n);
 
-/* A LOB data message's content (TTI_LOB, after its token): a value, chunked
- * past 252 bytes - by ub1 chunks on 8i and 9i (whose servers always chunk it:
- * 963 of 963 in the replay corpus) and by sb4 ones from 12.1. */
+/* A LOB data message's content (TTI_LOB, after its token), both ways
+ * (SF_LOB). Read, a value chunked past 252 bytes - by ub1 chunks on 8i and
+ * 9i (whose servers always chunk it: 963 of 963 in the replay corpus) and by
+ * sb4 ones from 12.1; written, as a LOB write sends it. */
 typedef struct {
   SeerBytes data;
 } SeerLobDataMsg;

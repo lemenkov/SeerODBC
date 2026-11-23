@@ -7853,19 +7853,11 @@ static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_
   SeerWriter tw;
   if (!seer_writer_init(&tw, n + n / 252 + 16))
     return SEER_ENOMEM;
+  /* The content as a LOB data message: SEER_LOB_DATA_SCHEMA at 9.2 (#398). */
   seer_writer_u8(&tw, TTI_LOB);
-  if (n <= 252) {
-    seer_writer_u8(&tw, (uint8_t)n);
-    seer_writer_bytes(&tw, data, n);
-  } else {
-    seer_writer_u8(&tw, 0xFE);
-    for (size_t off = 0; off < n; off += 252) {
-      size_t k = n - off < 252 ? n - off : 252;
-      seer_writer_u8(&tw, (uint8_t)k);
-      seer_writer_bytes(&tw, data + off, k);
-    }
-    seer_writer_u8(&tw, 0);
-  }
+  SeerLobDataMsg lm = {.data = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  seer_schema_encode(SEER_LOB_DATA_SCHEMA, &cx, &lm, &tw);
   uint8_t *resp = NULL;
   size_t rlen = 0;
   SeerStatus st = seer_writer_ok(&tw) ? fv2_lobop_send(c, loc, 86, &m, tw.buf, tw.len, &resp, &rlen)
