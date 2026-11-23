@@ -51,9 +51,11 @@ typedef enum {
   SF_EACH,    /* the sub-schema `sub` as many times as the int64_t member at
                * `arg` says, each item read into a scratch message of `subsize`
                * bytes and dropped: what the client passes over; decode only */
-  SF_CHR      /* SF_VALUE as thin writes a bind value (oracledb encode_chr):
-               * inline only up to 64 bytes below 12.1, 252 from; read as
-               * SF_VALUE */
+  SF_CHR      /* a SeerBytes as a bind value is written (oracledb
+               * encode_chr, 8i's o8w_chr): a ub1 length and the bytes up to
+               * 64 bytes - 252 on thin from 12.1 - else 0xFE, chunks of 64,
+               * a 0; each chunk's length a ub1, on thin from 12.1 an sb4.
+               * Read as SF_VALUE */
 } SeerFieldKind;
 
 /* Guards: which codecs carry the field (0 = all); the field-version range it

@@ -72,23 +72,35 @@ static void put_num(SeerWriter *w, const SeerSchemaCtx *cx, uint8_t kind, int64_
   put_le(w, (uint64_t)v, kind == SF_N1 ? 1 : kind == SF_N2 ? 2 : 4);
 }
 
-/* SF_SQL: the SQL text (seerdb _ALL8_HEAD's sql; 8i o8w_chr). */
+/* SF_CHR: a bind value's bytes (oracledb encode_chr; 8i o8w_chr). Inline
+ * up to 64 bytes, on thin from 12.1 up to 252; past that 0xFE and chunks of
+ * 64 to a zero length, each length a ub1, or an sb4 on thin from 12.1. */
+static void put_chr(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
+{
+  bool wide = cx->codec == SEER_CODEC_THIN && cx->wide_chunks;
+  if (b->n <= (wide ? 252u : 64u)) {
+    seer_writer_u8(w, (uint8_t)b->n);
+    if (b->n > 0)
+      seer_writer_bytes(w, b->p, b->n);
+    return;
+  }
+  seer_writer_u8(w, 0xFE);
+  for (size_t off = 0; off < b->n; off += 64) {
+    size_t k = b->n - off < 64 ? b->n - off : 64;
+    if (wide)
+      seer_enc_sb4(w, (uint32_t)k);
+    else
+      seer_writer_u8(w, (uint8_t)k);
+    seer_writer_bytes(w, b->p + off, k);
+  }
+  seer_writer_u8(w, 0);
+}
+
+/* SF_SQL: the SQL text (seerdb _ALL8_HEAD's sql; 8i as SF_CHR). */
 static void put_sql(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
 {
   if (cx->codec == SEER_CODEC_O8I) {
-    if (b->n <= 64) {
-      seer_writer_u8(w, (uint8_t)b->n);
-      if (b->n > 0)
-        seer_writer_bytes(w, b->p, b->n);
-      return;
-    }
-    seer_writer_u8(w, 0xFE);
-    for (size_t off = 0; off < b->n; off += 64) {
-      size_t k = b->n - off < 64 ? b->n - off : 64;
-      seer_writer_u8(w, (uint8_t)k);
-      seer_writer_bytes(w, b->p + off, k);
-    }
-    seer_writer_u8(w, 0);
+    put_chr(w, cx, b);
     return;
   }
   if (cx->fv < TTC_FIELD_VERSION_12_1) {
@@ -108,13 +120,13 @@ static void put_sql(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
     seer_enc_sb4(w, 0);
 }
 
-static void put_value(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b, size_t inline_max)
+static void put_value(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
 {
   if (b->n == 0) {
     seer_writer_u8(w, 0);
     return;
   }
-  if (b->n <= inline_max) {
+  if (b->n <= 252) {
     seer_writer_u8(w, (uint8_t)b->n);
     seer_writer_bytes(w, b->p, b->n);
     return;
@@ -161,11 +173,10 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
       seer_writer_bytes(w, f->lit, f->arg);
       break;
     case SF_VALUE:
-      put_value(w, cx, (const SeerBytes *)((const char *)msg + f->off), 252);
+      put_value(w, cx, (const SeerBytes *)((const char *)msg + f->off));
       break;
     case SF_CHR:
-      put_value(w, cx, (const SeerBytes *)((const char *)msg + f->off),
-                cx->codec == SEER_CODEC_THIN && !cx->wide_chunks ? 64 : 252);
+      put_chr(w, cx, (const SeerBytes *)((const char *)msg + f->off));
       break;
     case SF_SQL:
       put_sql(w, cx, (const SeerBytes *)((const char *)msg + f->off));
@@ -202,7 +213,7 @@ void seer_schema_encode(const SeerField *schema, const SeerSchemaCtx *cx, const 
       const SeerBytes *b = (const SeerBytes *)((const char *)msg + f->off);
       put_num(w, cx, f->arg ? (uint8_t)f->arg : SF_N4, (int64_t)b->n);
       if (b->n > 0)
-        put_value(w, cx, b, 252);
+        put_value(w, cx, b);
       break;
     }
     default:

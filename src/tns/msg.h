@@ -28,6 +28,14 @@ typedef struct {
 
 extern const SeerField SEER_OAC_SCHEMA[];
 
+/* A bind value's bytes alone, as SF_CHR writes them: a VARCHAR or RAW
+ * value, a REF, an object image, 8i's text values. */
+typedef struct {
+  SeerBytes value;
+} SeerChrMsg;
+
+extern const SeerField SEER_CHR_SCHEMA[];
+
 /* A LOBOPS call's body, after the function header. One field list on every
  * path (seerdb _O7_LOBOPS): 8i and 9i carry the offsets and amount in the
  * short slots, 10g+ adds the long ones and three reserved array slots and

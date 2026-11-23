@@ -45,6 +45,11 @@ const SeerField SEER_OAC_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_CHR_SCHEMA[] = {
+    SEER_F(SF_CHR, SeerChrMsg, value),
+    SEER_END,
+};
+
 #define D SeerDcbColumnMsg
 const SeerField SEER_DCB_COLUMN_SCHEMA[] = {
     OAC_FIELDS(D),

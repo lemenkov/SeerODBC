@@ -1961,42 +1961,20 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
                        rxd_len);
 }
 
-/* Encode a bind value (oracledb encode_chr). Two forms, split at 12.2:
- *   - 12.2+ (write_bytes_with_length): inline <ub1 len><bytes> for n <= 252, else
- *     the 0xFE marker + 64-byte chunks each prefixed by an *sb4* length, then a
- *     zero-length terminator.
- *   - pre-12.2 (11g/10g): inline <ub1 len><bytes> for n <= 64, else 0xFE + 64-byte
- *     chunks each prefixed by a bare *ub1* length, then a 0 terminator.
+/* Encode a bind value (oracledb encode_chr) by SEER_CHR_SCHEMA (#398): from
+ * 12.1 inline up to 252 bytes, else 0xFE and 64-byte chunks each with an sb4
+ * length; before, inline only up to 64 and each chunk's length a ub1.
  * Sending the wrong chunk width desyncs the server's two-task conversion
  * (ORA-03120). Used for VARCHAR and RAW bind values; malloc'd *out. */
 static SeerStatus encode_chr(const uint8_t *data, size_t n, uint8_t fv, uint8_t **out,
                              size_t *outlen)
 {
-  bool new_form = fv >= TTC_FIELD_VERSION_12_1;
-  /* A plain length byte covers 1..252: 0xFD (253), 0xFE (chunked) and 0xFF
-   * (NULL) are markers, so a 253-byte value inline reads as a marker. */
-  size_t inline_max = new_form ? 252 : 64;
   SeerWriter w;
   if (!seer_writer_init(&w, n + 16))
     return SEER_ENOMEM;
-  if (n <= inline_max) {
-    seer_writer_u8(&w, (uint8_t)n);
-    seer_writer_bytes(&w, data, n);
-  } else {
-    seer_writer_u8(&w, 0xFE);
-    for (size_t i = 0; i < n; i += 0x40) {
-      size_t chunk = (n - i < 0x40) ? n - i : 0x40;
-      if (new_form)
-        seer_enc_sb4(&w, (uint32_t)chunk);
-      else
-        seer_writer_u8(&w, (uint8_t)chunk);
-      seer_writer_bytes(&w, data + i, chunk);
-    }
-    if (new_form)
-      seer_enc_sb4(&w, 0); /* zero-length terminator */
-    else
-      seer_writer_u8(&w, 0);
-  }
+  SeerChrMsg m = {.value = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, &w);
   if (!seer_writer_ok(&w)) {
     seer_writer_free(&w);
     return SEER_ENOMEM;
@@ -5609,22 +5587,13 @@ static void o8w_le32(SeerWriter *w, uint32_t v)
     seer_writer_u8(w, (uint8_t)(v >> (8 * i)));
 }
 
-/* Text as the pre-10g chunked string: a length byte up to 64 bytes, else 0xFE,
- * 64-byte chunks and a zero length. */
+/* A value as 8i writes one, SEER_CHR_SCHEMA at 8i's widths (#398): a length
+ * byte up to 64 bytes, else 0xFE, 64-byte chunks and a zero length. */
 static void o8w_chr(SeerWriter *w, const uint8_t *p, size_t n)
 {
-  if (n <= 64) {
-    seer_writer_u8(w, (uint8_t)n);
-    seer_writer_bytes(w, p, n);
-    return;
-  }
-  seer_writer_u8(w, 0xFE);
-  for (size_t off = 0; off < n; off += 64) {
-    size_t k = n - off < 64 ? n - off : 64;
-    seer_writer_u8(w, (uint8_t)k);
-    seer_writer_bytes(w, p + off, k);
-  }
-  seer_writer_u8(w, 0);
+  SeerChrMsg m = {.value = {.p = p, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, w);
 }
 
 /* UTF-8 text in 8i's session charset, WE8ISO8859P1: a character it cannot hold
@@ -9657,14 +9626,10 @@ static void obj_write_length(SeerWriter *w, uint32_t n)
  * of encode_chr): <ub1 len> inline up to 252, else 0xFE + sb4 chunks. */
 static SeerStatus obj_append_chr(SeerWriter *w, const uint8_t *data, size_t n, uint8_t fv)
 {
-  uint8_t *enc = NULL;
-  size_t enclen = 0;
-  SeerStatus st = encode_chr(data, n, fv, &enc, &enclen);
-  if (st != SEER_OK)
-    return st;
-  seer_writer_bytes(w, enc, enclen);
-  free(enc);
-  return SEER_OK;
+  SeerChrMsg m = {.value = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, w);
+  return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
 /* Look up an object type's 16-byte OID (ALL_TYPES) and its ordered attribute
