@@ -50,6 +50,68 @@ const SeerField SEER_CHR_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_VALUE_SCHEMA[] = {
+    SEER_F(SF_VALUE, SeerChrMsg, value),
+    SEER_END,
+};
+
+const SeerField SEER_DESCRIBE_HEAD_SCHEMA[] = {
+    SEER_F(SF_N4, SeerDescribeHeadMsg, max_row_size),
+    SEER_F(SF_N4, SeerDescribeHeadMsg, ncols),
+    {.kind = SF_U8,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerDescribeHeadMsg, reserved),
+     .if_off = offsetof(SeerDescribeHeadMsg, ncols)},
+    SEER_END,
+};
+
+#define A SeerDcbAnnotationsMsg
+#define IF_ANN(kind_, member_)                                                                     \
+  {.kind = (kind_), .flags = SG_IF_SET, .off = offsetof(A, member_), .if_off = offsetof(A, count)}
+const SeerField SEER_DCB_ANNOTATIONS_HEAD_SCHEMA[] = {
+    SEER_F(SF_N4, A, count), IF_ANN(SF_U8, ptr), IF_ANN(SF_N4, count2),
+    IF_ANN(SF_U8, ptr2),     SEER_END,
+};
+
+const SeerField SEER_DCB_ANNOTATIONS_TAIL_SCHEMA[] = {
+    SEER_F(SF_N4, A, flags),
+    SEER_END,
+};
+#undef IF_ANN
+#undef A
+
+const SeerField SEER_IMPLICIT_COUNT_SCHEMA[] = {
+    SEER_F(SF_N4, SeerImplicitMsg, nres),
+    SEER_END,
+};
+
+const SeerField SEER_IMPLICIT_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, SeerImplicitMsg, pre_len),
+    {.kind = SF_RAW,
+     .off = offsetof(SeerImplicitMsg, preamble),
+     .arg = offsetof(SeerImplicitMsg, pre_len)},
+    SEER_END,
+};
+
+const SeerField SEER_IMPLICIT_TAIL_SCHEMA[] = {
+    SEER_F(SF_N2, SeerImplicitMsg, cursor_id),
+    SEER_END,
+};
+
+const SeerField SEER_CURSOR_VALUE_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, SeerCursorValueMsg, len),
+    SEER_END,
+};
+
+const SeerField SEER_CURSOR_VALUE_TAIL_SCHEMA[] = {
+    SEER_F(SF_N2, SeerCursorValueMsg, cursor_id),
+    {.kind = SF_U8,
+     .flags = SG_IF_SET,
+     .off = offsetof(SeerCursorValueMsg, indicator),
+     .if_off = offsetof(SeerCursorValueMsg, has_indicator)},
+    SEER_END,
+};
+
 #define D SeerDcbColumnMsg
 const SeerField SEER_DCB_COLUMN_SCHEMA[] = {
     OAC_FIELDS(D),

@@ -703,19 +703,18 @@ static char *bytes_dup_str(const SeerBytes *b)
 
 static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_cols, int *out_ncols)
 {
-  (void)seer_dec_sb4(r); /* max row size */
-  int64_t ncols = seer_dec_sb4(r);
-  if (ncols < 0 || ncols > 4096 || !seer_reader_ok(r))
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerDescribeHeadMsg hm = {0}; /* SEER_DESCRIBE_HEAD_SCHEMA (#398) */
+  if (!seer_schema_decode(SEER_DESCRIBE_HEAD_SCHEMA, &cx, r, &hm) || hm.ncols < 0 ||
+      hm.ncols > 4096)
     return SEER_EPROTO;
-  if (ncols > 0)
-    (void)seer_reader_u8(r); /* reserved byte */
+  int64_t ncols = hm.ncols;
 
   SeerColumn *cols = calloc((size_t)ncols, sizeof *cols);
   if (cols == NULL && ncols > 0)
     return SEER_ENOMEM;
 
-  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
-  cx.wide_chunks = r->sb4_chunks;
   for (int64_t i = 0; i < ncols; i++) {
     /* SEER_DCB_COLUMN_SCHEMA (#398): the OAC's fields, nullable, the name and
      * the type's schema and name, the position, 11.2's UDS flags, 23.1's SQL
@@ -743,17 +742,19 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
       cols[i].n_obj_attrs = -1; /* layout not yet fetched */
     }
     seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
-    SeerStatus st;
     if (fv > TTC_FIELD_VERSION_23_1) {
-      /* 23ai (fv24): per-column annotation map + vector descriptor (#89).
-       * The count is sent twice around a 1-byte pointer; each key/value
-       * pair is followed by a ub4 flags word, with a trailing ub4 after
-       * the loop. The map is serialized as "name=value\n..." (name-only
-       * annotations get an empty value) into cols[i].annotations. Both
-       * fields must be fully consumed or the row stream desyncs. */
-      int64_t nann = seer_dec_sb4(r);
-      if (nann > 0) {
-        if (nann > 4096) {
+      /* 23ai (fv24): per-column annotation map + vector descriptor (#89),
+       * SEER_DCB_ANNOTATIONS_HEAD_SCHEMA, the pairs and the tail (#398).
+       * The map is serialized as "name=value\n..." (name-only annotations
+       * get an empty value) into cols[i].annotations. Both fields must be
+       * fully consumed or the row stream desyncs. */
+      SeerDcbAnnotationsMsg am = {0};
+      if (!seer_schema_decode(SEER_DCB_ANNOTATIONS_HEAD_SCHEMA, &cx, r, &am)) {
+        free(name);
+        goto fail;
+      }
+      if (am.count > 0) {
+        if (am.count > 4096 || am.count2 > 4096) {
           free(name);
           goto fail;
         }
@@ -762,30 +763,23 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
           free(name);
           goto fail;
         }
-        (void)seer_reader_u8(r); /* pointer            */
-        nann = seer_dec_sb4(r);  /* count, repeated    */
-        (void)seer_reader_u8(r); /* pointer            */
-        for (int64_t a = 0; a < nann && seer_reader_ok(r); a++) {
-          char *akey = NULL, *aval = NULL;
-          st = seer_read_str(r, &akey);
-          if (st == SEER_OK)
-            st = seer_read_str(r, &aval);
-          if (st != SEER_OK) {
-            free(akey);
-            free(aval);
+        for (int64_t a = 0; a < am.count2 && seer_reader_ok(r); a++) {
+          SeerAuthPairMsg pm = {0};
+          bool ok = seer_schema_decode(SEER_AUTH_PAIR_SCHEMA, &cx, r, &pm);
+          if (ok) {
+            seer_writer_bytes(&ann, pm.key.p, pm.key.n);
+            seer_writer_u8(&ann, '=');
+            seer_writer_bytes(&ann, pm.value.p, pm.value.n);
+            seer_writer_u8(&ann, '\n');
+          }
+          seer_schema_free(SEER_AUTH_PAIR_SCHEMA, &pm);
+          if (!ok) {
             seer_writer_free(&ann);
             free(name);
             goto fail;
           }
-          seer_writer_bytes(&ann, akey, strlen(akey));
-          seer_writer_u8(&ann, '=');
-          seer_writer_bytes(&ann, aval, strlen(aval));
-          seer_writer_u8(&ann, '\n');
-          free(akey);
-          free(aval);
-          (void)seer_dec_sb4(r); /* per-pair flags     */
         }
-        (void)seer_dec_sb4(r); /* trailing flags     */
+        (void)seer_schema_decode(SEER_DCB_ANNOTATIONS_TAIL_SCHEMA, &cx, r, &am);
         if (seer_writer_ok(&ann) && ann.len > 0) {
           char *s = malloc(ann.len + 1);
           if (s == NULL) {
@@ -841,7 +835,12 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
 
 static SeerStatus parse_dcb(SeerReader *r, SeerStmt *stmt)
 {
-  seer_skip_chunked(r); /* describe-info preamble */
+  /* The describe-info preamble, a value: SEER_VALUE_SCHEMA (#398). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerChrMsg pm = {0};
+  (void)seer_schema_decode(SEER_VALUE_SCHEMA, &cx, r, &pm);
+  seer_schema_free(SEER_VALUE_SCHEMA, &pm);
   SeerColumn *cols = NULL;
   int ncols = 0;
   SeerStatus st = parse_describe_body(r, stmt->conn->field_version, &cols, &ncols);
@@ -859,15 +858,17 @@ static SeerStatus parse_dcb(SeerReader *r, SeerStmt *stmt)
 static SeerStatus read_cursor_value(SeerReader *r, int fv, bool indicator, SeerColumn **out_cols,
                                     int *out_ncols, int64_t *out_id)
 {
-  (void)seer_reader_u8(r); /* value length */
+  /* SEER_CURSOR_VALUE_HEAD_SCHEMA, the describe, _TAIL_SCHEMA (#398). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  SeerCursorValueMsg m = {.has_indicator = indicator};
+  (void)seer_schema_decode(SEER_CURSOR_VALUE_HEAD_SCHEMA, &cx, r, &m);
   SeerColumn *cols = NULL;
   int ncols = 0;
   SeerStatus st = parse_describe_body(r, fv, &cols, &ncols);
   if (st != SEER_OK)
     return st;
-  int64_t cursor_id = seer_dec_sb4(r); /* nested cursor id */
-  if (indicator)
-    (void)seer_reader_u8(r);
+  (void)seer_schema_decode(SEER_CURSOR_VALUE_TAIL_SCHEMA, &cx, r, &m);
+  int64_t cursor_id = m.cursor_id; /* nested cursor id */
   if (!seer_reader_ok(r)) {
     free_columns(cols, ncols);
     return SEER_EPROTO;
@@ -903,19 +904,21 @@ static SeerStatus parse_refcursor_out(SeerReader *r, SeerStmt *stmt)
  * seer_stmt_next_result. */
 static SeerStatus parse_implicit(SeerReader *r, SeerStmt *stmt)
 {
-  int64_t nres = seer_dec_sb4(r);
-  if (nres < 0 || nres > 4096 || !seer_reader_ok(r))
+  /* SEER_IMPLICIT_COUNT_SCHEMA, then each result's _HEAD_SCHEMA, describe
+   * and _TAIL_SCHEMA (#398). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  SeerImplicitMsg m = {0};
+  if (!seer_schema_decode(SEER_IMPLICIT_COUNT_SCHEMA, &cx, r, &m) || m.nres < 0 || m.nres > 4096)
     return SEER_EPROTO;
-  for (int64_t i = 0; i < nres; i++) {
-    uint8_t prelen = seer_reader_u8(r); /* preamble length */
-    if (prelen > 0)
-      seer_reader_bytes(r, prelen);
+  for (int64_t i = 0; i < m.nres; i++) {
+    (void)seer_schema_decode(SEER_IMPLICIT_HEAD_SCHEMA, &cx, r, &m);
     SeerColumn *cols = NULL;
     int ncols = 0;
     SeerStatus st = parse_describe_body(r, stmt->conn->field_version, &cols, &ncols);
     if (st != SEER_OK)
       return st;
-    int64_t cursor_id = seer_dec_sb4(r); /* ub2 cursor id */
+    (void)seer_schema_decode(SEER_IMPLICIT_TAIL_SCHEMA, &cx, r, &m);
+    int64_t cursor_id = m.cursor_id;
     if (!seer_reader_ok(r)) {
       free_columns(cols, ncols);
       return SEER_EPROTO;

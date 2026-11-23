@@ -36,6 +36,50 @@ typedef struct {
 
 extern const SeerField SEER_CHR_SCHEMA[];
 
+/* A value alone, read: the DCB's describe-info preamble. */
+extern const SeerField SEER_VALUE_SCHEMA[];
+
+/* A describe's head, before its columns: the maximum row size, the column
+ * count and, when there are columns, a reserved byte. */
+typedef struct {
+  int64_t max_row_size, ncols, reserved;
+} SeerDescribeHeadMsg;
+
+extern const SeerField SEER_DESCRIBE_HEAD_SCHEMA[];
+
+/* A column's annotation map on 23ai (fv24, #89): the count, and when there
+ * are annotations a pointer byte, the count again and a pointer byte; then
+ * each annotation as an AUTH_ pair (SEER_AUTH_PAIR_SCHEMA: the name, the
+ * value, a flags word) and a trailing flags word. */
+typedef struct {
+  int64_t count, ptr, count2, ptr2, flags;
+} SeerDcbAnnotationsMsg;
+
+extern const SeerField SEER_DCB_ANNOTATIONS_HEAD_SCHEMA[];
+extern const SeerField SEER_DCB_ANNOTATIONS_TAIL_SCHEMA[];
+
+/* An implicit result (TTI_IRD, after the count): a preamble - a ub1 length
+ * and its bytes - then the describe, then the cursor id. */
+typedef struct {
+  int64_t nres, pre_len;
+  SeerBytes preamble;
+  int64_t cursor_id;
+} SeerImplicitMsg;
+
+extern const SeerField SEER_IMPLICIT_COUNT_SCHEMA[];
+extern const SeerField SEER_IMPLICIT_HEAD_SCHEMA[];
+extern const SeerField SEER_IMPLICIT_TAIL_SCHEMA[];
+
+/* A cursor value: a length byte, the describe, the cursor id, then for a REF
+ * CURSOR OUT bind (§6.5) an indicator; a nested CURSOR(...) column has
+ * none. */
+typedef struct {
+  int64_t len, cursor_id, has_indicator, indicator;
+} SeerCursorValueMsg;
+
+extern const SeerField SEER_CURSOR_VALUE_HEAD_SCHEMA[];
+extern const SeerField SEER_CURSOR_VALUE_TAIL_SCHEMA[];
+
 /* A LOBOPS call's body, after the function header. One field list on every
  * path (seerdb _O7_LOBOPS): 8i and 9i carry the offsets and amount in the
  * short slots, 10g+ adds the long ones and three reserved array slots and
