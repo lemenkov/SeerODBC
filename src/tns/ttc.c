@@ -10,6 +10,7 @@
 #include "conn.h"
 #include "log.h"
 #include "marshal.h"
+#include "msg.h"       /* the function header as a schema (#398) */
 #include "netcompat.h" /* gethostname(): <unistd.h> on POSIX, Winsock on Windows */
 #include "wire.h"      /* the host name and pid a login sends (#396) */
 #include "packet.h"
@@ -694,15 +695,16 @@ uint8_t seer_ttc_next_seq(SeerConn *c)
 
 void seer_ttc_fun_header(SeerConn *c, SeerWriter *w, uint8_t opcode)
 {
-  seer_writer_u8(w, TTI_FUN);
-  seer_writer_u8(w, opcode);
-  seer_writer_u8(w, seer_ttc_next_seq(c));
-  /* fv24 (23ai): oracledb writes a ub8 token after the sequence number on every
-   * function message (seerdb _fun_header, PROTOCOL.md §20). It is 0 for an
-   * ordinary call (encoding to a single 0x00) and 1..N for a pipelined op
-   * (§32/#158), so the server can correlate each burst response. */
-  if (c->field_version > TTC_FIELD_VERSION_23_1)
-    seer_enc_sb4(w, c->pipeline_token);
+  /* SEER_FUN_HEAD_SCHEMA: from fv24 (23ai) a ub8 token follows the sequence
+   * number on every function message (seerdb _fun_header, PROTOCOL.md §20) -
+   * 0 for an ordinary call, 1..N for a pipelined op (§32/#158), so the server
+   * can correlate each burst response. */
+  SeerFunHeadMsg h = {.type = TTI_FUN,
+                      .function = opcode,
+                      .seq = seer_ttc_next_seq(c),
+                      .call_token = c->pipeline_token};
+  SeerSchemaCtx cx = seer_msg_ctx(c->is_8i, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
 }
 
 /* ------------------------------------------------------------- TTI_PRO/DTY */

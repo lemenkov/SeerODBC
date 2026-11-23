@@ -101,6 +101,25 @@ typedef struct {
 
 extern const SeerField SEER_CELL_SCHEMA[];
 
+/* A function call's header: the message type (TTI_FUN, or the piggyback
+ * 0x11), the function, the sequence number, and from field version 24 the
+ * call's token - 0 for an ordinary call, a pipelined op's own (#158). */
+typedef struct {
+  int64_t type, function, seq, call_token;
+} SeerFunHeadMsg;
+
+extern const SeerField SEER_FUN_HEAD_SCHEMA[];
+
+/* Close cursors (TTI_OCCA, a piggyback ahead of the next call; seerdb
+ * _CLOSE_CURSORS): the list's pointer, then the cursor ids, counted. */
+typedef struct {
+  int64_t list_ptr;
+  const int *ids;
+  int64_t n;
+} SeerCloseCursorsMsg;
+
+extern const SeerField SEER_CLOSE_CURSORS_SCHEMA[];
+
 /* The context a connection's messages are written and read in. */
 SeerSchemaCtx seer_msg_ctx(int is_8i, uint8_t fv, uint8_t server_fv);
 

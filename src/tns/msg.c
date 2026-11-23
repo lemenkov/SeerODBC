@@ -126,6 +126,22 @@ const SeerField SEER_LOB_DATA_SCHEMA[] = {
     SEER_END,
 };
 
+const SeerField SEER_FUN_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, SeerFunHeadMsg, type),
+    SEER_F(SF_U8, SeerFunHeadMsg, function),
+    SEER_F(SF_U8, SeerFunHeadMsg, seq),
+    SEER_FV(SF_N4, THIN, TTC_FIELD_VERSION_23_1 + 1, 0, SeerFunHeadMsg, call_token),
+    SEER_END,
+};
+
+const SeerField SEER_CLOSE_CURSORS_SCHEMA[] = {
+    SEER_F(SF_U8, SeerCloseCursorsMsg, list_ptr),
+    {.kind = SF_INTS,
+     .off = offsetof(SeerCloseCursorsMsg, ids),
+     .arg = offsetof(SeerCloseCursorsMsg, n)},
+    SEER_END,
+};
+
 const SeerField SEER_LOBOPS_REPLY_SCHEMA[] = {
     SEER_F(SF_BE2, SeerLobopReplyMsg, loc_len),
     {.kind = SF_RAW,

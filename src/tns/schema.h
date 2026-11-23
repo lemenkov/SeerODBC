@@ -36,8 +36,10 @@ typedef enum {
   SF_VALUE,   /* bytes with their length: thin ub1 / 0xFE chunks, 8i the same at ub1 */
   SF_RAW,     /* bytes as they are, as many as the member at `arg` (an int64_t) says */
   SF_COUNTED, /* a count, then (when > 0) a SF_VALUE: thin's bytes-with-length */
-  SF_U8L      /* a byte, written by thin with its length byte even when 0 (`01 00`,
+  SF_U8L,     /* a byte, written by thin with its length byte even when 0 (`01 00`,
                * as ojdbc14 writes it), one byte on 8i */
+  SF_INTS     /* an N4 count, then that many N4s: the member is a `const int *`,
+               * `arg` the offsetof its int64_t count; encode only */
 } SeerFieldKind;
 
 /* Guards: which codecs carry the field (0 = all); the field-version range it

@@ -3083,15 +3083,12 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   /* Flush any closed statements' server cursors as a CLOSE_CURSORS piggyback in
    * front of this execute, so they don't leak until session end. */
   if (c->n_close > 0) {
-    seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-    seer_writer_u8(w, TTI_OCCA);
-    seer_writer_u8(w, seer_ttc_next_seq(c));
-    if (c->field_version > TTC_FIELD_VERSION_23_1)
-      seer_enc_sb4(w, 0); /* ub8 token (fv24) */
-    seer_writer_u8(w, 1); /* cursor-list pointer present */
-    seer_enc_sb4(w, (uint32_t)c->n_close);
-    for (int i = 0; i < c->n_close; i++)
-      seer_enc_sb4(w, (uint32_t)c->close_cursors[i]);
+    SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    SeerFunHeadMsg h = {
+        .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_OCCA, .seq = seer_ttc_next_seq(c)};
+    SeerCloseCursorsMsg cc = {.list_ptr = 1, .ids = c->close_cursors, .n = c->n_close};
+    seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+    seer_schema_encode(SEER_CLOSE_CURSORS_SCHEMA, &cx, &cc, w);
     c->n_close = 0;
   }
 
@@ -5935,13 +5932,13 @@ static void o8i_closing(SeerConn *c, SeerWriter *w)
 {
   if (c->n_close == 0)
     return;
-  seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-  seer_writer_u8(w, TTI_OCCA);
-  seer_writer_u8(w, seer_ttc_next_seq(c));
-  seer_writer_u8(w, 1);
-  o8w_le32(w, (uint32_t)c->n_close);
-  for (int i = 0; i < c->n_close; i++)
-    o8w_le32(w, (uint32_t)c->close_cursors[i]);
+  /* SEER_CLOSE_CURSORS_SCHEMA, as 10g+'s, at 8i's widths (#398) */
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerFunHeadMsg h = {
+      .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_OCCA, .seq = seer_ttc_next_seq(c)};
+  SeerCloseCursorsMsg cc = {.list_ptr = 1, .ids = c->close_cursors, .n = c->n_close};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+  seer_schema_encode(SEER_CLOSE_CURSORS_SCHEMA, &cx, &cc, w);
   c->n_close = 0;
 }
 
