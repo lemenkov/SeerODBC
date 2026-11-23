@@ -29,9 +29,22 @@
 /* ---------------------------------------------------------- static messages */
 
 /* TTI_PRO request: token, version vector 6..0 (0-terminated), driver name. */
-static const uint8_t PRO_MSG[] = {
-    TTI_PRO, 6, 5, 4, 3, 2, 1, 0, 'p', 'y', 't', 'h', 'o', 'n', 0,
-};
+/* The TTI_PRO request, SEER_PRO_SCHEMA (#398): protocol versions 6 down to
+ * 1, and the banner python-oracledb sends. */
+static void pro_write(SeerWriter *w)
+{
+  static const uint8_t VERSIONS[] = {6, 5, 4, 3, 2, 1};
+  static const char BANNER[] = "python";
+  SeerProMsg m = {.versions_len = sizeof VERSIONS,
+                  .versions = {.p = VERSIONS, .n = sizeof VERSIONS},
+                  .banner_len = sizeof BANNER - 1,
+                  .banner = {.p = (const uint8_t *)BANNER, .n = sizeof BANNER - 1}};
+  /* Sent before any field version is agreed; nothing in it depends on one,
+   * so the oldest thin one. */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  seer_writer_u8(w, TTI_PRO);
+  seer_schema_encode(SEER_PRO_SCHEMA, &cx, &m, w);
+}
 
 /* TTI_DTY capability arrays for field version 6 (11.2), byte-identical to the
  * reference client (see PROTOCOL.md §4.2). compile_caps[7] is the field
@@ -1148,19 +1161,20 @@ static SeerStatus fast_auth_login(SeerConn *conn, const SeerConnParams *params,
     return st;
   }
 
-  if (!seer_writer_init(&bundle, sizeof PRO_MSG + dty.len + sess.len + 16)) {
+  if (!seer_writer_init(&bundle, dty.len + sess.len + 32)) {
     seer_writer_free(&dty);
     seer_writer_free(&sess);
     return SEER_ENOMEM;
   }
+  /* SEER_FAST_AUTH_HEAD_SCHEMA, TTI_PRO, _TAIL_SCHEMA (#398) */
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  SeerFastAuthMsg fm = {.version = 1,
+                        .flags1 = TNS_SERVER_CONVERTS_CHARS,
+                        .field_version = TTC_FIELD_VERSION_19_1_EXT1};
   seer_writer_u8(&bundle, TNS_MSG_TYPE_FAST_AUTH);
-  seer_writer_u8(&bundle, 1); /* version          */
-  seer_writer_u8(&bundle, TNS_SERVER_CONVERTS_CHARS);
-  seer_writer_u8(&bundle, 0); /* flag2            */
-  seer_writer_bytes(&bundle, PRO_MSG, sizeof PRO_MSG);
-  for (int i = 0; i < 5; i++) /* charset/flag/ncharset */
-    seer_writer_u8(&bundle, 0);
-  seer_writer_u8(&bundle, TTC_FIELD_VERSION_19_1_EXT1);
+  seer_schema_encode(SEER_FAST_AUTH_HEAD_SCHEMA, &cx, &fm, &bundle);
+  pro_write(&bundle);
+  seer_schema_encode(SEER_FAST_AUTH_TAIL_SCHEMA, &cx, &fm, &bundle);
   seer_writer_bytes(&bundle, dty.buf, dty.len);
   seer_writer_bytes(&bundle, sess.buf, sess.len);
   seer_writer_free(&dty);
@@ -1293,7 +1307,12 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   SeerStatus st;
 
   /* --- TTI_PRO: protocol negotiation --- */
-  st = seer_ttc_send(conn, PRO_MSG, sizeof PRO_MSG);
+  SeerWriter pw;
+  if (!seer_writer_init(&pw, 16))
+    return SEER_ENOMEM;
+  pro_write(&pw);
+  st = seer_writer_ok(&pw) ? seer_ttc_send(conn, pw.buf, pw.len) : SEER_ENOMEM;
+  seer_writer_free(&pw);
   if (st != SEER_OK)
     return st;
   st = seer_ttc_recv(conn, &resp, &rlen);

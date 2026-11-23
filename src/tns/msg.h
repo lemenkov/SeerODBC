@@ -36,6 +36,31 @@ typedef struct {
 
 extern const SeerField SEER_CHR_SCHEMA[];
 
+/* TTI_PRO, the protocol negotiation (after its token): the protocol versions
+ * the client takes, highest first, and a 0; then the client's banner and a
+ * NUL. */
+typedef struct {
+  int64_t versions_len;
+  SeerBytes versions;
+  int64_t banner_len;
+  SeerBytes banner;
+} SeerProMsg;
+
+extern const SeerField SEER_PRO_SCHEMA[];
+
+/* The fast-auth bundle (TNS_MSG_TYPE_FAST_AUTH, after its type; the
+ * one-round-trip login from fv24): a version (1), the server-converts-chars
+ * flag and a second flag; then the TTI_PRO message, token included; then the
+ * charset, a flag and the ncharset (0: the server's), the field version to
+ * use; then TTI_DTY and AUTH phase 1, each a message of its own. */
+typedef struct {
+  int64_t version, flags1, flags2;
+  int64_t charset, flag, ncharset, field_version;
+} SeerFastAuthMsg;
+
+extern const SeerField SEER_FAST_AUTH_HEAD_SCHEMA[];
+extern const SeerField SEER_FAST_AUTH_TAIL_SCHEMA[];
+
 /* TTI_DTY, the data-type negotiation (after its token): the charsets in and
  * out, little-endian; a flags byte - 3 with 12c's two-byte type table, 1
  * with the one-byte one; the compile and runtime capabilities, each a length

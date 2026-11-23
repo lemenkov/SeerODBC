@@ -111,6 +111,31 @@ const SeerField SEER_DTY_END_SCHEMA[] = {
 #undef DTY_WIDE
 #undef E
 
+const SeerField SEER_PRO_SCHEMA[] = {
+    {.kind = SF_RAW,
+     .off = offsetof(SeerProMsg, versions),
+     .arg = offsetof(SeerProMsg, versions_len)},
+    SEER_PAD(1),
+    {.kind = SF_RAW, .off = offsetof(SeerProMsg, banner), .arg = offsetof(SeerProMsg, banner_len)},
+    SEER_PAD(1),
+    SEER_END,
+};
+
+const SeerField SEER_FAST_AUTH_HEAD_SCHEMA[] = {
+    SEER_F(SF_U8, SeerFastAuthMsg, version),
+    SEER_F(SF_U8, SeerFastAuthMsg, flags1),
+    SEER_F(SF_U8, SeerFastAuthMsg, flags2),
+    SEER_END,
+};
+
+const SeerField SEER_FAST_AUTH_TAIL_SCHEMA[] = {
+    SEER_F(SF_LE2, SeerFastAuthMsg, charset),
+    SEER_F(SF_U8, SeerFastAuthMsg, flag),
+    SEER_F(SF_LE2, SeerFastAuthMsg, ncharset),
+    SEER_F(SF_U8, SeerFastAuthMsg, field_version),
+    SEER_END,
+};
+
 const SeerField SEER_VALUE_SCHEMA[] = {
     SEER_F(SF_VALUE, SeerChrMsg, value),
     SEER_END,
