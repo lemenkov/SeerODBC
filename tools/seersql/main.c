@@ -166,7 +166,8 @@ int main(int argc, char **argv)
   seer_log_set_level(level);
 
   SeerConn *conn = NULL;
-  SeerStatus st = seer_connect(&p, &conn);
+  char why[512];
+  SeerStatus st = seer_connect_diag(&p, &conn, why, sizeof why);
 
   if (st == SEER_OK) {
     printf("connected to %s:%u\n", p.host, p.port);
@@ -177,17 +178,12 @@ int main(int argc, char **argv)
     return rc;
   }
 
-  if (st == SEER_ENOTIMPL) {
-    /* Expected at the current milestone: the handshake + TTC negotiation
-     * run to completion and reach the auth challenge (see the log above),
-     * but O5LOGON is not wired up yet. Treat it as a successful protocol
-     * probe, not a hard failure. */
-    printf("login reached the authentication challenge against %s:%u; "
-           "O5LOGON not yet implemented.\n",
-           p.host, p.port);
-    return 0;
-  }
-
-  fprintf(stderr, "connect failed: %s\n", seer_strerror(st));
+  /* The server's or listener's own reason when there is one (an ORA- error,
+   * a listener refusal, the address that didn't answer), not only the status
+   * (#401). */
+  if (why[0])
+    fprintf(stderr, "connect failed: %s (%s)\n", why, seer_strerror(st));
+  else
+    fprintf(stderr, "connect failed: %s\n", seer_strerror(st));
   return 1;
 }
