@@ -52,10 +52,6 @@ static const Gate GATES[] = {
      "8.1.7 has no TIMESTAMP type"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 9, 9, GATE_SERVER,
      "9i's TRUNC takes no TIMESTAMP WITH LOCAL TIME ZONE (ORA-00932)"},
-    {"multi-batch fetch with a repeated column", 8, 8, GATE_SERVER,
-     "8i has no CONNECT BY level row generator"},
-    {"typed NULL parameter (COALESCE with NUMBER / DATE)", 8, 8, GATE_SERVER,
-     "8.1.7 has no COALESCE"},
     {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 8, GATE_SERVER,
      "8.1.7 has no UNISTR, and its national charset is WE8ISO8859P1"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
@@ -72,8 +68,6 @@ static const Gate GATES[] = {
      "no DBMS_SQL.RETURN_RESULT before 12c"},
     {"implicit results", 8, 11, GATE_SERVER, "no DBMS_SQL.RETURN_RESULT before 12c"},
     {"array DML row counts", 8, 11, GATE_SERVER, "no array-DML row counts before 12c"},
-    {"fetch all rows inside an open transaction", 8, 8, GATE_SERVER,
-     "8i has no CONNECT BY level row generator"},
     {"BOOLEAN (23ai)", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
     {"VECTOR (23ai)", 8, 21, GATE_SERVER, "no VECTOR type before 23ai"},
     {"JSON (OSON)", 8, 18, GATE_SERVER, "no JSON type before 21c"},
@@ -92,8 +86,6 @@ static const Gate GATES[] = {
      "XMLSERIALIZE reads it"},
     {"BINARY_FLOAT bind", 8, 9, GATE_SERVER, "no BINARY_FLOAT before 10g"},
     {"BOOLEAN bind (23ai)", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
-    {"CLOB fetch", 8, 8, GATE_SERVER, "8i has no TO_CLOB"},
-    {"BLOB fetch (hex)", 8, 8, GATE_SERVER, "8i has no TO_BLOB"},
 };
 
 static void pass(const char *name)
@@ -210,6 +202,32 @@ static void check_scalar(SQLHDBC dbc, const char *name, const char *sql, const c
     return;
   }
   pass(name);
+}
+
+/* A CLOB and a BLOB fetched as text: SQL_C_CHAR from binary is uppercase hex
+ * (the ODBC convention, per convert.c - the core's seersql path renders
+ * lowercase). 8.1.7 has no TO_CLOB / TO_BLOB, so 8i reads them from a table it
+ * fills with a string and HEXTORAW (#408). */
+static void check_lob_scalars(SQLHDBC dbc)
+{
+  if (g_release != 8) {
+    check_scalar(dbc, "CLOB fetch", "SELECT TO_CLOB('clobdata') FROM DUAL", "clobdata");
+    check_scalar(dbc, "BLOB fetch (hex)", "SELECT TO_BLOB(HEXTORAW('DEADBEEF')) FROM DUAL",
+                 "DEADBEEF");
+    return;
+  }
+  char err[256] = "";
+  exec_do(dbc, "DROP TABLE seer_lob8", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_lob8 (c CLOB, b BLOB)", err, sizeof err)) ||
+      !SQL_SUCCEEDED(exec_do(dbc, "INSERT INTO seer_lob8 VALUES ('clobdata', HEXTORAW('DEADBEEF'))",
+                             err, sizeof err))) {
+    fail("CLOB fetch", err);
+    fail("BLOB fetch (hex)", err);
+  } else {
+    check_scalar(dbc, "CLOB fetch", "SELECT c FROM seer_lob8", "clobdata");
+    check_scalar(dbc, "BLOB fetch (hex)", "SELECT b FROM seer_lob8", "DEADBEEF");
+  }
+  exec_do(dbc, "DROP TABLE seer_lob8", err, sizeof err);
 }
 
 static void check_bind(SQLHDBC dbc)
@@ -359,10 +377,16 @@ static void check_fetch_in_txn(SQLHDBC dbc)
   SQLHSTMT st;
   long n = 0;
   /* In an inline view: 9i ends a bare CONNECT BY on dual after the first
-   * fetch batch, which looked like a fetch that stopped at 10 rows. */
+   * fetch batch, which looked like a fetch that stopped at 10 rows. 8i's
+   * CONNECT BY on dual gives one row, so its 250 come from all_objects
+   * (#408). */
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLRETURN rc = SQLExecDirect(
-      st, (SQLCHAR *)"SELECT * FROM (SELECT level FROM dual CONNECT BY level <= 250)", SQL_NTS);
+      st,
+      (SQLCHAR *)(g_release == 8
+                      ? "SELECT * FROM (SELECT ROWNUM FROM all_objects WHERE ROWNUM <= 250)"
+                      : "SELECT * FROM (SELECT level FROM dual CONNECT BY level <= 250)"),
+      SQL_NTS);
   if (SQL_SUCCEEDED(rc))
     while (SQL_SUCCEEDED(SQLFetch(st)))
       n++;
@@ -447,10 +471,15 @@ static void check_batch_resume_repeated_column(SQLHDBC dbc)
   SQLHSTMT st;
   char err[256] = "";
   /* An inline view, as in check_fetch_in_txn: 9i ends a bare CONNECT BY on
-   * dual after one batch. */
+   * dual after one batch, and 8i's rows come from all_objects (#408). */
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLRETURN rc = SQLExecDirect(
-      st, (SQLCHAR *)"SELECT * FROM (SELECT level a, 'tail' t FROM dual CONNECT BY level <= 250)",
+      st,
+      (SQLCHAR *)(g_release == 8
+                      ? "SELECT * FROM (SELECT ROWNUM a, 'tail' t FROM all_objects "
+                        "WHERE ROWNUM <= 250)"
+                      : "SELECT * FROM (SELECT level a, 'tail' t FROM dual CONNECT BY level <= "
+                        "250)"),
       SQL_NTS);
   int rows = 0, good = SQL_SUCCEEDED(rc);
   while (good && SQL_SUCCEEDED(rc = SQLFetch(st))) {
@@ -825,7 +854,12 @@ static void check_array_null_last_row(SQLHDBC dbc)
 
 /* A NULL parameter declared as SQL_INTEGER / SQL_TYPE_DATE is typed as such,
  * so it can meet a NUMBER or DATE in COALESCE (a VARCHAR NULL gets
- * ORA-00932: inconsistent datatypes). */
+ * ORA-00932: inconsistent datatypes). 8.1.7 has no COALESCE; its CASE is as
+ * strict about types (a VARCHAR bind there gets the same ORA-00932), so 8i
+ * checks the same typing with CASE (#408). 8.1.7's CASE also tells a stored
+ * DATE (a column or a bind, Typ=12) from a computed one (TO_DATE, Typ=13)
+ * and won't mix them, even with no bind at all, so its other branch is a
+ * stored DATE too: CAST(... AS DATE). */
 static void check_typed_null(SQLHDBC dbc)
 {
   const char *name = "typed NULL parameter (COALESCE with NUMBER / DATE)";
@@ -838,11 +872,12 @@ static void check_typed_null(SQLHDBC dbc)
   SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
   SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &iv, 0, &nul);
   SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_TYPE_DATE, SQL_TYPE_DATE, 0, 0, &dv, 0, &nul);
-  SQLRETURN rc = SQLExecDirect(
-      st,
-      (SQLCHAR *)"SELECT COALESCE(?, 7) + 1, TO_CHAR(COALESCE(?, DATE '2026-09-29'), 'YYYY') "
-                 "FROM dual",
-      SQL_NTS);
+  const char *sql =
+      g_release == 8
+          ? "SELECT CASE WHEN 1 = 0 THEN ? ELSE 7 END + 1, TO_CHAR(CASE WHEN 1 = 0 THEN ? ELSE "
+            "CAST(TO_DATE('2026-09-29', 'YYYY-MM-DD') AS DATE) END, 'YYYY') FROM dual"
+          : "SELECT COALESCE(?, 7) + 1, TO_CHAR(COALESCE(?, DATE '2026-09-29'), 'YYYY') FROM dual";
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS);
   int ok = SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)) &&
            SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, a, sizeof a, &ia)) &&
            SQL_SUCCEEDED(SQLGetData(st, 2, SQL_C_CHAR, b, sizeof b, &ib));
@@ -8292,11 +8327,7 @@ int main(void)
     skip("data-at-exec (SQLPutData)", "table setup failed");
     skip("SQLCancel (data-at-exec)", "table setup failed");
   }
-  check_scalar(dbc, "CLOB fetch", "SELECT TO_CLOB('clobdata') FROM DUAL", "clobdata");
-  /* SQL_C_CHAR from binary is uppercase hex (the ODBC convention, per
-   * convert.c - the core's seersql path renders lowercase). */
-  check_scalar(dbc, "BLOB fetch (hex)", "SELECT TO_BLOB(HEXTORAW('DEADBEEF')) FROM DUAL",
-               "DEADBEEF");
+  check_lob_scalars(dbc);
   check_rowid(dbc);
   check_urowid(dbc);
   check_urowid_long(dbc);
