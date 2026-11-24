@@ -5099,46 +5099,81 @@ static void check_timestamp_bind(SQLHDBC dbc)
   exec_do(dbc, "DROP TABLE seer_ts", err, sizeof err);
 }
 
-/* TLS (TCPS): connect over TLS through a terminating proxy (SEER_TLS_PROXY_PORT
- * on localhost, cert at SEER_TLS_CA) and run a query, exercising the OpenSSL
- * transport end-to-end. Skips unless the proxy env is set (see run-matrix.sh). */
-static void check_tls(const char *drv, const char *svc, const char *user, const char *pwd)
+/* One TLS connect with `cs` and a query over it; "" when both worked, else
+ * why into m. */
+static void tls_leg(const char *leg, const char *cs, char *m, size_t mlen)
 {
-  const char *name = "TLS transport (TCPS)";
-  const char *tport = getenv("SEER_TLS_PROXY_PORT");
-  const char *ca = getenv("SEER_TLS_CA");
-  if (tport == NULL || ca == NULL || !tport[0] || !ca[0]) {
-    skip(name, "set SEER_TLS_PROXY_PORT + SEER_TLS_CA to exercise TLS");
-    return;
-  }
   SQLHENV e;
   SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &e);
   SQLSetEnvAttr(e, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
   SQLHDBC d;
   SQLAllocHandle(SQL_HANDLE_DBC, e, &d);
-  char cs[640];
-  snprintf(cs, sizeof cs,
-           "DRIVER=%s;HOST=localhost;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;SSL=1;TLSCA=%s;", drv, tport,
-           svc, user, pwd, ca);
   SQLCHAR o[256];
   SQLSMALLINT ol;
   if (!SQL_SUCCEEDED(SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol,
                                       SQL_DRIVER_NOPROMPT))) {
-    char m[256];
-    diag_text(SQL_HANDLE_DBC, d, m, sizeof m);
-    fail(name, m[0] ? m : "TLS connect failed");
+    char t[256];
+    diag_text(SQL_HANDLE_DBC, d, t, sizeof t);
+    snprintf(m, mlen, "%s: %s", leg, t[0] ? t : "TLS connect failed");
   } else {
-    char out[32], err[256];
-    if (SQL_SUCCEEDED(
-            exec_scalar(d, "SELECT 'tls-ok' FROM dual", out, sizeof out, err, sizeof err)) &&
-        strcmp(out, "tls-ok") == 0)
-      pass(name);
-    else
-      fail(name, err[0] ? err : "query over TLS failed");
+    char out[32], err[256] = "";
+    if (!SQL_SUCCEEDED(
+            exec_scalar(d, "SELECT 'tls-ok' FROM dual", out, sizeof out, err, sizeof err)) ||
+        strcmp(out, "tls-ok") != 0)
+      snprintf(m, mlen, "%s: %s", leg, err[0] ? err : "query over TLS failed");
     SQLDisconnect(d);
   }
   SQLFreeHandle(SQL_HANDLE_DBC, d);
   SQLFreeHandle(SQL_HANDLE_ENV, e);
+}
+
+/* TLS (TCPS): connect over TLS and run a query, exercising the OpenSSL
+ * transport end-to-end, by either or both of two legs (see run-matrix.sh):
+ * - a terminating proxy, SEER_TLS_PROXY_PORT on localhost with its cert at
+ *   SEER_TLS_CA;
+ * - a real Oracle TCPS listener, SEER_TCPS_HOST (SEER_TCPS_PORT, default
+ *   2484; SEER_TCPS_SERVICE; SEER_TCPS_CA to verify its certificate, else
+ *   unverified; SEER_TCPS_USER / _PASS, default this tier's account). Only a
+ *   real listener asks for a TLS renegotiation on its RESEND (#405).
+ * Skips when neither is set, as in a corpus recording. */
+static void check_tls(const char *drv, const char *svc, const char *user, const char *pwd)
+{
+  const char *name = "TLS transport (TCPS)";
+  const char *tport = getenv("SEER_TLS_PROXY_PORT");
+  const char *ca = getenv("SEER_TLS_CA");
+  const char *thost = getenv("SEER_TCPS_HOST");
+  int proxy = tport != NULL && ca != NULL && tport[0] && ca[0];
+  int real = thost != NULL && thost[0];
+  if (!proxy && !real) {
+    skip(name, "set SEER_TLS_PROXY_PORT + SEER_TLS_CA to exercise TLS");
+    return;
+  }
+  char m[400] = "";
+  char cs[900];
+  if (proxy) {
+    snprintf(cs, sizeof cs,
+             "DRIVER=%s;HOST=localhost;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;SSL=1;TLSCA=%s;", drv,
+             tport, svc, user, pwd, ca);
+    tls_leg("proxy", cs, m, sizeof m);
+  }
+  if (real && m[0] == '\0') {
+    const char *p = getenv("SEER_TCPS_PORT"), *s = getenv("SEER_TCPS_SERVICE");
+    const char *c = getenv("SEER_TCPS_CA"), *u = getenv("SEER_TCPS_USER");
+    const char *w = getenv("SEER_TCPS_PASS");
+    char verify[300];
+    if (c != NULL && c[0])
+      snprintf(verify, sizeof verify, "TLSCA=%s;", c);
+    else
+      snprintf(verify, sizeof verify, "TLSVERIFY=0;");
+    snprintf(cs, sizeof cs, "DRIVER=%s;HOST=%s;PORT=%s;SERVICE=%s;UID=%s;PWD=%s;SSL=1;%s", drv,
+             thost, p && p[0] ? p : "2484", s && s[0] ? s : svc, u && u[0] ? u : user,
+             w && w[0] ? w : pwd, verify);
+    tls_leg("TCPS listener", cs, m, sizeof m);
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
 }
 
 /* The batched LOB check again on a LOBINLINE=1 connection (inline LOB fetch). */

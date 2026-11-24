@@ -64,10 +64,18 @@ SeerStatus seer_packet_send(SeerTransport *t, uint8_t type, const void *payload,
 SeerStatus seer_packet_recv(SeerTransport *t, uint8_t *out_type, uint8_t **out_body,
                             size_t *out_len)
 {
-  if (t == NULL || out_type == NULL || out_body == NULL || out_len == NULL)
+  uint8_t flags = 0;
+  return seer_packet_recv_flags(t, out_type, &flags, out_body, out_len);
+}
+
+SeerStatus seer_packet_recv_flags(SeerTransport *t, uint8_t *out_type, uint8_t *out_flags,
+                                  uint8_t **out_body, size_t *out_len)
+{
+  if (t == NULL || out_type == NULL || out_flags == NULL || out_body == NULL || out_len == NULL)
     return SEER_EPARAM;
   *out_body = NULL;
   *out_len = 0;
+  *out_flags = 0;
 
   uint8_t hdr[TNS_HEADER_LEN];
   SeerStatus st = seer_transport_read_full(t, hdr, sizeof hdr);
@@ -81,6 +89,7 @@ SeerStatus seer_packet_recv(SeerTransport *t, uint8_t *out_type, uint8_t **out_b
                           (uint32_t)hdr[3])
                        : ((uint32_t)hdr[0] << 8 | (uint32_t)hdr[1]);
   uint8_t type = hdr[4];
+  *out_flags = hdr[5];
   if (total < TNS_HEADER_LEN) {
     seer_log(SEER_LOG_ERROR, "packet: bogus length %u (< header)", total);
     return SEER_EPROTO;

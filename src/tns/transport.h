@@ -54,6 +54,12 @@ void seer_transport_set_keepalive(SeerTransport *t, int idle_s);
 SeerStatus seer_transport_start_tls(SeerTransport *t, const char *sni_host, const char *ca_file,
                                     int verify);
 
+/* Drop the TLS session without a close_notify and run a new handshake on the
+ * same socket, as seer_transport_start_tls: what a TCPS listener's RESEND with
+ * TLS_RENEG asks for (#405). The TCP connection stays up throughout. */
+SeerStatus seer_transport_restart_tls(SeerTransport *t, const char *sni_host, const char *ca_file,
+                                      int verify);
+
 /* Large-SDU framing (§ negotiated TNS version >= 315, #155): once set, packets
  * use the 4-byte packet-length header instead of the legacy 2-byte length. Set
  * after the ACCEPT (which is itself always legacy-framed); read by packet.c. */
