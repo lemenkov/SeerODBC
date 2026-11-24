@@ -11,12 +11,16 @@
 #ifndef SEER_TNS_TRANSPORT_H
 #define SEER_TNS_TRANSPORT_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "seer/seertns.h"
 
 typedef struct SeerTransport SeerTransport;
+
+/* The connect and per-read/write timeout when none is given: 30 s. */
+#define SEER_TRANSPORT_DEFAULT_TIMEOUT_MS 30000
 
 /* Connect to host:port. `timeout_ms` bounds the connect attempt (<=0 picks a
  * default); it also seeds the per-read/write socket timeout, which bounds the
@@ -27,7 +31,8 @@ SeerStatus seer_transport_connect(const char *host, uint16_t port, int timeout_m
 
 /* As seer_transport_connect; on failure `err` (when non-NULL) says why, with
  * the address: the name doesn't resolve, the port refuses, the connect timed
- * out, or the socket error (#203). */
+ * out, or the socket error (#203). A connect that never answered within
+ * `timeout_ms` is SEER_ETIMEOUT, the other failures SEER_EIO (#403). */
 SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int timeout_ms,
                                        SeerTransport **out, char *err, size_t errlen);
 
@@ -71,5 +76,10 @@ SeerStatus seer_transport_send_oob(SeerTransport *t);
 /* Read exactly `len` bytes (looping over short reads). SEER_EIO on EOF or
  * error before `len` bytes arrive. */
 SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len);
+
+/* Whether a read or write on `t` failed because the socket timeout ran out,
+ * not because the link broke: the login timeout, when it bounds the login
+ * (#403). */
+bool seer_transport_timed_out(const SeerTransport *t);
 
 #endif /* SEER_TNS_TRANSPORT_H */

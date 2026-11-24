@@ -352,7 +352,8 @@ static SQLRETURN do_connect(OdbcDbc *c, const char *dsn, const char *cs, const c
     SQLINTEGER native = strncmp(why, "ORA-", 4) == 0 ? (SQLINTEGER)atoi(why + 4) : 0;
     /* No session came up - unreachable, refused by the listener, the handshake
      * cut short: 08001, the client could not establish the connection. 08S01
-     * is for a link that was up and failed (#205). */
+     * is for a link that was up and failed (#205). The login timeout running
+     * out is HYT00, by way of SEER_ETIMEOUT (#403). */
     const char *state = (st == SEER_EIO || st == SEER_EPROTO) ? "08001" : seer_odbc_sqlstate(st);
     ret = seer_odbc_diag(c, state, native, why[0] ? why : seer_strerror(st), SQL_ERROR);
     goto out;

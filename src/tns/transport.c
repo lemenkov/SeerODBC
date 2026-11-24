@@ -73,15 +73,31 @@ static void sigpipe_restore(SigpipeGuard *g)
 }
 #endif
 
-#define DEFAULT_TIMEOUT_MS 30000
-
 struct SeerTransport {
   seer_socket_t fd;
   SSL *ssl; /* non-NULL once TLS is established */
   SSL_CTX *ctx;
   bool large_frames; /* 4-byte packet length (§ ver >= 315, #155) */
+  bool timed_out;    /* a read or write ran out of time (#403) */
   unsigned wire_id;  /* the connection's id in a wire record, 0 when none (#396) */
 };
+
+bool seer_transport_timed_out(const SeerTransport *t)
+{
+  return t != NULL && t->timed_out;
+}
+
+/* A failed recv/send: a socket timeout that ran out is noted as one, and
+ * logged as what it is rather than as an errno (#403). */
+static void io_failed(SeerTransport *t, const char *what, int e)
+{
+  if (seer_sock_timed_out(e)) {
+    t->timed_out = true;
+    seer_log(SEER_LOG_ERROR, "transport: %s timed out", what);
+  } else {
+    seer_log(SEER_LOG_ERROR, "transport: %s failed (error %d)", what, e);
+  }
+}
 
 void seer_transport_set_large_frames(SeerTransport *t, int on)
 {
@@ -99,7 +115,7 @@ void seer_transport_set_io_timeout(SeerTransport *t, int timeout_ms)
   if (t == NULL || t->fd == SEER_INVALID_SOCKET) /* a replayed connection has none */
     return;
   if (timeout_ms < 0)
-    timeout_ms = DEFAULT_TIMEOUT_MS;
+    timeout_ms = SEER_TRANSPORT_DEFAULT_TIMEOUT_MS;
   seer_sock_set_io_timeout(t->fd, timeout_ms);
 }
 
@@ -240,7 +256,7 @@ SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int time
     return SEER_EPARAM;
   *out = NULL;
   if (timeout_ms <= 0)
-    timeout_ms = DEFAULT_TIMEOUT_MS;
+    timeout_ms = SEER_TRANSPORT_DEFAULT_TIMEOUT_MS;
 
   if (seer_wire_replaying()) { /* no socket: the record's next connect (#396) */
     unsigned id = 0;
@@ -297,7 +313,7 @@ SeerStatus seer_transport_connect_diag(const char *host, uint16_t port, int time
     (void)seer_wire_connect(host, port, 0);
     connect_error(err, errlen, host, port, first_why, timeout_ms);
     seer_log(SEER_LOG_ERROR, "transport: %s", err != NULL && err[0] ? err : "connect failed");
-    return SEER_EIO;
+    return first_why == SEER_ETIMEDOUT ? SEER_ETIMEOUT : SEER_EIO;
   }
 
   SeerTransport *t = calloc(1, sizeof *t);
@@ -361,11 +377,22 @@ SeerStatus seer_transport_start_tls(SeerTransport *t, const char *sni_host, cons
   SigpipeGuard g;
   for (;;) {
     sigpipe_block(&g);
+    seer_sock_clear_errno();
     rc = SSL_connect(ssl);
+    int se = seer_sock_errno();
     sigpipe_restore(&g);
     if (rc == 1)
       break;
     int e = SSL_get_error(ssl, rc);
+    /* A server that never answers the handshake: the socket timeout ran out,
+     * and retrying would wait it out forever (#403). */
+    if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SYSCALL) &&
+        seer_sock_timed_out(se)) {
+      io_failed(t, "TLS handshake", se);
+      SSL_free(ssl);
+      SSL_CTX_free(ctx);
+      return SEER_EIO;
+    }
     if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
       continue; /* blocking fd: retry */
     seer_log(SEER_LOG_ERROR, "transport: TLS handshake failed: %s", ssl_err());
@@ -414,12 +441,22 @@ SeerStatus seer_transport_write_all(SeerTransport *t, const void *buf, size_t le
     if (t->ssl != NULL) {
       SigpipeGuard g;
       sigpipe_block(&g);
+      seer_sock_clear_errno();
       int n = SSL_write(t->ssl, p + off, (int)(len - off));
+      int se = seer_sock_errno();
       sigpipe_restore(&g);
       if (n <= 0) {
         int e = SSL_get_error(t->ssl, n);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-          continue;
+        /* As in the read: a WANT_* over a socket timeout that ran out fails
+         * the write; any other is retried (#403). */
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SYSCALL) {
+          if (seer_sock_timed_out(se)) {
+            io_failed(t, "TLS write", se);
+            return SEER_EIO;
+          }
+          if (e != SSL_ERROR_SYSCALL)
+            continue;
+        }
         seer_log(SEER_LOG_ERROR, "transport: TLS write failed: %s", ssl_err());
         return SEER_EIO;
       }
@@ -428,9 +465,10 @@ SeerStatus seer_transport_write_all(SeerTransport *t, const void *buf, size_t le
     }
     ptrdiff_t n = seer_sock_send(t->fd, p + off, len - off);
     if (n < 0) {
-      if (seer_sock_errno() == SEER_EINTR)
+      int se = seer_sock_errno();
+      if (se == SEER_EINTR)
         continue;
-      seer_log(SEER_LOG_ERROR, "transport: write failed (error %d)", seer_sock_errno());
+      io_failed(t, "write", se);
       return SEER_EIO;
     }
     off += (size_t)n;
@@ -450,11 +488,24 @@ SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len)
   size_t off = 0;
   while (off < len) {
     if (t->ssl != NULL) {
+      seer_sock_clear_errno();
       int n = SSL_read(t->ssl, p + off, (int)(len - off));
+      int se = seer_sock_errno();
       if (n <= 0) {
         int e = SSL_get_error(t->ssl, n);
-        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-          continue;
+        /* On this blocking socket a WANT_* means the socket timeout ran out
+         * (EAGAIN underneath), or OpenSSL wants another go; only the first
+         * fails the read. Retrying a timeout would wait it out again, and
+         * again, past any login timeout (#403). */
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_SYSCALL) {
+          if (seer_sock_timed_out(se)) {
+            io_failed(t, "TLS read", se);
+            seer_wire_event(t->wire_id, "RFAIL");
+            return SEER_EIO;
+          }
+          if (e != SSL_ERROR_SYSCALL)
+            continue;
+        }
         if (e == SSL_ERROR_ZERO_RETURN)
           seer_log(SEER_LOG_ERROR,
                    "transport: TLS closed by peer "
@@ -470,9 +521,10 @@ SeerStatus seer_transport_read_full(SeerTransport *t, void *buf, size_t len)
     }
     ptrdiff_t n = seer_sock_recv(t->fd, p + off, len - off);
     if (n < 0) {
-      if (seer_sock_errno() == SEER_EINTR)
+      int se = seer_sock_errno();
+      if (se == SEER_EINTR)
         continue;
-      seer_log(SEER_LOG_ERROR, "transport: read failed (error %d)", seer_sock_errno());
+      io_failed(t, "read", se);
       seer_wire_event(t->wire_id, "RFAIL");
       return SEER_EIO;
     }
