@@ -18,6 +18,7 @@
 #include "oson.h"
 #include "placeholders.h"
 #include "log.h"
+#include "msg.h" /* the messages as schemas (#395 spike) */
 #include "marshal.h"
 #include "reader.h"
 #include "tns_consts.h"
@@ -314,45 +315,18 @@ static void cell_set_text(SeerCell *c, char *owned)
  * ub1 length) then content, followed by two trailing ub4 indicators (§11.10). */
 static SeerStatus decode_long(SeerReader *r, bool is_raw, SeerCell *cell)
 {
-  SeerWriter acc;
-  if (!seer_writer_init(&acc, 64))
-    return SEER_ENOMEM;
-
-  uint8_t marker = seer_reader_u8(r);
-  if (!seer_reader_ok(r)) {
-    seer_writer_free(&acc);
+  /* SEER_LONG_CELL_SCHEMA (#398): the value, then the two trailing
+   * indicators; a 00 is NULL, a 0xFE run with no chunks an empty value. */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_LONG_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_LONG_CELL_SCHEMA, &m);
     return SEER_EPROTO;
   }
-  bool is_null = (marker == 0x00);
-  if (marker == 0xFE) {
-    for (;;) {
-      /* Each chunk's length: an sb4 on 12c+, a bare ub1 before (§6.4). */
-      int64_t clen = r->sb4_chunks ? seer_dec_sb4(r) : (int64_t)seer_reader_u8(r);
-      if (!seer_reader_ok(r) || clen <= 0)
-        break;
-      const uint8_t *p = seer_reader_bytes(r, (size_t)clen);
-      if (p == NULL)
-        break;
-      seer_writer_bytes(&acc, p, (size_t)clen);
-    }
-  } else if (!is_null) {
-    const uint8_t *p = seer_reader_bytes(r, marker);
-    if (p != NULL)
-      seer_writer_bytes(&acc, p, marker);
-  }
-  (void)seer_dec_sb4(r); /* trailing indicator 1 */
-  (void)seer_dec_sb4(r); /* trailing indicator 2 */
-
-  if (!seer_reader_ok(r) || !seer_writer_ok(&acc)) {
-    seer_writer_free(&acc);
-    return SEER_EPROTO;
-  }
-  if (is_null) {
-    seer_writer_free(&acc);
-    return SEER_OK; /* leaves the cell as SQL NULL */
-  }
-  SeerStatus st = cell_set_bytes(cell, acc.buf, acc.len, is_raw);
-  seer_writer_free(&acc);
+  SeerStatus st = m.value.p == NULL ? SEER_OK : cell_set_bytes(cell, m.value.p, m.value.n, is_raw);
+  seer_schema_free(SEER_LONG_CELL_SCHEMA, &m);
   return st;
 }
 
@@ -373,24 +347,22 @@ static void rowid_b64(uint32_t v, int nchars, char *out)
  * "OOOOOOFFFBBBBBBRRR". */
 static SeerStatus decode_rowid(SeerReader *r, SeerCell *cell)
 {
-  uint8_t ind = seer_reader_u8(r);
-  if (!seer_reader_ok(r))
+  /* SEER_ROWID_CELL_SCHEMA (#398): a size (0 or 0xFF NULL), then the object,
+   * file, block and slot, rendered as the 18-character rowid. */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_ROWID_CELL_SCHEMA, &cx, r, &m))
     return SEER_EPROTO;
-  if (ind == 0 || ind == 0xFF)
+  if (m.rowid_size == 0)
     return SEER_OK; /* SQL NULL */
-  uint32_t obj = (uint32_t)seer_dec_sb4(r);
-  uint32_t file = (uint32_t)seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* unused */
-  uint32_t blk = (uint32_t)seer_dec_sb4(r);
-  uint32_t slot = (uint32_t)seer_dec_sb4(r);
-  if (!seer_reader_ok(r))
-    return SEER_EPROTO;
-  char s[18];
-  rowid_b64(obj, 6, s);
-  rowid_b64(file, 3, s + 6);
-  rowid_b64(blk, 6, s + 9);
-  rowid_b64(slot, 3, s + 15);
-  return cell_set_bytes(cell, s, sizeof s, false);
+  char rid[18];
+  rowid_b64((uint32_t)m.rowid_obj, 6, rid);
+  rowid_b64((uint32_t)m.rowid_file, 3, rid + 6);
+  rowid_b64((uint32_t)m.rowid_block, 6, rid + 9);
+  rowid_b64((uint32_t)m.rowid_slot, 3, rid + 15);
+  return cell_set_bytes(cell, rid, sizeof rid, false);
 }
 
 /* Standard-alphabet base64 (no padding) of `n` bytes, into the writer. */
@@ -455,20 +427,19 @@ static SeerStatus urowid_cell(const uint8_t *p, size_t nbytes, SeerCell *cell)
 
 static SeerStatus decode_urowid(SeerReader *r, SeerCell *cell)
 {
-  int64_t nbytes = seer_dec_sb4(r);
-  if (nbytes <= 0)
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO; /* NULL */
-  /* The rowid as a value, as a LOB's locator is: a ub1 length, or past 252
-   * bytes 0xFE and chunks - an index-organized table's logical rowid grows
-   * with its key. Read as one length byte and num_bytes raw bytes, a rowid
-   * past 252 bytes desynced the reply, and the query failed with a bogus
-   * ORA-01403 (#144). */
-  uint8_t *p = NULL;
-  size_t n = 0;
-  SeerStatus st = seer_dec_dalc(r, &p, &n);
-  if (st == SEER_OK)
-    st = urowid_cell(p, n, cell);
-  free(p);
+  /* SEER_UROWID_CELL_SCHEMA (#398): a count (0 NULL), then the rowid as a
+   * value - chunked past 252 bytes, as an index-organized table's logical
+   * rowid can be (#144). */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_UROWID_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_UROWID_CELL_SCHEMA, &m);
+    return SEER_EPROTO;
+  }
+  SeerStatus st = m.value.p == NULL ? SEER_OK : urowid_cell(m.value.p, m.value.n, cell);
+  seer_schema_free(SEER_UROWID_CELL_SCHEMA, &m);
   return st;
 }
 
@@ -691,13 +662,17 @@ static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *ce
     break;
   }
 
-  uint8_t *val = NULL;
-  size_t vlen = 0;
-  SeerStatus st = seer_dec_dalc(r, &val, &vlen);
-  if (st != SEER_OK)
-    return st;
-  st = decode_scalar(col->ora_type, val, vlen, cell);
-  free(val);
+  /* SEER_CELL_SCHEMA (#395 spike): the value read in place. */
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m;
+  if (!seer_schema_decode(SEER_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_CELL_SCHEMA, &m);
+    return SEER_EPROTO;
+  }
+  SeerStatus st = decode_scalar(col->ora_type, m.value.p, m.value.n, cell);
+  seer_schema_free(SEER_CELL_SCHEMA, &m);
   if (st == SEER_OK)
     national_to_utf8(col, cell);
   return st;
@@ -714,99 +689,72 @@ static SeerStatus decode_cell(SeerReader *r, const SeerColumn *col, SeerCell *ce
  * trailer's `dcbqcky` (query-cache key) are 11g additions, absent on a 10g
  * (fv 4) describe, so reading them there would eat the next column / the first
  * row token and desync the whole decode. */
+/* A decoded byte string as a NUL-terminated malloc'd string ("" when empty). */
+static char *bytes_dup_str(const SeerBytes *b)
+{
+  char *s = malloc(b->n + 1);
+  if (s == NULL)
+    return NULL;
+  if (b->n > 0)
+    memcpy(s, b->p, b->n);
+  s[b->n] = '\0';
+  return s;
+}
+
 static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_cols, int *out_ncols)
 {
-  (void)seer_dec_sb4(r); /* max row size */
-  int64_t ncols = seer_dec_sb4(r);
-  if (ncols < 0 || ncols > 4096 || !seer_reader_ok(r))
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerDescribeHeadMsg hm = {0}; /* SEER_DESCRIBE_HEAD_SCHEMA (#398) */
+  if (!seer_schema_decode(SEER_DESCRIBE_HEAD_SCHEMA, &cx, r, &hm) || hm.ncols < 0 ||
+      hm.ncols > 4096)
     return SEER_EPROTO;
-  if (ncols > 0)
-    (void)seer_reader_u8(r); /* reserved byte */
+  int64_t ncols = hm.ncols;
 
   SeerColumn *cols = calloc((size_t)ncols, sizeof *cols);
   if (cols == NULL && ncols > 0)
     return SEER_ENOMEM;
 
   for (int64_t i = 0; i < ncols; i++) {
-    uint8_t type = seer_reader_u8(r);
-    (void)seer_reader_u8(r);               /* flags     */
-    cols[i].precision = seer_reader_u8(r); /* precision */
-    if (fv >= TTC_FIELD_VERSION_12_1)
-      cols[i].scale = (int8_t)seer_reader_u8(r); /* scale: a raw sb1 from 12.1 */
-    else
-      cols[i].scale = (int)seer_dec_sb4(r); /* scale: variable on 11g */
-    int64_t data_len = seer_dec_sb4(r);     /* buffer size (data length) */
-    (void)seer_dec_sb4(r);                  /* max array elems */
-    (void)seer_dec_sb4(r);                  /* cont flags */
-    int64_t oidlen = seer_dec_sb4(r);
-    if (oidlen > 0)
-      seer_skip_chunked(r);
-    (void)seer_dec_sb4(r); /* version */
-    int64_t charset = seer_dec_sb4(r);
-    (void)seer_reader_u8(r); /* csfrm */
-    int64_t max_size = seer_dec_sb4(r);
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      (void)seer_dec_sb4(r); /* oaccolid (12.2+) */
-    uint8_t null_ok = seer_reader_u8(r);
-    (void)seer_reader_u8(r); /* v7 name length */
-
-    char *name = NULL;
-    SeerStatus st = seer_read_str(r, &name);
-    if (st != SEER_OK) {
-      cols[i].name = NULL;
+    /* SEER_DCB_COLUMN_SCHEMA (#398): the OAC's fields, nullable, the name and
+     * the type's schema and name, the position, 11.2's UDS flags, 23.1's SQL
+     * domain; a raw sb1 scale from 12.1. */
+    SeerDcbColumnMsg dm = {0};
+    if (!seer_schema_decode(SEER_DCB_COLUMN_SCHEMA, &cx, r, &dm)) {
+      seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
       goto fail;
     }
-    char *schema = NULL, *tname = NULL;
-    st = seer_read_str(r, &schema); /* type owner (ADT) */
-    if (st != SEER_OK) {
-      free(name);
+    uint8_t type = (uint8_t)dm.data_type;
+    cols[i].precision = (uint8_t)dm.precision;
+    cols[i].scale = fv >= TTC_FIELD_VERSION_12_1 ? (int8_t)dm.scale : (int)dm.scale;
+    int64_t data_len = dm.max_length; /* buffer size (data length) */
+    int64_t charset = dm.charset;
+    int64_t max_size = dm.max_chars;
+    uint8_t null_ok = (uint8_t)dm.null_ok;
+    char *name = bytes_dup_str(&dm.name);
+    if (name == NULL) {
+      seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
       goto fail;
     }
-    st = seer_read_str(r, &tname); /* type name (ADT)  */
-    if (st != SEER_OK) {
-      free(name);
-      free(schema);
-      goto fail;
-    }
-    if (type == ORA_TYPE_ADT && schema && schema[0] && tname && tname[0]) {
-      cols[i].type_schema = schema;
-      schema = NULL;
-      cols[i].type_name = tname;
-      tname = NULL;
+    if (type == ORA_TYPE_ADT && dm.type_schema.n > 0 && dm.type_name.n > 0) {
+      cols[i].type_schema = bytes_dup_str(&dm.type_schema);
+      cols[i].type_name = bytes_dup_str(&dm.type_name);
       cols[i].n_obj_attrs = -1; /* layout not yet fetched */
     }
-    free(schema);
-    free(tname);
-    char *skip = NULL;
-    (void)seer_dec_sb4(r); /* column position */
-    if (fv >= TTC_FIELD_VERSION_11_2)
-      (void)seer_dec_sb4(r); /* uds flags (11g+ only) */
-    if (fv >= TTC_FIELD_VERSION_23_1) {
-      /* 23c+ (fv>=17): the column's SQL-domain schema and name, each a
-       * DALC string (empty 0x00 for a column with no domain). */
-      st = seer_read_str(r, &skip);
-      free(skip);
-      if (st != SEER_OK) {
-        free(name);
-        goto fail;
-      }
-      st = seer_read_str(r, &skip);
-      free(skip);
-      if (st != SEER_OK) {
-        free(name);
-        goto fail;
-      }
-    }
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
     if (fv > TTC_FIELD_VERSION_23_1) {
-      /* 23ai (fv24): per-column annotation map + vector descriptor (#89).
-       * The count is sent twice around a 1-byte pointer; each key/value
-       * pair is followed by a ub4 flags word, with a trailing ub4 after
-       * the loop. The map is serialized as "name=value\n..." (name-only
-       * annotations get an empty value) into cols[i].annotations. Both
-       * fields must be fully consumed or the row stream desyncs. */
-      int64_t nann = seer_dec_sb4(r);
-      if (nann > 0) {
-        if (nann > 4096) {
+      /* 23ai (fv24): per-column annotation map + vector descriptor (#89),
+       * SEER_DCB_ANNOTATIONS_HEAD_SCHEMA, the pairs and the tail (#398).
+       * The map is serialized as "name=value\n..." (name-only annotations
+       * get an empty value) into cols[i].annotations. Both fields must be
+       * fully consumed or the row stream desyncs. */
+      SeerDcbAnnotationsMsg am = {0};
+      if (!seer_schema_decode(SEER_DCB_ANNOTATIONS_HEAD_SCHEMA, &cx, r, &am)) {
+        free(name);
+        goto fail;
+      }
+      if (am.count > 0) {
+        if (am.count > 4096 || am.count2 > 4096) {
           free(name);
           goto fail;
         }
@@ -815,30 +763,23 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
           free(name);
           goto fail;
         }
-        (void)seer_reader_u8(r); /* pointer            */
-        nann = seer_dec_sb4(r);  /* count, repeated    */
-        (void)seer_reader_u8(r); /* pointer            */
-        for (int64_t a = 0; a < nann && seer_reader_ok(r); a++) {
-          char *akey = NULL, *aval = NULL;
-          st = seer_read_str(r, &akey);
-          if (st == SEER_OK)
-            st = seer_read_str(r, &aval);
-          if (st != SEER_OK) {
-            free(akey);
-            free(aval);
+        for (int64_t a = 0; a < am.count2 && seer_reader_ok(r); a++) {
+          SeerAuthPairMsg pm = {0};
+          bool ok = seer_schema_decode(SEER_AUTH_PAIR_SCHEMA, &cx, r, &pm);
+          if (ok) {
+            seer_writer_bytes(&ann, pm.key.p, pm.key.n);
+            seer_writer_u8(&ann, '=');
+            seer_writer_bytes(&ann, pm.value.p, pm.value.n);
+            seer_writer_u8(&ann, '\n');
+          }
+          seer_schema_free(SEER_AUTH_PAIR_SCHEMA, &pm);
+          if (!ok) {
             seer_writer_free(&ann);
             free(name);
             goto fail;
           }
-          seer_writer_bytes(&ann, akey, strlen(akey));
-          seer_writer_u8(&ann, '=');
-          seer_writer_bytes(&ann, aval, strlen(aval));
-          seer_writer_u8(&ann, '\n');
-          free(akey);
-          free(aval);
-          (void)seer_dec_sb4(r); /* per-pair flags     */
         }
-        (void)seer_dec_sb4(r); /* trailing flags     */
+        (void)seer_schema_decode(SEER_DCB_ANNOTATIONS_TAIL_SCHEMA, &cx, r, &am);
         if (seer_writer_ok(&ann) && ann.len > 0) {
           char *s = malloc(ann.len + 1);
           if (s == NULL) {
@@ -852,10 +793,10 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
         }
         seer_writer_free(&ann);
       }
-      int64_t vdims = seer_dec_sb4(r); /* vector dimensions */
-      cols[i].vector_dims = (uint32_t)(vdims < 0 ? 0 : vdims);
-      cols[i].vector_format = seer_reader_u8(r); /* vector format */
-      (void)seer_reader_u8(r);                   /* vector flags  */
+      SeerDcbColumnMsg vm = {0}; /* SEER_DCB_VECTOR_SCHEMA */
+      (void)seer_schema_decode(SEER_DCB_VECTOR_SCHEMA, &cx, r, &vm);
+      cols[i].vector_dims = (uint32_t)(vm.vector_dims < 0 ? 0 : vm.vector_dims);
+      cols[i].vector_format = (uint8_t)vm.vector_format;
     }
 
     cols[i].name = name;
@@ -878,11 +819,9 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
     return SEER_EPROTO;
   }
 
-  seer_skip_bytes_with_length(r); /* current date */
-  for (int k = 0; k < 4; k++)
-    (void)seer_dec_sb4(r); /* dcbflag/dcbmdbz/dcbmnpr/dcbmxpr */
-  if (fv >= TTC_FIELD_VERSION_11_2)
-    seer_skip_bytes_with_length(r); /* dcbqcky - query-cache key (11g+) */
+  SeerDcbTrailerMsg tm = {0}; /* SEER_DCB_TRAILER_SCHEMA */
+  (void)seer_schema_decode(SEER_DCB_TRAILER_SCHEMA, &cx, r, &tm);
+  seer_schema_free(SEER_DCB_TRAILER_SCHEMA, &tm);
 
   if (!seer_reader_ok(r)) {
     free_columns(cols, (int)ncols);
@@ -896,7 +835,12 @@ static SeerStatus parse_describe_body(SeerReader *r, int fv, SeerColumn **out_co
 
 static SeerStatus parse_dcb(SeerReader *r, SeerStmt *stmt)
 {
-  seer_skip_chunked(r); /* describe-info preamble */
+  /* The describe-info preamble, a value: SEER_VALUE_SCHEMA (#398). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerChrMsg pm = {0};
+  (void)seer_schema_decode(SEER_VALUE_SCHEMA, &cx, r, &pm);
+  seer_schema_free(SEER_VALUE_SCHEMA, &pm);
   SeerColumn *cols = NULL;
   int ncols = 0;
   SeerStatus st = parse_describe_body(r, stmt->conn->field_version, &cols, &ncols);
@@ -914,15 +858,17 @@ static SeerStatus parse_dcb(SeerReader *r, SeerStmt *stmt)
 static SeerStatus read_cursor_value(SeerReader *r, int fv, bool indicator, SeerColumn **out_cols,
                                     int *out_ncols, int64_t *out_id)
 {
-  (void)seer_reader_u8(r); /* value length */
+  /* SEER_CURSOR_VALUE_HEAD_SCHEMA, the describe, _TAIL_SCHEMA (#398). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  SeerCursorValueMsg m = {.has_indicator = indicator};
+  (void)seer_schema_decode(SEER_CURSOR_VALUE_HEAD_SCHEMA, &cx, r, &m);
   SeerColumn *cols = NULL;
   int ncols = 0;
   SeerStatus st = parse_describe_body(r, fv, &cols, &ncols);
   if (st != SEER_OK)
     return st;
-  int64_t cursor_id = seer_dec_sb4(r); /* nested cursor id */
-  if (indicator)
-    (void)seer_reader_u8(r);
+  (void)seer_schema_decode(SEER_CURSOR_VALUE_TAIL_SCHEMA, &cx, r, &m);
+  int64_t cursor_id = m.cursor_id; /* nested cursor id */
   if (!seer_reader_ok(r)) {
     free_columns(cols, ncols);
     return SEER_EPROTO;
@@ -958,19 +904,21 @@ static SeerStatus parse_refcursor_out(SeerReader *r, SeerStmt *stmt)
  * seer_stmt_next_result. */
 static SeerStatus parse_implicit(SeerReader *r, SeerStmt *stmt)
 {
-  int64_t nres = seer_dec_sb4(r);
-  if (nres < 0 || nres > 4096 || !seer_reader_ok(r))
+  /* SEER_IMPLICIT_COUNT_SCHEMA, then each result's _HEAD_SCHEMA, describe
+   * and _TAIL_SCHEMA (#398). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  SeerImplicitMsg m = {0};
+  if (!seer_schema_decode(SEER_IMPLICIT_COUNT_SCHEMA, &cx, r, &m) || m.nres < 0 || m.nres > 4096)
     return SEER_EPROTO;
-  for (int64_t i = 0; i < nres; i++) {
-    uint8_t prelen = seer_reader_u8(r); /* preamble length */
-    if (prelen > 0)
-      seer_reader_bytes(r, prelen);
+  for (int64_t i = 0; i < m.nres; i++) {
+    (void)seer_schema_decode(SEER_IMPLICIT_HEAD_SCHEMA, &cx, r, &m);
     SeerColumn *cols = NULL;
     int ncols = 0;
     SeerStatus st = parse_describe_body(r, stmt->conn->field_version, &cols, &ncols);
     if (st != SEER_OK)
       return st;
-    int64_t cursor_id = seer_dec_sb4(r); /* ub2 cursor id */
+    (void)seer_schema_decode(SEER_IMPLICIT_TAIL_SCHEMA, &cx, r, &m);
+    int64_t cursor_id = m.cursor_id;
     if (!seer_reader_ok(r)) {
       free_columns(cols, ncols);
       return SEER_EPROTO;
@@ -994,27 +942,29 @@ static SeerStatus parse_implicit(SeerReader *r, SeerStmt *stmt)
  * the previous batch's last row, and that column is then not sent. Ignoring
  * the vector read the next column's bytes in its place (seerdb tns.py's RXH
  * handling; python-oracledb _process_row_header). */
-static SeerStatus parse_rxh(SeerReader *r, uint8_t **bv, size_t *bvlen)
+static SeerStatus parse_rxh(SeerReader *r, int fv, uint8_t **bv, size_t *bvlen)
 {
-  (void)seer_reader_u8(r); /* flags */
-  for (int i = 0; i < 4; i++)
-    (void)seer_dec_sb4(r); /* num requests/iter/iters/buffer len */
-  int64_t n = seer_dec_sb4(r);
-  if (n > 0) {
-    (void)seer_reader_u8(r); /* repeated length */
-    const uint8_t *p = seer_reader_bytes(r, (size_t)n);
-    if (p != NULL) {
-      uint8_t *copy = malloc((size_t)n);
-      if (copy == NULL)
-        return SEER_ENOMEM;
-      memcpy(copy, p, (size_t)n);
-      free(*bv);
-      *bv = copy;
-      *bvlen = (size_t)n;
-    }
+  /* SEER_RXH_SCHEMA (#398); the bit vector is kept for the rows after it. */
+  SeerSchemaCtx cx = seer_msg_ctx(0, (uint8_t)fv, (uint8_t)fv);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerRxhMsg m = {0};
+  if (!seer_schema_decode(SEER_RXH_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_RXH_SCHEMA, &m);
+    return SEER_EPROTO;
   }
-  seer_skip_bytes_with_length(r); /* rxhrid */
-  return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
+  if (m.bit_vector.n > 0) {
+    uint8_t *copy = malloc(m.bit_vector.n);
+    if (copy == NULL) {
+      seer_schema_free(SEER_RXH_SCHEMA, &m);
+      return SEER_ENOMEM;
+    }
+    memcpy(copy, m.bit_vector.p, m.bit_vector.n);
+    free(*bv);
+    *bv = copy;
+    *bvlen = m.bit_vector.n;
+  }
+  seer_schema_free(SEER_RXH_SCHEMA, &m);
+  return SEER_OK;
 }
 
 static SeerStatus parse_bvc(SeerReader *r, int ncols, uint8_t **bv, size_t *bvlen)
@@ -1022,11 +972,13 @@ static SeerStatus parse_bvc(SeerReader *r, int ncols, uint8_t **bv, size_t *bvle
   free(*bv);
   *bv = NULL;
   *bvlen = 0;
-  (void)seer_dec_sb4(r); /* num columns sent */
+  /* SEER_BVC_SCHEMA (#398): the count sent, then a bit per column */
   size_t veclen = (size_t)((ncols + 7) / 8);
-  const uint8_t *p = seer_reader_bytes(r, veclen);
-  if (p == NULL)
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN, .fv = TTC_FIELD_VERSION_10_2}; /* 10g+ only */
+  SeerBvcMsg m = {.bits_len = (int64_t)veclen};
+  if (!seer_schema_decode(SEER_BVC_SCHEMA, &cx, r, &m))
     return SEER_EPROTO;
+  const uint8_t *p = m.bits.p;
   uint8_t *copy = malloc(veclen ? veclen : 1);
   if (copy == NULL)
     return SEER_ENOMEM;
@@ -1092,18 +1044,30 @@ static SeerStatus append_row(SeerStmt *stmt, SeerCell *row)
  * LOB, otherwise a ub4 size then the locator as a DALC. */
 static SeerStatus read_lob_locator(SeerReader *r, uint8_t **loc, size_t *loclen)
 {
+  /* SEER_LOB_CELL_SCHEMA (#398): the locator's length (0 NULL) and the
+   * locator as a value. */
   *loc = NULL;
   *loclen = 0;
-  if (seer_reader_remaining(r) == 0)
+  SeerSchemaCtx cx = {.codec = SEER_CODEC_THIN,
+                      .fv = TTC_FIELD_VERSION_10_2, /* 10g+ only */
+                      .wide_chunks = r->sb4_chunks};
+  SeerCellMsg m = {0};
+  if (!seer_schema_decode(SEER_LOB_CELL_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_LOB_CELL_SCHEMA, &m);
     return SEER_EPROTO;
-  if (r->buf[r->pos] == 0x00) {
-    (void)seer_reader_u8(r); /* NULL LOB */
-    return SEER_OK;
   }
-  int64_t num_bytes = seer_dec_sb4(r);
-  if (num_bytes <= 0 || !seer_reader_ok(r))
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
-  return seer_dec_dalc(r, loc, loclen);
+  SeerStatus st = SEER_OK;
+  if (m.value.n > 0) {
+    *loc = malloc(m.value.n);
+    if (*loc == NULL)
+      st = SEER_ENOMEM;
+    else {
+      memcpy(*loc, m.value.p, m.value.n);
+      *loclen = m.value.n;
+    }
+  }
+  seer_schema_free(SEER_LOB_CELL_SCHEMA, &m);
+  return st;
 }
 
 /* Record a LOB cell to resolve after the result set is fully fetched. Takes
@@ -1130,21 +1094,29 @@ static SeerStatus record_pending_lob(SeerStmt *stmt, size_t row, int col, uint8_
  * byte string. On a non-NULL value *img is a malloc'd image (caller owns). */
 static SeerStatus read_object_image(SeerReader *r, uint8_t **img, size_t *imglen)
 {
+  /* SEER_OBJECT_SCHEMA (#398); thin, 9i's included - the chunk width the
+   * reader's */
   *img = NULL;
   *imglen = 0;
-  for (int k = 0; k < 3; k++) { /* type OID, object OID, snapshot */
-    int64_t n = seer_dec_sb4(r);
-    if (n > 0)
-      seer_skip_chunked(r);
-  }
-  (void)seer_dec_sb4(r);             /* version */
-  int64_t present = seer_dec_sb4(r); /* image length (gate) */
-  (void)seer_dec_sb4(r);             /* flags */
-  if (!seer_reader_ok(r))
+  SeerSchemaCtx cx = {
+      .codec = SEER_CODEC_THIN, .fv = TTC_FIELD_VERSION_10_2, .wide_chunks = r->sb4_chunks};
+  SeerObjectMsg m = {0};
+  if (!seer_schema_decode(SEER_OBJECT_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_OBJECT_SCHEMA, &m);
     return SEER_EPROTO;
-  if (present == 0)
-    return SEER_OK; /* NULL object */
-  return seer_dec_dalc(r, img, imglen);
+  }
+  SeerStatus st = SEER_OK;
+  if (m.image_len != 0 && m.image.n > 0) { /* 0: a NULL object */
+    *img = malloc(m.image.n);
+    if (*img == NULL)
+      st = SEER_ENOMEM;
+    else {
+      memcpy(*img, m.image.p, m.image.n);
+      *imglen = m.image.n;
+    }
+  }
+  seer_schema_free(SEER_OBJECT_SCHEMA, &m);
+  return st;
 }
 
 /* Record an ADT cell to decode after the result set is fully fetched (its
@@ -1306,30 +1278,16 @@ static void skip_capability_block(SeerReader *r)
  * back to skipping zero bytes. Mirrors seerdb's _skip_rpa_tail_fields. */
 static bool skip_rpa_tail_fields(SeerReader *r, const SeerStmt *stmt)
 {
+  /* SEER_RPA_TAIL_SCHEMA (#398), on a copy */
   SeerReader t = *r;
-  int64_t txl = seer_dec_sb4(&t);
-  if (txl < 0 || (txl > 0 && seer_reader_bytes(&t, (size_t)txl) == NULL))
-    return false;
-  int64_t npairs = seer_dec_sb4(&t);
-  if (npairs < 0 || npairs > 1024)
-    return false;
-  for (int64_t i = 0; i < npairs && seer_reader_ok(&t); i++) {
-    for (int part = 0; part < 2; part++) { /* text value, then binary value */
-      if (seer_dec_sb4(&t) > 0) {
-        uint8_t *v = NULL;
-        size_t vl = 0;
-        SeerStatus st = seer_dec_dalc(&t, &v, &vl);
-        free(v);
-        if (st != SEER_OK)
-          return false;
-      }
-    }
-    (void)seer_dec_sb4(&t); /* keyword number */
-  }
-  int64_t reglen = seer_dec_sb4(&t);
-  if (reglen < 0 || (reglen > 0 && seer_reader_bytes(&t, (size_t)reglen) == NULL))
-    return false;
-  if (!seer_reader_ok(&t))
+  SeerSchemaCtx cx =
+      stmt != NULL ? seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version)
+                   : seer_msg_ctx(0, TTC_FIELD_VERSION_10_2, TTC_FIELD_VERSION_10_2);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerRpaMsg m = {0};
+  bool whole = seer_schema_decode(SEER_RPA_TAIL_SCHEMA, &cx, &t, &m);
+  seer_schema_free(SEER_RPA_TAIL_SCHEMA, &m);
+  if (!whole || m.txn_len < 0 || m.npairs < 0 || m.npairs > 1024 || m.reg_len < 0)
     return false;
   bool rowcount_tail = stmt != NULL && stmt->want_dml_rowcounts && stmt->dml_rowcounts == NULL;
   if (seer_reader_remaining(&t) > 0 && !is_known_token(t.buf[t.pos]) && !rowcount_tail)
@@ -1349,29 +1307,37 @@ static SeerStatus skip_rpa(SeerReader *r, SeerStmt *stmt)
    * would stop short and decode the OER off by those bytes. Mirrors seerdb's
    * decode_token_rpa_piggyback (#181). */
   bool break_on_token = (stmt == NULL) || stmt->conn->field_version < TTC_FIELD_VERSION_10_2;
-  int64_t num = seer_dec_sb4(r);
-  for (int64_t i = 0; i < num && seer_reader_ok(r); i++) {
-    if (seer_reader_remaining(r) == 0)
-      break;
-    if (break_on_token && is_known_token(r->buf[r->pos]))
-      break;
-    (void)seer_dec_sb4(r);
+  if (break_on_token) {
+    int64_t num = seer_dec_sb4(r);
+    for (int64_t i = 0; i < num && seer_reader_ok(r); i++) {
+      if (seer_reader_remaining(r) == 0 || is_known_token(r->buf[r->pos]))
+        break;
+      (void)seer_dec_sb4(r);
+    }
+  } else { /* SEER_RPA_HEAD_SCHEMA (#398) */
+    SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+    SeerRpaMsg m = {0};
+    (void)seer_schema_decode(SEER_RPA_HEAD_SCHEMA, &cx, r, &m);
   }
   if (break_on_token || !skip_rpa_tail_fields(r, stmt))
     while (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0)
       (void)seer_reader_u8(r);
-  /* Array-DML row counts (12c+): when armed, a ub4 count and that many ub4
-   * per-iteration affected-row counts ride here, ahead of the OER. */
+  /* Array-DML row counts (12c+): when armed, SEER_DML_ROWCOUNTS_SCHEMA and
+   * per iteration SEER_DML_ROWCOUNT_SCHEMA ride here, ahead of the OER
+   * (#398). */
   if (stmt != NULL && stmt->want_dml_rowcounts && stmt->dml_rowcounts == NULL &&
       seer_reader_remaining(r) > 0 && !is_known_token(r->buf[r->pos])) {
-    int64_t cnt = seer_dec_sb4(r);
-    if (cnt > 0 && cnt <= 65535 && seer_reader_ok(r)) {
-      uint32_t *arr = malloc((size_t)cnt * sizeof *arr);
+    SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+    SeerDmlRowCountsMsg m = {0};
+    if (seer_schema_decode(SEER_DML_ROWCOUNTS_SCHEMA, &cx, r, &m) && m.count > 0 &&
+        m.count <= 65535) {
+      uint32_t *arr = malloc((size_t)m.count * sizeof *arr);
       if (arr != NULL) {
-        for (int64_t i = 0; i < cnt && seer_reader_ok(r); i++)
-          arr[i] = (uint32_t)seer_dec_sb4(r);
+        for (int64_t i = 0; i < m.count && seer_schema_decode(SEER_DML_ROWCOUNT_SCHEMA, &cx, r, &m);
+             i++)
+          arr[i] = (uint32_t)m.rows;
         stmt->dml_rowcounts = arr;
-        stmt->n_dml_rowcounts = (size_t)cnt;
+        stmt->n_dml_rowcounts = (size_t)m.count;
       }
     }
   }
@@ -1393,101 +1359,82 @@ static void free_batch_errors(SeerStmt *stmt)
 /* Read an array-DML batch field (§6.7): a ub4 count, then a DALC blob packing
  * that many var-int ub4 values. On SEER_OK *out is a malloc'd array of *n
  * values (NULL/0 when the count is zero); caller frees. */
-static SeerStatus read_batch_ub4_array(SeerReader *r, uint32_t **out, size_t *n)
+/* The ub4s a batch-error array's value packs (TTC compressed integers). */
+static uint32_t *oer_ub4s(const SeerBytes *b, size_t *n)
 {
-  *out = NULL;
   *n = 0;
-  int64_t count = seer_dec_sb4(r);
-  if (count <= 0 || count > 65535)
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
-
-  uint8_t *blob = NULL;
-  size_t blen = 0;
-  if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
-    return SEER_EPROTO;
-  uint32_t *arr = malloc((size_t)count * sizeof *arr);
-  if (arr == NULL) {
-    free(blob);
-    return SEER_ENOMEM;
-  }
+  if (b->n == 0)
+    return NULL;
+  uint32_t *arr = malloc(b->n * sizeof *arr); /* at most one per byte */
+  if (arr == NULL)
+    return NULL;
   SeerReader br;
-  seer_reader_init(&br, blob, blen);
-  for (int64_t i = 0; i < count; i++)
-    arr[i] = (uint32_t)seer_dec_sb4(&br);
-  free(blob);
-  *out = arr;
-  *n = (size_t)count;
-  return SEER_OK;
+  seer_reader_init(&br, b->p, b->n);
+  while (seer_reader_remaining(&br) > 0 && seer_reader_ok(&br))
+    arr[(*n)++] = (uint32_t)seer_dec_sb4(&br);
+  return arr;
 }
 
+/* The batch errors' messages (§6.7), after SEER_OER_BATCH_SCHEMA counted `n`:
+ * SEER_OER_MSGS_HEAD_SCHEMA, then each as SEER_OER_MSG_SCHEMA - the same on
+ * 10g+ and 9i (#398). Each text NUL-terminated and malloc'd; an empty one ""
+ * with `blank` (10g+), else NULL (9i). NULL when the array can't be had. */
+static char **oer_batch_msgs(SeerReader *r, const SeerSchemaCtx *cx, int64_t n, bool blank)
+{
+  char **msgs = calloc((size_t)n, sizeof *msgs);
+  SeerOerTextMsg hm = {0};
+  (void)seer_schema_decode(SEER_OER_MSGS_HEAD_SCHEMA, cx, r, &hm);
+  for (int64_t i = 0; i < n && seer_reader_ok(r); i++) {
+    SeerOerTextMsg tm = {0};
+    bool ok = seer_schema_decode(SEER_OER_MSG_SCHEMA, cx, r, &tm);
+    if (ok && msgs != NULL && (tm.text.n > 0 || blank)) {
+      msgs[i] = malloc(tm.text.n + 1);
+      if (msgs[i] != NULL) {
+        if (tm.text.n > 0)
+          memcpy(msgs[i], tm.text.p, tm.text.n);
+        msgs[i][tm.text.n] = '\0';
+      }
+    }
+    seer_schema_free(SEER_OER_MSG_SCHEMA, &tm);
+    if (!ok)
+      break;
+  }
+  return msgs;
+}
+
+/* The end-of-call status, by SEER_OER_HEAD_SCHEMA / _TAIL_SCHEMA (#395
+ * spike): the batch errors' messages between them stay code. */
 static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
 {
-  oer->call_status = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r);            /* end-to-end seq# */
-  oer->row_count = seer_dec_sb4(r); /* current row number / DML rowcount */
-  oer->err_code = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* array elem error 1 */
-  (void)seer_dec_sb4(r); /* array elem error 2 */
-  oer->cursor_id = seer_dec_sb4(r);
-  oer->err_offset = seer_dec_sb4(r); /* error position (parse offset) */
-  /* sql_type, fatal, flags, user_cursor_options, upi_param, warn_flags: the
-   * last is a real signal (§6.3a). Below 12.1 `flags` is a variable-length
-   * ub2 - `00` when clear, `01 20` when a warning (e.g. an aggregate that
-   * skipped NULLs) sets it - so it cannot be read as one byte there. */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    const uint8_t *six = seer_reader_bytes(r, 6);
-    if (six != NULL)
-      oer->warn_flags = six[5];
-  } else {
-    seer_reader_bytes(r, 2); /* sql_type, fatal */
-    (void)seer_dec_sb4(r);   /* flags (ub2)     */
-    const uint8_t *three = seer_reader_bytes(r, 3);
-    if (three != NULL)
-      oer->warn_flags = three[2];
+  SeerConn *c = stmt->conn;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerOerMsg m = {0};
+  if (!seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, r, &m) ||
+      !seer_schema_decode(SEER_OER_FLAGS_SCHEMA, &cx, r, &m) ||
+      !seer_schema_decode(SEER_OER_BATCH_SCHEMA, &cx, r, &m)) {
+    seer_schema_free(SEER_OER_BATCH_SCHEMA, &m);
+    return SEER_EPROTO;
   }
-  (void)seer_dec_sb4(r);          /* rowid: data object  */
-  (void)seer_dec_sb4(r);          /* rowid: file         */
-  seer_reader_bytes(r, 1);        /* rowid: reserved     */
-  (void)seer_dec_sb4(r);          /* rowid: block        */
-  (void)seer_dec_sb4(r);          /* rowid: slot         */
-  (void)seer_dec_sb4(r);          /* os error            */
-  seer_reader_bytes(r, 2);        /* statement #, call # */
-  (void)seer_dec_sb4(r);          /* padding             */
-  (void)seer_dec_sb4(r);          /* successful iterations */
-  seer_skip_bytes_with_length(r); /* oerrdd */
+  oer->call_status = m.call_status;
+  oer->row_count = m.rows;
+  oer->err_code = m.code;
+  oer->cursor_id = m.cursor;
+  oer->err_offset = m.position;
+  oer->warn_flags = (uint8_t)m.warnings;
 
-  /* Batch-error arrays (all empty for a plain statement; populated by an
-   * array-DML execute in batcherrors mode, §6.7). The code and offset arrays
-   * line up by position with the messages: error i hit iteration
-   * offsets[i] with ORA-codes[i] and text messages[i]. */
-  uint32_t *codes = NULL, *offsets = NULL;
+  /* The batch errors (§6.7): code i hit iteration offsets[i], text msgs[i]. */
   size_t ncodes = 0, noffsets = 0;
-  SeerStatus bst = read_batch_ub4_array(r, &codes, &ncodes);
-  if (bst == SEER_OK)
-    bst = read_batch_ub4_array(r, &offsets, &noffsets);
-  if (bst != SEER_OK) {
-    free(codes);
-    free(offsets);
-    return bst;
-  }
+  uint32_t *codes = oer_ub4s(&m.codes, &ncodes);
+  uint32_t *offsets = oer_ub4s(&m.offsets, &noffsets);
+  seer_schema_free(SEER_OER_BATCH_SCHEMA, &m);
 
   char **msgs = NULL;
   size_t nmsgs = 0;
-  int64_t nmsg = seer_dec_sb4(r);
-  if (nmsg > 0 && nmsg < 65536) {
-    msgs = calloc((size_t)nmsg, sizeof *msgs);
-    seer_reader_bytes(r, 1); /* indicator byte */
-    for (int64_t i = 0; i < nmsg && seer_reader_ok(r); i++) {
-      char *m = NULL;
-      seer_read_str(r, &m);
-      if (msgs != NULL)
-        msgs[i] = m; /* takes ownership */
-      else
-        free(m);
-      seer_reader_bytes(r, 2); /* per-message trailer */
-    }
+  if (m.nmsgs > 0 && m.nmsgs < 65536) {
+    msgs = oer_batch_msgs(r, &cx, m.nmsgs, true);
     if (msgs != NULL)
-      nmsgs = (size_t)nmsg;
+      nmsgs = (size_t)m.nmsgs;
   }
 
   if (!seer_reader_ok(r)) {
@@ -1499,7 +1446,6 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
     return SEER_EPROTO;
   }
 
-  /* Assemble the captured per-row failures onto the statement. */
   size_t nb = noffsets;
   if (ncodes > nb)
     nb = ncodes;
@@ -1525,42 +1471,20 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
     free(msgs[i]);
   free(msgs);
 
-  /* 12c+ extends the OER before the trailing message: an extended error number
-   * + rowcount (12.1+, by the negotiated version), then a SQL type + server
-   * checksum - which a 21c+ server sends to every session, so that pair follows
-   * the version the SERVER advertised, not the negotiated one
-   * (seerdb/seerdb@e513309). Read by the negotiated version, a session capped
-   * below 20.1 took the SQL type for the message length and lost every error's
-   * text. */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    (void)seer_dec_sb4(r); /* extended error number */
-    (void)seer_dec_sb4(r); /* extended rowcount (ub8) */
-    if (stmt->conn->server_field_version >= TTC_FIELD_VERSION_20_1 ||
-        stmt->conn->field_version >= TTC_FIELD_VERSION_20_1) {
-      (void)seer_dec_sb4(r); /* SQL type */
-      (void)seer_dec_sb4(r); /* server checksum */
+  /* The tail: 12.1's extended fields, a 20.1+ server's SQL type and
+   * checksum, then the "ORA-NNNNN: ..." text when there is an error. */
+  SeerOerMsg t = {.code = oer->err_code};
+  (void)seer_schema_decode(SEER_OER_TAIL_SCHEMA, &cx, r, &t);
+  if (t.message.n > 0) {
+    char *nbuf = malloc(t.message.n + 1);
+    if (nbuf != NULL) {
+      memcpy(nbuf, t.message.p, t.message.n);
+      nbuf[t.message.n] = '\0';
+      free(c->last_error);
+      c->last_error = nbuf;
     }
   }
-
-  /* Trailing "ORA-NNNNN: ..." message when the error code is non-zero. */
-  if (oer->err_code != 0 && seer_reader_remaining(r) > 0) {
-    uint8_t *msg = NULL;
-    size_t mlen = 0;
-    if (seer_dec_dalc(r, &msg, &mlen) == SEER_OK && msg != NULL) {
-      /* Build the replacement first, then swap: the old buffer is only
-       * freed once the new one is fully populated, so no read ever touches
-       * freed memory and an allocation failure leaves the prior error
-       * intact instead of nulling it. */
-      char *nbuf = malloc(mlen + 1);
-      if (nbuf != NULL) {
-        memcpy(nbuf, msg, mlen);
-        nbuf[mlen] = '\0';
-        free(stmt->conn->last_error);
-        stmt->conn->last_error = nbuf;
-      }
-    }
-    free(msg);
-  }
+  seer_schema_free(SEER_OER_TAIL_SCHEMA, &t);
   return SEER_OK;
 }
 
@@ -1569,33 +1493,26 @@ static SeerStatus parse_oer(SeerReader *r, SeerStmt *stmt, OerResult *oer)
  * decode (per the bind's declared type) into pbinds[i].out. */
 static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
 {
-  (void)seer_reader_u8(r); /* flag */
-  int64_t num_requests = seer_dec_sb4(r);
-  int64_t num_iters = seer_dec_sb4(r);
-  int64_t num_binds = num_iters * 256 + num_requests;
-  (void)seer_dec_sb4(r);           /* num iters this time   */
-  (void)seer_dec_sb4(r);           /* uac buffer length     */
-  int64_t bvlen = seer_dec_sb4(r); /* fast-fetch bit vector */
-  if (bvlen > 0)
-    seer_reader_bytes(r, (size_t)bvlen);
-  int64_t ridlen = seer_dec_sb4(r); /* rowid                 */
-  if (ridlen > 0)
-    seer_reader_bytes(r, (size_t)ridlen);
-  if (num_binds < 0 || num_binds > 100000 || !seer_reader_ok(r))
+  /* SEER_IOV_SCHEMA, then a direction byte per bind (#398) */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
+  SeerIovMsg iov = {0};
+  bool whole = seer_schema_decode(SEER_IOV_SCHEMA, &cx, r, &iov);
+  seer_schema_free(SEER_IOV_SCHEMA, &iov);
+  int64_t num_binds = iov.iterations * 256 + iov.requests;
+  if (!whole || num_binds < 0 || num_binds > 100000)
     return SEER_EPROTO;
-
+  iov.nbinds = num_binds;
+  if (!seer_schema_decode(SEER_IOV_DIRS_SCHEMA, &cx, r, &iov))
+    return SEER_EPROTO;
   uint8_t *dirs = malloc(num_binds ? (size_t)num_binds : 1);
   if (dirs == NULL)
     return SEER_ENOMEM;
   bool has_out = false;
   for (int64_t i = 0; i < num_binds; i++) {
-    dirs[i] = seer_reader_u8(r);
+    dirs[i] = iov.directions.p[i];
     if (dirs[i] != 32) /* 32 = IN; else OUT/IN OUT */
       has_out = true;
-  }
-  if (!seer_reader_ok(r)) {
-    free(dirs);
-    return SEER_EPROTO;
   }
 
   /* Returned OUT values, in bind order. A scalar value is a DALC blob plus a
@@ -1624,7 +1541,8 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
           free(dirs);
           return SEER_EPROTO;
         }
-        (void)seer_dec_sb4(r); /* return code */
+        SeerCellMsg tm = {0}; /* the return code: SEER_OUT_TAIL_SCHEMA (#398) */
+        (void)seer_schema_decode(SEER_OUT_TAIL_SCHEMA, &cx, r, &tm);
         free(b->out.data);
         b->out = (SeerCell){0};
         free(b->out_image);
@@ -1633,126 +1551,109 @@ static SeerStatus parse_iov(SeerReader *r, SeerStmt *stmt)
         continue;
       }
       if (b != NULL && b->is_array) {
-        /* OUT assoc array (#122): ub4 count, then each element as a DALC
-         * value + a ub4 per-element return code. */
-        int64_t count = seer_dec_sb4(r);
-        if (count < 0 || count > 1000000 || !seer_reader_ok(r)) {
+        /* OUT assoc array (#122): SEER_OUT_ARRAY_SCHEMA's count, then each
+         * element as SEER_OUT_CELL_SCHEMA - the value and its return code -
+         * as on 8i (#398). */
+        SeerOutArrayMsg am = {0};
+        if (!seer_schema_decode(SEER_OUT_ARRAY_SCHEMA, &cx, r, &am) || am.count < 0 ||
+            am.count > 1000000) {
           free(dirs);
           return SEER_EPROTO;
         }
+        int64_t count = am.count;
         for (int k = 0; k < b->out_arr_n; k++)
           free(b->out_arr[k].data);
         free(b->out_arr);
         b->out_arr = count ? calloc((size_t)count, sizeof *b->out_arr) : NULL;
         b->out_arr_n = 0;
         for (int64_t e = 0; e < count; e++) {
-          uint8_t *ev = NULL;
-          size_t evl = 0;
-          if (seer_dec_dalc(r, &ev, &evl) != SEER_OK) {
-            free(ev);
+          SeerCellMsg em = {0};
+          if (!seer_schema_decode(SEER_OUT_CELL_SCHEMA, &cx, r, &em)) {
+            seer_schema_free(SEER_OUT_CELL_SCHEMA, &em);
             free(dirs);
             return SEER_EPROTO;
           }
-          (void)seer_dec_sb4(r); /* per-element return code (ub4) */
           if (b->out_arr != NULL)
-            decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, ev, evl, &b->out_arr[e]);
-          free(ev);
+            decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, em.value.p, em.value.n,
+                          &b->out_arr[e]);
+          seer_schema_free(SEER_OUT_CELL_SCHEMA, &em);
         }
         b->out_arr_n = (int)count;
         continue;
       }
-      uint8_t *v = NULL;
-      size_t vl = 0;
-      if (seer_dec_dalc(r, &v, &vl) != SEER_OK) {
-        free(v);
+      /* SEER_OUT_CELL_SCHEMA: the value, then its ub4 return code - 0 for
+       * a value and non-zero for a NULL (1405), which takes more bytes; read
+       * as one byte, a NULL or never-assigned OUT desynced the reply (#149). */
+      SeerCellMsg om = {0};
+      if (!seer_schema_decode(SEER_OUT_CELL_SCHEMA, &cx, r, &om)) {
+        seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
         free(dirs);
         return SEER_EPROTO;
       }
-      /* Then the value's ub4 return code, as an object's or an array
-       * element's: 0 - one byte, `00` - for a value, and non-zero for a NULL
-       * (1405, "fetched column value is NULL"), which takes more bytes. Read
-       * as one byte, a NULL or never-assigned OUT desynced the reply and the
-       * block failed with "unexpected response token" (#149). */
-      (void)seer_dec_sb4(r);
       if (b != NULL) {
         free(b->out.data);
         b->out = (SeerCell){0};
-        decode_scalar(b->oac_type ? b->oac_type : 1, v, vl, &b->out);
+        decode_scalar(b->oac_type ? b->oac_type : 1, om.value.p, om.value.n, &b->out);
       }
-      free(v);
+      seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
     }
   }
   free(dirs);
   return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
 }
 
-/* DML RETURNING ... INTO return data (§5.6): for each OUT (return) bind, in bind
- * order, a ub4 affected-row count then per row a DALC value and an sb4 truncation
- * length. We capture the first affected row's value into pbinds[i].out (one ODBC
- * OUT parameter holds one value). */
+/* DML RETURNING ... INTO return data (§5.6), by SEER_RETURNING_COUNT_SCHEMA
+ * and per row SEER_RETURNING_VALUE_SCHEMA, or _LOB_SCHEMA for a LOB target
+ * (#398). We capture the first affected row's value into pbinds[i].out (one
+ * ODBC OUT parameter holds one value); a LOB's content is read through its
+ * locator once the response is parsed. */
 static SeerStatus parse_returning_rxd(SeerReader *r, SeerStmt *stmt)
 {
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  cx.wide_chunks = r->sb4_chunks;
   for (int i = 0; i < stmt->npbinds; i++) {
     SeerBind *b = &stmt->pbinds[i];
     if (!b->is_out)
       continue;
     b->out_full_len = 0;
-    int64_t num_rows = seer_dec_sb4(r);
-    if (num_rows < 0 || num_rows > 1000000 || !seer_reader_ok(r))
+    SeerReturningMsg cm = {0};
+    if (!seer_schema_decode(SEER_RETURNING_COUNT_SCHEMA, &cx, r, &cm) || cm.nrows < 0 ||
+        cm.nrows > 1000000)
       return SEER_EPROTO;
-    for (int64_t row = 0; row < num_rows; row++) {
-      if (b->ret_lob != 0) {
-        /* A LOB return value is the LOB block (§22.1d): from 12.1 a lone 0x00
-         * for NULL, else ub4 block length, ub8 size, ub4 chunk size and the
-         * locator as a DALC; before 12.1 (measured on 10g / 11g) a ub4 size and
-         * the locator, as a fetched LOB column. Then the usual sb4 length. The
-         * content is read through the locator once the response is parsed. */
-        uint8_t *loc = NULL;
-        size_t ll = 0;
-        if (stmt->conn->field_version < TTC_FIELD_VERSION_12_1) {
-          if (read_lob_locator(r, &loc, &ll) != SEER_OK) { /* 11g: ub4 + locator */
-            free(loc);
-            return SEER_EPROTO;
-          }
-        } else if (seer_reader_remaining(r) > 0 && r->buf[r->pos] == 0x00) {
-          (void)seer_reader_u8(r);
-        } else {
-          (void)seer_dec_sb4(r); /* block length */
-          (void)seer_dec_sb4(r); /* LOB size (ub8) */
-          (void)seer_dec_sb4(r); /* chunk size */
-          if (seer_dec_dalc(r, &loc, &ll) != SEER_OK) {
-            free(loc);
-            return SEER_EPROTO;
-          }
-        }
-        (void)seer_dec_sb4(r); /* sb4 length */
-        if (row == 0) {
-          free(b->out.data);
-          b->out = (SeerCell){0};
-          free(b->ret_locator);
-          b->ret_locator = loc;
-          b->ret_loclen = ll;
-        } else {
-          free(loc);
-        }
-        continue;
-      }
-      uint8_t *v = NULL;
-      size_t vl = 0;
-      if (seer_dec_dalc(r, &v, &vl) != SEER_OK) {
-        free(v);
+    const SeerField *row_schema =
+        b->ret_lob != 0 ? SEER_RETURNING_LOB_SCHEMA : SEER_RETURNING_VALUE_SCHEMA;
+    for (int64_t row = 0; row < cm.nrows; row++) {
+      SeerReturningMsg m = {0};
+      if (!seer_schema_decode(row_schema, &cx, r, &m)) {
+        seer_schema_free(row_schema, &m);
         return SEER_EPROTO;
       }
-      /* The value's real length: larger than what arrived when the server
-       * cut it to the bind's declared size (seerdb/seerdb@1812615). */
-      int64_t actual = seer_dec_sb4(r);
+      SeerStatus st = SEER_OK;
       if (row == 0) { /* keep the first row's value */
         free(b->out.data);
         b->out = (SeerCell){0};
-        decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, v, vl, &b->out);
-        b->out_full_len = actual > (int64_t)vl ? actual : 0;
+        if (b->ret_lob != 0) {
+          free(b->ret_locator);
+          b->ret_locator = NULL;
+          b->ret_loclen = 0;
+          if (m.locator.n > 0) {
+            b->ret_locator = malloc(m.locator.n);
+            if (b->ret_locator == NULL)
+              st = SEER_ENOMEM;
+            else {
+              memcpy(b->ret_locator, m.locator.p, m.locator.n);
+              b->ret_loclen = m.locator.n;
+            }
+          }
+        } else {
+          decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, m.value.p, m.value.n,
+                        &b->out);
+          b->out_full_len = m.actual_len > (int64_t)m.value.n ? m.actual_len : 0;
+        }
       }
-      free(v);
+      seer_schema_free(row_schema, &m);
+      if (st != SEER_OK)
+        return st;
     }
   }
   return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
@@ -1791,55 +1692,25 @@ static SeerStatus resolve_returned_lobs(SeerStmt *stmt)
   return SEER_OK;
 }
 
-/* Consume a server-side piggyback (TTI_SVR_PIGGYBACK, DRCP #130) the server
- * prepends to a pooled session's response. The values (assigned session id /
- * serial, session-state pairs, MTS pid) aren't needed - skip the block
- * byte-for-byte so the real response tokens follow. Mirrors python-oracledb. */
-static SeerStatus skip_server_piggyback(SeerReader *r)
+/* Consume a server-side piggyback (TTI_SVR_PIGGYBACK) the server prepends to
+ * a response: a pooled session's (DRCP #130), an MTS pid, or a sessionless
+ * transaction's sync state (§31, keyword 201 the transaction id). The values
+ * aren't needed: the block is read by its schema and dropped, so the real
+ * response tokens follow (#398). */
+static SeerStatus skip_server_piggyback(SeerReader *r, const SeerConn *c)
 {
   uint8_t opcode = seer_reader_u8(r);
-  if (opcode == TNS_SVR_PIG_SESS_RET) {
-    (void)seer_dec_sb4(r);            /* number of DTYs (ub2)   */
-    (void)seer_reader_u8(r);          /* length of DTYs (ub1)   */
-    int64_t npairs = seer_dec_sb4(r); /* number of pairs (ub2)  */
-    if (npairs > 0) {
-      (void)seer_reader_u8(r);
-      for (int64_t i = 0; i < npairs && seer_reader_ok(r); i++) {
-        if (seer_dec_sb4(r) > 0)
-          seer_skip_chunked(r); /* key   */
-        if (seer_dec_sb4(r) > 0)
-          seer_skip_chunked(r); /* value */
-        (void)seer_dec_sb4(r);  /* pair flags (ub2)       */
-      }
-    }
-    (void)seer_dec_sb4(r); /* session flags (ub4)    */
-    (void)seer_dec_sb4(r); /* session id (ub4)       */
-    (void)seer_dec_sb4(r); /* serial number (ub2)    */
-  } else if (opcode == TNS_SVR_PIG_OS_PID_MTS) {
-    (void)seer_dec_sb4(r); /* ub2                    */
-    seer_skip_chunked(r);  /* pid bytes              */
-  } else if (opcode == TNS_SVR_PIG_SYNC) {
-    /* Sessionless-txn sync state (§31): keyword-value pairs (keyword 201 =
-     * the transaction id) the server piggybacks on the next call's response
-     * while a sessionless txn is active. The values aren't needed - consume
-     * the block byte-for-byte so the real tokens follow. The pair loop is
-     * framed like SESS_RET but the length ub1 is always present. */
-    (void)seer_dec_sb4(r);            /* number of DTYs (ub2)   */
-    (void)seer_reader_u8(r);          /* length of DTYs (ub1)   */
-    int64_t npairs = seer_dec_sb4(r); /* number of pairs (ub2)  */
-    (void)seer_reader_u8(r);          /* length (ub1)           */
-    for (int64_t i = 0; i < npairs && seer_reader_ok(r); i++) {
-      if (seer_dec_sb4(r) > 0)
-        seer_skip_chunked(r); /* text value   */
-      if (seer_dec_sb4(r) > 0)
-        seer_skip_chunked(r); /* binary value */
-      (void)seer_dec_sb4(r);  /* keyword num (ub2)      */
-    }
-    (void)seer_dec_sb4(r); /* overall flags (ub4)    */
-  } else {
+  const SeerField *schema = opcode == TNS_SVR_PIG_SESS_RET     ? SEER_SVR_PIG_SESS_RET_SCHEMA
+                            : opcode == TNS_SVR_PIG_OS_PID_MTS ? SEER_SVR_PIG_MTS_SCHEMA
+                            : opcode == TNS_SVR_PIG_SYNC       ? SEER_SVR_PIG_SYNC_SCHEMA
+                                                               : NULL;
+  if (schema == NULL)
     return SEER_EPROTO; /* unknown piggyback opcode */
-  }
-  return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  SeerSvrPiggybackMsg m = {0};
+  bool ok = seer_schema_decode(schema, &cx, r, &m);
+  seer_schema_free(schema, &m);
+  return ok ? SEER_OK : SEER_EPROTO;
 }
 
 /* Walk one response message, appending rows and capturing the OER outcome. */
@@ -1917,7 +1788,7 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       }
       break;
     case TTI_RXH:
-      st = parse_rxh(&r, &bv, &bvlen);
+      st = parse_rxh(&r, stmt->conn->field_version, &bv, &bvlen);
       break;
     case TTI_BVC:
       st = parse_bvc(&r, stmt->ncols, &bv, &bvlen);
@@ -1942,7 +1813,7 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       st = skip_rpa(&r, stmt);
       break;
     case TTI_SVR_PIGGYBACK:
-      st = skip_server_piggyback(&r);
+      st = skip_server_piggyback(&r, stmt->conn);
       break;
     case TTI_OER:
       st = parse_oer(&r, stmt, oer);
@@ -1976,7 +1847,12 @@ static SeerStatus parse_response(SeerStmt *stmt, const uint8_t *buf, size_t len,
       /* Pipelining (§32/#158): a response-correlation marker leading a
        * pipelined op's response — a ub8 token number. Consume it and keep
        * decoding the op body (which ends on its own OER/EOR). */
-      (void)seer_dec_sb4(&r);
+      {
+        SeerCountMsg tm = {0}; /* SEER_COUNT_SCHEMA (#398) */
+        SeerSchemaCtx tcx =
+            seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+        (void)seer_schema_decode(SEER_COUNT_SCHEMA, &tcx, &r, &tm);
+      }
       break;
     default:
       seer_log(SEER_LOG_ERROR, "stmt: unexpected response token %u", tok);
@@ -2074,42 +1950,20 @@ static SeerStatus store_bind(SeerStmt *s, int param, uint8_t oac_type, uint32_t 
                        rxd_len);
 }
 
-/* Encode a bind value (oracledb encode_chr). Two forms, split at 12.2:
- *   - 12.2+ (write_bytes_with_length): inline <ub1 len><bytes> for n <= 252, else
- *     the 0xFE marker + 64-byte chunks each prefixed by an *sb4* length, then a
- *     zero-length terminator.
- *   - pre-12.2 (11g/10g): inline <ub1 len><bytes> for n <= 64, else 0xFE + 64-byte
- *     chunks each prefixed by a bare *ub1* length, then a 0 terminator.
+/* Encode a bind value (oracledb encode_chr) by SEER_CHR_SCHEMA (#398): from
+ * 12.1 inline up to 252 bytes, else 0xFE and 64-byte chunks each with an sb4
+ * length; before, inline only up to 64 and each chunk's length a ub1.
  * Sending the wrong chunk width desyncs the server's two-task conversion
  * (ORA-03120). Used for VARCHAR and RAW bind values; malloc'd *out. */
 static SeerStatus encode_chr(const uint8_t *data, size_t n, uint8_t fv, uint8_t **out,
                              size_t *outlen)
 {
-  bool new_form = fv >= TTC_FIELD_VERSION_12_1;
-  /* A plain length byte covers 1..252: 0xFD (253), 0xFE (chunked) and 0xFF
-   * (NULL) are markers, so a 253-byte value inline reads as a marker. */
-  size_t inline_max = new_form ? 252 : 64;
   SeerWriter w;
   if (!seer_writer_init(&w, n + 16))
     return SEER_ENOMEM;
-  if (n <= inline_max) {
-    seer_writer_u8(&w, (uint8_t)n);
-    seer_writer_bytes(&w, data, n);
-  } else {
-    seer_writer_u8(&w, 0xFE);
-    for (size_t i = 0; i < n; i += 0x40) {
-      size_t chunk = (n - i < 0x40) ? n - i : 0x40;
-      if (new_form)
-        seer_enc_sb4(&w, (uint32_t)chunk);
-      else
-        seer_writer_u8(&w, (uint8_t)chunk);
-      seer_writer_bytes(&w, data + i, chunk);
-    }
-    if (new_form)
-      seer_enc_sb4(&w, 0); /* zero-length terminator */
-    else
-      seer_writer_u8(&w, 0);
-  }
+  SeerChrMsg m = {.value = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, &w);
   if (!seer_writer_ok(&w)) {
     seer_writer_free(&w);
     return SEER_ENOMEM;
@@ -2283,11 +2137,9 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
   SeerWriter v, oac;
   bool ok = seer_writer_init(&v, loclen + 8);
   if (ok) {
-    seer_writer_u8(&v, 0x01);
-    seer_writer_u8(&v, 0x28);
-    seer_writer_u8(&v, 0x28);
-    seer_writer_u16(&v, (uint16_t)loclen);
-    seer_writer_bytes(&v, loc, loclen);
+    SeerLobBindMsg lm = {.loc_len = (int64_t)loclen, .locator = {.p = loc, .n = loclen}};
+    SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    seer_schema_encode(SEER_LOB_BIND_SCHEMA, &cx, &lm, &v); /* #398 */
     ok = seer_writer_ok(&v);
   }
   if (!ok || !seer_writer_init(&oac, 64)) {
@@ -2994,52 +2846,58 @@ static bool sql_is_cacheable(const char *sql)
  * a 12c server is rejected (ORA-03115). The 12c shape starts at 12.1; only the
  * oaccolid waits for 12.2: a 12.1 session sent it answers ORA-03106, one sent
  * the 11g shape ORA-03120 (seerdb/seerdb@50f0a83). */
+/* One bind or define descriptor by SEER_OAC_SCHEMA (#398): at 8i's widths, or
+ * thin's at field version `fv`. The values are the caller's. */
+static void oac_write(SeerWriter *w, bool is_8i, uint8_t fv, const SeerOacMsg *m)
+{
+  SeerSchemaCtx cx = is_8i ? seer_msg_ctx(1, 0, 0) : seer_msg_ctx(0, fv, fv);
+  seer_schema_encode(SEER_OAC_SCHEMA, &cx, m, w);
+}
+
+/* A bind value by SEER_CHR_SCHEMA (#398): at 8i's widths, or thin's at
+ * field version `fv`. No bytes is the empty value, a NULL. */
+static void chr_write(SeerWriter *w, bool is_8i, uint8_t fv, const uint8_t *p, size_t n)
+{
+  SeerSchemaCtx cx = is_8i ? seer_msg_ctx(1, 0, 0) : seer_msg_ctx(0, fv, fv);
+  SeerChrMsg m = {.value = {.p = p, .n = n}};
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, w);
+}
+
+/* One of 8i's fixed slots (SEER_O8I_OUT_SLOT_SCHEMA, _CURSOR_SLOT_SCHEMA). */
+static void o8i_slot(SeerWriter *w, const SeerField *schema)
+{
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerChrMsg none = {0};
+  seer_schema_encode(schema, &cx, &none, w);
+}
+
+/* An associative array's element count, as SEER_OUT_ARRAY_SCHEMA reads it. */
+static void aa_count(SeerWriter *w, bool is_8i, uint8_t fv, int n)
+{
+  SeerSchemaCtx cx = is_8i ? seer_msg_ctx(1, 0, 0) : seer_msg_ctx(0, fv, fv);
+  SeerOutArrayMsg m = {.count = n};
+  seer_schema_encode(SEER_OUT_ARRAY_SCHEMA, &cx, &m, w);
+}
+
 static void emit_oac(SeerWriter *w, int fv, uint8_t dtype, uint32_t length, uint32_t flag,
                      uint32_t charset)
 {
+  /* The values 10g+ sends; the layout is SEER_OAC_SCHEMA's (#395). From 12.1
+   * a charset is AL32UTF8 / AL16UTF16 / none with its form, and the flags are
+   * TNS_BIND_USE_INDICATORS; before, the caller's charset and continuation
+   * flag, form 2 for AL16UTF16 and 1 otherwise. */
+  SeerOacMsg m = {.data_type = dtype, .max_length = length};
   if (fv >= TTC_FIELD_VERSION_12_1) {
-    uint32_t bind_charset;
-    uint8_t csfrm;
-    if (charset == 0) {
-      bind_charset = 0;
-      csfrm = 0;
-    } else if (charset == 2000) {
-      bind_charset = 2000;
-      csfrm = 2;
-    } /* AL16UTF16 */
-    else {
-      bind_charset = 873;
-      csfrm = 1;
-    } /* AL32UTF8  */
-    seer_writer_u8(w, dtype);
-    seer_writer_u8(w, 1); /* TNS_BIND_USE_INDICATORS */
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, length);
-    seer_enc_sb4(w, 0);            /* max number of array elements */
-    seer_enc_sb4(w, 0);            /* cont flag (ub8) */
-    seer_enc_sb4(w, 0);            /* OID */
-    seer_enc_sb4(w, 0);            /* version */
-    seer_enc_sb4(w, bind_charset); /* charset id (ub2) */
-    seer_writer_u8(w, csfrm);      /* character set form */
-    seer_enc_sb4(w, 0);            /* LOB prefetch length */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      seer_enc_sb4(w, 0); /* oaccolid */
-    return;
+    m.flags = 1;
+    m.charset = charset == 0 ? 0 : charset == 2000 ? 2000 : 873;
+    m.csfrm = charset == 0 ? 0 : charset == 2000 ? 2 : 1;
+  } else {
+    m.flags = 3;
+    m.cont_flags = flag;
+    m.charset = charset;
+    m.csfrm = charset == 2000 ? 2 : 1;
   }
-  uint8_t form_of_use = (charset == 2000) ? 2 : 1; /* AL16UTF16 => 2 */
-  seer_writer_u8(w, dtype);
-  seer_writer_u8(w, 3);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, length);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, flag);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, charset);
-  seer_writer_u8(w, form_of_use);
-  seer_enc_sb4(w, 0); /* max */
+  oac_write(w, false, (uint8_t)fv, &m);
 }
 
 /* The LOB type a DML RETURNING target is declared as, or 0. A VARCHAR / RAW
@@ -3068,20 +2926,13 @@ static void emit_lob_oac(SeerWriter *w, int fv, uint8_t lob_type)
     emit_oac(w, fv, lob_type, 112, 0, clob ? 873 : 0);
     return;
   }
-  seer_writer_u8(w, lob_type);
-  seer_writer_u8(w, 1); /* TNS_BIND_USE_INDICATORS */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 112);        /* max data length: the LOB buffer-size factor */
-  seer_enc_sb4(w, 0);          /* max number of array elements */
-  seer_enc_sb4(w, 0x02000000); /* cont flag (ub8): LOB */
-  seer_enc_sb4(w, 0);          /* OID */
-  seer_enc_sb4(w, 0);          /* version */
-  seer_enc_sb4(w, clob ? 873 : 0);
-  seer_writer_u8(w, clob ? 1 : 0); /* character set form */
-  seer_enc_sb4(w, 0);              /* LOB prefetch length */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    seer_enc_sb4(w, 0); /* oaccolid */
+  SeerOacMsg m = {.data_type = lob_type,
+                  .flags = 1, /* TNS_BIND_USE_INDICATORS */
+                  .max_length = 112,
+                  .cont_flags = 0x02000000, /* LOB */
+                  .charset = clob ? 873 : 0,
+                  .csfrm = clob ? 1 : 0};
+  oac_write(w, false, (uint8_t)fv, &m);
 }
 
 static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
@@ -3165,15 +3016,12 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   /* Flush any closed statements' server cursors as a CLOSE_CURSORS piggyback in
    * front of this execute, so they don't leak until session end. */
   if (c->n_close > 0) {
-    seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-    seer_writer_u8(w, TTI_OCCA);
-    seer_writer_u8(w, seer_ttc_next_seq(c));
-    if (c->field_version > TTC_FIELD_VERSION_23_1)
-      seer_enc_sb4(w, 0); /* ub8 token (fv24) */
-    seer_writer_u8(w, 1); /* cursor-list pointer present */
-    seer_enc_sb4(w, (uint32_t)c->n_close);
-    for (int i = 0; i < c->n_close; i++)
-      seer_enc_sb4(w, (uint32_t)c->close_cursors[i]);
+    SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    SeerFunHeadMsg h = {
+        .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_OCCA, .seq = seer_ttc_next_seq(c)};
+    SeerCloseCursorsMsg cc = {.list_ptr = 1, .ids = c->close_cursors, .n = c->n_close};
+    seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+    seer_schema_encode(SEER_CLOSE_CURSORS_SCHEMA, &cx, &cc, w);
     c->n_close = 0;
   }
 
@@ -3186,35 +3034,29 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
     size_t total = 0;
     for (int i = 0; i < c->n_free_lobs; i++)
       total += 2 + c->free_lob_lens[i];
-    seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-    seer_writer_u8(w, TTI_LOBOPS);
-    seer_writer_u8(w, seer_ttc_next_seq(c));
-    if (c->field_version > TTC_FIELD_VERSION_23_1)
-      seer_enc_sb4(w, 0);             /* ub8 token (fv24) */
-    seer_writer_u8(w, 1);             /* source pointer */
-    seer_enc_sb4(w, (uint32_t)total); /* the locators' total length */
-    seer_writer_u8(w, 0);             /* dest pointer */
-    seer_enc_sb4(w, 0);               /* dest length */
-    seer_enc_sb4(w, 0);               /* short source offset */
-    seer_enc_sb4(w, 0);               /* short dest offset */
-    for (int i = 0; i < 3; i++)       /* charset / short amount / null-LOB */
-      seer_writer_u8(w, 0);
-    seer_enc_sb4(w, LOB_OP_FREE_TEMP | LOB_OP_ARRAY);
-    seer_writer_u8(w, 0);         /* scn array pointer */
-    seer_enc_sb4(w, 0);           /* scn array length */
-    seer_enc_sb4(w, 0);           /* source offset (ub8) */
-    seer_enc_sb4(w, 0);           /* dest offset (ub8) */
-    seer_writer_u8(w, 0);         /* amount pointer */
-    for (int i = 0; i < 3; i++) { /* array-LOB slots: pointer + ub4 */
-      seer_writer_u8(w, 0);
-      seer_enc_sb4(w, 0);
-    }
-    for (int i = 0; i < c->n_free_lobs; i++) {
-      seer_writer_u16(w, (uint16_t)c->free_lob_lens[i]);
-      seer_writer_bytes(w, c->free_lobs[i], c->free_lob_lens[i]);
+    /* SEER_LOBOPS_SCHEMA (#398): FREE_TEMP with the ARRAY bit, the source
+     * length the locators' total, the locators each ub2-prefixed. */
+    SeerWriter locs;
+    if (!seer_writer_init(&locs, total + 1))
+      return SEER_ENOMEM;
+    SeerSchemaCtx lcx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    for (int i = 0; i < c->n_free_lobs; i++) { /* SEER_LOCATOR_ITEM_SCHEMA each */
+      SeerLocatorItemMsg li = {.len = (int64_t)c->free_lob_lens[i],
+                               .locator = {.p = c->free_lobs[i], .n = c->free_lob_lens[i]}};
+      seer_schema_encode(SEER_LOCATOR_ITEM_SCHEMA, &lcx, &li, &locs);
       free(c->free_lobs[i]);
     }
     c->n_free_lobs = 0;
+    SeerFunHeadMsg lh = {
+        .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_LOBOPS, .seq = seer_ttc_next_seq(c)};
+    SeerLobopMsg lm = {.src_ptr = 1,
+                       .src_len = (int64_t)total,
+                       .op = LOB_OP_FREE_TEMP | LOB_OP_ARRAY,
+                       .loc_len = (int64_t)locs.len,
+                       .locator = {.p = locs.buf, .n = locs.len}};
+    seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &lcx, &lh, w);
+    seer_schema_encode(SEER_LOBOPS_SCHEMA, &lcx, &lm, w);
+    seer_writer_free(&locs);
   }
 
   /* Statement-cache reuse: re-execute a parsed cursor with no re-parse - send
@@ -3223,74 +3065,38 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
   if (reuse)
     opt &= ~0x0001u; /* PARSE off                    */
 
+  /* The SQL text goes by SF_SQL (#398), framed as the field version wants;
+   * a no-parse re-execute has no sql_ptr and sends none, where even a zero
+   * length would shift the server's read of the al8i4 array. */
+  /* SEER_ALL8_SCHEMA (#398). 12c+ carries al8pidmlrc (12.1+), the SQL-id
+   * slot (12.2+) and the 12.2_EXT1 chunk ids - all null for us; without them
+   * the server reads al8i4 at the wrong offset (ORA-03120; gating the tail
+   * on 12.2 sent a 12.1 session the 11g shape, seerdb/seerdb@50f0a83). A
+   * server but 10g takes five more register bytes. */
   seer_ttc_fun_header(stmt->conn, w, TTI_ALL8);
-  seer_enc_sb4(w, opt);
-  seer_enc_sb4(w, reuse ? (uint32_t)stmt->reuse_cursor : 0); /* cursor    */
-  seer_writer_u8(w, reuse ? 0 : 1);                          /* query present                */
-  seer_enc_sb4(w, reuse ? 0 : (uint32_t)qlen);               /* query length         */
-  seer_writer_u8(w, 1);                                      /* all8 present                 */
-  seer_enc_sb4(w, 13);                                       /* all8 length                  */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, lmax); /* long max value               */
-  seer_enc_sb4(w, stmt->describe_only
-                      ? 1u
-                      : (stmt->prefetch ? stmt->prefetch : PREFETCH_ROWS)); /* prefetch */
-  seer_enc_sb4(w, 0x7FFFFFFF);       /* max value                    */
-  seer_writer_u8(w, nb > 0 ? 1 : 0); /* bind present                 */
-  seer_enc_sb4(w, (uint32_t)nb);     /* bind count                   */
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0); /* define present               */
-  seer_enc_sb4(w, 0);   /* define length                */
-
-  seer_writer_u8(w, 0); /* OALL8 header: register 0,0,1 ..*/
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);
-  if ((stmt->conn->server_release >> 24) != 10)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0); /* .. reg_lsb..msb */
-
-  /* 12c+ OALL8 carries the al8pidmlrc block (12.1+), the al8sqlsig / SQL-id
-   * slot (12.2+), and (12.2_EXT1+) chunk-id pointers - all null for us - and
-   * length-prefixes the SQL (12.1+). Without these the server reads the al8i4
-   * array at the wrong offset and rejects the call (ORA-03120); gating the
-   * whole tail on 12.2 sent a 12.1 session the 11g shape
-   * (seerdb/seerdb@50f0a83). */
-  if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_1) {
-    if (dml_rowcounts) {
-      /* al8pidmlrc: pointer(1) + ub4 (1 + iteration count) + 1. */
-      seer_writer_u8(w, 1);
-      seer_enc_sb4(w, (uint32_t)(1 + iters));
-      seer_writer_u8(w, 1);
-    } else {
-      for (int i = 0; i < 3; i++)
-        seer_writer_u8(w, 0); /* al8pidmlrc    */
-    }
-    if (stmt->conn->field_version >= TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 5; i++)
-        seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
-    if (stmt->conn->field_version > TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 2; i++)
-        seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
-    /* On a no-parse re-execute the SQL bytes are omitted entirely - even a
-     * zero-length prefix would shift the server's read of the al8i4 array. */
-    if (!reuse) {
-      if (qlen <= 252) { /* length-prefixed SQL (253+ would read as a marker) */
-        seer_writer_u8(w, (uint8_t)qlen);
-        seer_writer_bytes(w, stmt->sql, qlen);
-      } else {
-        seer_writer_u8(w, 254); /* LONG chunked form */
-        seer_enc_sb4(w, (uint32_t)qlen);
-        seer_writer_bytes(w, stmt->sql, qlen);
-        seer_enc_sb4(w, 0); /* zero-length terminator */
-      }
-    }
-  } else if (!reuse) {
-    seer_writer_bytes(w, stmt->sql, qlen); /* raw SQL text (11g) */
-  }
-  for (int i = 0; i < 13; i++)
-    seer_enc_sb4(w, all8[i]); /* All8 array    */
+  SeerAll8Msg am = {
+      .options = opt,
+      .cursor = reuse ? stmt->reuse_cursor : 0,
+      .sql_ptr = reuse ? 0 : 1,
+      .sql_len = reuse ? 0 : (int64_t)qlen,
+      .al8i4_ptr = 1,
+      .al8i4_len = 13,
+      .prefetch_size = lmax,
+      .prefetch_rows = stmt->describe_only ? 1 : (stmt->prefetch ? stmt->prefetch : PREFETCH_ROWS),
+      .max_long = 0x7FFFFFFF,
+      .binds_ptr = nb > 0,
+      .bind_count = nb,
+      .reg2 = 1,
+      .register_tail = (stmt->conn->server_release >> 24) != 10,
+      .pidmlrc_ptr = dml_rowcounts,
+      .pidmlrc_len = dml_rowcounts ? 1 + iters : 0, /* al8pidmlrc: 1 + the iterations */
+      .pidmlrc_ptr2 = dml_rowcounts,
+      .sql = {.p = (const uint8_t *)stmt->sql, .n = reuse ? 0 : qlen},
+      .al8i4 = all8,
+      .al8i4_n = 13,
+  };
+  SeerSchemaCtx acx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &acx, &am, w);
 
   /* Bind section: one OAC descriptor per bind position (sized to the widest
    * value across iterations), then one RXD token per iteration carrying that
@@ -3343,7 +3149,7 @@ static SeerStatus build_exec(SeerStmt *stmt, SeerWriter *w)
           if (rxd != NULL)
             seer_writer_bytes(w, rxd, b->rxd_len[it]);
           else
-            seer_writer_u8(w, 0); /* unbound/NULL -> 0 */
+            chr_write(w, false, c->field_version, NULL, 0); /* unbound: NULL */
         }
       }
     }
@@ -3409,43 +3215,29 @@ static SeerStatus build_define(SeerStmt *stmt, SeerWriter *w)
   int fv = c->field_version;
   if (!seer_writer_init(w, 96 + (size_t)stmt->ncols * 24))
     return SEER_ENOMEM;
+  /* SEER_ALL8_SCHEMA with the DEFINE option alone (#398): no SQL, no binds,
+   * a define a column */
   seer_ttc_fun_header(c, w, TTI_ALL8);
-  seer_enc_sb4(w, 0x8010u);                   /* NOT_PLSQL | DEFINE */
-  seer_enc_sb4(w, (uint32_t)stmt->cursor_id); /* cursor */
-  seer_writer_u8(w, 0);                       /* query absent */
-  seer_enc_sb4(w, 0);                         /* query length */
-  seer_writer_u8(w, 1);                       /* all8 present */
-  seer_enc_sb4(w, 13);                        /* all8 length */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, fv > TTC_FIELD_VERSION_23_1 ? 0u : 0xFFFFFFFFu); /* long max */
-  seer_enc_sb4(w, PREFETCH_ROWS);                                  /* rows */
-  seer_enc_sb4(w, 0x7FFFFFFF);                                     /* max value */
-  seer_writer_u8(w, 0);                                            /* binds absent */
-  seer_enc_sb4(w, 0);
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);                   /* defines present */
-  seer_enc_sb4(w, (uint32_t)stmt->ncols); /* define count */
-  seer_writer_u8(w, 0);                   /* registration 0,0,1 .. */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);
-  if ((c->server_release >> 24) != 10)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0);
-  for (int i = 0; i < 3; i++)
-    seer_writer_u8(w, 0); /* al8pidmlrc */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
-  if (fv > TTC_FIELD_VERSION_12_2)
-    for (int i = 0; i < 2; i++)
-      seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
   uint32_t all8[13] = {0};
   all8[1] = PREFETCH_ROWS; /* rows to return */
   all8[7] = 1;             /* a query */
-  for (int i = 0; i < 13; i++)
-    seer_enc_sb4(w, all8[i]);
+  SeerAll8Msg am = {
+      .options = 0x8010u, /* NOT_PLSQL | DEFINE */
+      .cursor = stmt->cursor_id,
+      .al8i4_ptr = 1,
+      .al8i4_len = 13,
+      .prefetch_size = fv > TTC_FIELD_VERSION_23_1 ? 0 : 0xFFFFFFFFu,
+      .prefetch_rows = PREFETCH_ROWS,
+      .max_long = 0x7FFFFFFF,
+      .defines_ptr = 1,
+      .define_count = stmt->ncols,
+      .reg2 = 1,
+      .register_tail = (c->server_release >> 24) != 10,
+      .al8i4 = all8,
+      .al8i4_n = 13,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
   for (int i = 0; i < stmt->ncols; i++) {
     const SeerColumn *col = &stmt->cols[i];
     if (col->ora_type == ORA_TYPE_CLOB) /* as LONG, in the database charset */
@@ -3468,8 +3260,9 @@ static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
   if (!seer_writer_init(w, 16))
     return SEER_ENOMEM;
   seer_ttc_fun_header(stmt->conn, w, TTI_FETCH);
-  seer_enc_sb4(w, (uint32_t)stmt->cursor_id);
-  seer_enc_sb4(w, PREFETCH_ROWS);
+  SeerFetchMsg m = {.cursor = stmt->cursor_id, .rows = PREFETCH_ROWS}; /* #398 */
+  SeerSchemaCtx cx = seer_msg_ctx(0, stmt->conn->field_version, stmt->conn->server_field_version);
+  seer_schema_encode(SEER_FETCH_SCHEMA, &cx, &m, w);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
     return SEER_ENOMEM;
@@ -3488,48 +3281,28 @@ static SeerStatus build_fetch(SeerStmt *stmt, SeerWriter *w)
 static SeerStatus build_fetch_only(SeerStmt *stmt, SeerWriter *w)
 {
   SeerConn *c = stmt->conn;
-  int fv = c->field_version;
   if (!seer_writer_init(w, 64))
     return SEER_ENOMEM;
+  /* SEER_ALL8_SCHEMA with the FETCH option alone (#398): no SQL, no binds,
+   * a query's rows */
   seer_ttc_fun_header(c, w, TTI_ALL8);
-  seer_enc_sb4(w, 0x8040u);                   /* NOT_PLSQL | FETCH */
-  seer_enc_sb4(w, (uint32_t)stmt->cursor_id); /* cursor */
-  seer_writer_u8(w, 0);                       /* query absent */
-  seer_enc_sb4(w, 0);                         /* query length */
-  seer_writer_u8(w, 1);                       /* all8 present */
-  seer_enc_sb4(w, 13);                        /* all8 length */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);             /* long max */
-  seer_enc_sb4(w, PREFETCH_ROWS); /* rows */
-  seer_enc_sb4(w, 0x7FFFFFFF);    /* max value */
-  seer_writer_u8(w, 0);           /* binds absent */
-  seer_enc_sb4(w, 0);
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0); /* defines absent */
-  seer_enc_sb4(w, 0);
-  seer_writer_u8(w, 0); /* registration 0,0,1 .. */
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 1);
-  if ((c->server_release >> 24) != 10)
-    for (int i = 0; i < 5; i++)
-      seer_writer_u8(w, 0);
-  if (fv >= TTC_FIELD_VERSION_12_1) {
-    for (int i = 0; i < 3; i++)
-      seer_writer_u8(w, 0); /* al8pidmlrc */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 5; i++)
-        seer_writer_u8(w, 0); /* al8sqlsig / SQL id */
-    if (fv > TTC_FIELD_VERSION_12_2)
-      for (int i = 0; i < 2; i++)
-        seer_writer_u8(w, 0); /* 12.2_EXT1 chunk ids */
-  }
   uint32_t all8[13] = {0};
   all8[1] = PREFETCH_ROWS; /* rows to return */
   all8[7] = 1;             /* a query */
-  for (int i = 0; i < 13; i++)
-    seer_enc_sb4(w, all8[i]);
+  SeerAll8Msg am = {
+      .options = 0x8040u, /* NOT_PLSQL | FETCH */
+      .cursor = stmt->cursor_id,
+      .al8i4_ptr = 1,
+      .al8i4_len = 13,
+      .prefetch_rows = PREFETCH_ROWS,
+      .max_long = 0x7FFFFFFF,
+      .reg2 = 1,
+      .register_tail = (c->server_release >> 24) != 10,
+      .al8i4 = all8,
+      .al8i4_n = 13,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
   if (!seer_writer_ok(w)) {
     seer_writer_free(w);
     return SEER_ENOMEM;
@@ -4575,6 +4348,8 @@ static SeerStatus fv2_txn(SeerConn *c, const uint8_t *msg, size_t mlen, uint8_t 
   return seer_ttc_recv(c, resp, rlen);
 }
 
+static void fv2_call_head(SeerWriter *w, uint8_t function);
+
 /* The server cursor every 9i statement runs on, opened by the first one that
  * needs it. Each OOPEN allocates a cursor; one per statement, all parsed on
  * cursor 1, left one open a statement until the session hit open_cursors
@@ -4583,19 +4358,27 @@ static SeerStatus fv2_txn(SeerConn *c, const uint8_t *msg, size_t mlen, uint8_t 
 static SeerStatus fv2_shared_cursor(SeerConn *c, uint32_t *out)
 {
   if (c->fv2_cursor == 0) {
-    static const uint8_t open[] = {TTI_FUN, O7_OPEN, 0, 0x01, 0x00};
+    /* SEER_OPEN_SCHEMA, and its reply's SEER_OPEN_REPLY_SCHEMA (#398) */
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    SeerWriter w;
+    if (!seer_writer_init(&w, 8))
+      return SEER_ENOMEM;
+    fv2_call_head(&w, O7_OPEN);
+    SeerOpenMsg om = {.cursor_ptr = 1};
+    seer_schema_encode(SEER_OPEN_SCHEMA, &cx, &om, &w);
     uint8_t *resp = NULL;
     size_t rlen = 0;
-    SeerStatus st = fv2_txn(c, open, sizeof open, &resp, &rlen);
+    SeerStatus st = seer_writer_ok(&w) ? fv2_txn(c, w.buf, w.len, &resp, &rlen) : SEER_ENOMEM;
+    seer_writer_free(&w);
     if (st != SEER_OK)
       return st;
     int64_t id = 0;
     if (rlen > 1 && resp[0] == TTI_RPA) {
       SeerReader r;
       seer_reader_init(&r, resp + 1, rlen - 1);
-      id = seer_dec_sb4(&r);
-      if (!seer_reader_ok(&r))
-        id = 0;
+      SeerOpenMsg rm = {0};
+      if (seer_schema_decode(SEER_OPEN_REPLY_SCHEMA, &cx, &r, &rm))
+        id = rm.cursor;
     }
     free(resp);
     if (id <= 0) {
@@ -4614,10 +4397,11 @@ static void fv2_close_cursor(SeerConn *c, uint32_t cursor)
   SeerWriter w;
   if (!seer_writer_init(&w, 16))
     return;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_CLOSE);
-  seer_writer_u8(&w, 0);
-  seer_enc_sb4(&w, cursor);
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerFunHeadMsg h = {.type = TTI_FUN, .function = O7_CLOSE};
+  SeerCursorCallMsg m = {.cursor = cursor};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, &w); /* #398 */
+  seer_schema_encode(SEER_CURSOR_CALL_SCHEMA, &cx, &m, &w);
   uint8_t *resp = NULL;
   size_t rlen = 0;
   if (seer_writer_ok(&w) && fv2_txn(c, w.buf, w.len, &resp, &rlen) == SEER_OK)
@@ -4634,10 +4418,11 @@ static void fv2_free_cursor(SeerConn *c, uint32_t cursor)
   SeerWriter w;
   if (!seer_writer_init(&w, 16))
     return;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_FREE);
-  seer_writer_u8(&w, 0);
-  seer_enc_sb4(&w, cursor);
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerFunHeadMsg h = {.type = TTI_FUN, .function = O7_FREE};
+  SeerCursorCallMsg m = {.cursor = cursor};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, &w); /* #398 */
+  seer_schema_encode(SEER_CURSOR_CALL_SCHEMA, &cx, &m, &w);
   uint8_t *resp = NULL;
   size_t rlen = 0;
   if (seer_writer_ok(&w) && fv2_txn(c, w.buf, w.len, &resp, &rlen) == SEER_OK)
@@ -4694,11 +4479,12 @@ static int64_t fv2_oer_code(const uint8_t *resp, size_t rlen)
 {
   if (rlen < 1 || resp[0] != TTI_OER)
     return 0;
+  /* SEER_OER_HEAD_SCHEMA at 9.2 (#398): the row count, then the code */
   SeerReader r;
   seer_reader_init(&r, resp + 1, rlen - 1);
-  (void)seer_dec_sb4(&r); /* rows-this-fetch / rowcount */
-  int64_t code = seer_dec_sb4(&r);
-  return seer_reader_ok(&r) ? code : -1;
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerOerMsg m = {0};
+  return seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, &r, &m) ? m.code : -1;
 }
 
 /* The message of a 9i status as a chunked run starting at resp[i]: 0xFE, then
@@ -4766,21 +4552,24 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
   seer_reader_init(&r, data, dlen);
   if (data[0] == TTI_RPA) { /* skip the RPA piggyback */
     r.pos = 1;
-    int64_t num = seer_dec_sb4(&r);
-    /* The parameters are consumed by count: the first is a counter that grows
-     * with the instance, and once past 2^24 its length byte is 0x04 - the OER
-     * token - so stopping at a token-valued byte took the counter for the
-     * status and made every successful DML/DDL on an aged 9i report a garbled
-     * negative ORA code (seerdb/seerdb@0babf60). Only when the counted walk
-     * doesn't land on the OER is the old token-sniffing walk used. */
-    size_t start = r.pos;
-    for (int64_t i = 0; i < num && i < 100000 && seer_reader_ok(&r); i++)
-      (void)seer_dec_sb4(&r);
-    while (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
+    /* The parameters are consumed by count, SEER_RPA_HEAD_SCHEMA as 10g+'s
+     * and 8i's (#398): the first is a counter that grows with the instance,
+     * and once past 2^24 its length byte is 0x04 - the OER token - so
+     * stopping at a token-valued byte took the counter for the status and
+     * made every successful DML/DDL on an aged 9i report a garbled negative
+     * ORA code (seerdb/seerdb@0babf60). Only when the counted walk doesn't
+     * land on the OER is the old token-sniffing walk used - a recovery, not
+     * a message form, so it stays by hand. */
+    SeerSchemaCtx rcx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    SeerRpaMsg rm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_RPA_HEAD_SCHEMA, &rcx, &r, &rm);
+    seer_schema_free(SEER_RPA_HEAD_SCHEMA, &rm);
+    while (res == SCH_OK && seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0)
       r.pos++;
-    if (!seer_reader_ok(&r) || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
+    if (res != SCH_OK || seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER) {
       seer_reader_init(&r, data, dlen);
-      r.pos = start;
+      r.pos = 1;
+      int64_t num = seer_dec_sb4(&r);
       for (int64_t i = 0; i < num && i < 100000 && seer_reader_remaining(&r) > 0; i++) {
         uint8_t t = r.buf[r.pos];
         if (t == TTI_OER || t == TTI_RXH || t == TTI_RXD)
@@ -4794,26 +4583,19 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
   if (seer_reader_remaining(&r) == 0 || r.buf[r.pos] != TTI_OER)
     return false;
   r.pos += 1;
-  out->rows = seer_dec_sb4(&r);
-  out->code = seer_dec_sb4(&r);
-  if (!seer_reader_ok(&r))
+  /* SEER_OER_*_SCHEMA at field version 2 (#395 spike): no call status or
+   * sequence, the cursor options a compressed integer - 8 (`01 08`) on a
+   * session that logged on with the XA names (#171). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerOerMsg m = {0};
+  if (!seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, &r, &m))
     return false;
-  (void)seer_dec_sb4(&r); /* array error */
-  (void)seer_dec_sb4(&r); /* array error 2 */
-  (void)seer_dec_sb4(&r); /* cursor */
-  int64_t position = seer_dec_sb4(&r);
-  (void)seer_reader_u8(&r); /* sql type */
-  (void)seer_reader_u8(&r); /* fatal */
-  (void)seer_dec_sb4(&r);   /* flags (ub2) */
-  /* Cursor options are a compressed integer: 0 (`00`) on a plain session, 8
-   * (`01 08`) on one that logged on with the XA names (#171). Read as a byte,
-   * the 8 shifted the warning flags. */
-  (void)seer_dec_sb4(&r);   /* cursor options */
-  (void)seer_reader_u8(&r); /* UPI parameter */
-  uint8_t warnings = seer_reader_u8(&r);
-  if (seer_reader_ok(&r)) { /* a short status ends after the code */
-    out->position = position > 0 ? position : 0;
-    out->warnings = warnings;
+  out->rows = m.rows;
+  out->code = m.code;
+  if (seer_schema_decode(SEER_OER_FLAGS_SCHEMA, &cx, &r,
+                         &m)) { /* a short one ends after the code */
+    out->position = m.position > 0 ? m.position : 0;
+    out->warnings = (uint8_t)m.warnings;
     if (batch != NULL)
       fv2_read_batch_errors(&r, batch);
   }
@@ -4823,25 +4605,6 @@ static bool fv2_read_status_ex(const uint8_t *data, size_t dlen, Fv2Status *out,
 static bool fv2_read_status(const uint8_t *data, size_t dlen, Fv2Status *out)
 {
   return fv2_read_status_ex(data, dlen, out, NULL);
-}
-
-/* `count` TTC ub4s packed in a batch-error array's value; NULL on a short one. */
-static uint32_t *fv2_ub4s(const uint8_t *blob, size_t len, int64_t count)
-{
-  if (count <= 0 || count > 65536)
-    return NULL;
-  uint32_t *v = calloc((size_t)count, sizeof *v);
-  if (v == NULL)
-    return NULL;
-  SeerReader r;
-  seer_reader_init(&r, blob, len);
-  for (int64_t i = 0; i < count; i++)
-    v[i] = (uint32_t)seer_dec_sb4(&r);
-  if (!seer_reader_ok(&r)) {
-    free(v);
-    return NULL;
-  }
-  return v;
 }
 
 /* The rest of a 9i status, from after the warning flags (seerdb PROTOCOL.md
@@ -4855,60 +4618,22 @@ static uint32_t *fv2_ub4s(const uint8_t *blob, size_t len, int64_t count)
  * offsets[i] with codes[i]. A status cut short stores nothing. */
 static void fv2_read_batch_errors(SeerReader *r, SeerStmt *stmt)
 {
-  (void)seer_dec_sb4(r);   /* rowid: data object */
-  (void)seer_dec_sb4(r);   /* relative file */
-  (void)seer_reader_u8(r); /* reserved */
-  (void)seer_dec_sb4(r);   /* block */
-  (void)seer_dec_sb4(r);   /* slot */
-  (void)seer_dec_sb4(r);   /* OS error */
-  (void)seer_reader_u8(r); /* statement number */
-  (void)seer_reader_u8(r); /* call number */
-  (void)seer_dec_sb4(r);   /* padding (ub2) */
-  (void)seer_dec_sb4(r);   /* iterations */
-  uint8_t *blob = NULL;
-  size_t blen = 0;
-  if (seer_dec_sb4(r) > 0) { /* oerrdd */
-    if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
-      return;
-    free(blob);
+  /* The rowid to the batch counts: SEER_OER_BATCH_SCHEMA, as 10g+'s (#395). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerOerMsg bm = {0};
+  if (!seer_schema_decode(SEER_OER_BATCH_SCHEMA, &cx, r, &bm)) {
+    seer_schema_free(SEER_OER_BATCH_SCHEMA, &bm);
+    return;
   }
-  uint32_t *codes = NULL, *offsets = NULL;
-  int64_t ncodes = seer_dec_sb4(r);
-  if (ncodes > 0) {
-    blob = NULL;
-    if (seer_dec_dalc(r, &blob, &blen) != SEER_OK)
-      return;
-    codes = fv2_ub4s(blob, blen, ncodes);
-    free(blob);
-  }
-  int64_t noffsets = seer_dec_sb4(r);
-  if (noffsets > 0) {
-    blob = NULL;
-    if (seer_dec_dalc(r, &blob, &blen) == SEER_OK)
-      offsets = fv2_ub4s(blob, blen, noffsets);
-    free(blob);
-  }
-  int64_t nmsgs = seer_dec_sb4(r);
+  size_t nc = 0, no = 0;
+  uint32_t *codes = oer_ub4s(&bm.codes, &nc), *offsets = oer_ub4s(&bm.offsets, &no);
+  int64_t ncodes = (int64_t)nc, noffsets = (int64_t)no;
+  seer_schema_free(SEER_OER_BATCH_SCHEMA, &bm);
+  int64_t nmsgs = bm.nmsgs;
   char **msgs = NULL;
-  if (nmsgs > 0 && nmsgs <= 65536 && seer_reader_ok(r)) {
-    (void)seer_reader_u8(r); /* indicator */
-    msgs = calloc((size_t)nmsgs, sizeof *msgs);
-    for (int64_t i = 0; msgs != NULL && i < nmsgs && seer_reader_ok(r); i++) {
-      if (seer_dec_sb4(r) > 0) {
-        uint8_t *t = NULL;
-        size_t tl = 0;
-        if (seer_dec_dalc(r, &t, &tl) != SEER_OK)
-          break;
-        msgs[i] = malloc(tl + 1);
-        if (msgs[i] != NULL) {
-          memcpy(msgs[i], t, tl);
-          msgs[i][tl] = '\0';
-        }
-        free(t);
-      }
-      (void)seer_reader_bytes(r, 2);
-    }
-  } else
+  if (nmsgs > 0 && nmsgs <= 65536 && seer_reader_ok(r))
+    msgs = oer_batch_msgs(r, &cx, nmsgs, false);
+  else
     nmsgs = 0;
   size_t nb = 0;
   if (codes != NULL)
@@ -4997,7 +4722,8 @@ static void fv2_set_error(SeerConn *c, const uint8_t *resp, size_t rlen)
   }
 }
 
-/* Append one fv2 define entry: the client's requested return type for a column. */
+/* Append one fv2 define entry: the client's requested return type for a
+ * column, an OAC (SEER_OAC_SCHEMA at 9.2). */
 /* The define sizes of a rowid fetched as text on 9i (fv2_define_entry). */
 #define FV2_MAX_ROWID_TEXT 128
 #define FV2_MAX_UROWID_TEXT 5267
@@ -5045,92 +4771,66 @@ static void fv2_define_entry(SeerWriter *w, const SeerColumn *col)
      * 9.2 failed the fetch with ORA-00600 [kkdogty01] (#168); so it did for
      * an XMLType column, whose describe gives an all-zero OID and version
      * 256, defined with version 1. */
-    seer_writer_u8(w, deftype);
-    seer_writer_u8(w, flag);
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0x7FFFFFFFu);
-    seer_writer_u8(w, 0); /* max array */
-    seer_writer_u8(w, 0); /* cont flags */
-    seer_enc_sb4(w, (uint32_t)col->toidlen);
-    seer_writer_u8(w, (uint8_t)col->toidlen);
-    seer_writer_bytes(w, col->toid, col->toidlen);
-    seer_enc_sb4(w, col->type_version ? col->type_version : 1); /* version */
-    seer_enc_sb4(w, charset);
-    seer_writer_u8(w, 0);
+    SeerOacMsg m = {.data_type = deftype,
+                    .flags = flag,
+                    .max_length = 0x7FFFFFFF,
+                    .toid_length = (int64_t)col->toidlen,
+                    .toid = {.p = col->toid, .n = col->toidlen},
+                    .version = col->type_version ? col->type_version : 1,
+                    .charset = charset};
+    oac_write(w, false, TTC_FIELD_VERSION_9_2, &m);
     return;
   }
-  seer_writer_u8(w, deftype);
-  seer_writer_u8(w, flag);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, maxsize);
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, 0);
-  seer_enc_sb4(w, charset);
   /* The charset form: a national column (described in AL16UTF16) must be
    * defined in the national form, 2. Form 0 makes 9i convert its value to the
    * database charset - lossy, and not the UTF-16BE the decoder expects. */
-  seer_writer_u8(w, charset == ORA_CHARSET_AL16UTF16 ? 2 : 0);
+  SeerOacMsg m = {.data_type = deftype,
+                  .flags = flag,
+                  .max_length = maxsize,
+                  .charset = charset,
+                  .csfrm = charset == ORA_CHARSET_AL16UTF16 ? 2 : 0};
+  oac_write(w, false, TTC_FIELD_VERSION_9_2, &m);
 }
 
 /* Decode one fv2 column descriptor (OAC-fv2 + name) into `col`. */
 static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
 {
-  uint8_t data_type = seer_reader_u8(r);
-  (void)seer_reader_u8(r);            /* flag       */
-  col->precision = seer_reader_u8(r); /* precision  */
-  col->scale = (int)seer_dec_sb4(r);  /* data_scale */
-  int64_t max_len = seer_dec_sb4(r);
-  (void)seer_dec_sb4(r); /* _mal       */
-  (void)seer_dec_sb4(r); /* _fl2       */
-  /* The type OID: a ub4 length, then - for an object column, 16 bytes - the
-   * value. Read as a bare value it took its length for its first byte, and an
-   * object column's describe failed (#168); other columns send `00`. */
-  int64_t toidlen = seer_dec_sb4(r);
-  if (toidlen > 0) {
-    uint8_t *toid = NULL;
-    size_t tl = 0;
-    if (seer_dec_dalc(r, &toid, &tl) != SEER_OK) {
-      free(toid);
-      return SEER_EPROTO;
-    }
+  /* SEER_DCB_COLUMN_SCHEMA at field version 2 (#398): the OAC's fields (no
+   * max_chars, a compressed-integer scale), nullable - read properly, where
+   * reading it and the name's byte length as one ub4 slipped for a NOT NULL
+   * column (seerdb PROTOCOL.md §19.1) - the name, and the type's schema and
+   * name. The type's OID is kept: the define names the type by it (#168). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerDcbColumnMsg dm = {0};
+  if (!seer_schema_decode(SEER_DCB_COLUMN_SCHEMA, &cx, r, &dm)) {
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
+    return SEER_EPROTO;
+  }
+  uint8_t data_type = (uint8_t)dm.data_type;
+  col->precision = (uint8_t)dm.precision;
+  col->scale = (int)dm.scale;
+  int64_t max_len = dm.max_length;
+  if (dm.toid.n > 0) {
     free(col->toid);
-    col->toid = toid; /* kept: the define names the type by it */
-    col->toidlen = tl;
+    col->toid = malloc(dm.toid.n);
+    if (col->toid != NULL) {
+      memcpy(col->toid, dm.toid.p, dm.toid.n);
+      col->toidlen = dm.toid.n;
+    }
   }
-  col->type_version = (uint32_t)seer_dec_sb4(r); /* _vsn */
-  int64_t charset = seer_dec_sb4(r);
-  (void)seer_reader_u8(r); /* csfrm      */
-  /* Before the name: null_ok(1B) + name-length-in-bytes(1B), then the name length
-   * in chars (a real ub4, always width 1 for a <=255-char name), then the DALC
-   * name (seerdb PROTOCOL.md §19.1). Reading the null_ok + byte-length pair as
-   * one "ub4 namelen" only decodes cleanly for a NULLABLE column (null_ok=1
-   * mimics a width-1 ub4); a NOT-NULL column (null_ok=0) makes that ub4 slip.
-   * Verified live: a NOT NULL vs nullable pair with identical 9-char names differ
-   * only in this first byte (00 vs 01). We read null_ok properly; the two length
-   * fields are redundant with the DALC and discarded. */
-  uint8_t null_ok = seer_reader_u8(r); /* 0 = NOT NULL, 1 = nullable */
-  (void)seer_reader_u8(r);             /* name length in bytes (redundant) */
-  (void)seer_dec_sb4(r);               /* name length in chars (ub4) */
-  uint8_t *name = NULL;
-  size_t namelen = 0;
-  if (seer_dec_dalc(r, &name, &namelen) != SEER_OK) {
-    free(name);
-    return SEER_EPROTO;
-  }
-  if (!seer_reader_ok(r)) {
-    free(name);
-    return SEER_EPROTO;
-  }
-  col->name = malloc(namelen + 1);
+  col->type_version = (uint32_t)dm.version;
+  int64_t charset = dm.charset;
+  uint8_t null_ok = (uint8_t)dm.null_ok;
+  col->name = bytes_dup_str(&dm.name);
   if (col->name == NULL) {
-    free(name);
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
     return SEER_ENOMEM;
   }
-  memcpy(col->name, name, namelen);
-  col->name[namelen] = '\0';
-  free(name);
+  if (data_type == ORA_TYPE_ADT && dm.type_schema.n > 0 && dm.type_name.n > 0) {
+    col->type_schema = bytes_dup_str(&dm.type_schema);
+    col->type_name = bytes_dup_str(&dm.type_name);
+  }
+  seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
   col->ora_type = data_type;
   col->charset = (uint16_t)charset;
   col->max_size = (uint32_t)(max_len < 0 ? 0 : max_len);
@@ -5152,34 +4852,6 @@ static SeerStatus fv2_decode_column(SeerReader *r, SeerColumn *col)
   return SEER_OK;
 }
 
-/* A describe's type schema or type name: a ub4 length, then the DALC name
- * when there is one (only an object column names its type). Into *out as a
- * string when `out` is non-NULL, NULL for none. */
-static SeerStatus fv2_read_type_ident(SeerReader *r, char **out)
-{
-  if (out != NULL)
-    *out = NULL;
-  int64_t len = seer_dec_sb4(r);
-  if (!seer_reader_ok(r) || len < 0)
-    return SEER_EPROTO;
-  if (len == 0)
-    return SEER_OK;
-  uint8_t *v = NULL;
-  size_t vl = 0;
-  SeerStatus st = seer_dec_dalc(r, &v, &vl);
-  if (st == SEER_OK && out != NULL && vl > 0) {
-    *out = malloc(vl + 1);
-    if (*out == NULL) {
-      free(v);
-      return SEER_ENOMEM;
-    }
-    memcpy(*out, v, vl);
-    (*out)[vl] = '\0';
-  }
-  free(v);
-  return st;
-}
-
 /* Decode the describe RPA into a column array:
  *   08 <ub4 numcols> <column>*
  *   column = <OAC-fv2> <null_ok> <name...> <ub4 type_schema_len> [<DALC>]
@@ -5194,32 +4866,24 @@ static SeerStatus fv2_decode_describe(const uint8_t *data, size_t dlen, SeerColu
     return SEER_EPROTO;
   SeerReader r;
   seer_reader_init(&r, data + 1, dlen - 1);
-  int64_t n = seer_dec_sb4(&r);
-  if (!seer_reader_ok(&r) || n <= 0 || n > 4096)
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerCountMsg cm = {0}; /* the column count: SEER_COUNT_SCHEMA (#398) */
+  if (!seer_schema_decode(SEER_COUNT_SCHEMA, &cx, &r, &cm) || cm.n <= 0 || cm.n > 4096)
     return SEER_EPROTO;
+  int64_t n = cm.n;
   int ncols = (int)n;
   SeerColumn *cols = calloc((size_t)ncols, sizeof *cols);
   if (cols == NULL)
     return SEER_ENOMEM;
   for (int i = 0; i < ncols; i++) {
-    char *schema = NULL, *tname = NULL;
-    if (fv2_decode_column(&r, &cols[i]) != SEER_OK || fv2_read_type_ident(&r, &schema) != SEER_OK ||
-        fv2_read_type_ident(&r, &tname) != SEER_OK) {
-      free(schema);
-      free(tname);
+    if (fv2_decode_column(&r, &cols[i]) != SEER_OK) {
       free_columns(cols, ncols);
       return SEER_EPROTO;
     }
     /* An object or collection column names its type, whose layout the image
      * decode reads from the dictionary, as on 10g+ (#168). */
-    if (cols[i].ora_type == ORA_TYPE_ADT && schema != NULL && tname != NULL) {
-      cols[i].type_schema = schema;
-      cols[i].type_name = tname;
+    if (cols[i].type_schema != NULL && cols[i].type_name != NULL)
       cols[i].n_obj_attrs = -1;
-    } else {
-      free(schema);
-      free(tname);
-    }
   }
   *out_cols = cols;
   *out_n = ncols;
@@ -5240,13 +4904,14 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
     uint8_t token = r.buf[r.pos];
     if (token == TTI_RXH) {
       r.pos += 1;
-      (void)seer_reader_u8(&r); /* flags */
-      while (seer_reader_remaining(&r) > 0) {
-        uint8_t t = r.buf[r.pos];
-        if (t == TTI_RXD || t == TTI_OER || t == TTI_RXH)
-          break;
-        (void)seer_dec_sb4(&r); /* a small RXH count field */
-      }
+      /* SEER_RXH_SCHEMA at field version 2, as 10g+'s (#398) - where the
+       * counts were skipped up to the next token byte */
+      SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+      SeerRxhMsg m = {0};
+      bool whole = seer_schema_decode(SEER_RXH_SCHEMA, &cx, &r, &m);
+      seer_schema_free(SEER_RXH_SCHEMA, &m);
+      if (!whole)
+        break;
     } else if (token == TTI_RXD) {
       r.pos += 1;
       SeerCell *row = calloc(ncols ? (size_t)ncols : 1, sizeof *row);
@@ -5255,32 +4920,27 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
       for (int ci = 0; ci < ncols; ci++) {
         uint8_t ct = stmt->cols[ci].ora_type;
         if (ct == ORA_TYPE_CLOB || ct == ORA_TYPE_BLOB || ct == ORA_TYPE_BFILE) {
-          /* LOB column: a locator (ub4 num_bytes + DALC) then an indicator,
-           * or a bare 0x00 = NULL LOB. Capture the locator to resolve via
-           * TTI_LOBOPS after the fetch; the cell is left NULL for now. */
-          if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x00) {
-            r.pos += 1;
-            if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
-              r.pos += 2;
-          } else {
-            (void)seer_dec_sb4(&r); /* ub4 num_bytes */
-            uint8_t *locv = NULL;
-            size_t loclen = 0;
-            if (seer_dec_dalc(&r, &locv, &loclen) != SEER_OK) {
-              free(locv);
-              for (int k = 0; k < ci; k++)
-                free(row[k].data);
-              free(row);
-              return SEER_EPROTO;
-            }
-            if (seer_reader_remaining(&r) > 0)
-              r.pos += 1; /* present indicator */
-            if (locv != NULL && loclen > 0 &&
-                record_pending_lob(stmt, stmt->nrows, ci, ct, locv, loclen) != SEER_OK)
-              free(locv);
-            else if (locv == NULL || loclen == 0)
-              free(locv);
+          /* SEER_LOB_CELL_SCHEMA at field version 2 (#398): the locator's
+           * length (0 NULL) and the locator, then the indicator. Captured to
+           * resolve via TTI_LOBOPS after the fetch; the cell stays NULL now. */
+          SeerSchemaCtx lcx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+          SeerCellMsg lm = {0};
+          if (!seer_schema_decode(SEER_LOB_CELL_SCHEMA, &lcx, &r, &lm)) {
+            seer_schema_free(SEER_LOB_CELL_SCHEMA, &lm);
+            for (int k = 0; k < ci; k++)
+              free(row[k].data);
+            free(row);
+            return SEER_EPROTO;
           }
+          if (lm.value.n > 0) {
+            uint8_t *locv = malloc(lm.value.n);
+            if (locv != NULL) {
+              memcpy(locv, lm.value.p, lm.value.n);
+              if (record_pending_lob(stmt, stmt->nrows, ci, ct, locv, lm.value.n) != SEER_OK)
+                free(locv);
+            }
+          }
+          seer_schema_free(SEER_LOB_CELL_SCHEMA, &lm);
           continue;
         }
         if (ct == ORA_TYPE_ADT) {
@@ -5311,25 +4971,27 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
             r.pos += 2;
           continue; /* cell stays NULL */
         }
-        uint8_t *val = NULL;
-        size_t vlen = 0;
-        if (seer_dec_dalc(&r, &val, &vlen) != SEER_OK) {
-          free(val);
+        /* SEER_CELL_SCHEMA at field version 2 (#398): the value and its
+         * indicator, 00 or 81 01 for NULL */
+        SeerSchemaCtx ccx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+        SeerCellMsg cm = {0};
+        if (!seer_schema_decode(SEER_CELL_SCHEMA, &ccx, &r, &cm)) {
+          seer_schema_free(SEER_CELL_SCHEMA, &cm);
           for (int k = 0; k < ci; k++)
             free(row[k].data);
           free(row);
           return SEER_EPROTO;
         }
-        if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81) {
-          r.pos += 2; /* 81 01 = NULL (leave cell zeroed) */
+        const uint8_t *val = cm.value.p;
+        size_t vlen = cm.value.n;
+        if (cm.indicator == -1) {
+          /* NULL: the cell stays zeroed */
         } else if (ct == ORA_TYPE_REFCURSOR) {
           /* A CURSOR() cell: the nested cursor's id. ODBC has no nested-cursor
            * type, so the cell is NULL, as on 10g+; the cursor is closed and
            * freed before the next batch (#166, #196). */
-          (void)seer_reader_u8(&r); /* present indicator */
           fv2_note_nested(stmt, fv2_cursor_id(val, vlen));
         } else {
-          (void)seer_reader_u8(&r); /* present indicator (0x00) */
           if (vlen > 0) {
             /* A rowid column was defined as VARCHAR (fv2_define_entry): its
              * value is the rowid's text, not the native form. A LONG is text
@@ -5345,7 +5007,7 @@ static SeerStatus fv2_decode_rows(SeerStmt *stmt, const uint8_t *data, size_t dl
               national_to_utf8(&stmt->cols[ci], &row[ci]);
           }
         }
-        free(val);
+        seer_schema_free(SEER_CELL_SCHEMA, &cm);
       }
       if (!seer_reader_ok(&r) || append_row(stmt, row) != SEER_OK) {
         for (int k = 0; k < ncols; k++)
@@ -5506,15 +5168,9 @@ static void fv2_bind_oac(SeerWriter *w, const SeerBind *b)
     charset = 31;
     csfrm = 1;
   }
-  seer_writer_u8(w, type);
-  seer_writer_u8(w, 0x01);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, maxsize);
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, 0);
-  seer_enc_sb4(w, charset);
-  seer_writer_u8(w, csfrm);
+  SeerOacMsg m = {
+      .data_type = type, .flags = 0x01, .max_length = maxsize, .charset = charset, .csfrm = csfrm};
+  oac_write(w, false, TTC_FIELD_VERSION_9_2, &m); /* #395 */
 }
 
 /* Build the TTI_ALL7 parse message (shared by SELECT and DML). With input binds
@@ -5535,15 +5191,28 @@ static uint32_t fv2_sql_chars(const char *sql)
   return n;
 }
 
+/* A 9i call's head and body by their schemas (#398): the function header
+ * (sequence 0, as ojdbc14 sends it) and SEER_O7_ALL7_SCHEMA. */
+static void fv2_call_head(SeerWriter *w, uint8_t function)
+{
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerFunHeadMsg h = {.type = TTI_FUN, .function = function};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+}
+
+static void fv2_all7(SeerWriter *w, const SeerO7All7Msg *m)
+{
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  fv2_call_head(w, TTI_ALL7);
+  seer_schema_encode(SEER_O7_ALL7_SCHEMA, &cx, m, w);
+}
+
 static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
 {
   size_t qlen = strlen(stmt->sql);
   int nb = stmt->npbinds;
   if (!seer_writer_init(w, 64 + qlen + (size_t)nb * 48))
     return SEER_ENOMEM;
-  seer_writer_u8(w, TTI_FUN);
-  seer_writer_u8(w, TTI_ALL7);
-  seer_writer_u8(w, 0);
   /* The option word: NOT_PLSQL | EXECUTE | PARSE, + BIND with binds. The
    * EXECUTE bit makes this call run the statement as well, so a describe
    * (seer_stmt_describe) drops it: a parse alone needs no bind values, where
@@ -5555,29 +5224,18 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
     opt &= ~0x20u;
   if (stmt->batch_errors && stmt->n_iters > 1)
     opt |= 0x80000u;
-  seer_enc_sb4(w, opt);
-  seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
-  seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, fv2_sql_chars(stmt->sql));
-  {
-    static const uint8_t mid[] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0};
-    seer_writer_bytes(w, mid, sizeof mid);
-  }
-  if (nb > 0) {
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, (uint8_t)nb);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-  }
-  seer_writer_bytes(w, (const uint8_t *)stmt->sql, qlen);
   int rows = (nb > 0 && stmt->n_iters > 1) ? stmt->n_iters : 1;
-  seer_writer_u8(w, 0x01);
-  seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, (uint32_t)rows); /* the rows: 1, or an array DML's */
-  for (int i = 0; i < 5; i++)
-    seer_writer_u8(w, 0);
+  SeerO7All7Msg m = {
+      .options = opt,
+      .cursor = stmt->conn->fv2_cursor,
+      .sql_ptr = 1,
+      .sql_len = (int64_t)fv2_sql_chars(stmt->sql),
+      .binds_ptr = nb > 0,
+      .bind_count = nb,
+      .sql = {.p = (const uint8_t *)stmt->sql, .n = qlen},
+      .rows = rows, /* 1, or an array DML's */
+  };
+  fv2_all7(w, &m);
   if (nb > 0) {
     for (int i = 0; i < nb; i++)
       fv2_bind_oac(w, &stmt->pbinds[i]);
@@ -5589,7 +5247,7 @@ static SeerStatus fv2_emit_parse(SeerStmt *stmt, SeerWriter *w)
         if (rxd != NULL)
           seer_writer_bytes(w, rxd, b->rxd_len[row]);
         else
-          seer_writer_u8(w, 0); /* unbound -> NULL value */
+          chr_write(w, false, TTC_FIELD_VERSION_9_2, NULL, 0); /* unbound: NULL */
       }
     }
   }
@@ -5606,37 +5264,18 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
   int nb = stmt->npbinds;
   if (!seer_writer_init(w, 64 + qlen + (size_t)nb * 32))
     return SEER_ENOMEM;
-  seer_writer_u8(w, TTI_FUN);
-  seer_writer_u8(w, TTI_ALL7);
-  seer_writer_u8(w, 0);
-  if (nb > 0) {
-    seer_writer_u8(w, 0x02);
-    seer_writer_u8(w, 0x04);
-    seer_writer_u8(w, 0x29);
-  } else {
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0x21);
-  }
-  seer_enc_sb4(w, stmt->conn->fv2_cursor); /* the cursor, then the SQL's pointer */
-  seer_writer_u8(w, 0x01);
-  seer_enc_sb4(w, fv2_sql_chars(stmt->sql));
-  {
-    static const uint8_t mid[] = {0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0, 0, 0};
-    seer_writer_bytes(w, mid, sizeof mid);
-  }
-  if (nb > 0) {
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, (uint8_t)nb);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-  }
-  seer_writer_bytes(w, (const uint8_t *)stmt->sql, qlen);
-  {
-    static const uint8_t tl[] = {0x01, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0};
-    seer_writer_bytes(w, tl, sizeof tl);
-  }
+  /* EXECUTE | PARSE, + BIND and PL/SQL's 0x400 with binds */
+  SeerO7All7Msg m = {
+      .options = nb > 0 ? 0x0429 : 0x21,
+      .cursor = stmt->conn->fv2_cursor,
+      .sql_ptr = 1,
+      .sql_len = (int64_t)fv2_sql_chars(stmt->sql),
+      .binds_ptr = nb > 0,
+      .bind_count = nb,
+      .sql = {.p = (const uint8_t *)stmt->sql, .n = qlen},
+      .rows = 1,
+  };
+  fv2_all7(w, &m);
   for (int i = 0; i < nb; i++)
     fv2_bind_oac(w, &stmt->pbinds[i]); /* OACs only, no inline values */
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
@@ -5647,60 +5286,23 @@ static SeerStatus fv2_emit_block(SeerStmt *stmt, SeerWriter *w)
  * GETLEN learns the length, READ pulls exactly that many chars/bytes. Every request
  * is `03 60 00 01 <sb4 loclen> <op middle> <locator[1:]> <trailer>`. The captured
  * locator (from the RXD) is echoed with its leading byte dropped. (PROTOCOL §19.5) */
-static const uint8_t FV2_LOBOP_GETLEN_MID[] = {0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0};
-static const uint8_t FV2_LOBOP_READ_MID[] = {0, 0, 1, 1, 0, 0, 1, 0, 1, 2, 0, 0, 0};
-
-/* Parse an accumulated 9i LOBOPS READ reply: TTI_LOB(0e) [fe] then <ub1 len><bytes>
- * chunks ending at a zero-length chunk. *complete is false until that terminator is
- * seen (content spans more packets). Caller frees *out. */
-static void fv2_parse_lob_chunks(const uint8_t *data, size_t dlen, uint8_t **out, size_t *outlen,
-                                 bool *complete)
-{
-  *out = NULL;
-  *outlen = 0;
-  *complete = false;
-  if (dlen < 2 || data[0] != TTI_LOB)
-    return;
-  size_t pos = (data[1] == 0xFE) ? 2 : 1;
-  SeerWriter w;
-  if (!seer_writer_init(&w, dlen))
-    return;
-  while (pos < dlen) {
-    uint8_t clen = data[pos];
-    if (clen == 0) {
-      *complete = true;
-      break;
-    }
-    if (pos + 1 + clen > dlen)
-      break; /* chunk split across packets */
-    seer_writer_bytes(&w, data + pos + 1, clen);
-    pos += 1 + clen;
-  }
-  if (seer_writer_ok(&w)) {
-    *out = w.buf;
-    *outlen = w.len;
-  } else
-    seer_writer_free(&w);
-}
 
 /* Build + send a fv2 LOBOPS request (op `mid`, `trailer`) and receive the reply. */
-static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen, const uint8_t *mid,
-                                 size_t midlen, const uint8_t *trailer, size_t trlen,
-                                 uint8_t **resp, size_t *rlen)
+static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen, SeerLobopMsg *m,
+                                 const uint8_t *tail, size_t taillen, uint8_t **resp, size_t *rlen)
 {
   SeerWriter w;
-  if (!seer_writer_init(&w, 16 + loclen + midlen + trlen))
+  if (!seer_writer_init(&w, 64 + loclen + taillen))
     return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, TTI_LOBOPS);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x01);
-  seer_enc_sb4(&w, (uint32_t)loclen);
-  seer_writer_bytes(&w, mid, midlen);
-  if (loclen > 1)
-    seer_writer_bytes(&w, loc + 1, loclen - 1); /* locator[1:] */
-  if (trlen > 0)
-    seer_writer_bytes(&w, trailer, trlen);
+  fv2_call_head(&w, TTI_LOBOPS);
+  m->src_ptr = 1;
+  m->src_len = (int64_t)loclen;
+  m->loc_len = loclen > 1 ? (int64_t)loclen - 1 : 0; /* its first byte goes as 00 */
+  m->locator = (SeerBytes){.p = loclen > 1 ? loc + 1 : loc, .n = (size_t)m->loc_len};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, m, &w); /* #395 */
+  if (taillen > 0)
+    seer_writer_bytes(&w, tail, taillen);
   if (!seer_writer_ok(&w)) {
     seer_writer_free(&w);
     return SEER_ENOMEM;
@@ -5713,22 +5315,20 @@ static SeerStatus fv2_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen,
 /* GETLEN: the LOB length (chars for CLOB, bytes for BLOB). -1 on error. */
 static int64_t fv2_lob_getlen(SeerConn *c, const uint8_t *loc, size_t loclen)
 {
-  static const uint8_t trl[] = {0};
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_GETLEN_MID, sizeof FV2_LOBOP_GETLEN_MID, trl,
-                     sizeof trl, &resp, &rlen) != SEER_OK)
+  SeerLobopMsg m = {.short_amount_ptr = 1, .op = LOB_OP_GET_LENGTH, .has_amount = 1};
+  if (fv2_lobop_send(c, loc, loclen, &m, NULL, 0, &resp, &rlen) != SEER_OK)
     return -1;
-  int64_t amount = 0; /* RPA 00 <ub1 loclen><echo> <ub4 amount> */
-  if (rlen >= 3 && resp[0] == TTI_RPA) {
-    size_t pos = 2;
-    size_t el = resp[pos];
-    pos += 1 + el;
-    if (pos < rlen) {
-      SeerReader r;
-      seer_reader_init(&r, resp + pos, rlen - pos);
-      amount = seer_dec_sb4(&r);
-    }
+  /* The RPA: the locator echoed, then the length (SEER_LOBOPS_REPLY_SCHEMA). */
+  int64_t amount = 0;
+  if (rlen >= 1 && resp[0] == TTI_RPA) {
+    SeerReader r;
+    seer_reader_init(&r, resp + 1, rlen - 1);
+    SeerLobopReplyMsg rm = {.has_amount = 1};
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    (void)seer_schema_decode(SEER_LOBOPS_REPLY_SCHEMA, &cx, &r, &rm);
+    amount = rm.amount;
   }
   free(resp);
   return amount;
@@ -5753,8 +5353,13 @@ static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, i
   /* Send READ; the first reply comes back via fv2_lobop_send, then accumulate. */
   uint8_t *pkt = NULL;
   size_t plen = 0;
-  if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_READ_MID, sizeof FV2_LOBOP_READ_MID, trailer, trlen,
-                     &pkt, &plen) != SEER_OK)
+  (void)trlen;
+  SeerLobopMsg m = {.short_src_off = 1,
+                    .short_amount_ptr = 1,
+                    .op = LOB_OP_READ,
+                    .has_amount = 1,
+                    .amount = amount};
+  if (fv2_lobop_send(c, loc, loclen, &m, NULL, 0, &pkt, &plen) != SEER_OK)
     return SEER_EPROTO;
   SeerWriter acc;
   if (!seer_writer_init(&acc, (size_t)amount + 32)) {
@@ -5764,18 +5369,29 @@ static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, i
   seer_writer_bytes(&acc, pkt, plen);
   free(pkt);
   for (int guard = 0; guard < 1000000; guard++) {
-    uint8_t *cont = NULL;
-    size_t clen = 0;
-    bool complete = false;
-    if (seer_writer_ok(&acc))
-      fv2_parse_lob_chunks(acc.buf, acc.len, &cont, &clen, &complete);
-    if (complete) {
-      *content = cont;
-      *contentlen = clen;
-      seer_writer_free(&acc);
-      return SEER_OK;
+    /* SEER_LOB_DATA_SCHEMA, its old framing: whole once the zero arrives,
+     * short while the chunks are still coming. */
+    if (seer_writer_ok(&acc) && acc.len >= 2 && acc.buf[0] == TTI_LOB) {
+      SeerReader r;
+      seer_reader_init(&r, acc.buf + 1, acc.len - 1);
+      SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+      SeerLobDataMsg lm = {0};
+      SeerSchemaResult res = seer_schema_decode_ex(SEER_LOB_DATA_SCHEMA, &cx, &r, &lm);
+      if (res == SCH_OK) {
+        size_t n = lm.data.n;
+        uint8_t *cont = malloc(n ? n : 1);
+        if (cont != NULL && n > 0)
+          memcpy(cont, lm.data.p, n);
+        seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
+        seer_writer_free(&acc);
+        if (cont == NULL)
+          return SEER_ENOMEM;
+        *content = cont;
+        *contentlen = n;
+        return SEER_OK;
+      }
+      seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
     }
-    free(cont);
     uint8_t *more = NULL;
     size_t morelen = 0;
     if (seer_ttc_recv(c, &more, &morelen) != SEER_OK) {
@@ -5792,8 +5408,6 @@ static SeerStatus fv2_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, i
 /* 9i BFILE read: FILE_OPEN -> GETLEN -> READ -> FILE_CLOSE (PROTOCOL §19.8). The
  * FILE_OPEN reply's RPA carries an *updated* (open-flagged) locator that GETLEN /
  * READ / FILE_CLOSE must use. FILE_CLOSE always runs (best-effort). */
-static const uint8_t FV2_LOBOP_FOPEN_MID[] = {0, 0, 0, 0, 0, 1, 0, 2, 1, 0, 0, 0, 0};
-static const uint8_t FV2_LOBOP_FCLOSE_MID[] = {0, 0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0};
 
 static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen, uint8_t **content,
                                  size_t *contentlen)
@@ -5804,8 +5418,9 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
 
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  if (fv2_lobop_send(c, loc, loclen, FV2_LOBOP_FOPEN_MID, sizeof FV2_LOBOP_FOPEN_MID, fopen_trl,
-                     sizeof fopen_trl, &resp, &rlen) != SEER_OK)
+  (void)fopen_trl;
+  SeerLobopMsg om = {.short_amount_ptr = 1, .op = LOB_OP_FILE_OPEN, .has_amount = 1, .amount = 11};
+  if (fv2_lobop_send(c, loc, loclen, &om, NULL, 0, &resp, &rlen) != SEER_OK)
     return SEER_EPROTO;
   /* Opened locator: RPA 00 <ub1 len><body>  ->  00 <ub1 len><body>. A file
    * that won't open is answered with a status: its error (ORA-22285 for a
@@ -5815,24 +5430,21 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
     free(resp);
     return SEER_EDB;
   }
-  if (rlen < 3 || resp[0] != TTI_RPA) {
+  SeerLobopReplyMsg orm = {0};
+  SeerSchemaCtx ocx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerReader orr;
+  if (rlen > 0)
+    seer_reader_init(&orr, resp + 1, rlen - 1);
+  if (rlen < 3 || resp[0] != TTI_RPA ||
+      !seer_schema_decode(SEER_LOBOPS_REPLY_SCHEMA, &ocx, &orr, &orm)) {
     free(resp);
     return SEER_EPROTO;
   }
-  size_t olen = resp[2];
-  if (3 + olen > rlen) {
-    free(resp);
-    return SEER_EPROTO;
-  }
-  size_t openedlen = 2 + olen;
-  uint8_t *opened = malloc(openedlen);
-  if (opened == NULL) {
-    free(resp);
-    return SEER_ENOMEM;
-  }
-  opened[0] = 0;
-  memcpy(opened + 1, resp + 2, 1 + olen); /* the length byte + body */
+  size_t openedlen = 0;
+  uint8_t *opened = seer_lobop_reply_locator(&orm, &openedlen); /* its length + body */
   free(resp);
+  if (opened == NULL)
+    return SEER_ENOMEM;
 
   int64_t amount = fv2_lob_getlen(c, opened, openedlen);
   SeerStatus rst = SEER_OK;
@@ -5841,8 +5453,8 @@ static SeerStatus fv2_bfile_read(SeerConn *c, const uint8_t *loc, size_t loclen,
 
   uint8_t *cresp = NULL;
   size_t crlen = 0;
-  if (fv2_lobop_send(c, opened, openedlen, FV2_LOBOP_FCLOSE_MID, sizeof FV2_LOBOP_FCLOSE_MID, NULL,
-                     0, &cresp, &crlen) == SEER_OK)
+  SeerLobopMsg cm = {.op = LOB_OP_FILE_CLOSE};
+  if (fv2_lobop_send(c, opened, openedlen, &cm, NULL, 0, &cresp, &crlen) == SEER_OK)
     free(cresp);
   free(opened);
   return rst;
@@ -5928,77 +5540,19 @@ static uint8_t o8r_u8(O8iRd *r)
   return o8r_has(r, 1) ? r->b[r->pos++] : 0;
 }
 
-static uint32_t o8r_le16(O8iRd *r)
-{
-  if (!o8r_has(r, 2))
-    return 0;
-  uint32_t v = (uint32_t)r->b[r->pos] | (uint32_t)r->b[r->pos + 1] << 8;
-  r->pos += 2;
-  return v;
-}
-
-static uint32_t o8r_le32(O8iRd *r)
-{
-  if (!o8r_has(r, 4))
-    return 0;
-  const uint8_t *p = r->b + r->pos;
-  r->pos += 4;
-  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
-}
-
-static void o8r_skip(O8iRd *r, size_t k)
-{
-  if (o8r_has(r, k))
-    r->pos += k;
-}
-
-/* A value: a ub1 length and the bytes, or 0xFE then ub1-length chunks to a
- * zero length. Appended to `out` when non-NULL. */
-static void o8r_value(O8iRd *r, SeerWriter *out)
-{
-  uint8_t len = o8r_u8(r);
-  if (len != 0xFE) {
-    if (o8r_has(r, len)) {
-      if (out != NULL)
-        seer_writer_bytes(out, r->b + r->pos, len);
-      r->pos += len;
-    }
-    return;
-  }
-  for (;;) {
-    uint8_t cl = o8r_u8(r);
-    if (r->cut || r->bad || cl == 0)
-      return;
-    if (!o8r_has(r, cl))
-      return;
-    if (out != NULL)
-      seer_writer_bytes(out, r->b + r->pos, cl);
-    r->pos += cl;
-  }
-}
-
 static void o8w_le32(SeerWriter *w, uint32_t v)
 {
   for (int i = 0; i < 4; i++)
     seer_writer_u8(w, (uint8_t)(v >> (8 * i)));
 }
 
-/* Text as the pre-10g chunked string: a length byte up to 64 bytes, else 0xFE,
- * 64-byte chunks and a zero length. */
+/* A value as 8i writes one, SEER_CHR_SCHEMA at 8i's widths (#398): a length
+ * byte up to 64 bytes, else 0xFE, 64-byte chunks and a zero length. */
 static void o8w_chr(SeerWriter *w, const uint8_t *p, size_t n)
 {
-  if (n <= 64) {
-    seer_writer_u8(w, (uint8_t)n);
-    seer_writer_bytes(w, p, n);
-    return;
-  }
-  seer_writer_u8(w, 0xFE);
-  for (size_t off = 0; off < n; off += 64) {
-    size_t k = n - off < 64 ? n - off : 64;
-    seer_writer_u8(w, (uint8_t)k);
-    seer_writer_bytes(w, p + off, k);
-  }
-  seer_writer_u8(w, 0);
+  SeerChrMsg m = {.value = {.p = p, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, w);
 }
 
 /* UTF-8 text in 8i's session charset, WE8ISO8859P1: a character it cannot hold
@@ -6066,26 +5620,29 @@ static void o8i_all8(SeerConn *c, SeerWriter *w, uint32_t options, uint32_t curs
                      uint32_t max_long, uint32_t bind_count, uint32_t i0, uint32_t i1, uint32_t i7)
 {
   seer_ttc_fun_header(c, w, TTI_ALL8);
-  o8w_le32(w, options);
-  o8w_le32(w, cursor);
-  seer_writer_u8(w, has_sql ? 1 : 0);
-  o8w_le32(w, has_sql ? (uint32_t)sqllen : 0);
-  seer_writer_u8(w, 1); /* al8i4 */
-  o8w_le32(w, 12);
-  seer_writer_u8(w, 0); /* al8o4  */
-  seer_writer_u8(w, 1); /* al8o4l */
-  o8w_le32(w, 0);       /* prefetch size */
-  o8w_le32(w, prefetch_rows);
-  o8w_le32(w, max_long);
-  seer_writer_u8(w, bind_count ? 1 : 0);
-  o8w_le32(w, bind_count);
-  for (int i = 0; i < 4; i++)
-    seer_writer_u8(w, 0); /* al8app, al8txn, al8txl, al8kv */
-  seer_writer_u8(w, 1);   /* al8kvl */
-  if (has_sql)
-    o8w_chr(w, sql, sqllen);
-  for (int i = 0; i < 12; i++)
-    o8w_le32(w, i == 0 ? i0 : i == 1 ? i1 : i == 7 ? i7 : 0);
+  /* SEER_ALL8_SCHEMA at 8i's widths (#398): al8o4l and al8kvl set, no
+   * defines or register; the SQL by SF_SQL, the pre-10g chunked string. */
+  uint32_t i4[12] = {0};
+  i4[0] = i0, i4[1] = i1, i4[7] = i7;
+  SeerAll8Msg am = {
+      .options = options,
+      .cursor = cursor,
+      .sql_ptr = has_sql,
+      .sql_len = has_sql ? (int64_t)sqllen : 0,
+      .al8i4_ptr = 1,
+      .al8i4_len = 12,
+      .al8o4l = 1,
+      .prefetch_rows = prefetch_rows,
+      .max_long = max_long,
+      .binds_ptr = bind_count != 0,
+      .bind_count = bind_count,
+      .al8kvl = 1,
+      .sql = {.p = sql, .n = has_sql ? sqllen : 0},
+      .al8i4 = i4,
+      .al8i4_n = 12,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_ALL8_SCHEMA, &cx, &am, w);
 }
 
 /* The close of the finished cursors, piggybacked ahead of the next call
@@ -6095,13 +5652,13 @@ static void o8i_closing(SeerConn *c, SeerWriter *w)
 {
   if (c->n_close == 0)
     return;
-  seer_writer_u8(w, TTI_MSG_TYPE_PIGGYBACK);
-  seer_writer_u8(w, TTI_OCCA);
-  seer_writer_u8(w, seer_ttc_next_seq(c));
-  seer_writer_u8(w, 1);
-  o8w_le32(w, (uint32_t)c->n_close);
-  for (int i = 0; i < c->n_close; i++)
-    o8w_le32(w, (uint32_t)c->close_cursors[i]);
+  /* SEER_CLOSE_CURSORS_SCHEMA, as 10g+'s, at 8i's widths (#398) */
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerFunHeadMsg h = {
+      .type = TTI_MSG_TYPE_PIGGYBACK, .function = TTI_OCCA, .seq = seer_ttc_next_seq(c)};
+  SeerCloseCursorsMsg cc = {.list_ptr = 1, .ids = c->close_cursors, .n = c->n_close};
+  seer_schema_encode(SEER_FUN_HEAD_SCHEMA, &cx, &h, w);
+  seer_schema_encode(SEER_CLOSE_CURSORS_SCHEMA, &cx, &cc, w);
   c->n_close = 0;
 }
 
@@ -6129,26 +5686,27 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
   memset(s, 0, sizeof *s);
   if (o8r_has(r, 1) && r->b[r->pos] == TTI_RPA) {
     r->pos++;
-    uint32_t cnt = o8r_le16(r);
-    for (uint32_t i = 0; i < cnt && !r->cut; i++)
-      (void)o8r_le32(r);
-    /* Two ub2 counts, zero after a DML, where seerdb's _O8I_RPA has four
-     * zero bytes: a transaction id's length (0 in every reply seen), and the
-     * session's changed settings as keyword pairs - an ALTER SESSION returns
-     * its 16 NLS values (8.1.7, 2026-11-14). A pair is a ub4 key length and
-     * the key, a ub4 value length and the value (each a ub1 length and the
-     * bytes, none when the length is 0), and the ub2 keyword: 16 AMERICAN, 9
-     * AMERICA, ..., 7 the date format. Read as four bytes, the status behind
-     * an ALTER SESSION was not found. */
-    o8r_skip(r, o8r_le16(r));
-    uint32_t pairs = o8r_le16(r);
-    for (uint32_t i = 0; i < pairs && !r->cut && !r->bad; i++) {
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-      (void)o8r_le16(r);
+    /* SEER_RPA_HEAD / _TAIL_SCHEMA at 8i's widths (#398): the parameters,
+     * the transaction id (0 in every reply seen) and the changed settings -
+     * an ALTER SESSION returns its 16 NLS values (8.1.7, 2026-11-14); read as
+     * four zero bytes, the status behind one was not found. */
+    SeerReader rr;
+    seer_reader_init(&rr, r->b + r->pos, r->n - r->pos);
+    SeerSchemaCtx rcx = seer_msg_ctx(1, 0, 0);
+    SeerRpaMsg rm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_RPA_HEAD_SCHEMA, &rcx, &rr, &rm);
+    if (res == SCH_OK)
+      res = seer_schema_decode_ex(SEER_RPA_TAIL_SCHEMA, &rcx, &rr, &rm);
+    seer_schema_free(SEER_RPA_TAIL_SCHEMA, &rm);
+    if (res == SCH_SHORT) {
+      r->cut = true;
+      return;
     }
+    if (res == SCH_BAD) {
+      r->bad = true;
+      return;
+    }
+    r->pos += rr.pos;
   }
   if (!o8r_has(r, 1))
     return; /* cut: the caller reads on until the status arrives */
@@ -6157,32 +5715,46 @@ static void o8i_read_status(O8iRd *r, O8iStatus *s)
     return;
   }
   r->pos++;
-  s->rows = o8r_le32(r);
-  s->code = o8r_le16(r);
-  (void)o8r_le16(r); /* array errors */
-  (void)o8r_le16(r);
-  s->cursor = o8r_le16(r);
-  s->position = o8r_le16(r);
-  o8r_skip(r, 2);       /* sql type, fatal */
-  s->flags = o8r_u8(r); /* 0x40: no transaction open (bus 95) */
-  o8r_skip(r, 2);       /* cursor options, upi param */
-  s->warnings = o8r_u8(r);
-  o8r_skip(r, 13);   /* rowid: ub4 object, ub2 file, a byte, ub4 block, ub2 slot */
-  (void)o8r_le32(r); /* os error */
-  o8r_skip(r, 4);    /* statement, call, padding */
-  (void)o8r_le32(r); /* iterations */
-  if (o8r_le16(r) > 0)
-    o8r_value(r, NULL); /* oerrdd: the rowid again after a DML */
-  o8r_skip(r, 12);      /* batch-error array counts */
-  s->complete = !r->cut && !r->bad;
-  if (s->code != 0 && !r->cut && !r->bad) {
+  /* SEER_OER_*_SCHEMA at 8i's widths (#395 spike): no call status or
+   * sequence; rows a ub4, code / cursor / position ub2s; the flags' 0x40 says
+   * no transaction is open (bus 95). The batch counts are three ub4s. */
+  SeerReader sr;
+  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerOerMsg om = {0};
+  bool whole = seer_schema_decode(SEER_OER_HEAD_SCHEMA, &cx, &sr, &om) &&
+               seer_schema_decode(SEER_OER_FLAGS_SCHEMA, &cx, &sr, &om) &&
+               seer_schema_decode(SEER_OER_BATCH_SCHEMA, &cx, &sr, &om);
+  seer_schema_free(SEER_OER_BATCH_SCHEMA, &om);
+  s->rows = (uint32_t)om.rows;
+  s->code = (uint32_t)om.code;
+  s->cursor = (uint32_t)om.cursor;
+  s->position = (uint32_t)om.position;
+  s->flags = (uint8_t)om.flags;
+  s->warnings = (uint8_t)om.warnings;
+  if (!whole) {
+    r->cut = true;
+    return;
+  }
+  r->pos += sr.pos;
+  s->complete = true;
+  if (s->code != 0) {
+    SeerOerMsg tm = {.code = om.code};
+    if (!seer_schema_decode(SEER_OER_TAIL_SCHEMA, &cx, &sr, &tm)) {
+      seer_schema_free(SEER_OER_TAIL_SCHEMA, &tm);
+      r->cut = true;
+      return;
+    }
+    r->pos = (size_t)(sr.buf - r->b) + sr.pos;
     SeerWriter m;
     if (!seer_writer_init(&m, 64)) {
+      seer_schema_free(SEER_OER_TAIL_SCHEMA, &tm);
       r->bad = true;
       return;
     }
-    o8r_value(r, &m);
-    if (!r->cut && seer_writer_ok(&m)) {
+    seer_writer_bytes(&m, tm.message.p, tm.message.n);
+    seer_schema_free(SEER_OER_TAIL_SCHEMA, &tm);
+    if (seer_writer_ok(&m)) {
       SeerCell tmp = {0};
       if (o8i_text_cell(&tmp, m.buf, m.len) == SEER_OK) {
         s->message = malloc(tmp.len + 1);
@@ -6237,6 +5809,8 @@ static void o8i_read_describe(O8iRd *r, SeerColumn **out, int *ncols)
   o8i_read_columns(r, false, out, ncols);
 }
 
+static SeerSchemaResult o8i_decode(O8iRd *r, const SeerField *schema, void *msg);
+
 /* The describe's body. A cursor's cell - a REF CURSOR OUT value, a CURSOR()
  * column - carries it too, with the max row size ahead of the preamble, which
  * is empty there (seerdb §19.17a, from sqlplus 9.2 against 8.1.7). `out` may
@@ -6247,86 +5821,80 @@ static void o8i_read_columns(O8iRd *r, bool cursor_cell, SeerColumn **out, int *
     *out = NULL;
     *ncols = 0;
   }
+  /* The preamble, a value, and the describe head about it (#398): before it
+   * the row size in a cursor cell, after it otherwise. */
+  SeerDescribeHeadMsg hm = {0};
+  SeerChrMsg pm = {0};
   if (cursor_cell)
-    (void)o8r_le32(r); /* max row size */
-  o8r_value(r, NULL);  /* preamble */
-  if (!cursor_cell)
-    (void)o8r_le32(r); /* max row size */
-  uint32_t n = o8r_le32(r);
-  if (r->cut)
+    (void)o8i_decode(r, SEER_DESCRIBE_ROWSIZE_SCHEMA, &hm);
+  if (!r->cut && !r->bad) {
+    (void)o8i_decode(r, SEER_VALUE_SCHEMA, &pm);
+    seer_schema_free(SEER_VALUE_SCHEMA, &pm);
+  }
+  if (!r->cut && !r->bad)
+    (void)o8i_decode(r, cursor_cell ? SEER_DESCRIBE_COUNT_SCHEMA : SEER_DESCRIBE_HEAD_SCHEMA, &hm);
+  if (r->cut || r->bad)
     return;
-  if (n > 4096) {
+  if (hm.ncols < 0 || hm.ncols > 4096) {
     r->bad = true;
     return;
   }
-  if (n > 0)
-    (void)o8r_u8(r);
+  uint32_t n = (uint32_t)hm.ncols;
   SeerColumn *cols = calloc(n ? n : 1, sizeof *cols);
   if (cols == NULL) {
     r->bad = true;
     return;
   }
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
   for (uint32_t i = 0; i < n && !r->cut && !r->bad; i++) {
+    /* SEER_DCB_COLUMN_SCHEMA at 8i's widths (#398): the OAC's fields (no
+     * max_chars), nullable, the name and the type's schema and name - an
+     * object or collection column's, its layout read by them (#168). */
     SeerColumn *col = &cols[i];
-    col->ora_type = o8r_u8(r);
-    o8r_skip(r, 1); /* flags */
-    col->precision = o8r_u8(r);
-    col->scale = (int8_t)o8r_u8(r);
-    col->max_size = o8r_le32(r);
-    col->char_size = col->byte_size = col->max_size; /* 8i: byte semantics only */
-    (void)o8r_le32(r);                               /* max array */
-    (void)o8r_le32(r);                               /* continuation flags */
-    if (o8r_le32(r) > 0)
-      o8r_value(r, NULL); /* the type's OID */
-    (void)o8r_le16(r);    /* version */
-    col->charset = (uint16_t)o8r_le16(r);
-    (void)o8r_u8(r); /* csfrm */
-    col->null_ok = o8r_u8(r);
-    (void)o8r_u8(r);   /* name length in bytes */
-    (void)o8r_le32(r); /* name length in characters */
-    SeerWriter nm;
-    if (!seer_writer_init(&nm, 32)) {
-      r->bad = true;
+    SeerReader sr;
+    seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+    SeerDcbColumnMsg dm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_DCB_COLUMN_SCHEMA, &cx, &sr, &dm);
+    if (res != SCH_OK) {
+      seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else
+        r->bad = true;
       break;
     }
-    o8r_value(r, &nm);
-    seer_writer_u8(&nm, 0);
-    if (seer_writer_ok(&nm)) {
-      col->name = (char *)nm.buf;
-    } else {
-      seer_writer_free(&nm);
+    r->pos += sr.pos;
+    col->ora_type = (uint8_t)dm.data_type;
+    col->precision = (uint8_t)dm.precision;
+    col->scale = (int8_t)dm.scale;
+    col->max_size = (uint32_t)dm.max_length;
+    col->char_size = col->byte_size = col->max_size; /* 8i: byte semantics only */
+    col->charset = (uint16_t)dm.charset;
+    col->null_ok = (uint8_t)dm.null_ok;
+    col->name = bytes_dup_str(&dm.name);
+    if (col->name == NULL)
       r->bad = true;
-    }
-    /* The type's schema and name: an object or collection column's, which
-     * its image decode reads the layout by (#168). */
-    char *ident[2] = {NULL, NULL};
-    for (int k = 0; k < 2; k++) {
-      if (o8r_le32(r) == 0)
-        continue;
-      SeerWriter v;
-      if (!seer_writer_init(&v, 32)) {
-        r->bad = true;
-        break;
-      }
-      o8r_value(r, &v);
-      seer_writer_u8(&v, 0);
-      if (seer_writer_ok(&v) && col->ora_type == ORA_TYPE_ADT)
-        ident[k] = (char *)v.buf;
-      else
-        seer_writer_free(&v);
-    }
     col->n_obj_attrs = 0;
-    if (ident[0] != NULL && ident[1] != NULL) {
-      col->type_schema = ident[0];
-      col->type_name = ident[1];
+    if (col->ora_type == ORA_TYPE_ADT && dm.type_schema.n > 0 && dm.type_name.n > 0) {
+      col->type_schema = bytes_dup_str(&dm.type_schema);
+      col->type_name = bytes_dup_str(&dm.type_name);
       col->n_obj_attrs = -1; /* layout not yet fetched */
-    } else {
-      free(ident[0]);
-      free(ident[1]);
     }
+    seer_schema_free(SEER_DCB_COLUMN_SCHEMA, &dm);
   }
-  if (o8r_le32(r) > 0)
-    o8r_value(r, NULL); /* the describe time */
+  if (!r->cut && !r->bad) { /* SEER_DCB_TRAILER_SCHEMA: the describe time */
+    SeerReader tr;
+    seer_reader_init(&tr, r->b + r->pos, r->n - r->pos);
+    SeerDcbTrailerMsg tm = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_DCB_TRAILER_SCHEMA, &cx, &tr, &tm);
+    seer_schema_free(SEER_DCB_TRAILER_SCHEMA, &tm);
+    if (res == SCH_OK)
+      r->pos += tr.pos;
+    else if (res == SCH_SHORT)
+      r->cut = true;
+    else
+      r->bad = true;
+  }
   if (r->cut || r->bad || out == NULL) {
     free_columns(cols, (int)n);
     return;
@@ -6343,8 +5911,15 @@ static void o8i_read_cursor_cell(O8iRd *r, bool row_cell, SeerColumn **cols, int
                                  uint32_t *cursor)
 {
   o8i_read_columns(r, true, cols, ncols);
-  *cursor = o8r_le32(r);
-  o8r_skip(r, row_cell ? 4 : 2);
+  /* The cursor id, SEER_COUNT_SCHEMA, then a row cell's trailer or an OUT
+   * value's indicator (#398). */
+  SeerCountMsg cm = {0};
+  SeerCellMsg tm = {0};
+  *cursor = 0;
+  if (!r->cut && !r->bad && o8i_decode(r, SEER_COUNT_SCHEMA, &cm) == SCH_OK) {
+    *cursor = (uint32_t)cm.n;
+    (void)o8i_decode(r, row_cell ? SEER_CELL_TRAILER_SCHEMA : SEER_OUT_TAIL_SCHEMA, &tm);
+  }
   if ((r->cut || r->bad) && cols != NULL && *cols != NULL) {
     free_columns(*cols, *ncols);
     *cols = NULL;
@@ -6367,23 +5942,28 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell,
      * PROTOCOL.md §19.17c, #168). Read as a plain value it came back as raw
      * framing bytes and the rows after it were lost. The image is kept for
      * o8i_resolve_lobs to decode by the type's layout. */
-    for (int k = 0; k < 3; k++)
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-    (void)o8r_le16(r); /* version */
-    uint32_t imglen = o8r_le32(r);
-    (void)o8r_le16(r); /* flags */
-    SeerWriter img;
-    if (!seer_writer_init(&img, 64))
-      return SEER_ENOMEM;
-    if (imglen > 0)
-      o8r_value(r, &img);
-    bool null = o8r_le16(r) == 0xFFFF;
-    o8r_skip(r, 2); /* return code */
+    /* SEER_OBJECT_SCHEMA at 8i's widths, then the cell's trailer (#398) */
+    SeerReader sr;
+    seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    SeerObjectMsg om = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_OBJECT_SCHEMA, &cx, &sr, &om);
+    r->pos += sr.pos;
+    if (res != SCH_OK) {
+      seer_schema_free(SEER_OBJECT_SCHEMA, &om);
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else
+        r->bad = true;
+      return SEER_OK;
+    }
+    SeerCellMsg tm = {0}; /* SEER_CELL_TRAILER_SCHEMA: indicator, return code */
+    (void)o8i_decode(r, SEER_CELL_TRAILER_SCHEMA, &tm);
+    bool null = tm.indicator == 0xFFFF;
     SeerStatus st = SEER_OK;
-    if (!r->cut && !r->bad && !null && imglen > 0 && seer_writer_ok(&img))
-      st = cell_set_bytes(cell, img.buf, img.len, true);
-    seer_writer_free(&img);
+    if (!r->cut && !r->bad && !null && om.image_len > 0 && om.image.n > 0)
+      st = cell_set_bytes(cell, om.image.p, om.image.n, true);
+    seer_schema_free(SEER_OBJECT_SCHEMA, &om);
     return st;
   }
   if (t == ORA_TYPE_REFCURSOR) {
@@ -6392,65 +5972,56 @@ static SeerStatus o8i_read_cell(O8iRd *r, const SeerColumn *col, SeerCell *cell,
     o8i_read_cursor_cell(r, true, NULL, NULL, nested);
     return SEER_OK;
   }
+  /* The cell by its kind's schema, at 8i's widths (#398): a LOB's locator
+   * (its ub4 length - 86 for a CLOB or BLOB, not the content's - and the
+   * value, §19.10, §19.15, seerdb #387), a UROWID (a ub2 length), a ROWID's
+   * fields, a LONG's or any other value; then the trailer, the indicator (-1
+   * for NULL) and the return code. A NULL VARCHAR2 from a table comes as an
+   * empty value and the trailer with the indicator -1, not as the trailer
+   * alone (#153). */
+  const SeerField *sch = SEER_CELL_SCHEMA;
+  if (t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE)
+    sch = SEER_LOB_CELL_SCHEMA;
+  else if (t == ORA_TYPE_UROWID)
+    sch = SEER_UROWID_CELL_SCHEMA;
+  else if (t == ORA_TYPE_RID)
+    sch = SEER_ROWID_CELL_SCHEMA;
+  SeerReader sr;
+  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerCellMsg m = {0};
+  SeerSchemaResult res = seer_schema_decode_ex(sch, &cx, &sr, &m);
+  if (res != SCH_OK) {
+    seer_schema_free(sch, &m);
+    if (res == SCH_SHORT)
+      r->cut = true;
+    else
+      r->bad = true;
+    return SEER_OK;
+  }
+  r->pos += sr.pos;
+  bool null = m.indicator == 0xFFFF;
   if (t == ORA_TYPE_RID) {
-    uint8_t size = o8r_u8(r);
-    uint32_t obj = 0, file = 0, blk = 0, slot = 0;
-    if (size != 0) {
-      obj = o8r_le32(r);
-      file = o8r_le16(r);
-      o8r_skip(r, 1);
-      blk = o8r_le32(r);
-      slot = o8r_le16(r);
-    }
-    o8r_skip(r, 4); /* trailer */
-    if (r->cut || r->bad || size == 0)
+    if (null || m.rowid_size == 0)
       return SEER_OK;
     char rid[18];
-    rowid_b64(obj, 6, rid);
-    rowid_b64(file, 3, rid + 6);
-    rowid_b64(blk, 6, rid + 9);
-    rowid_b64(slot, 3, rid + 15);
+    rowid_b64((uint32_t)m.rowid_obj, 6, rid);
+    rowid_b64((uint32_t)m.rowid_file, 3, rid + 6);
+    rowid_b64((uint32_t)m.rowid_block, 6, rid + 9);
+    rowid_b64((uint32_t)m.rowid_slot, 3, rid + 15);
     return cell_set_bytes(cell, rid, sizeof rid, false);
   }
-  SeerWriter v;
-  if (!seer_writer_init(&v, 32))
-    return SEER_ENOMEM;
-  bool null = false;
-  bool lob = t == ORA_TYPE_CLOB || t == ORA_TYPE_BLOB || t == ORA_TYPE_BFILE;
-  if (lob) {
-    /* A ub4 length - the locator's, 86 for a CLOB or BLOB, not the content's -
-     * then the locator as a value; NULL is a zero length and the trailer
-     * alone, no locator (§19.10, §19.15, seerdb #387). */
-    if (o8r_le32(r) > 0)
-      o8r_value(r, &v);
-    else
-      null = true;
-  } else if (t == ORA_TYPE_UROWID) {
-    if (o8r_le16(r) > 0)
-      o8r_value(r, &v);
-    else
-      null = true;
-  } else if (t == ORA_TYPE_LONG || t == ORA_TYPE_LONGRAW) {
-    if (o8r_has(r, 1) && r->b[r->pos] == 0) {
-      r->pos++;
-      null = true;
-    } else {
-      o8r_value(r, &v);
-    }
-  } else if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
-    null = true; /* the trailer alone */
-  } else {
-    o8r_value(r, &v);
-  }
-  /* The trailer: the sb2 indicator, -1 for NULL, and the ub2 return code. A
-   * NULL VARCHAR2 from a table comes as an empty value and the trailer with
-   * the indicator -1, not as the trailer alone: read only by its first
-   * byte, it came back an empty string (#153). */
-  if (o8r_le16(r) == 0xFFFF)
+  if (m.value.p == NULL)
     null = true;
-  o8r_skip(r, 2);
+  SeerWriter v;
+  if (!seer_writer_init(&v, m.value.n + 1)) {
+    seer_schema_free(sch, &m);
+    return SEER_ENOMEM;
+  }
+  seer_writer_bytes(&v, m.value.p, m.value.n);
+  seer_schema_free(sch, &m);
   SeerStatus st = SEER_OK;
-  if (!r->cut && !r->bad && !null && seer_writer_ok(&v)) {
+  if (!null && seer_writer_ok(&v)) {
     switch (t) {
     case ORA_TYPE_CLOB:
     case ORA_TYPE_BLOB:
@@ -6492,22 +6063,24 @@ static SeerStatus o8i_read_rows(O8iRd *r, SeerStmt *stmt, SeerCell ***rows, size
     uint8_t tok = r->b[r->pos];
     if (tok == TTI_RXH) {
       r->pos++;
-      o8r_skip(r, 1 + 8); /* flags, ub2 requests, iteration, iterations, buffer len */
-      uint32_t bl = o8r_le32(r);
+      /* SEER_RXH_SCHEMA at 8i's widths: the counts ub2s (#398) */
+      SeerReader sr;
+      seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+      SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+      SeerRxhMsg m = {0};
+      SeerSchemaResult res = seer_schema_decode_ex(SEER_RXH_SCHEMA, &cx, &sr, &m);
       veclen = 0;
-      if (bl > 0) {
-        SeerWriter bv;
-        if (!seer_writer_init(&bv, 16))
-          return SEER_ENOMEM;
-        o8r_value(r, &bv);
-        if (seer_writer_ok(&bv) && bv.len <= sizeof vec) {
-          memcpy(vec, bv.buf, bv.len);
-          veclen = bv.len;
-        }
-        seer_writer_free(&bv);
+      if (res == SCH_OK && m.bit_vector.n > 0 && m.bit_vector.n <= sizeof vec) {
+        memcpy(vec, m.bit_vector.p, m.bit_vector.n);
+        veclen = m.bit_vector.n;
       }
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL); /* rowid */
+      seer_schema_free(SEER_RXH_SCHEMA, &m);
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else if (res == SCH_BAD)
+        r->bad = true;
+      else
+        r->pos += sr.pos;
     } else if (tok == TTI_RXD) {
       r->pos++;
       SeerCell *row = calloc(ncols ? (size_t)ncols : 1, sizeof *row);
@@ -6805,12 +6378,11 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
     /* A LOB sends a locator even as a pure OUT: an empty one, a LE ub4 86,
      * the ub1 length 86, 00 54 and 84 zeros. With the OUT placeholder fd 01,
      * 8.1.7 waits for the value and the call hangs (§19.17b, #167). */
-    o8w_le32(val, 86);
-    seer_writer_u8(val, 86);
-    seer_writer_u8(val, 0x00);
-    seer_writer_u8(val, 0x54);
-    for (int i = 0; i < 84; i++)
-      seer_writer_u8(val, 0);
+    static const uint8_t EMPTY_LOCATOR[86] = {0x00, 0x54};
+    SeerLegacyLobBindMsg lm = {.loc_len = sizeof EMPTY_LOCATOR,
+                               .locator = {.p = EMPTY_LOCATOR, .n = sizeof EMPTY_LOCATOR}};
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    seer_schema_encode(SEER_LEGACY_LOB_BIND_SCHEMA, &cx, &lm, val); /* #398 */
     *size = 32;
     return SEER_OK;
   }
@@ -6822,21 +6394,19 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
   }
   if (b->oac_type == ORA_TYPE_REFCURSOR) {
     /* A REF CURSOR sends an empty slot, 01 00 (§19.17a). */
-    seer_writer_u8(val, 0x01);
-    seer_writer_u8(val, 0x00);
+    o8i_slot(val, SEER_O8I_CURSOR_SLOT_SCHEMA);
     *size = 1;
     return SEER_OK;
   }
   if (b->is_out && b->out_only) {
     /* A pure OUT bind sends the fixed placeholder fd 01 in its slot, and
      * declares its return buffer (§19.14). */
-    seer_writer_u8(val, 0xFD);
-    seer_writer_u8(val, 0x01);
+    o8i_slot(val, SEER_O8I_OUT_SLOT_SCHEMA);
     *size = o8i_out_buffer(b, b->oac_size);
     return SEER_OK;
   }
   if (v == NULL || vn == 0 || (vn == 1 && v[0] == 0)) {
-    seer_writer_u8(val, 0);
+    chr_write(val, true, 0, NULL, 0); /* the empty value */
     *size = b->oac_size ? b->oac_size : 1;
     return SEER_OK;
   }
@@ -6884,18 +6454,12 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
      * with its charset and form, a BLOB with neither (§19.17b, sqlplus 9.2
      * against 8.1.7; #167). */
     bool clob = b->ret_lob == ORA_TYPE_CLOB;
-    seer_writer_u8(w, b->ret_lob);
-    seer_writer_u8(w, 0x01);
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 32);
-    seer_writer_u8(w, 0);
-    for (int i = 0; i < 13; i++)
-      seer_writer_u8(w, 0);
-    for (int i = 3; i >= 0; i--)
-      seer_writer_u8(w, (uint8_t)((clob ? 31u : 0u) >> (8 * i)));
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, clob ? 1 : 0);
+    SeerOacMsg m = {.data_type = b->ret_lob,
+                    .flags = 0x01,
+                    .max_length = 32,
+                    .charset = clob ? 31 : 0,
+                    .csfrm = clob ? 1 : 0};
+    oac_write(w, true, 0, &m); /* #395 */
     return;
   }
   switch (b->oac_type) {
@@ -6917,18 +6481,9 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
   }
   if (size > 0xFFFF)
     size = 0xFFFF;
-  seer_writer_u8(w, type);
-  seer_writer_u8(w, flag);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, (uint8_t)(size & 0xFF));
-  seer_writer_u8(w, (uint8_t)(size >> 8));
-  for (int i = 0; i < 13; i++)
-    seer_writer_u8(w, 0);
-  for (int i = 3; i >= 0; i--)
-    seer_writer_u8(w, (uint8_t)(charset >> (8 * i)));
-  seer_writer_u8(w, 0);
-  seer_writer_u8(w, csfrm);
+  SeerOacMsg m = {
+      .data_type = type, .flags = flag, .max_length = size, .charset = charset, .csfrm = csfrm};
+  oac_write(w, true, 0, &m); /* #395 */
 }
 
 /* The statement's binds, refused before anything is sent when 8i can't take
@@ -7160,21 +6715,19 @@ static SeerStatus o8i_lobop_send(SeerConn *c, const uint8_t *loc, size_t loclen,
     return SEER_ENOMEM;
   o8i_closing(c, &w);
   seer_ttc_fun_header(c, &w, TTI_LOBOPS);
-  seer_writer_u8(&w, 1); /* source */
-  o8w_le32(&w, (uint32_t)loclen);
-  seer_writer_u8(&w, 0); /* destination */
-  o8w_le32(&w, 0);
-  o8w_le32(&w, offset);
-  o8w_le32(&w, 0);       /* destination offset */
-  seer_writer_u8(&w, 0); /* charset */
-  seer_writer_u8(&w, has_amount ? 1 : 0);
-  seer_writer_u8(&w, 0); /* null LOB */
-  o8w_le32(&w, op);
-  seer_writer_u8(&w, 0); /* SCN */
-  o8w_le32(&w, 0);
-  seer_writer_bytes(&w, loc, loclen);
-  if (has_amount)
-    o8w_le32(&w, amount);
+  SeerLobopMsg m = {
+      .src_ptr = 1,
+      .src_len = (int64_t)loclen,
+      .short_src_off = offset,
+      .short_amount_ptr = has_amount,
+      .op = op,
+      .loc_len = (int64_t)loclen,
+      .locator = {.p = loc, .n = loclen},
+      .has_amount = has_amount,
+      .amount = amount,
+  };
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, &m, &w); /* #395 */
   SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   return st;
@@ -7198,83 +6751,78 @@ static SeerStatus o8i_lobop_reply(SeerConn *c, bool has_amount, SeerWriter *cont
     return SEER_ENOMEM;
   SeerStatus st;
   O8iStatus s = {0};
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerLobDataMsg lm = {0};
+  SeerLobopReplyMsg rm = {0};
+  /* How far a READ's content has been found whole: seer_schema_value_scan
+   * goes on from there as each packet comes, so the content is walked once,
+   * not once a packet (#400); it is decoded once it has all arrived. */
+  size_t lob_pos = 0;
+  bool lob_whole = false;
   for (;;) {
     st = o8i_recv_more(c, &buf);
     if (st != SEER_OK)
       break;
-    O8iRd r = {buf.buf, buf.len, 0, false, false};
-    if (o8r_has(&r, 1) && r.b[0] == TTI_LOB) {
-      r.pos = o8r_has(&r, 2) && r.b[1] == 0xFE ? 2 : 1;
-      for (;;) {
-        uint8_t cl = o8r_u8(&r);
-        if (r.cut || cl == 0)
-          break;
-        o8r_skip(&r, cl);
-        if (r.cut)
-          break;
-      }
-      if (r.cut)
+    if (!lob_whole && buf.len > 0 && buf.buf[0] == TTI_LOB) {
+      SeerSchemaResult sr = seer_schema_value_scan(&cx, buf.buf, buf.len, 1, &lob_pos);
+      if (sr == SCH_SHORT)
         continue;
+      if (sr == SCH_BAD) {
+        st = SEER_EPROTO;
+        break;
+      }
+      lob_whole = true;
     }
-    if (o8r_has(&r, 1) && r.b[r.pos] == TTI_RPA) {
+    /* The reply by its schemas, at 8i's widths: the LOB data (a READ's
+     * content), the RPA, then the status. A part that hasn't fully arrived
+     * reads short: read on (#398). */
+    seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
+    seer_schema_free(SEER_LOBOPS_REPLY_SCHEMA, &rm);
+    lm = (SeerLobDataMsg){0};
+    rm = (SeerLobopReplyMsg){.has_amount = has_amount};
+    SeerReader r;
+    seer_reader_init(&r, buf.buf, buf.len);
+    SeerSchemaResult res = SCH_OK;
+    if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_LOB) {
       r.pos++;
-      uint32_t n = 0;
-      if (o8r_has(&r, 2)) {
-        n = (uint32_t)r.b[r.pos] << 8 | r.b[r.pos + 1];
-        r.pos += 2;
-      }
-      o8r_skip(&r, n);
-      if (has_amount)
-        (void)o8r_le32(&r);
-      if (r.cut)
-        continue;
+      res = seer_schema_decode_ex(SEER_LOB_DATA_SCHEMA, &cx, &r, &lm);
     }
-    o8i_status_free(&s);
-    o8i_read_status(&r, &s);
-    o8i_note_txn(c, &s);
-    if (r.bad) {
+    if (res == SCH_OK && seer_reader_remaining(&r) > 0 && r.buf[r.pos] == TTI_RPA) {
+      r.pos++;
+      res = seer_schema_decode_ex(SEER_LOBOPS_REPLY_SCHEMA, &cx, &r, &rm);
+    }
+    if (res == SCH_SHORT)
+      continue;
+    if (res == SCH_BAD) {
       st = SEER_EPROTO;
       break;
     }
-    if (!r.cut)
+    O8iRd sr = {buf.buf, buf.len, r.pos, false, false};
+    o8i_status_free(&s);
+    o8i_read_status(&sr, &s);
+    o8i_note_txn(c, &s);
+    if (sr.bad) {
+      st = SEER_EPROTO;
+      break;
+    }
+    if (!sr.cut)
       break;
   }
   if (st == SEER_OK && s.code != 0) {
     st = o8i_fail(c, &s);
   } else if (st == SEER_OK) {
     /* Whole now: take the parts out. */
-    size_t pos = 0;
-    if (buf.buf[0] == TTI_LOB) {
-      uint8_t *data = NULL;
-      size_t dlen = 0;
-      bool complete = false;
-      fv2_parse_lob_chunks(buf.buf, buf.len, &data, &dlen, &complete);
-      if (content != NULL)
-        seer_writer_bytes(content, data, dlen);
-      free(data);
-      pos = buf.buf[1] == 0xFE ? 2 : 1;
-      while (pos < buf.len && buf.buf[pos] != 0)
-        pos += 1 + (size_t)buf.buf[pos];
-      pos++;
-    }
-    if (pos < buf.len && buf.buf[pos] == TTI_RPA && pos + 3 <= buf.len) {
-      size_t n = (size_t)buf.buf[pos + 1] << 8 | buf.buf[pos + 2];
-      if (loc != NULL && pos + 3 + n <= buf.len) {
-        *loc = malloc(2 + n);
-        if (*loc != NULL) {
-          memcpy(*loc, buf.buf + pos + 1, 2 + n); /* its length and the bytes */
-          *loclen = 2 + n;
-        }
-      }
-      if (amount != NULL && has_amount && pos + 3 + n + 4 <= buf.len) {
-        const uint8_t *a = buf.buf + pos + 3 + n;
-        *amount =
-            (uint32_t)a[0] | (uint32_t)a[1] << 8 | (uint32_t)a[2] << 16 | (uint32_t)a[3] << 24;
-      }
-    }
+    if (content != NULL)
+      seer_writer_bytes(content, lm.data.p, lm.data.n);
+    if (loc != NULL && rm.locator.p != NULL)
+      *loc = seer_lobop_reply_locator(&rm, loclen); /* its length and the bytes */
+    if (amount != NULL && has_amount)
+      *amount = (uint32_t)rm.amount;
     if (content != NULL && !seer_writer_ok(content))
       st = SEER_ENOMEM;
   }
+  seer_schema_free(SEER_LOB_DATA_SCHEMA, &lm);
+  seer_schema_free(SEER_LOBOPS_REPLY_SCHEMA, &rm);
   o8i_status_free(&s);
   seer_writer_free(&buf);
   return st;
@@ -7388,46 +6936,60 @@ static SeerStatus o8i_resolve_lobs(SeerStmt *stmt)
 /* One OUT value of an 8i block reply into `b->out` (§19.14, _O8I_OUT_CELL):
  * a value and an sb2 indicator, -1 for NULL; `ff` and the indicator 3105
  * for one the block never assigned. Text comes in WE8ISO8859P1. */
+/* Decode `schema` at 8i's widths from where `r` stands: past it when whole,
+ * `cut` when the reply hasn't brought it all yet, `bad` otherwise. */
+static SeerSchemaResult o8i_decode(O8iRd *r, const SeerField *schema, void *msg)
+{
+  SeerReader sr;
+  seer_reader_init(&sr, r->b + r->pos, r->n - r->pos);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  SeerSchemaResult res = seer_schema_decode_ex(schema, &cx, &sr, msg);
+  if (res == SCH_OK)
+    r->pos += sr.pos;
+  else if (res == SCH_SHORT)
+    r->cut = true;
+  else
+    r->bad = true;
+  return res;
+}
+
 static void o8i_out_cell(O8iRd *r, SeerBind *b)
 {
   free(b->out.data);
   b->out = (SeerCell){0};
   if (b->is_array) {
-    /* An associative array (§19.17c, #172): a LE ub4 count, then each
-     * element as a value and an sb2 indicator, -1 for NULL; no return code,
-     * as the OAC doesn't ask for one (flag 0x04). Text in WE8ISO8859P1. */
+    /* An associative array (§19.17c, #172) by SEER_OUT_ARRAY_SCHEMA: a
+     * count, then each element by SEER_OUT_CELL_SCHEMA, a value and an
+     * indicator (-1 NULL); no return code, as the OAC doesn't ask for one
+     * (flag 0x04). Text in WE8ISO8859P1. */
     for (int k = 0; k < b->out_arr_n; k++)
       free(b->out_arr[k].data);
     free(b->out_arr);
     b->out_arr = NULL;
     b->out_arr_n = 0;
-    uint32_t count = o8r_le32(r);
-    if (r->cut || r->bad)
+    SeerOutArrayMsg am = {0};
+    if (o8i_decode(r, SEER_OUT_ARRAY_SCHEMA, &am) != SCH_OK)
       return;
-    if (count > 65535) {
+    if (am.count < 0 || am.count > 65535) {
       r->bad = true;
       return;
     }
+    uint32_t count = (uint32_t)am.count;
     SeerCell *cells = calloc(count ? count : 1, sizeof *cells);
     if (cells == NULL) {
       r->bad = true;
       return;
     }
     for (uint32_t e = 0; e < count && !r->cut && !r->bad; e++) {
-      SeerWriter v;
-      if (!seer_writer_init(&v, 32)) {
-        r->bad = true;
-        break;
-      }
-      o8r_value(r, &v);
-      uint16_t ind = (uint16_t)o8r_le16(r);
-      if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v)) {
+      SeerCellMsg em = {0};
+      if (o8i_decode(r, SEER_OUT_CELL_SCHEMA, &em) == SCH_OK && em.indicator != 0xFFFF &&
+          em.value.n > 0) {
         if (b->oac_type == ORA_TYPE_NUMBER)
-          (void)decode_scalar(ORA_TYPE_NUMBER, v.buf, v.len, &cells[e]);
+          (void)decode_scalar(ORA_TYPE_NUMBER, em.value.p, em.value.n, &cells[e]);
         else
-          (void)o8i_text_cell(&cells[e], v.buf, v.len);
+          (void)o8i_text_cell(&cells[e], em.value.p, em.value.n);
       }
-      seer_writer_free(&v);
+      seer_schema_free(SEER_OUT_CELL_SCHEMA, &em);
     }
     if (r->cut || r->bad) {
       for (uint32_t e = 0; e < count; e++)
@@ -7441,97 +7003,77 @@ static void o8i_out_cell(O8iRd *r, SeerBind *b)
   }
   if (b->oac_type == ORA_TYPE_ADT && b->obj_type != NULL) {
     /* An object or collection: the bind value's form - the 8i row cell
-     * without its trailer (§19.17c, #172). The image is decoded by the
-     * type's layout once the reply is in. Read as a plain value it left the
-     * status misaligned and the block's cursor id wrong. */
-    for (int k = 0; k < 3; k++)
-      if (o8r_le32(r) > 0)
-        o8r_value(r, NULL);
-    (void)o8r_le16(r); /* version */
-    uint32_t imglen = o8r_le32(r);
-    (void)o8r_le16(r); /* flags */
-    SeerWriter img;
-    if (!seer_writer_init(&img, 64)) {
-      r->bad = true;
-      return;
-    }
-    if (imglen > 0)
-      o8r_value(r, &img);
+     * without its trailer (§19.17c, #172), SEER_OBJECT_SCHEMA at 8i's widths
+     * (#398). The image is decoded by the type's layout once the reply is
+     * in. Read as a plain value it left the status misaligned and the
+     * block's cursor id wrong. */
+    SeerObjectMsg om = {0};
+    SeerSchemaResult res = o8i_decode(r, SEER_OBJECT_SCHEMA, &om);
     free(b->out_image);
     b->out_image = NULL;
     b->out_imagelen = 0;
-    if (!r->cut && !r->bad && imglen > 0 && seer_writer_ok(&img)) {
-      b->out_image = img.buf;
-      b->out_imagelen = img.len;
-    } else {
-      seer_writer_free(&img);
+    if (res == SCH_OK && om.image_len > 0 && om.image.n > 0) {
+      b->out_image = malloc(om.image.n);
+      if (b->out_image != NULL) {
+        memcpy(b->out_image, om.image.p, om.image.n);
+        b->out_imagelen = om.image.n;
+      }
     }
+    seer_schema_free(SEER_OBJECT_SCHEMA, &om);
     return;
   }
   if (b->oac_type == ORA_TYPE_REF && b->oac_override != NULL) {
     /* A REF: `2a` + its 42 bytes as a value, then - as ref_bind's OUT
-     * descriptor sets flag 0x01 - a ub2 indicator; no return code. A NULL is
-     * an empty value and ff ff (bus 91, #325). Without the flag there is no
-     * indicator and a NULL is ORA-01405 (bus 85, #241). */
-    SeerWriter v;
-    if (!seer_writer_init(&v, 48)) {
-      r->bad = true;
-      return;
-    }
-    o8r_value(r, &v);
-    uint16_t ind = (uint16_t)o8r_le16(r);
-    if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v))
-      (void)decode_scalar(ORA_TYPE_REF, v.buf, v.len, &b->out);
-    seer_writer_free(&v);
+     * descriptor sets flag 0x01 - the indicator, SEER_OUT_CELL_SCHEMA's
+     * form; no return code. A NULL is an empty value and ff ff (bus 91,
+     * #325). Without the flag there is no indicator and a NULL is ORA-01405
+     * (bus 85, #241). */
+    SeerCellMsg om = {0};
+    if (o8i_decode(r, SEER_OUT_CELL_SCHEMA, &om) == SCH_OK && om.indicator != 0xFFFF &&
+        om.value.n > 0)
+      (void)decode_scalar(ORA_TYPE_REF, om.value.p, om.value.n, &b->out);
+    seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
     return;
   }
   if (b->ret_lob != 0) {
-    /* A LOB: a LE ub4 length, the locator as a value, a ub2 indicator, and
-     * no return code; NULL is a zero length and ff ff (§19.17b, #167). The
-     * content is read by the locator once the reply is in. */
+    /* A LOB by SEER_LOB_OUT_SCHEMA: the locator, counted, then the
+     * indicator; no return code; NULL is a zero count and ff ff (§19.17b,
+     * #167). The content is read by the locator once the reply is in. */
     free(b->ret_locator);
     b->ret_locator = NULL;
     b->ret_loclen = 0;
-    SeerWriter loc;
-    if (!seer_writer_init(&loc, 96)) {
-      r->bad = true;
-      return;
+    SeerCellMsg lm = {0};
+    if (o8i_decode(r, SEER_LOB_OUT_SCHEMA, &lm) == SCH_OK && lm.indicator != 0xFFFF &&
+        lm.value.n > 2) {
+      bool blank = true;
+      for (size_t i = 2; i < lm.value.n; i++)
+        blank &= lm.value.p[i] == 0;
+      if (!blank && (b->ret_locator = malloc(lm.value.n)) != NULL) {
+        memcpy(b->ret_locator, lm.value.p, lm.value.n);
+        b->ret_loclen = lm.value.n;
+      }
     }
-    if (o8r_le32(r) > 0)
-      o8r_value(r, &loc);
-    uint32_t ind = o8r_le16(r);
-    bool blank = true;
-    for (size_t i = 2; i < loc.len; i++)
-      blank &= loc.buf[i] == 0;
-    if (!r->cut && !r->bad && ind != 0xFFFF && loc.len > 2 && !blank && seer_writer_ok(&loc)) {
-      b->ret_locator = loc.buf;
-      b->ret_loclen = loc.len;
-    } else {
-      seer_writer_free(&loc);
-    }
+    seer_schema_free(SEER_LOB_OUT_SCHEMA, &lm);
     return;
   }
   if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
-    r->pos++;
-    (void)o8r_le16(r); /* 3105: never assigned */
+    /* SEER_OUT_UNSET_SCHEMA: a bind the block never assigned */
+    SeerCellMsg um = {0};
+    (void)o8i_decode(r, SEER_OUT_UNSET_SCHEMA, &um);
     return;
   }
-  SeerWriter v;
-  if (!seer_writer_init(&v, 32)) {
-    r->bad = true;
-    return;
-  }
-  o8r_value(r, &v);
-  uint16_t ind = (uint16_t)o8r_le16(r);
-  if (!r->cut && !r->bad && ind != 0xFFFF && v.len > 0 && seer_writer_ok(&v)) {
+  /* SEER_OUT_CELL_SCHEMA at 8i's widths: the value and its indicator */
+  SeerCellMsg om = {0};
+  if (o8i_decode(r, SEER_OUT_CELL_SCHEMA, &om) == SCH_OK && om.indicator != 0xFFFF &&
+      om.value.n > 0) {
     bool text = b->oac_type == ORA_TYPE_VARCHAR || b->oac_type == ORA_TYPE_CHAR ||
                 b->oac_type == ORA_TYPE_LONG || b->oac_type == 0;
     if (text)
-      (void)o8i_text_cell(&b->out, v.buf, v.len);
+      (void)o8i_text_cell(&b->out, om.value.p, om.value.n);
     else
-      (void)decode_scalar(b->oac_type, v.buf, v.len, &b->out);
+      (void)decode_scalar(b->oac_type, om.value.p, om.value.n, &b->out);
   }
-  seer_writer_free(&v);
+  seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
 }
 
 /* A REF CURSOR OUT value (§19.17a): the cursor cell, its columns and id kept
@@ -7544,9 +7086,9 @@ static void o8i_refcursor_cell(O8iRd *r, SeerStmt *stmt)
   stmt->refcursor_cols = NULL;
   stmt->refcursor_ncols = 0;
   stmt->refcursor_present = false;
-  if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) {
-    r->pos++;
-    (void)o8r_le16(r);
+  if (o8r_has(r, 1) && r->b[r->pos] == 0xFF) { /* NULL: ff, the indicator */
+    SeerCellMsg um = {0};
+    (void)o8i_decode(r, SEER_OUT_UNSET_SCHEMA, &um);
     return;
   }
   SeerColumn *cols = NULL;
@@ -7571,15 +7113,27 @@ static void o8i_block_reply(O8iRd *r, SeerStmt *stmt, O8iStatus *s)
 {
   if (o8r_has(r, 1) && r->b[r->pos] == TTI_IOV) {
     r->pos++;
-    o8r_skip(r, 1); /* flags */
-    uint32_t requests = o8r_le16(r);
-    uint32_t iterations = o8r_le16(r);
-    o8r_skip(r, 4 + 8);
-    uint32_t count = iterations * 256 + requests;
-    if (r->cut || r->bad || !o8r_has(r, count))
+    /* SEER_IOV_SCHEMA at 8i's widths, then a mask a bind (#398) */
+    SeerReader ir;
+    seer_reader_init(&ir, r->b + r->pos, r->n - r->pos);
+    SeerSchemaCtx icx = seer_msg_ctx(1, 0, 0);
+    SeerIovMsg iov = {0};
+    SeerSchemaResult res = seer_schema_decode_ex(SEER_IOV_SCHEMA, &icx, &ir, &iov);
+    seer_schema_free(SEER_IOV_SCHEMA, &iov);
+    uint32_t count = (uint32_t)(iov.iterations * 256 + iov.requests);
+    if (res == SCH_OK) {
+      iov.nbinds = count;
+      res = seer_schema_decode_ex(SEER_IOV_DIRS_SCHEMA, &icx, &ir, &iov);
+    }
+    if (res != SCH_OK) {
+      if (res == SCH_SHORT)
+        r->cut = true;
+      else
+        r->bad = true;
       return;
-    const uint8_t *masks = r->b + r->pos;
-    r->pos += count;
+    }
+    const uint8_t *masks = iov.directions.p;
+    r->pos += ir.pos;
     bool any_out = false;
     for (uint32_t k = 0; k < count; k++)
       any_out |= (masks[k] & O8I_DIR_OUT) != 0;
@@ -7805,8 +7359,9 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
     return SEER_ENOMEM;
   o8i_closing(c, &w);
   seer_ttc_fun_header(c, &w, TTI_OOPEN);
-  seer_writer_u8(&w, 1);
-  o8w_le32(&w, 0);
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0); /* SEER_OPEN_SCHEMA (#398) */
+  SeerOpenMsg om = {.cursor_ptr = 1};
+  seer_schema_encode(SEER_OPEN_SCHEMA, &cx, &om, &w);
   SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   if (st != SEER_OK)
@@ -7817,9 +7372,12 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
   if (st != SEER_OK)
     return st;
   uint32_t cursor = 0;
-  if (rlen >= 5 && resp[0] == TTI_RPA) {
-    O8iRd r = {resp, rlen, 1, false, false};
-    cursor = o8r_le32(&r);
+  if (rlen > 1 && resp[0] == TTI_RPA) {
+    SeerReader r;
+    seer_reader_init(&r, resp + 1, rlen - 1);
+    SeerOpenMsg rm = {0};
+    if (seer_schema_decode(SEER_OPEN_REPLY_SCHEMA, &cx, &r, &rm))
+      cursor = (uint32_t)rm.cursor;
   }
   free(resp);
   if (cursor == 0) {
@@ -7840,12 +7398,9 @@ static SeerStatus o8i_describe_only(SeerStmt *stmt, int nmarkers)
   o8i_all8(c, &w, nmarkers > 0 ? 0x00028009 : 0x00028001, cursor, sql, sqllen, true, 1, 0,
            (uint32_t)nmarkers, 1, 0, O8I_STMT_SELECT);
   free(sql);
-  for (int i = 0; i < nmarkers; i++) {
-    seer_writer_u8(&w, ORA_TYPE_VARCHAR);
-    seer_writer_u8(&w, 0x80);
-    for (int k = 0; k < 23; k++)
-      seer_writer_u8(&w, 0);
-  }
+  SeerOacMsg mm = {.data_type = ORA_TYPE_VARCHAR, .flags = 0x80}; /* the rest 0 */
+  for (int i = 0; i < nmarkers; i++)
+    oac_write(&w, true, 0, &mm);
   st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
   seer_writer_free(&w);
   if (st != SEER_OK) {
@@ -8098,15 +7653,10 @@ static SeerStatus fv2_describe_cursor(SeerStmt *stmt, uint32_t cursor)
   SeerStatus st;
   if (!seer_writer_init(&w, 16))
     return SEER_ENOMEM;
-  seer_writer_u8(&w, TTI_FUN);
-  seer_writer_u8(&w, O7_DESCRIBE);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0x07);
-  seer_enc_sb4(&w, cursor);
-  {
-    static const uint8_t d[] = {0, 0, 0x01, 0x02, 0x01, 0x01};
-    seer_writer_bytes(&w, d, sizeof d);
-  }
+  fv2_call_head(&w, O7_DESCRIBE); /* and SEER_O7_DESCRIBE_SCHEMA (#398) */
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerO7DescribeMsg dm = {.cursor = cursor};
+  seer_schema_encode(SEER_O7_DESCRIBE_SCHEMA, &cx, &dm, &w);
   st = fv2_txn(c, w.buf, w.len, &resp, &rlen);
   seer_writer_free(&w);
   if (st != SEER_OK)
@@ -8161,22 +7711,16 @@ static SeerStatus fv2_fetch_cursor(SeerStmt *stmt, uint32_t cursor, int64_t *err
   for (;;) {
     if (!seer_writer_init(&w, 48 + (size_t)ncols * 24))
       return SEER_ENOMEM;
-    seer_writer_u8(&w, TTI_FUN);
-    seer_writer_u8(&w, TTI_ALL7);
-    seer_writer_u8(&w, 0);
-    {
-      static const uint8_t opt[] = {0x02, 0x80, 0x50}; /* execute + fetch */
-      static const uint8_t h[] = {0, 0, 0, 0, 0x01, 0x01, 0x07, 0x01, 0x01, 0x02, 0};
-      seer_writer_bytes(&w, opt, sizeof opt);
-      seer_enc_sb4(&w, cursor);
-      seer_writer_bytes(&w, h, sizeof h);
-    }
-    seer_writer_u8(&w, 0x01); /* defines pointer present */
-    seer_enc_sb4(&w, ncols);  /* define count, a ub4: 300 is `02 01 2c` */
-    {
-      static const uint8_t h2[] = {0, 0, 0x01, 0x01, 0x01, 0x0a, 0, 0, 0, 0, 0};
-      seer_writer_bytes(&w, h2, sizeof h2);
-    }
+    /* execute + fetch: no SQL, a define a column (a ub4 count: 300 is
+     * `02 01 2c`), 10 rows */
+    SeerO7All7Msg m = {
+        .options = 0x8050,
+        .cursor = cursor,
+        .defines_ptr = 1,
+        .define_count = ncols,
+        .rows = 10,
+    };
+    fv2_all7(&w, &m);
     for (int i = 0; i < ncols; i++)
       fv2_define_entry(&w, &stmt->cols[i]);
     if (!seer_writer_ok(&w)) {
@@ -8230,28 +7774,49 @@ static const uint8_t FV2_EMPTY_LOCATOR[86] = {0x00, 0x54};
 static SeerStatus fv2_create_temp(SeerConn *c, uint8_t type, uint8_t loc[86])
 {
   bool blob = type == ORA_TYPE_BLOB;
-  const uint8_t mid[] = {
-      0x00, 0x01, 0x0a, 0x01, blob ? 0x00 : 0x01, 0x01, type, 0x01, 0x01, 0x01, 0x02, 0x01,
-      0x10, 0x00, 0x00, 0x00};
-  SeerWriter tw;
-  if (!seer_writer_init(&tw, 16))
-    return SEER_ENOMEM;
-  seer_enc_sb4(&tw, c->db_charset ? c->db_charset : 873u); /* the database charset */
-  seer_enc_sb4(&tw, 10);                                   /* the duration again */
+  /* As ojdbc14 sends it: the duration (10) in the destination length, the
+   * charset form and the LOB type in the short offsets - each with its length
+   * byte, `01 00` for a BLOB's form - the charset, null-LOB and amount
+   * pointers set; the database charset, then the duration again as the
+   * amount. */
+  SeerLobopMsg m = {
+      .dst_len = 10,
+      .explicit_short = 1,
+      .short_src_off = blob ? 0 : 1,
+      .short_dst_off = type,
+      .charset_ptr = 1,
+      .short_amount_ptr = 1,
+      .null_lob_ptr = 1,
+      .op = LOB_OP_CREATE_TEMP,
+      .charset = c->db_charset ? c->db_charset : 873u,
+      .has_amount = 1,
+      .amount = 10,
+  };
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  SeerStatus st = seer_writer_ok(&tw)
-                      ? fv2_lobop_send(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, mid,
-                                       sizeof mid, tw.buf, tw.len, &resp, &rlen)
-                      : SEER_ENOMEM;
-  seer_writer_free(&tw);
+  SeerStatus st =
+      fv2_lobop_send(c, FV2_EMPTY_LOCATOR, sizeof FV2_EMPTY_LOCATOR, &m, NULL, 0, &resp, &rlen);
+  /* The reply: the new locator, 84 bytes, as the RPA schema reads it. */
+  SeerLobopReplyMsg rm = {0};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  SeerReader r;
+  if (st == SEER_OK && rlen > 0)
+    seer_reader_init(&r, resp + 1, rlen - 1);
   if (st == SEER_OK &&
-      (rlen < 3 + 84 || resp[0] != TTI_RPA || resp[1] != 0x00 || resp[2] != 0x54)) {
+      (rlen < 1 || resp[0] != TTI_RPA ||
+       !seer_schema_decode(SEER_LOBOPS_REPLY_SCHEMA, &cx, &r, &rm) || rm.locator.n != 84)) {
     fv2_set_error(c, resp, rlen);
     st = SEER_EDB;
   }
-  if (st == SEER_OK)
-    memcpy(loc, resp + 1, 86); /* 00 54 and the body */
+  if (st == SEER_OK) {
+    size_t n = 0;
+    uint8_t *full = seer_lobop_reply_locator(&rm, &n); /* 00 54 and the body */
+    if (full == NULL)
+      st = SEER_ENOMEM;
+    else
+      memcpy(loc, full, 86);
+    free(full);
+  }
   free(resp);
   return st;
 }
@@ -8262,30 +7827,23 @@ static SeerStatus fv2_create_temp(SeerConn *c, uint8_t type, uint8_t loc[86])
 static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_t *data, size_t n,
                                 uint32_t amount)
 {
-  static const uint8_t mid[] = {0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
-                                0x00, 0x01, 0x40, 0x00, 0x00, 0x00};
+  SeerLobopMsg m = {.short_src_off = 1,
+                    .short_amount_ptr = 1,
+                    .op = LOB_OP_WRITE,
+                    .has_amount = 1,
+                    .amount = amount};
   SeerWriter tw;
   if (!seer_writer_init(&tw, n + n / 252 + 16))
     return SEER_ENOMEM;
-  seer_enc_sb4(&tw, amount);
+  /* The content as a LOB data message: SEER_LOB_DATA_SCHEMA at 9.2 (#398). */
   seer_writer_u8(&tw, TTI_LOB);
-  if (n <= 252) {
-    seer_writer_u8(&tw, (uint8_t)n);
-    seer_writer_bytes(&tw, data, n);
-  } else {
-    seer_writer_u8(&tw, 0xFE);
-    for (size_t off = 0; off < n; off += 252) {
-      size_t k = n - off < 252 ? n - off : 252;
-      seer_writer_u8(&tw, (uint8_t)k);
-      seer_writer_bytes(&tw, data + off, k);
-    }
-    seer_writer_u8(&tw, 0);
-  }
+  SeerLobDataMsg lm = {.data = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  seer_schema_encode(SEER_LOB_DATA_SCHEMA, &cx, &lm, &tw);
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  SeerStatus st = seer_writer_ok(&tw)
-                      ? fv2_lobop_send(c, loc, 86, mid, sizeof mid, tw.buf, tw.len, &resp, &rlen)
-                      : SEER_ENOMEM;
+  SeerStatus st = seer_writer_ok(&tw) ? fv2_lobop_send(c, loc, 86, &m, tw.buf, tw.len, &resp, &rlen)
+                                      : SEER_ENOMEM;
   seer_writer_free(&tw);
   if (st == SEER_OK && (rlen < 1 || resp[0] != TTI_RPA)) {
     fv2_set_error(c, resp, rlen);
@@ -8298,11 +7856,10 @@ static SeerStatus fv2_lob_write(SeerConn *c, const uint8_t loc[86], const uint8_
 /* FREE_TEMP (op 0x111), as ojdbc14 frees one: the locator, all else zero. */
 static void fv2_free_temp(SeerConn *c, const uint8_t loc[86])
 {
-  static const uint8_t mid[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                0x02, 0x01, 0x11, 0x00, 0x00, 0x00};
+  SeerLobopMsg m = {.op = LOB_OP_FREE_TEMP};
   uint8_t *resp = NULL;
   size_t rlen = 0;
-  if (fv2_lobop_send(c, loc, 86, mid, sizeof mid, NULL, 0, &resp, &rlen) == SEER_OK) {
+  if (fv2_lobop_send(c, loc, 86, &m, NULL, 0, &resp, &rlen) == SEER_OK) {
     if (rlen < 1 || resp[0] != TTI_RPA)
       seer_log(SEER_LOG_WARNING, "stmt: 9i: a temporary LOB was not freed (reply %02x)",
                rlen ? resp[0] : 0);
@@ -8407,13 +7964,9 @@ static SeerStatus fv2_temp_lobs_begin(SeerStmt *stmt, bool query, Fv2TempLob **o
         if (!seer_writer_init(&bv, 96)) {
           st = SEER_ENOMEM;
         } else {
-          seer_enc_sb4(&bv, 86);
-          seer_writer_u8(&bv, 0xFE);
-          seer_writer_u8(&bv, 64);
-          seer_writer_bytes(&bv, t->loc, 64);
-          seer_writer_u8(&bv, 22);
-          seer_writer_bytes(&bv, t->loc + 64, 22);
-          seer_writer_u8(&bv, 0);
+          SeerLegacyLobBindMsg lm = {.loc_len = 86, .locator = {.p = t->loc, .n = 86}};
+          SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+          seer_schema_encode(SEER_LEGACY_LOB_BIND_SCHEMA, &cx, &lm, &bv); /* #398 */
           if (!seer_writer_ok(&bv)) {
             seer_writer_free(&bv);
             st = SEER_ENOMEM;
@@ -8591,12 +8144,20 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
   *code = 0;
   const uint8_t *rest = data;
   size_t restlen = dlen;
-  if (dlen >= 8 && data[0] == FV2_BIND_PROMPT) { /* skip the bind prompt */
-    size_t pos = 8;
-    while (pos < dlen && data[pos] != TTI_RXD && data[pos] != TTI_RPA)
-      pos++;
-    rest = data + pos;
-    restlen = dlen - pos;
+  SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+  if (dlen >= 1 && data[0] == FV2_BIND_PROMPT) {
+    /* The bind prompt, an I/O vector: SEER_IOV_SCHEMA and its direction
+     * bytes, as 10g+'s (#398) - where it was skipped to the next RXD / RPA */
+    SeerReader pr;
+    seer_reader_init(&pr, data + 1, dlen - 1);
+    SeerIovMsg iov = {0};
+    if (seer_schema_decode(SEER_IOV_SCHEMA, &cx, &pr, &iov)) {
+      iov.nbinds = iov.iterations * 256 + iov.requests;
+      (void)seer_schema_decode(SEER_IOV_DIRS_SCHEMA, &cx, &pr, &iov);
+    }
+    seer_schema_free(SEER_IOV_SCHEMA, &iov);
+    rest = data + 1 + pr.pos;
+    restlen = dlen - 1 - pr.pos;
   }
   SeerReader r;
   seer_reader_init(&r, rest, restlen);
@@ -8608,12 +8169,13 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
         continue;
       /* An OUT bind the block never assigned - what a RETURNING ... INTO that
        * matched no row leaves - is four fixed bytes, neither a value with its
-       * indicator nor an assigned NULL (empty value + 81 01). Read as a value,
+       * indicator nor an assigned NULL (empty value + 81 01): tried as
+       * SEER_O7_OUT_UNSET_SCHEMA on a copy of the reader. Read as a value,
        * it desynced every OUT bind after it (seerdb #801). */
-      static const uint8_t UNASSIGNED[] = {0xFF, 0x02, 0x0C, 0x21};
-      if (seer_reader_remaining(&r) >= sizeof UNASSIGNED &&
-          memcmp(r.buf + r.pos, UNASSIGNED, sizeof UNASSIGNED) == 0) {
-        r.pos += sizeof UNASSIGNED;
+      SeerReader t = r;
+      SeerCellMsg um = {0};
+      if (seer_schema_decode_ex(SEER_O7_OUT_UNSET_SCHEMA, &cx, &t, &um) == SCH_OK) {
+        r = t;
         free(b->out.data);
         b->out = (SeerCell){0}; /* NULL */
         continue;
@@ -8632,59 +8194,48 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
           free(img);
           break;
         }
-        if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
-          r.pos += 2;
-        else if (seer_reader_remaining(&r) > 0)
-          r.pos += 1;
+        SeerCellMsg im = {0};
+        (void)seer_schema_decode(SEER_OUT_IND_SCHEMA, &cx, &r, &im);
         free(b->out_image);
         b->out_image = img;
         b->out_imagelen = il;
         continue;
       }
       if (b->ret_lob != 0) {
-        /* A LOB: a column's LOB cell (§19.5) - a ub4 length, the locator as a
-         * value and a ub4 indicator; NULL is a zero length and 81 01. A NULL
-         * LOB from a RETURNING comes as a locator all zero past its first two
-         * bytes, which no real one is (§19.17b, #167). */
+        /* A LOB by SEER_LOB_OUT_SCHEMA, as 8i's: the locator, counted, then
+         * the indicator; NULL is a zero count and 81 01. A NULL LOB from a
+         * RETURNING comes as a locator all zero past its first two bytes,
+         * which no real one is (§19.17b, #167). */
         free(b->out.data);
         b->out = (SeerCell){0};
-        int64_t llen = seer_dec_sb4(&r);
-        if (llen <= 0) {
-          if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81)
-            r.pos += 2;
-          continue;
-        }
-        uint8_t *loc = NULL;
-        size_t loclen = 0;
-        if (seer_dec_dalc(&r, &loc, &loclen) != SEER_OK) {
-          free(loc);
+        SeerCellMsg lm = {0};
+        if (!seer_schema_decode(SEER_LOB_OUT_SCHEMA, &cx, &r, &lm)) {
+          seer_schema_free(SEER_LOB_OUT_SCHEMA, &lm);
           break;
         }
-        (void)seer_dec_sb4(&r); /* indicator */
         bool blank = true;
-        for (size_t i = 2; i < loclen; i++)
-          blank &= loc[i] == 0;
-        if (loclen <= 2 || blank) {
-          free(loc);
-          continue;
+        for (size_t i = 2; i < lm.value.n; i++)
+          blank &= lm.value.p[i] == 0;
+        if (lm.value.n > 2 && !blank && (b->ret_locator = malloc(lm.value.n)) != NULL) {
+          memcpy(b->ret_locator, lm.value.p, lm.value.n);
+          b->ret_loclen = lm.value.n;
         }
-        b->ret_locator = loc;
-        b->ret_loclen = loclen;
+        seer_schema_free(SEER_LOB_OUT_SCHEMA, &lm);
         continue;
       }
-      uint8_t *val = NULL;
-      size_t vlen = 0;
-      if (seer_dec_dalc(&r, &val, &vlen) != SEER_OK) {
-        free(val);
+      /* SEER_OUT_CELL_SCHEMA: the value and its indicator, 81 01 NULL */
+      SeerCellMsg om = {0};
+      if (!seer_schema_decode(SEER_OUT_CELL_SCHEMA, &cx, &r, &om)) {
+        seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
         break;
       }
+      const uint8_t *val = om.value.p;
+      size_t vlen = om.value.n;
       free(b->out.data);
       b->out = (SeerCell){0};
-      if (seer_reader_remaining(&r) > 0 && r.buf[r.pos] == 0x81) {
-        r.pos += 2; /* 81 01 NULL */
+      if (om.indicator == -1) {
+        /* NULL */
       } else {
-        if (seer_reader_remaining(&r) > 0)
-          r.pos += 1; /* present indicator */
         if (b->oac_type == ORA_TYPE_REFCURSOR) {
           /* The opened cursor's id: its rows become the statement's result
            * set once the block is done (#166). */
@@ -8696,7 +8247,7 @@ static void fv2_decode_block_out(SeerStmt *stmt, const uint8_t *data, size_t dle
         } else if (vlen > 0)
           decode_scalar(b->oac_type ? b->oac_type : ORA_TYPE_VARCHAR, val, vlen, &b->out);
       }
-      free(val);
+      seer_schema_free(SEER_OUT_CELL_SCHEMA, &om);
     }
   }
   fv2_decode_dml_response(r.buf + r.pos, seer_reader_remaining(&r), rowcount, code);
@@ -8888,7 +8439,7 @@ static SeerStatus fv2_execute_block(SeerStmt *stmt)
       if (rxd != NULL)
         seer_writer_bytes(&w, rxd, b->rxd_len[0]);
       else
-        seer_writer_u8(&w, 0);
+        chr_write(&w, false, TTC_FIELD_VERSION_9_2, NULL, 0); /* unbound: NULL */
     }
     if (!seer_writer_ok(&w)) {
       seer_writer_free(&w);
@@ -10045,14 +9596,10 @@ static void obj_write_length(SeerWriter *w, uint32_t n)
  * of encode_chr): <ub1 len> inline up to 252, else 0xFE + sb4 chunks. */
 static SeerStatus obj_append_chr(SeerWriter *w, const uint8_t *data, size_t n, uint8_t fv)
 {
-  uint8_t *enc = NULL;
-  size_t enclen = 0;
-  SeerStatus st = encode_chr(data, n, fv, &enc, &enclen);
-  if (st != SEER_OK)
-    return st;
-  seer_writer_bytes(w, enc, enclen);
-  free(enc);
-  return SEER_OK;
+  SeerChrMsg m = {.value = {.p = data, .n = n}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  seer_schema_encode(SEER_CHR_SCHEMA, &cx, &m, w);
+  return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
 /* Look up an object type's 16-byte OID (ALL_TYPES) and its ordered attribute
@@ -10247,30 +9794,41 @@ static SeerStatus obj_encode_field(SeerWriter *body, uint8_t ora_type, const cha
   return SEER_OK;
 }
 
-/* Object bind-value framing (oracledb write_dbobject), shared by SQL object
- * binds and AQ object payloads: a 36-byte TOID (prefix + the 16-byte type OID +
- * extent OID), empty object OID, zero snapshot/version, the image length, the
- * TOP_LEVEL flag, then the image - each length-framed. */
-static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], const uint8_t *img,
-                                        size_t imglen, uint8_t fv)
+/* An object value's frame, written by SEER_OBJECT_SCHEMA (#398): the type
+ * block `tb` (36 bytes, or none on 9i), an empty object OID, a zero snapshot
+ * and version, the image's length, the TOP_LEVEL flag and the image. */
+static SeerStatus obj_frame_write(SeerWriter *bv, const SeerSchemaCtx *cx, const uint8_t *tb,
+                                  size_t tblen, const uint8_t *img, size_t imglen)
+{
+  SeerObjectMsg m = {.type_oid = {.p = tb, .n = tblen},
+                     .image_len = (int64_t)imglen,
+                     .flags = 1, /* TOP_LEVEL */
+                     .image = {.p = img, .n = imglen}};
+  seer_schema_encode(SEER_OBJECT_SCHEMA, cx, &m, bv);
+  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+}
+
+/* The 36-byte type block an object value names its type by, on 10g+ and on
+ * 8i (oracledb write_dbobject): 00 22 02 08, the 16-byte type OID, then the
+ * extent OID - 16 bytes ending 00 01 00 01. */
+static void obj_type_block(const uint8_t oid[16], uint8_t tb[36])
 {
   static const uint8_t PFX[4] = {0x00, 0x22, 0x02, 0x08};
   static const uint8_t EXT[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1};
-  uint8_t toid[36];
-  memcpy(toid, PFX, 4);
-  memcpy(toid + 4, oid, 16);
-  memcpy(toid + 20, EXT, 16);
-  seer_enc_sb4(bv, 36);
-  if (obj_append_chr(bv, toid, sizeof toid, fv) != SEER_OK)
-    return SEER_ENOMEM;
-  seer_enc_sb4(bv, 0);                /* object OID (empty) */
-  seer_enc_sb4(bv, 0);                /* snapshot */
-  seer_enc_sb4(bv, 0);                /* version */
-  seer_enc_sb4(bv, (uint32_t)imglen); /* image length */
-  seer_enc_sb4(bv, 1);                /* flags: TOP_LEVEL */
-  if (obj_append_chr(bv, img, imglen, fv) != SEER_OK)
-    return SEER_ENOMEM;
-  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+  memcpy(tb, PFX, 4);
+  memcpy(tb + 4, oid, 16);
+  memcpy(tb + 20, EXT, 16);
+}
+
+/* Object bind-value framing (oracledb write_dbobject), shared by SQL object
+ * binds and AQ object payloads: the frame with the type block. */
+static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], const uint8_t *img,
+                                        size_t imglen, uint8_t fv)
+{
+  uint8_t tb[36];
+  obj_type_block(oid, tb);
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+  return obj_frame_write(bv, &cx, tb, sizeof tb, img, imglen);
 }
 
 /* The object frame of a NULL object of the type `oid`: the frame an object
@@ -10278,21 +9836,7 @@ static SeerStatus obj_encode_bind_value(SeerWriter *bv, const uint8_t oid[16], c
  * object / collection bind sends (seerdb encode_object_column_value). */
 static SeerStatus obj_encode_null_value(SeerWriter *bv, const uint8_t oid[16], uint8_t fv)
 {
-  static const uint8_t PFX[4] = {0x00, 0x22, 0x02, 0x08};
-  static const uint8_t EXT[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1};
-  uint8_t toid[36];
-  memcpy(toid, PFX, 4);
-  memcpy(toid + 4, oid, 16);
-  memcpy(toid + 20, EXT, 16);
-  seer_enc_sb4(bv, 36);
-  if (obj_append_chr(bv, toid, sizeof toid, fv) != SEER_OK)
-    return SEER_ENOMEM;
-  seer_enc_sb4(bv, 0); /* object OID (empty) */
-  seer_enc_sb4(bv, 0); /* snapshot */
-  seer_enc_sb4(bv, 0); /* version */
-  seer_enc_sb4(bv, 0); /* image gate: 0 = NULL, no image */
-  seer_enc_sb4(bv, 1); /* flags: TOP_LEVEL */
-  return seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
+  return obj_encode_bind_value(bv, oid, NULL, 0, fv); /* image length 0: no image */
 }
 
 /* Store an object / collection bind of type (schema, type_name), OID `oid`:
@@ -10320,59 +9864,29 @@ static void o8w_chr(SeerWriter *w, const uint8_t *p, size_t n);
 static SeerStatus obj_legacy_bind(SeerConn *c, const uint8_t oid[16], const uint8_t *img,
                                   size_t imglen, bool is_out, SeerWriter *oac, SeerWriter *bv)
 {
+  SeerOacMsg m = {.data_type = ORA_TYPE_ADT,
+                  .toid_length = 16,
+                  .toid = {.p = oid, .n = 16},
+                  .version = 1}; /* SEER_OAC_SCHEMA (#398) */
   if (c->is_8i) {
-    seer_writer_u8(oac, ORA_TYPE_ADT);
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00);
-    o8w_le32(oac, 2000);
-    o8w_le32(oac, 0); /* max array */
-    o8w_le32(oac, 0); /* cont flags */
-    o8w_le32(oac, 16);
-    seer_writer_u8(oac, 16);
-    seer_writer_bytes(oac, oid, 16);
-    seer_writer_u8(oac, 0x01); /* version 1, LE */
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00); /* charset */
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00); /* form */
+    m.max_length = 2000;
+    oac_write(oac, true, 0, &m);
 
-    uint8_t block[36] = {0x00, 0x22, 0x02, 0x08};
-    memcpy(block + 4, oid, 16);
-    block[33] = 0x01;
-    block[35] = 0x01;
-    o8w_le32(bv, 36);
-    o8w_chr(bv, block, sizeof block);
-    o8w_le32(bv, 0);          /* object OID */
-    o8w_le32(bv, 0);          /* snapshot */
-    seer_writer_u8(bv, 0x00); /* version (ub2) */
-    seer_writer_u8(bv, 0x00);
-    o8w_le32(bv, (uint32_t)imglen);
-    seer_writer_u8(bv, 0x01); /* flags 01 00 */
-    seer_writer_u8(bv, 0x00);
-    if (imglen > 0)
-      o8w_chr(bv, img, imglen);
+    /* The frame at 8i's widths, with 10g+'s type block (#398). */
+    uint8_t tb[36];
+    obj_type_block(oid, tb);
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    if (obj_frame_write(bv, &cx, tb, sizeof tb, img, imglen) != SEER_OK)
+      return SEER_ENOMEM;
   } else {
-    seer_writer_u8(oac, ORA_TYPE_ADT);
-    seer_writer_u8(oac, 0x01);
-    seer_writer_u8(oac, 0x00);
-    seer_writer_u8(oac, 0x00);
-    seer_enc_sb4(oac, imglen > 0 && !is_out ? (uint32_t)imglen : 0x7FFFFFFFu);
-    seer_writer_u8(oac, 0x00); /* max array */
-    seer_writer_u8(oac, 0x00); /* cont flags */
-    seer_enc_sb4(oac, 16);
-    seer_writer_u8(oac, 16);
-    seer_writer_bytes(oac, oid, 16);
-    seer_enc_sb4(oac, 1);  /* version */
-    seer_enc_sb4(oac, 31); /* charset */
-    seer_writer_u8(oac, 0x00);
+    m.flags = 0x01;
+    m.max_length = imglen > 0 && !is_out ? (int64_t)imglen : 0x7FFFFFFF;
+    m.charset = 31;
+    oac_write(oac, false, TTC_FIELD_VERSION_9_2, &m);
 
-    for (int k = 0; k < 4; k++) /* type OID, object OID, snapshot, version: empty */
-      seer_writer_u8(bv, 0x00);
-    seer_enc_sb4(bv, (uint32_t)imglen);
-    seer_writer_u8(bv, 0x01); /* flags 01 01 */
-    seer_writer_u8(bv, 0x01);
-    if (imglen > 0 && obj_append_chr(bv, img, imglen, c->field_version) != SEER_OK)
+    /* The frame with no type block: the type is the descriptor's (#398). */
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2);
+    if (obj_frame_write(bv, &cx, NULL, 0, img, imglen) != SEER_OK)
       return SEER_ENOMEM;
   }
   return seer_writer_ok(oac) && seer_writer_ok(bv) ? SEER_OK : SEER_ENOMEM;
@@ -10409,26 +9923,16 @@ static SeerStatus obj_store_bind(SeerStmt *stmt, int param, const char *schema,
 
   if (!seer_writer_init(&oac, 64))
     goto fail;
-  seer_writer_u8(&oac, ORA_TYPE_ADT);
-  seer_writer_u8(&oac, 1); /* USE_INDICATORS */
-  seer_writer_u8(&oac, 0);
-  seer_writer_u8(&oac, 0);
-  seer_enc_sb4(&oac, (uint32_t)(imglen > 2000 ? imglen : 2000)); /* buffer size */
-  seer_enc_sb4(&oac, 0);                                         /* max array elements */
-  seer_enc_sb4(&oac, 0);                                         /* cont flag */
-  seer_enc_sb4(&oac, 16);
-  if (obj_append_chr(&oac, oid, 16, fv) != SEER_OK) {
-    seer_writer_free(&oac);
-    goto fail;
-  }
-  seer_enc_sb4(&oac, 1);   /* type version */
-  seer_enc_sb4(&oac, 0);   /* charset */
-  seer_writer_u8(&oac, 0); /* csfrm */
-  seer_enc_sb4(&oac, 0);   /* LOB prefetch length */
-  /* No oaccolid before 12.2: 11g and 10g answer it with a fatal ORA-03106
+  /* SEER_OAC_SCHEMA (#398): the buffer size, the type's OID and version 1.
+   * No oaccolid before 12.2: 11g and 10g answer it with a fatal ORA-03106
    * (seerdb PROTOCOL.md, measured against JDBC thin 11.2, #172). */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    seer_enc_sb4(&oac, 0); /* oaccolid */
+  SeerOacMsg m = {.data_type = ORA_TYPE_ADT,
+                  .flags = 1, /* USE_INDICATORS */
+                  .max_length = (int64_t)(imglen > 2000 ? imglen : 2000),
+                  .toid_length = 16,
+                  .toid = {.p = oid, .n = 16},
+                  .version = 1};
+  oac_write(&oac, false, fv, &m);
   if (!seer_writer_ok(&oac)) {
     seer_writer_free(&oac);
     goto fail;
@@ -10571,24 +10075,16 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
     seer_writer_free(&oac);
     return SEER_ENOMEM;
   }
+  /* Each path's descriptor is SEER_OAC_SCHEMA with the type's OID and
+   * version 1 (#398). */
+  SeerOacMsg m = {
+      .data_type = ORA_TYPE_REF, .toid_length = 16, .toid = {.p = oid, .n = 16}, .version = 1};
   if (o8i) { /* OCIBindObject (SQLT_REF) on 8.1.7: the 8i object descriptor, type 111 */
-    seer_writer_u8(&oac, ORA_TYPE_REF);
     /* flag 0x01 on an OUT: an indicator comes back, so a NULL is -1, not
      * ORA-01405 (bus 91, #325) */
-    seer_writer_u8(&oac, out ? 0x01 : 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    o8w_le32(&oac, 2000);
-    o8w_le32(&oac, 0);
-    o8w_le32(&oac, 0);
-    o8w_le32(&oac, 16);
-    seer_writer_u8(&oac, 16);
-    seer_writer_bytes(&oac, oid, 16);
-    seer_writer_u8(&oac, 0x01); /* version 1 */
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00); /* charset */
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00); /* form */
+    m.flags = out ? 0x01 : 0x00;
+    m.max_length = 2000;
+    oac_write(&oac, true, 0, &m);
     if (out) {
       /* OCI's image of an empty OCIRef: body length 2, a 2-byte zero body
        * (bus 88, the same on 9.2 native). */
@@ -10598,42 +10094,21 @@ static SeerStatus ref_bind(SeerStmt *stmt, int param, const char *type_schema,
       o8w_chr(&v, ref, len);
     }
   } else if (o9i) { /* ojdbc14 9.0.2 on 9.2.0.4 */
-    seer_writer_u8(&oac, ORA_TYPE_REF);
-    seer_writer_u8(&oac, 0x01);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, out ? 4000u : (uint32_t)len);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, 16);
-    seer_writer_u8(&oac, 16);
-    seer_writer_bytes(&oac, oid, 16);
-    seer_enc_sb4(&oac, 1);  /* version */
-    seer_enc_sb4(&oac, 31); /* charset */
-    seer_writer_u8(&oac, 0x00);
+    m.flags = 0x01;
+    m.max_length = out ? 4000 : (int64_t)len;
+    m.charset = 31;
+    oac_write(&oac, false, TTC_FIELD_VERSION_9_2, &m);
     if (out)
-      seer_writer_u8(&v, 0x00);
+      chr_write(&v, false, fv, NULL, 0); /* the empty value */
     else if (obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   } else { /* 10g+, a JDBC thin capture (seerdb #139; 10g / 11g bus 106) */
-    seer_writer_u8(&oac, ORA_TYPE_REF);
-    seer_writer_u8(&oac, 0x03);
-    seer_writer_u8(&oac, 0x00);
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, 4000);
-    seer_enc_sb4(&oac, 0); /* max array */
-    seer_enc_sb4(&oac, 0); /* cont flags */
-    seer_enc_sb4(&oac, 16);
-    if (obj_append_chr(&oac, oid, 16, fv) != SEER_OK)
-      st = SEER_ENOMEM;
-    seer_enc_sb4(&oac, 1); /* version */
-    seer_enc_sb4(&oac, 2); /* charset */
-    seer_writer_u8(&oac, 0x00);
-    seer_enc_sb4(&oac, 0); /* LOB prefetch */
-    if (fv >= TTC_FIELD_VERSION_12_2)
-      seer_enc_sb4(&oac, 0); /* oaccolid; 12.1 refuses it (seerdb #1144) */
+    m.flags = 0x03;
+    m.max_length = 4000;
+    m.charset = 2;
+    oac_write(&oac, false, fv, &m); /* oaccolid from 12.2; 12.1 refuses it (seerdb #1144) */
     if (out)
-      seer_writer_u8(&v, 0x00); /* an empty value, as JDBC sends */
+      chr_write(&v, false, fv, NULL, 0); /* an empty value, as JDBC sends */
     else if (st == SEER_OK && obj_append_chr(&v, ref, len, fv) != SEER_OK)
       st = SEER_ENOMEM;
   }
@@ -10693,21 +10168,27 @@ static SeerStatus native_lob_bind(SeerStmt *stmt, int param, uint8_t ora_type, c
    * vector past ~8190 dimensions (seerdb/seerdb@d15e421). */
   if (imagelen > 0xFFFFFF)
     return SEER_EPARAM;
-  uint8_t fv = stmt->conn->field_version;
-  static const uint8_t DESC[18] = {
-      0x01, 0x28, 0x28, 0x00, 0x26, 0x00, 0x04, 0x61, 0x08,
-      0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-  };
-  SeerWriter v;
-  if (!seer_writer_init(&v, 64 + imagelen))
+  SeerConn *c = stmt->conn;
+  /* SEER_LOB_BIND_SCHEMA with the value LOB's 38-byte locator, then the
+   * image (#398). */
+  SeerWriter loc;
+  if (!seer_writer_init(&loc, SEER_VALUE_LOCATOR_LEN))
     return SEER_ENOMEM;
-  seer_writer_bytes(&v, DESC, sizeof DESC);
-  seer_writer_u8(&v, (uint8_t)(imagelen >> 16));
-  seer_writer_u8(&v, (uint8_t)(imagelen >> 8));
-  seer_writer_u8(&v, (uint8_t)(imagelen & 0xFF));
-  for (int i = 0; i < 22; i++)
-    seer_writer_u8(&v, 0);
-  obj_append_chr(&v, image, imagelen, fv);
+  SeerValueLocatorMsg vl = {.len_hi = (int64_t)(imagelen >> 16),
+                            .len_lo = (int64_t)(imagelen & 0xFFFF)};
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_VALUE_LOCATOR_SCHEMA, &cx, &vl, &loc);
+  SeerWriter v;
+  if (!seer_writer_ok(&loc) || !seer_writer_init(&v, 64 + imagelen)) {
+    seer_writer_free(&loc);
+    return SEER_ENOMEM;
+  }
+  SeerLobBindMsg lm = {.loc_len = (int64_t)loc.len,
+                       .locator = {.p = loc.buf, .n = loc.len},
+                       .has_image = 1,
+                       .image = {.p = image, .n = imagelen}};
+  seer_schema_encode(SEER_LOB_BIND_SCHEMA, &cx, &lm, &v);
+  seer_writer_free(&loc);
   if (!seer_writer_ok(&v)) {
     seer_writer_free(&v);
     return SEER_ENOMEM;
@@ -11013,23 +10494,16 @@ static uint8_t *aa_build_oac(uint8_t fv, uint8_t dtype, uint32_t length, uint32_
   SeerWriter w;
   if (!seer_writer_init(&w, 48))
     return NULL;
-  seer_writer_u8(&w, dtype);
   /* TNS_BIND_USE_INDICATORS | ARRAY; below 12.1 the flags are 03 | ARRAY, as
    * JDBC thin 11.2 sends them, and there is no oaccolid (seerdb, measured on
    * 11g XE and 10.2.0.5; #172). */
-  seer_writer_u8(&w, fv < TTC_FIELD_VERSION_12_1 ? 0x43 : 0x41);
-  seer_writer_u8(&w, 0);
-  seer_writer_u8(&w, 0);
-  seer_enc_sb4(&w, length);                  /* element max length */
-  seer_enc_sb4(&w, capacity ? capacity : 1); /* max number of array elements */
-  seer_enc_sb4(&w, 0);                       /* cont flag (ub8) */
-  seer_enc_sb4(&w, 0);                       /* OID */
-  seer_enc_sb4(&w, 0);                       /* version */
-  seer_enc_sb4(&w, charset);                 /* charset id (ub2) */
-  seer_writer_u8(&w, csfrm);                 /* character set form */
-  seer_enc_sb4(&w, 0);                       /* LOB prefetch length */
-  if (fv >= TTC_FIELD_VERSION_12_2)
-    seer_enc_sb4(&w, 0); /* oaccolid */
+  SeerOacMsg m = {.data_type = dtype,
+                  .flags = fv < TTC_FIELD_VERSION_12_1 ? 0x43 : 0x41,
+                  .max_length = length,
+                  .max_array = capacity ? capacity : 1,
+                  .charset = charset,
+                  .csfrm = csfrm};
+  oac_write(&w, false, fv, &m);
   if (!seer_writer_ok(&w)) {
     seer_writer_free(&w);
     return NULL;
@@ -11046,31 +10520,30 @@ static uint8_t *aa_build_oac(uint8_t fv, uint8_t dtype, uint32_t length, uint32_
 static uint8_t *o8i_aa_oac(uint8_t dtype, uint32_t length, uint32_t capacity, size_t *out_len)
 {
   bool text = dtype != ORA_TYPE_NUMBER;
-  uint8_t *o = calloc(1, 25);
-  if (o == NULL)
+  SeerWriter w;
+  if (!seer_writer_init(&w, 32))
     return NULL;
-  o[0] = dtype;
-  o[1] = 0x43;
-  if (length > 0xFFFF)
-    length = 0xFFFF;
-  o[4] = (uint8_t)(length & 0xFF);
-  o[5] = (uint8_t)(length >> 8);
-  for (int i = 0; i < 4; i++)
-    o[8 + i] = (uint8_t)((capacity ? capacity : 1) >> (8 * i));
-  o[22] = text ? 31 : 0; /* charset, big-endian ub4 at +19: WE8ISO8859P1 for text */
-  o[24] = text ? 1 : 0;  /* form */
-  *out_len = 25;
-  return o;
+  SeerOacMsg m = {.data_type = dtype,
+                  .flags = 0x43,
+                  .max_length = length > 0xFFFF ? 0xFFFF : length,
+                  .max_array = capacity ? capacity : 1,
+                  .charset = text ? 31 : 0, /* WE8ISO8859P1 for text */
+                  .csfrm = text ? 1 : 0};
+  oac_write(&w, true, 0, &m);
+  if (!seer_writer_ok(&w)) {
+    seer_writer_free(&w);
+    return NULL;
+  }
+  *out_len = w.len;
+  return w.buf; /* ownership transferred */
 }
 
 static void o8i_aa_elem(SeerWriter *v, const uint8_t *p, size_t n)
 {
-  if (p == NULL) {
-    seer_writer_u8(v, 0xFD); /* a NULL element */
-    seer_writer_u8(v, 0x01);
-  } else {
-    o8w_chr(v, p, n);
-  }
+  if (p == NULL)
+    o8i_slot(v, SEER_O8I_OUT_SLOT_SCHEMA); /* a NULL element */
+  else
+    chr_write(v, true, 0, p, n);
 }
 
 /* Attach a prebuilt array OAC + RXD to a bind position (a single PL/SQL
@@ -11189,7 +10662,7 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
     SeerWriter v;
     if (!seer_writer_init(&v, 8 + (size_t)n * 24))
       return SEER_ENOMEM;
-    o8w_le32(&v, (uint32_t)n);
+    aa_count(&v, true, 0, n);
     for (int i = 0; i < n; i++) {
       uint8_t num[24];
       size_t nn = seer_encode_number_int(values[i], num);
@@ -11206,16 +10679,15 @@ SeerStatus seer_stmt_bind_int64_array(SeerStmt *stmt, int param, const int64_t *
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
     return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
-  /* RXD: ub4 element count, then each element <ub1 len><NUMBER bytes>. */
+  /* RXD: the element count, then each element a bind value (#398). */
   SeerWriter rxd;
   if (!seer_writer_init(&rxd, 16 + (size_t)n * 12))
     return SEER_ENOMEM;
-  seer_enc_sb4(&rxd, (uint32_t)n);
+  aa_count(&rxd, false, stmt->conn->field_version, n);
   for (int i = 0; i < n; i++) {
     uint8_t num[24];
     size_t nn = seer_encode_number_int(values[i], num);
-    seer_writer_u8(&rxd, (uint8_t)nn);
-    seer_writer_bytes(&rxd, num, nn);
+    chr_write(&rxd, false, stmt->conn->field_version, num, nn);
   }
   if (!seer_writer_ok(&rxd)) {
     seer_writer_free(&rxd);
@@ -11241,7 +10713,7 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
     SeerWriter v;
     if (!seer_writer_init(&v, 8 + (size_t)n * 16))
       return SEER_ENOMEM;
-    o8w_le32(&v, (uint32_t)n);
+    aa_count(&v, true, 0, n);
     for (int i = 0; i < n; i++) {
       if (values[i] == NULL) {
         o8i_aa_elem(&v, NULL, 0);
@@ -11269,22 +10741,15 @@ SeerStatus seer_stmt_bind_text_array(SeerStmt *stmt, int param, const char *cons
   if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
     return SEER_ENOTIMPL; /* 9i: no reference client binds one in its compact form (#254) */
 
-  /* RXD: ub4 count, then each element as a length-framed CHR value. */
+  /* RXD: the count, then each element a bind value, a NULL one empty
+   * (#398). */
   SeerWriter rxd;
   if (!seer_writer_init(&rxd, 32 + (size_t)n * 16))
     return SEER_ENOMEM;
-  seer_enc_sb4(&rxd, (uint32_t)n);
-  for (int i = 0; i < n; i++) {
-    if (values[i] == NULL) {
-      seer_writer_u8(&rxd, 0); /* NULL element (zero-length) */
-      continue;
-    }
-    if (obj_append_chr(&rxd, (const uint8_t *)values[i], strlen(values[i]),
-                       stmt->conn->field_version) != SEER_OK) {
-      seer_writer_free(&rxd);
-      return SEER_ENOMEM;
-    }
-  }
+  aa_count(&rxd, false, stmt->conn->field_version, n);
+  for (int i = 0; i < n; i++)
+    chr_write(&rxd, false, stmt->conn->field_version, (const uint8_t *)values[i],
+              values[i] != NULL ? strlen(values[i]) : 0);
   if (!seer_writer_ok(&rxd)) {
     seer_writer_free(&rxd);
     return SEER_ENOMEM;
@@ -11346,100 +10811,68 @@ static bool xid_valid(const SeerXid *xid)
          xid->bqual_len <= 64 && (xid->gtrid_len + xid->bqual_len) <= TNS_TPC_XID_WIRE_LEN;
 }
 
-/* The format-id / gtrid-len / bqual-len / xid-pointer descriptor block shared by
- * both TPC messages (the 128-byte xid payload follows later in the body). */
-static void tpc_xid_descriptor(SeerWriter *w, const SeerXid *xid)
+/* A TPC message's head and tail from the connection and the xid: the stored
+ * context, replayed, and the xid's descriptor and 128-byte payload - gtrid
+ * then bqual, zero-padded - into `xbuf`. */
+static void tpc_msg(const SeerConn *c, const SeerXid *xid, uint32_t op,
+                    uint8_t xbuf[TNS_TPC_XID_WIRE_LEN], SeerTpcMsg *m)
 {
+  *m = (SeerTpcMsg){.op = op};
+  if (c->tpc_context != NULL) {
+    m->ctx_ptr = 1;
+    m->ctx_len = (int64_t)c->tpc_context_len;
+    m->ctx = (SeerBytes){c->tpc_context, c->tpc_context_len, 0};
+  }
   if (xid != NULL) {
-    seer_enc_sb4(w, (uint32_t)xid->format_id);
-    seer_enc_sb4(w, (uint32_t)xid->gtrid_len);
-    seer_enc_sb4(w, (uint32_t)xid->bqual_len);
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, TNS_TPC_XID_WIRE_LEN);
-  } else {
-    seer_enc_sb4(w, 0);
-    seer_enc_sb4(w, 0);
-    seer_enc_sb4(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0);
+    memset(xbuf, 0, TNS_TPC_XID_WIRE_LEN);
+    if (xid->gtrid_len > 0)
+      memcpy(xbuf, xid->gtrid, (size_t)xid->gtrid_len);
+    if (xid->bqual_len > 0)
+      memcpy(xbuf + xid->gtrid_len, xid->bqual, (size_t)xid->bqual_len);
+    m->format_id = (uint32_t)xid->format_id;
+    m->gtrid_len = xid->gtrid_len;
+    m->bqual_len = xid->bqual_len;
+    m->xid_ptr = 1;
+    m->xid_len = TNS_TPC_XID_WIRE_LEN;
+    m->xid = (SeerBytes){xbuf, TNS_TPC_XID_WIRE_LEN, 0};
   }
 }
 
-/* The 128-byte wire xid: gtrid then bqual, zero-padded. */
-static void tpc_xid_payload(SeerWriter *w, const SeerXid *xid)
-{
-  uint8_t buf[TNS_TPC_XID_WIRE_LEN] = {0};
-  int g = xid->gtrid_len, b = xid->bqual_len;
-  if (g > 0)
-    memcpy(buf, xid->gtrid, (size_t)g);
-  if (b > 0)
-    memcpy(buf + g, xid->bqual, (size_t)b);
-  seer_writer_bytes(w, buf, sizeof buf);
-}
-
-/* Build a TXN_SWITCH (begin/end) message, replaying any stored context. Before
- * 11g the internal and external names are absent: their pointers, lengths and
- * bytes (seerdb PROTOCOL.md §28, "Before 12c"). */
+/* Build a TXN_SWITCH (begin/end) message by SEER_TPC_SWITCH_SCHEMA, replaying
+ * any stored context. Before 11g the internal and external names are absent:
+ * their pointers, lengths and bytes (seerdb PROTOCOL.md §28, "Before 12c"). */
 SeerStatus seer_tpc_build_switch(SeerConn *c, SeerWriter *w, uint32_t op, const SeerXid *xid,
                                  uint32_t flags, uint32_t timeout)
 {
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_TPC_TXN_SWITCH);
-  seer_enc_sb4(w, op);
-  if (c->tpc_context != NULL) {
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, (uint32_t)c->tpc_context_len);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0);
-  }
-  tpc_xid_descriptor(w, xid);
-  seer_enc_sb4(w, flags);
-  seer_enc_sb4(w, timeout);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1); /* ptrs */
-  if (c->field_version >= TTC_FIELD_VERSION_11_2) {
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* internal name: none */
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* external name: none */
-  }
-  if (c->tpc_context != NULL)
-    seer_writer_bytes(w, c->tpc_context, c->tpc_context_len);
-  if (xid != NULL)
-    tpc_xid_payload(w, xid);
-  seer_enc_sb4(w, 0); /* app value */
+  uint8_t xbuf[TNS_TPC_XID_WIRE_LEN];
+  SeerTpcMsg m;
+  tpc_msg(c, xid, op, xbuf, &m);
+  m.flags = flags;
+  m.timeout = timeout;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_TPC_SWITCH_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
-/* Build a TXN_CHANGE_STATE (prepare/commit/abort) message. 9i has no flags:
- * the context follows the out-state pointer (PROTOCOL.md §28). */
+/* Build a TXN_CHANGE_STATE (prepare/commit/abort) message by
+ * SEER_TPC_CHANGE_STATE_SCHEMA. 9i has no flags: the context follows the
+ * out-state pointer (PROTOCOL.md §28). */
 static SeerStatus tpc_build_change_state(SeerConn *c, SeerWriter *w, uint32_t op, uint32_t state,
                                          const SeerXid *xid)
 {
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_TPC_TXN_CHANGE_STATE);
-  seer_enc_sb4(w, op);
-  if (c->tpc_context != NULL) {
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, (uint32_t)c->tpc_context_len);
-  } else {
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0);
-  }
-  tpc_xid_descriptor(w, xid);
-  seer_enc_sb4(w, 0); /* timeout */
-  seer_enc_sb4(w, state);
-  seer_writer_u8(w, 1); /* out-state pointer */
-  if (c->field_version >= TTC_FIELD_VERSION_10_2)
-    seer_enc_sb4(w, 0); /* flags */
-  if (c->tpc_context != NULL)
-    seer_writer_bytes(w, c->tpc_context, c->tpc_context_len);
-  if (xid != NULL)
-    tpc_xid_payload(w, xid);
+  uint8_t xbuf[TNS_TPC_XID_WIRE_LEN];
+  SeerTpcMsg m;
+  tpc_msg(c, xid, op, xbuf, &m);
+  m.state = state;
+  m.out_ptr = 1;
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_TPC_CHANGE_STATE_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
@@ -11469,25 +10902,25 @@ static SeerStatus tpc_call(SeerConn *c, SeerWriter *w, bool want_context, uint8_
   uint8_t tok = seer_reader_u8(&r);
 
   if (tok == TTI_RPA) {
+    SeerSchemaCtx scx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+    SeerTpcMsg m = {0};
     if (want_context) {
-      (void)seer_dec_sb4(&r); /* app value */
-      int64_t clen = seer_dec_sb4(&r);
-      if (clen < 0 || (size_t)clen > seer_reader_remaining(&r)) {
+      if (!seer_schema_decode(SEER_TPC_CONTEXT_REPLY_SCHEMA, &scx, &r, &m)) {
         free(resp);
         return SEER_EPROTO;
       }
-      uint8_t *cx = malloc((size_t)clen ? (size_t)clen : 1);
+      uint8_t *cx = malloc(m.ctx.n ? m.ctx.n : 1);
       if (cx == NULL) {
         free(resp);
         return SEER_ENOMEM;
       }
-      const uint8_t *p = seer_reader_bytes(&r, (size_t)clen);
-      if (p != NULL && clen > 0)
-        memcpy(cx, p, (size_t)clen);
+      if (m.ctx.n > 0)
+        memcpy(cx, m.ctx.p, m.ctx.n);
       *ctx = cx;
-      *ctxlen = (size_t)clen;
+      *ctxlen = m.ctx.n;
     } else if (state != NULL) {
-      *state = (uint32_t)seer_dec_sb4(&r);
+      (void)seer_schema_decode(SEER_TPC_STATE_REPLY_SCHEMA, &scx, &r, &m);
+      *state = (uint32_t)m.state;
     }
     if (seer_reader_remaining(&r) > 0 && seer_reader_u8(&r) == TTI_OER) {
       if (fv2) {
@@ -11855,88 +11288,34 @@ SeerStatus seer_txn_suspend_sessionless(SeerConn *conn)
 
 /* ---- Advanced Queuing (AQ, #128) ---------------------------------------- */
 
-/* Write an AQ value-with-length (write_value_with_length): a ub4 count, then the
- * bytes-with-length form when non-empty; NULL/empty -> just the zero count. */
-static void aq_value_with_length(SeerWriter *w, const char *s, uint8_t fv)
-{
-  size_t n = (s != NULL) ? strlen(s) : 0;
-  seer_enc_sb4(w, (uint32_t)n);
-  if (n > 0)
-    obj_append_chr(w, (const uint8_t *)s, n, fv);
-}
-
-/* Write a pointer+length pair: ptr byte (1 if present) then the sb4 length. The
- * value bytes themselves go in the data section. */
-static void aq_ptr_len(SeerWriter *w, const char *s)
-{
-  size_t n = (s != NULL) ? strlen(s) : 0;
-  seer_writer_u8(w, n > 0 ? 1 : 0);
-  seer_enc_sb4(w, (uint32_t)n);
-}
-
-/* Write a two-length byte value (oracledb write_bytes_with_two_lengths): a ub4
- * count then the bytes-with-length form. Used for the queue name and TOID. */
-static void aq_two_lengths(SeerWriter *w, const uint8_t *data, size_t n, uint8_t fv)
-{
-  seer_enc_sb4(w, (uint32_t)n);
-  obj_append_chr(w, data, n, fv);
-}
-
-/* A string in an AQ request's data section: the queue name, and on a dequeue
- * the consumer name and correlation. 11g reads them raw, with no length in
- * front: the 12c length byte shifted what follows (an enqueue got ORA-00600
- * [kpoaqeq: payload], a correlation dequeue ORA-21700; seerdb, measured on
- * 11.2.0.2 against JDBC thin's AQ, PROTOCOL.md §29, 2026-11-15). An enqueue's
- * correlation is in the message properties and keeps its lengths. 10.2 takes
- * the same form (seerdb, against JDBC thin 11.2 on 10.2.0.5). */
-static void aq_data_string(SeerWriter *w, const char *str, size_t n, uint8_t fv)
-{
-  if (fv < TTC_FIELD_VERSION_12_1)
-    seer_writer_bytes(w, str, n);
-  else
-    obj_append_chr(w, (const uint8_t *)str, n, fv);
-}
-
 /* The message-property block (oracledb write_msg_props), shared by single and
- * array enqueue: priority/delay/expiration/correlation, the four agent keyword
- * extensions (AGENT_PROTOCOL carries a one-byte 0x00 binary), the trailing
- * user-property/cscn/dscn/flags, and (at fv >= 21.1) a shard id. */
-static void aq_write_msg_props(SeerWriter *w, unsigned priority, unsigned delay, int expiration,
-                               const char *correlation, uint8_t fv)
+ * array enqueue and the array dequeue: SEER_AQ_PROPS_HEAD_SCHEMA with the
+ * priority, delay, expiration (-1 = forever) and correlation, the four agent
+ * keyword extensions (AGENT_PROTOCOL carries a one-byte 0x00 binary), then
+ * SEER_AQ_PROPS_TAIL_SCHEMA, from 21.1 with no shard (-1). */
+static void aq_write_msg_props(SeerWriter *w, const SeerSchemaCtx *cx, unsigned priority,
+                               unsigned delay, int expiration, const char *correlation)
 {
-  seer_enc_sb4(w, priority);
-  seer_enc_sb4(w, delay);
-  seer_enc_sb4(w, (uint32_t)expiration); /* -1 = forever                   */
-  aq_value_with_length(w, correlation, fv);
-  seer_enc_sb4(w, 0);      /* number of attempts             */
-  seer_enc_sb4(w, 0);      /* exception queue (none)         */
-  seer_enc_sb4(w, 0);      /* message state                  */
-  seer_enc_sb4(w, 0);      /* enqueue time length            */
-  seer_enc_sb4(w, 0);      /* enq txn id (none)              */
-  seer_enc_sb4(w, 4);      /* number of extensions           */
-  seer_writer_u8(w, 0x0e); /* oracledb's fixed extra byte    */
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_AGENT_NAME);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS);
-  seer_enc_sb4(w, 0);
-  {
-    uint8_t z = 0;
-    seer_enc_sb4(w, 1);
-    obj_append_chr(w, &z, 1, fv);
-  }
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_AGENT_PROTOCOL);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, 0);
-  seer_enc_sb4(w, TNS_AQ_EXT_KEYWORD_ORIGINAL_MSGID);
-  seer_enc_sb4(w, 0); /* user property                  */
-  seer_enc_sb4(w, 0); /* cscn                           */
-  seer_enc_sb4(w, 0); /* dscn                           */
-  seer_enc_sb4(w, 0); /* flags                          */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_enc_sb4(w, 0xFFFFFFFFu); /* shard id                       */
+  size_t cn = correlation != NULL ? strlen(correlation) : 0;
+  SeerAqPropsMsg p = {.priority = priority,
+                      .delay = delay,
+                      .expiration = (uint32_t)expiration,
+                      .correlation_len = (int64_t)cn,
+                      .correlation = {(const uint8_t *)correlation, cn, 0},
+                      .n_ext = 4,
+                      .ext_lead = 0x0e, /* oracledb's fixed extra byte */
+                      .shard_id = 0xFFFFFFFFu};
+  seer_schema_encode(SEER_AQ_PROPS_HEAD_SCHEMA, cx, &p, w);
+  static const uint8_t zero = 0;
+  const SeerAqExtMsg ext[4] = {
+      {.keyword = TNS_AQ_EXT_KEYWORD_AGENT_NAME},
+      {.keyword = TNS_AQ_EXT_KEYWORD_AGENT_ADDRESS},
+      {.bin_len = 1, .bin = {&zero, 1, 0}, .keyword = TNS_AQ_EXT_KEYWORD_AGENT_PROTOCOL},
+      {.keyword = TNS_AQ_EXT_KEYWORD_ORIGINAL_MSGID},
+  };
+  for (size_t i = 0; i < 4; i++)
+    seer_schema_encode(SEER_AQ_EXT_SCHEMA, cx, &ext[i], w);
+  seer_schema_encode(SEER_AQ_PROPS_TAIL_SCHEMA, cx, &p, w);
 }
 
 enum { AQ_PL_RAW = 0, AQ_PL_OBJECT = 1, AQ_PL_JSON = 2 };
@@ -11951,69 +11330,40 @@ static SeerStatus aq_build_enq(SeerConn *c, SeerWriter *w, const char *qname,
                                unsigned delay, int expiration, const char *correlation,
                                int payload_kind, const uint8_t *toid16)
 {
-  uint8_t fv = c->field_version;
   size_t qn = strlen(qname);
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_AQ_ENQ);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)qn); /* queue name ptr + len */
-
-  aq_write_msg_props(w, priority, delay, expiration, correlation, fv);
-
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);                    /* recipients ptr + count         */
-  seer_enc_sb4(w, TNS_AQ_ENQ_ON_COMMIT); /* visibility                     */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* relative message id ptr + len  */
-  seer_enc_sb4(w, 0); /* sequence deviation             */
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, 16);                     /* payload TOID ptr + len         */
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_VERSION); /* message version (ub2)          */
-  if (payload_kind == AQ_PL_OBJECT) {
-    seer_writer_u8(w, 1);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* payload 1, RAW 0, RAW len 0    */
-  } else if (payload_kind == AQ_PL_JSON) {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 0);
-    seer_enc_sb4(w, 0); /* payload 0, RAW 0, RAW len 0    */
-  } else {
-    seer_writer_u8(w, 0);
-    seer_writer_u8(w, 1);
-    seer_enc_sb4(w, (uint32_t)plen); /* payload 0, RAW 1, RAW len      */
-  }
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_ID_LENGTH); /* return msgid */
-  seer_enc_sb4(w, 0);                        /* enqueue flags (persistent)     */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* extensions 1 ptr + count       */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* extensions 2 ptr + count       */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* source sequence num ptr + len  */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);   /* max sequence num ptr + len     */
-  seer_writer_u8(w, 0); /* output ack length              */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* correlation ptr + len          */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* sender name ptr + len          */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);   /* sender address ptr + len       */
-  seer_writer_u8(w, 0); /* sender charset id ptr          */
-  seer_writer_u8(w, 0); /* sender ncharset id ptr         */
-  if (fv >= TTC_FIELD_VERSION_20_1)
-    seer_writer_u8(w, payload_kind == AQ_PL_JSON ? 1 : 0); /* JSON payload ptr */
-
-  /* data section: queue name, the 16-byte payload TOID (RAW sentinel or the
-   * object type's OID), then the payload (raw bytes / the object bind value). */
-  aq_data_string(w, qname, qn, fv);
-  seer_writer_bytes(w, toid16, 16);
-  if (plen > 0)
-    seer_writer_bytes(w, payload, plen);
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  /* By SEER_AQ_ENQ_HEAD_SCHEMA, the properties and SEER_AQ_ENQ_TAIL_SCHEMA:
+   * no recipients, ON_COMMIT visibility, persistent delivery; the payload
+   * flags by kind - an object's payload pointer, a RAW's pointer and length,
+   * a JSON's own pointer (from 20.1) - and the data section, the queue name,
+   * the 16-byte TOID (the RAW / JSON sentinel or the object type's OID) and
+   * the payload (raw bytes / the object bind value). */
+  SeerAqEnqMsg m = {.qname_ptr = 1,
+                    .qname_len = (int64_t)qn,
+                    .visibility = TNS_AQ_ENQ_ON_COMMIT,
+                    .toid_ptr = 1,
+                    .toid_len = 16,
+                    .msg_version = TNS_AQ_MESSAGE_VERSION,
+                    .payload_ptr = payload_kind == AQ_PL_OBJECT,
+                    .raw_ptr = payload_kind == AQ_PL_RAW,
+                    .raw_len = payload_kind == AQ_PL_RAW ? (int64_t)plen : 0,
+                    .msgid_ptr = 1,
+                    .msgid_len = TNS_AQ_MESSAGE_ID_LENGTH,
+                    .json_ptr = payload_kind == AQ_PL_JSON,
+                    .qname = {(const uint8_t *)qname, qn, 0},
+                    .toid = {toid16, 16, 0},
+                    .payload = {payload, plen, 0},
+                    .payload_len = (int64_t)plen};
+  seer_schema_encode(SEER_AQ_ENQ_HEAD_SCHEMA, &cx, &m, w);
+  aq_write_msg_props(w, &cx, priority, delay, expiration, correlation);
+  seer_schema_encode(SEER_AQ_ENQ_TAIL_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
+
+static SeerStatus aq_read_msgid(const SeerSchemaCtx *cx, SeerReader *r, uint8_t msgid[16]);
 
 /* Send a built AQ enqueue request and read the reply: TTI_RPA then the 16-byte
  * message id, or TTI_OER on error. Frees the writer. */
@@ -12035,10 +11385,8 @@ static SeerStatus aq_enq_send(SeerConn *conn, SeerWriter *w, uint8_t msgid[16])
   OerResult oer = {0};
   uint8_t tok = seer_reader_u8(&r);
   if (tok == TTI_RPA) {
-    const uint8_t *mid = seer_reader_bytes(&r, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (mid != NULL && msgid != NULL)
-      memcpy(msgid, mid, TNS_AQ_MESSAGE_ID_LENGTH);
-    st = seer_reader_ok(&r) ? SEER_OK : SEER_EPROTO;
+    SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+    st = aq_read_msgid(&cx, &r, msgid);
   } else if (tok == TTI_OER) {
     parse_oer(&r, &tmp, &oer);
     st = SEER_EDB;
@@ -12404,106 +11752,59 @@ SeerStatus seer_aq_enq_raw(SeerConn *conn, const char *queue_name, const uint8_t
 /* Consume one length-prefixed AQ string (read_str_with_length): a ub4 count,
  * then the 0xFE-aware DALC bytes when non-zero. We only need to skip these in a
  * RAW message's properties and payload header. */
-static SeerStatus aq_skip_str(SeerReader *r)
-{
-  int64_t n = seer_dec_sb4(r);
-  if (n > 0) {
-    uint8_t *b = NULL;
-    size_t bl = 0;
-    SeerStatus st = seer_dec_dalc(r, &b, &bl);
-    free(b);
-    return st;
-  }
-  return SEER_OK;
-}
-
-/* Build a RAW-payload dequeue (TNS_FUNC_AQ_DEQ): the given mode (REMOVE/BROWSE),
- * NEXT_MSG navigation, ON_COMMIT visibility, wait, and optional consumer name /
- * correlation filter. Mirrors oracledb AqDeqMessage. */
+/* Build a RAW-payload dequeue (TNS_FUNC_AQ_DEQ) by SEER_AQ_DEQ_SCHEMA: the
+ * given mode (REMOVE/BROWSE), FIRST_MSG navigation, ON_COMMIT visibility,
+ * wait, and optional consumer name / correlation filter. Mirrors oracledb
+ * AqDeqMessage. */
 static SeerStatus aq_build_deq(SeerConn *c, SeerWriter *w, const char *qname, uint32_t mode,
                                uint32_t wait_seconds, const char *correlation, const char *consumer,
                                const uint8_t *toid16)
 {
-  uint8_t fv = c->field_version;
   size_t qn = strlen(qname);
+  size_t un = consumer != NULL ? strlen(consumer) : 0;
+  size_t cn = correlation != NULL ? strlen(correlation) : 0;
   if (!seer_writer_init(w, 192))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_AQ_DEQ);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)qn); /* queue name ptr + len */
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);                  /* msg props + recipient list ptrs */
-  aq_ptr_len(w, consumer);               /* consumer name                  */
-  seer_enc_sb4(w, mode);                 /* mode (REMOVE / BROWSE)         */
-  seer_enc_sb4(w, TNS_AQ_DEQ_FIRST_MSG); /* navigation: each call is one-shot */
-  seer_enc_sb4(w, TNS_AQ_DEQ_ON_COMMIT); /* visibility                     */
-  seer_enc_sb4(w, wait_seconds);         /* wait                           */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0);         /* selector msgid (none)          */
-  aq_ptr_len(w, correlation); /* correlation filter             */
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, 16);                     /* payload TOID ptr + len         */
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_VERSION); /* message version (ub2)          */
-  seer_writer_u8(w, 1);                    /* payload ptr                    */
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_ID_LENGTH); /* return msgid */
-  seer_enc_sb4(w, 0);                        /* dequeue flags (persistent)     */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* condition (none)               */
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* extensions ptr + count         */
-  if (fv >= TTC_FIELD_VERSION_20_1)
-    seer_writer_u8(w, 0); /* JSON payload ptr               */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_enc_sb4(w, 0xFFFFFFFFu); /* shard id = -1                  */
-
-  /* data section: queue name, optional consumer, optional correlation, then the
-   * 16-byte RAW payload TOID (order mirrors AqDeqMessage). */
-  aq_data_string(w, qname, qn, fv);
-  if (consumer != NULL && consumer[0] != '\0')
-    aq_data_string(w, consumer, strlen(consumer), fv);
-  if (correlation != NULL && correlation[0] != '\0')
-    aq_data_string(w, correlation, strlen(correlation), fv);
-  seer_writer_bytes(w, toid16, 16);
+  SeerAqDeqMsg m = {.qname_ptr = 1,
+                    .qname_len = (int64_t)qn,
+                    .props_ptr = 1,
+                    .props_len_ptr = 1,
+                    .recip_ptr = 1,
+                    .recip_len_ptr = 1,
+                    .consumer_ptr = un > 0,
+                    .consumer_len = (int64_t)un,
+                    .mode = mode,
+                    .navigation = TNS_AQ_DEQ_FIRST_MSG, /* each call is one-shot */
+                    .visibility = TNS_AQ_DEQ_ON_COMMIT,
+                    .wait = wait_seconds,
+                    .corr_ptr = cn > 0,
+                    .corr_len = (int64_t)cn,
+                    .toid_ptr = 1,
+                    .toid_len = 16,
+                    .msg_version = TNS_AQ_MESSAGE_VERSION,
+                    .payload_ptr = 1,
+                    .msgid_ptr = 1,
+                    .msgid_len = TNS_AQ_MESSAGE_ID_LENGTH,
+                    .shard_id = 0xFFFFFFFFu, /* -1 */
+                    .qname = {(const uint8_t *)qname, qn, 0},
+                    .consumer = {(const uint8_t *)consumer, un, 0},
+                    .correlation = {(const uint8_t *)correlation, cn, 0},
+                    .toid = {toid16, 16, 0}};
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  seer_schema_encode(SEER_AQ_DEQ_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
-/* Skip the message-property block in a dequeue reply (parse order mirrors
- * oracledb _parse_aq_msg_props); we keep only the payload and msgid. */
-static SeerStatus aq_skip_msg_props(SeerReader *r, uint8_t fv)
+/* Pass over a reply's message-property block, SEER_AQ_PROPS_SCHEMA (parse
+ * order mirrors oracledb _parse_aq_msg_props); we keep only the payload and
+ * msgid. */
+static SeerStatus aq_skip_msg_props(const SeerSchemaCtx *cx, SeerReader *r)
 {
-  seer_dec_sb4(r);
-  seer_dec_sb4(r);
-  seer_dec_sb4(r);           /* priority/delay/expiration */
-  aq_skip_str(r);            /* correlation               */
-  seer_dec_sb4(r);           /* number of attempts        */
-  aq_skip_str(r);            /* exception queue           */
-  seer_dec_sb4(r);           /* state                     */
-  if (seer_dec_sb4(r) > 0) { /* enqueue time present       */
-    uint8_t *b = NULL;
-    size_t bl = 0;
-    seer_dec_dalc(r, &b, &bl);
-    free(b);
-  }
-  aq_skip_str(r);                 /* enqueue txn id            */
-  int64_t next = seer_dec_sb4(r); /* number of extensions      */
-  if (next > 0) {
-    seer_reader_u8(r); /* skip_ub1                  */
-    for (int64_t i = 0; i < next && seer_reader_ok(r); i++) {
-      aq_skip_str(r);
-      aq_skip_str(r);
-      seer_dec_sb4(r); /* text, binary, keyword */
-    }
-  }
-  seer_dec_sb4(r);
-  seer_dec_sb4(r);
-  seer_dec_sb4(r);
-  seer_dec_sb4(r); /* user/csn/dsn/flags */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_dec_sb4(r); /* shard id                  */
-  return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO;
+  SeerAqPropsMsg p = {0};
+  bool ok = seer_schema_decode(SEER_AQ_PROPS_SCHEMA, cx, r, &p);
+  seer_schema_free(SEER_AQ_PROPS_SCHEMA, &p);
+  return ok ? SEER_OK : SEER_EPROTO;
 }
 
 /* Send a dequeue request and consume the reply up to the payload: the empty-queue
@@ -12525,6 +11826,7 @@ static SeerStatus aq_deq_exchange(SeerConn *conn, SeerWriter *w, SeerReader *r, 
   uint8_t fv = conn->field_version;
   seer_reader_init(r, *resp, *rlen);
   r->sb4_chunks = fv >= TTC_FIELD_VERSION_12_1;
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, conn->server_field_version);
   uint8_t tok = seer_reader_u8(r);
   if (tok == TTI_OER) { /* empty queue / timeout / error */
     SeerStmt tmp = {.conn = conn};
@@ -12536,50 +11838,67 @@ static SeerStatus aq_deq_exchange(SeerConn *conn, SeerWriter *w, SeerReader *r, 
   }
   if (tok != TTI_RPA)
     return SEER_EPROTO;
-  if (seer_dec_sb4(r) == 0) /* no message body */
+  /* SEER_AQ_DEQ_REPLY_HEAD_SCHEMA, the properties, then
+   * SEER_AQ_DEQ_REPLY_MID_SCHEMA */
+  SeerAqReplyMsg m = {0};
+  (void)seer_schema_decode(SEER_AQ_DEQ_REPLY_HEAD_SCHEMA, &cx, r, &m);
+  if (m.props_len == 0) /* no message body */
     return SEER_ENODATA;
-  if (aq_skip_msg_props(r, fv) != SEER_OK)
+  if (aq_skip_msg_props(&cx, r) != SEER_OK)
     return SEER_EPROTO;
-  seer_dec_sb4(r); /* number of recipients */
+  (void)seer_schema_decode(SEER_AQ_DEQ_REPLY_MID_SCHEMA, &cx, r, &m);
   return SEER_OK;
 }
 
-/* Read the RAW-form payload from a dequeue reply positioned at the payload: skip
- * toid/oid/snapshot/version, read image_length + flags, then the image whose
- * first 4 bytes are a header - the payload is image[4:image_length]. On SEER_OK
- * *out is malloc'd (NULL/0 for an empty payload); the caller frees it. For a JSON
- * queue this payload is itself an OSON image. */
-static SeerStatus aq_read_payload(SeerReader *r, uint8_t **out, size_t *outlen)
+/* Read the RAW-form payload from a dequeue reply positioned at the payload:
+ * SEER_OBJECT_HEAD_SCHEMA - toid/oid/snapshot/version, image_length, flags -
+ * then, past an image's 4-byte header alone, SEER_OBJECT_IMAGE_SCHEMA: the
+ * payload is image[4:image_length]. On SEER_OK *out is malloc'd (NULL/0 for
+ * an empty payload); the caller frees it. For a JSON queue this payload is
+ * itself an OSON image. */
+static SeerStatus aq_read_payload(const SeerSchemaCtx *cx, SeerReader *r, uint8_t **out,
+                                  size_t *outlen)
 {
   *out = NULL;
   *outlen = 0;
-  aq_skip_str(r);
-  aq_skip_str(r);
-  aq_skip_str(r);  /* toid / oid / snapshot */
-  seer_dec_sb4(r); /* version (ub2) */
-  int64_t image_length = seer_dec_sb4(r);
-  seer_dec_sb4(r); /* flags (ub2)   */
-  if (image_length <= 4)
-    return seer_reader_ok(r) ? SEER_OK : SEER_EPROTO; /* empty payload */
-  uint8_t *img = NULL;
-  size_t imglen = 0;
-  SeerStatus st = seer_dec_dalc(r, &img, &imglen);
-  if (st != SEER_OK)
-    return st;
-  if ((size_t)image_length > imglen) {
-    free(img);
+  SeerObjectMsg m = {0};
+  bool ok = seer_schema_decode(SEER_OBJECT_HEAD_SCHEMA, cx, r, &m);
+  seer_schema_free(SEER_OBJECT_HEAD_SCHEMA, &m);
+  if (!ok)
+    return SEER_EPROTO;
+  if (m.image_len <= 4)
+    return SEER_OK; /* empty payload */
+  if (!seer_schema_decode(SEER_OBJECT_IMAGE_SCHEMA, cx, r, &m)) {
+    seer_schema_free(SEER_OBJECT_IMAGE_SCHEMA, &m);
     return SEER_EPROTO;
   }
-  size_t plen = (size_t)image_length - 4;
-  uint8_t *p = malloc(plen ? plen : 1);
-  if (p == NULL) {
-    free(img);
-    return SEER_ENOMEM;
+  SeerStatus st = SEER_OK;
+  if ((size_t)m.image_len > m.image.n) {
+    st = SEER_EPROTO;
+  } else {
+    size_t plen = (size_t)m.image_len - 4;
+    uint8_t *p = malloc(plen ? plen : 1);
+    if (p == NULL) {
+      st = SEER_ENOMEM;
+    } else {
+      memcpy(p, m.image.p + 4, plen);
+      *out = p;
+      *outlen = plen;
+    }
   }
-  memcpy(p, img + 4, plen);
-  free(img);
-  *out = p;
-  *outlen = plen;
+  seer_schema_free(SEER_OBJECT_IMAGE_SCHEMA, &m);
+  return st;
+}
+
+/* Read the 16-byte message id that ends an AQ reply, SEER_AQ_MSGID_SCHEMA,
+ * into `msgid` (when given). */
+static SeerStatus aq_read_msgid(const SeerSchemaCtx *cx, SeerReader *r, uint8_t msgid[16])
+{
+  SeerAqReplyMsg m = {.msgid_len = TNS_AQ_MESSAGE_ID_LENGTH};
+  if (!seer_schema_decode(SEER_AQ_MSGID_SCHEMA, cx, r, &m))
+    return SEER_EPROTO;
+  if (msgid != NULL)
+    memcpy(msgid, m.msgid.p, TNS_AQ_MESSAGE_ID_LENGTH);
   return SEER_OK;
 }
 
@@ -12620,7 +11939,8 @@ SeerStatus seer_aq_deq_raw_opt(SeerConn *conn, const char *queue_name, const See
 
   uint8_t *pl = NULL;
   size_t pll = 0;
-  st = aq_read_payload(&r, &pl, &pll);
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  st = aq_read_payload(&cx, &r, &pl, &pll);
   if (st == SEER_OK) {
     if (payload != NULL) {
       *payload = pl;
@@ -12628,11 +11948,7 @@ SeerStatus seer_aq_deq_raw_opt(SeerConn *conn, const char *queue_name, const See
         *payload_len = pll;
     } else
       free(pl);
-    const uint8_t *mid = seer_reader_bytes(&r, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (mid != NULL && msgid != NULL)
-      memcpy(msgid, mid, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (!seer_reader_ok(&r))
-      st = SEER_EPROTO;
+    st = aq_read_msgid(&cx, &r, msgid);
   }
   free(resp);
   return st;
@@ -12701,11 +12017,8 @@ SeerStatus seer_aq_deq_object(SeerConn *conn, const char *queue_name, const char
   }
   free(img);
   if (st == SEER_OK) {
-    const uint8_t *mid = seer_reader_bytes(&r, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (mid != NULL && msgid != NULL)
-      memcpy(msgid, mid, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (!seer_reader_ok(&r))
-      st = SEER_EPROTO;
+    SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+    st = aq_read_msgid(&cx, &r, msgid);
   }
   free(types);
   free(resp);
@@ -12748,7 +12061,8 @@ SeerStatus seer_aq_deq_json(SeerConn *conn, const char *queue_name, uint32_t wai
   /* the payload is an OSON image; decode it to JSON text */
   uint8_t *oson = NULL;
   size_t osonlen = 0;
-  st = aq_read_payload(&r, &oson, &osonlen);
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  st = aq_read_payload(&cx, &r, &oson, &osonlen);
   if (st == SEER_OK) {
     if (oson != NULL && out_text != NULL) {
       char *txt = NULL;
@@ -12758,11 +12072,7 @@ SeerStatus seer_aq_deq_json(SeerConn *conn, const char *queue_name, uint32_t wai
         free(txt);
     }
     free(oson);
-    const uint8_t *mid = seer_reader_bytes(&r, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (mid != NULL && msgid != NULL)
-      memcpy(msgid, mid, TNS_AQ_MESSAGE_ID_LENGTH);
-    if (!seer_reader_ok(&r))
-      st = SEER_EPROTO;
+    st = aq_read_msgid(&cx, &r, msgid);
   }
   free(resp);
   return st;
@@ -12771,46 +12081,57 @@ SeerStatus seer_aq_deq_json(SeerConn *conn, const char *queue_name, uint32_t wai
 /* Build a bulk RAW enqueue (TNS_FUNC_ARRAY_AQ): a ROW_HEADER (queue name + TOID +
  * version/flags) then one ROW_DATA per message (props + visibility + RAW length +
  * bytes), closed by a STATUS marker. Mirrors oracledb _aq_write_array_enq. */
+/* An array reply's iteration up to its payload: SEER_AQ_ITER_HEAD_SCHEMA, the
+ * properties when there are any, and SEER_AQ_ITER_MID_SCHEMA (the
+ * recipients, the payload's presence). */
+static SeerStatus aq_iter_head(const SeerSchemaCtx *cx, SeerReader *r, SeerAqReplyMsg *m)
+{
+  if (!seer_schema_decode(SEER_AQ_ITER_HEAD_SCHEMA, cx, r, m))
+    return SEER_EPROTO;
+  if (m->props_len > 0 && aq_skip_msg_props(cx, r) != SEER_OK)
+    return SEER_EPROTO;
+  return seer_schema_decode(SEER_AQ_ITER_MID_SCHEMA, cx, r, m) ? SEER_OK : SEER_EPROTO;
+}
+
 static SeerStatus aq_build_array_enq_raw(SeerConn *c, SeerWriter *w, const char *qname, int count,
                                          const uint8_t *const *payloads, const size_t *lens)
 {
-  uint8_t fv = c->field_version;
   size_t qn = strlen(qname);
   uint8_t raw_toid[16] = {0};
   raw_toid[15] = TNS_AQ_RAW_TOID_SENTINEL;
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_ARRAY_AQ);
-  seer_writer_u8(w, 0);
-  seer_enc_sb4(w, 0); /* input params ptr + len (ENQ) */
-  seer_enc_sb4(w, TNS_AQ_ARRAY_RETURN_MSGID);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 0);              /* output params ptr + len (ENQ) */
-  seer_enc_sb4(w, TNS_AQ_ARRAY_ENQ); /* operation */
-  seer_writer_u8(w, 1);              /* num iters ptr (ENQ) */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_enc_sb4(w, 0xFFFF);        /* shard id */
-  seer_enc_sb4(w, (uint32_t)count); /* num iters */
-
-  seer_enc_sb4(w, 0);         /* relative msgid length */
-  seer_writer_u8(w, TTI_RXH); /* ROW_HEADER */
-  aq_two_lengths(w, (const uint8_t *)qname, qn, fv);
-  seer_writer_bytes(w, raw_toid, 16);
-  seer_enc_sb4(w, TNS_AQ_MESSAGE_VERSION);
-  seer_enc_sb4(w, 0); /* flags */
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  /* SEER_AQ_ARRAY_HEAD_SCHEMA with the enqueue's operands (no input
+   * parameters, the output's pointer, the iteration count's pointer, no
+   * shard), the enqueue's head, then a row per message with default
+   * properties, and the closing status. */
+  SeerAqArrayMsg m = {.ret_flags = TNS_AQ_ARRAY_RETURN_MSGID,
+                      .out_ptr = 1,
+                      .op = TNS_AQ_ARRAY_ENQ,
+                      .iters_ptr = 1,
+                      .shard_id = 0xFFFF,
+                      .iters = count,
+                      .rxh = TTI_RXH,
+                      .qname_len = (int64_t)qn,
+                      .qname = {(const uint8_t *)qname, qn, 0},
+                      .toid = {raw_toid, 16, 0},
+                      .toid_len = 16,
+                      .msg_version = TNS_AQ_MESSAGE_VERSION,
+                      .rxd = TTI_RXD,
+                      .visibility = TNS_AQ_ENQ_ON_COMMIT,
+                      .sta = TTI_STA};
+  seer_schema_encode(SEER_AQ_ARRAY_HEAD_SCHEMA, &cx, &m, w);
+  seer_schema_encode(SEER_AQ_ARRAY_ENQ_HEAD_SCHEMA, &cx, &m, w);
   for (int i = 0; i < count; i++) {
-    seer_writer_u8(w, TTI_RXD); /* ROW_DATA */
-    seer_enc_sb4(w, 0);         /* aqi flags */
-    aq_write_msg_props(w, 0, 0, -1, NULL, fv);
-    seer_enc_sb4(w, 0);                    /* num recipients */
-    seer_enc_sb4(w, TNS_AQ_ENQ_ON_COMMIT); /* visibility */
-    seer_enc_sb4(w, 0);                    /* relative message id */
-    seer_enc_sb4(w, 0);                    /* sequence deviation */
-    seer_enc_sb4(w, (uint32_t)lens[i]);    /* RAW payload length */
-    if (lens[i] > 0)
-      seer_writer_bytes(w, payloads[i], lens[i]);
+    seer_schema_encode(SEER_AQ_ARRAY_ENQ_ROW_SCHEMA, &cx, &m, w);
+    aq_write_msg_props(w, &cx, 0, 0, -1, NULL);
+    m.raw_len = (int64_t)lens[i];
+    m.payload = (SeerBytes){payloads[i], lens[i], 0};
+    seer_schema_encode(SEER_AQ_ARRAY_ENQ_ROW_TAIL_SCHEMA, &cx, &m, w);
   }
-  seer_writer_u8(w, TTI_STA); /* STATUS */
+  seer_schema_encode(SEER_AQ_ARRAY_ENQ_END_SCHEMA, &cx, &m, w);
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
 
@@ -12869,32 +12190,28 @@ SeerStatus seer_aq_enq_raw_array(SeerConn *conn, const char *queue_name, int cou
   /* Response: ub4 iteration count, then per iteration props/recipients/payload
    * flags (0 for a bare enqueue ack), the returned message-id block, and two
    * trailing ub2s. The msgid block holds count*16 bytes. */
-  int64_t iters = seer_dec_sb4(&r);
-  for (int64_t it = 0; it < iters && seer_reader_ok(&r); it++) {
-    if (seer_dec_sb4(&r) > 0) { /* props present */
-      seer_reader_u8(&r);
-      aq_skip_msg_props(&r, conn->field_version);
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  SeerAqReplyMsg m = {0};
+  bool ok = seer_schema_decode(SEER_AQ_ARRAY_REPLY_HEAD_SCHEMA, &cx, &r, &m);
+  for (int64_t it = 0; ok && it < m.iters && seer_reader_ok(&r); it++) {
+    if (aq_iter_head(&cx, &r, &m) != SEER_OK) {
+      ok = false;
+      break;
     }
-    seer_dec_sb4(&r);           /* num recipients */
-    if (seer_dec_sb4(&r) > 0) { /* payload present */
+    if (m.payload_n > 0) {
       uint8_t *pp = NULL;
       size_t ppl = 0;
-      aq_read_payload(&r, &pp, &ppl);
+      ok = aq_read_payload(&cx, &r, &pp, &ppl) == SEER_OK;
       free(pp);
     }
-    if (seer_dec_sb4(&r) > 0) { /* msgid block (_aq_str) */
-      uint8_t *mb = NULL;
-      size_t mbl = 0;
-      if (seer_dec_dalc(&r, &mb, &mbl) == SEER_OK && msgids != NULL) {
-        size_t want = (size_t)count * 16;
-        memcpy(msgids, mb, mbl < want ? mbl : want);
-      }
-      free(mb);
+    if (ok && seer_schema_decode(SEER_AQ_ITER_TAIL_SCHEMA, &cx, &r, &m) && msgids != NULL &&
+        m.msgid.n > 0) {
+      size_t want = (size_t)count * 16;
+      memcpy(msgids, m.msgid.p, m.msgid.n < want ? m.msgid.n : want);
     }
-    seer_dec_sb4(&r); /* extensions length */
-    seer_dec_sb4(&r); /* output ack */
+    seer_schema_free(SEER_AQ_ITER_TAIL_SCHEMA, &m);
   }
-  if (!seer_reader_ok(&r))
+  if (!ok || !seer_reader_ok(&r))
     st = SEER_EPROTO;
 
 out:
@@ -12909,45 +12226,39 @@ out:
 static SeerStatus aq_build_array_deq_raw(SeerConn *c, SeerWriter *w, const char *qname, int count,
                                          uint32_t wait)
 {
-  uint8_t fv = c->field_version;
   size_t qn = strlen(qname);
   uint8_t raw_toid[16] = {0};
   raw_toid[15] = TNS_AQ_RAW_TOID_SENTINEL;
   if (!seer_writer_init(w, 256))
     return SEER_ENOMEM;
   seer_ttc_fun_header(c, w, TNS_FUNC_ARRAY_AQ);
-  seer_writer_u8(w, 1);
-  seer_enc_sb4(w, (uint32_t)count); /* input params ptr + len (DEQ) */
-  seer_enc_sb4(w, TNS_AQ_ARRAY_RETURN_MSGID);
-  seer_writer_u8(w, 1);
-  seer_writer_u8(w, 1);              /* output params (DEQ) */
-  seer_enc_sb4(w, TNS_AQ_ARRAY_DEQ); /* operation */
-  seer_writer_u8(w, 0);              /* num iters ptr (DEQ) */
-  if (fv >= TTC_FIELD_VERSION_21_1)
-    seer_enc_sb4(w, 0xFFFF); /* shard id */
+  SeerSchemaCtx cx = seer_msg_ctx(0, c->field_version, c->server_field_version);
+  /* SEER_AQ_ARRAY_HEAD_SCHEMA with the dequeue's operands (the input
+   * parameters, one per message, the output's pointer and length, no
+   * iteration count, no shard), then per message a row:
+   * SEER_AQ_ARRAY_DEQ_ROW_HEAD_SCHEMA, default properties and
+   * SEER_AQ_ARRAY_DEQ_ROW_TAIL_SCHEMA - no filters, the payload TOID. */
+  SeerAqArrayMsg h = {.in_ptr = 1,
+                      .in_len = count,
+                      .ret_flags = TNS_AQ_ARRAY_RETURN_MSGID,
+                      .out_ptr = 1,
+                      .out_len = 1,
+                      .op = TNS_AQ_ARRAY_DEQ,
+                      .shard_id = 0xFFFF};
+  seer_schema_encode(SEER_AQ_ARRAY_HEAD_SCHEMA, &cx, &h, w);
+  SeerAqArrayDeqRowMsg row = {.qname_len = (int64_t)qn,
+                              .qname = {(const uint8_t *)qname, qn, 0},
+                              .mode = TNS_AQ_DEQ_REMOVE,
+                              .navigation = TNS_AQ_DEQ_NEXT_MSG, /* sequential */
+                              .visibility = TNS_AQ_DEQ_ON_COMMIT,
+                              .wait = wait,
+                              .toid_len = 16,
+                              .toid = {raw_toid, 16, 0},
+                              .msg_version = TNS_AQ_MESSAGE_VERSION};
   for (int i = 0; i < count; i++) {
-    aq_two_lengths(w, (const uint8_t *)qname, qn, fv);
-    aq_write_msg_props(w, 0, 0, -1, NULL, fv);
-    seer_enc_sb4(w, 0);                    /* num recipients */
-    seer_enc_sb4(w, 0);                    /* consumer name (none) */
-    seer_enc_sb4(w, TNS_AQ_DEQ_REMOVE);    /* mode */
-    seer_enc_sb4(w, TNS_AQ_DEQ_NEXT_MSG);  /* navigation (sequential) */
-    seer_enc_sb4(w, TNS_AQ_DEQ_ON_COMMIT); /* visibility */
-    seer_enc_sb4(w, wait);                 /* wait */
-    seer_enc_sb4(w, 0);                    /* selector msgid (none) */
-    seer_enc_sb4(w, 0);                    /* correlation (none) */
-    seer_enc_sb4(w, 0);                    /* condition (none) */
-    seer_enc_sb4(w, 0);                    /* extensions */
-    seer_enc_sb4(w, 0);                    /* relative message id */
-    seer_enc_sb4(w, 0);                    /* sequence deviation */
-    aq_two_lengths(w, raw_toid, 16, fv);   /* payload TOID */
-    seer_enc_sb4(w, TNS_AQ_MESSAGE_VERSION);
-    seer_enc_sb4(w, 0); /* payload length */
-    seer_enc_sb4(w, 0); /* raw payload length */
-    seer_enc_sb4(w, 0);
-    seer_enc_sb4(w, 0); /* flags */
-    seer_enc_sb4(w, 0); /* extensions length */
-    seer_enc_sb4(w, 0); /* source sequence length */
+    seer_schema_encode(SEER_AQ_ARRAY_DEQ_ROW_HEAD_SCHEMA, &cx, &row, w);
+    aq_write_msg_props(w, &cx, 0, 0, -1, NULL);
+    seer_schema_encode(SEER_AQ_ARRAY_DEQ_ROW_TAIL_SCHEMA, &cx, &row, w);
   }
   return seer_writer_ok(w) ? SEER_OK : SEER_ENOMEM;
 }
@@ -13021,38 +12332,37 @@ SeerStatus seer_aq_deq_raw_array(SeerConn *conn, const char *queue_name, int max
     goto out;
   }
 
-  int64_t iters = seer_dec_sb4(&r);
+  SeerSchemaCtx cx = seer_msg_ctx(0, fv, conn->server_field_version);
+  SeerAqReplyMsg m = {0};
+  bool ok = seer_schema_decode(SEER_AQ_ARRAY_REPLY_HEAD_SCHEMA, &cx, &r, &m);
+  int64_t iters = m.iters;
   if (iters < 0)
     iters = 0;
   if (iters > max_count)
     iters = max_count; /* defensive clamp */
-  for (int64_t it = 0; it < iters && seer_reader_ok(&r); it++) {
-    if (seer_dec_sb4(&r) > 0) { /* props present */
-      seer_reader_u8(&r);
-      aq_skip_msg_props(&r, fv);
+  for (int64_t it = 0; ok && it < iters && seer_reader_ok(&r); it++) {
+    if (aq_iter_head(&cx, &r, &m) != SEER_OK) {
+      ok = false;
+      break;
     }
-    seer_dec_sb4(&r);           /* num recipients */
-    if (seer_dec_sb4(&r) > 0) { /* payload present */
+    if (m.payload_n > 0) {
       uint8_t *pp = NULL;
       size_t ppl = 0;
-      if (aq_read_payload(&r, &pp, &ppl) == SEER_OK) {
+      if (aq_read_payload(&cx, &r, &pp, &ppl) == SEER_OK) {
         payloads[it] = pp;
         lens[it] = ppl;
       } else {
         free(pp);
+        ok = false;
+        break;
       }
     }
-    if (seer_dec_sb4(&r) > 0) { /* msgid block (_aq_str) */
-      uint8_t *mb = NULL;
-      size_t mbl = 0;
-      seer_dec_dalc(&r, &mb, &mbl);
-      free(mb);
-    }
-    seer_dec_sb4(&r); /* extensions length */
-    seer_dec_sb4(&r); /* output ack */
-    *out_count = (int)(it + 1);
+    ok = seer_schema_decode(SEER_AQ_ITER_TAIL_SCHEMA, &cx, &r, &m);
+    seer_schema_free(SEER_AQ_ITER_TAIL_SCHEMA, &m);
+    if (ok)
+      *out_count = (int)(it + 1);
   }
-  if (!seer_reader_ok(&r)) {
+  if (!ok || !seer_reader_ok(&r)) {
     for (int i = 0; i < *out_count; i++) {
       free(payloads[i]);
       payloads[i] = NULL;

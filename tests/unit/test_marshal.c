@@ -5,7 +5,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "marshal.h"
+#include "msg.h"
 #include "reader.h"
+#include "tns_consts.h"
 #include "writer.h"
 
 #include <assert.h>
@@ -50,11 +52,15 @@ int main(void)
     assert(seer_dec_sb4(&r) == -256);
   }
 
-  /* §12.3 key/value pair: encode_kv("AUTH_MACHINE", "ExampleHost"). */
+  /* §12.3 key/value pair: encode_kv("AUTH_MACHINE", "ExampleHost"), by
+   * SEER_AUTH_PAIR_SCHEMA (#398). */
   {
     SeerWriter w;
     assert(seer_writer_init(&w, 64));
-    seer_enc_kv(&w, "AUTH_MACHINE", 12, "ExampleHost", 11, 0, true);
+    SeerSchemaCtx cx = seer_msg_ctx(0, TTC_FIELD_VERSION_12_1, TTC_FIELD_VERSION_12_1);
+    SeerAuthPairMsg m = {.key = {.p = (const uint8_t *)"AUTH_MACHINE", .n = 12},
+                         .value = {.p = (const uint8_t *)"ExampleHost", .n = 11}};
+    seer_schema_encode(SEER_AUTH_PAIR_SCHEMA, &cx, &m, &w);
     const uint8_t expect[] = {
         0x01, 0x0C, 0x0C, 'A', 'U', 'T', 'H', '_', 'M', 'A', 'C', 'H', 'I', 'N', 'E',
         0x01, 0x0B, 0x0B, 'E', 'x', 'a', 'm', 'p', 'l', 'e', 'H', 'o', 's', 't', 0x00,
@@ -108,7 +114,11 @@ int main(void)
     memset(val, 'P', sizeof val);
     SeerWriter w;
     assert(seer_writer_init(&w, 16));
-    seer_enc_kv(&w, "K", 1, val, sizeof val, 0, wide);
+    SeerSchemaCtx cx = seer_msg_ctx(0, wide ? TTC_FIELD_VERSION_12_1 : TTC_FIELD_VERSION_11_2,
+                                    TTC_FIELD_VERSION_11_2);
+    SeerAuthPairMsg m = {.key = {.p = (const uint8_t *)"K", .n = 1},
+                         .value = {.p = val, .n = sizeof val}};
+    seer_schema_encode(SEER_AUTH_PAIR_SCHEMA, &cx, &m, &w);
     /* key: 01 01 | 01 'K' (4) ; value: 02 01 2C (3) | FE (1) | chunks | term |
      * padding 00 (1) */
     size_t lenb = wide ? 2 : 1; /* a chunk length: sb4 var-int 01 NN, or NN */
@@ -119,6 +129,28 @@ int main(void)
       assert(w.buf[8] == 0x01 && w.buf[9] == 0x40 && w.buf[10] == 'P');
     else
       assert(w.buf[8] == 0x40 && w.buf[9] == 'P');
+    seer_writer_free(&w);
+  }
+
+  /* The same pair at 8i's widths: ub4 little-endian lengths and flags, the
+   * key and value each a ub1 length and the bytes, and past 252 bytes OCI's
+   * 255-byte chunks, each with a ub1 length (seerdb _OciCodec.value). 300
+   * bytes = 255 + 45. */
+  {
+    static uint8_t val[300];
+    memset(val, 'P', sizeof val);
+    SeerWriter w;
+    assert(seer_writer_init(&w, 16));
+    SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+    SeerAuthPairMsg m = {.key = {.p = (const uint8_t *)"K", .n = 1},
+                         .value = {.p = val, .n = sizeof val}};
+    seer_schema_encode(SEER_AUTH_PAIR_SCHEMA, &cx, &m, &w);
+    /* key: 01 00 00 00 | 01 'K' (6); value: 2C 01 00 00 (4) | FE | FF + 255 |
+     * 2D + 45 | 00 ; flags 00 00 00 00 (4) */
+    assert(seer_writer_ok(&w));
+    assert(w.len == 6 + 4 + 1 + 256 + 46 + 1 + 4);
+    assert(w.buf[6] == 0x2C && w.buf[7] == 0x01 && w.buf[10] == 0xFE && w.buf[11] == 0xFF);
+    assert(w.buf[11 + 256] == 0x2D && w.buf[11 + 256 + 46] == 0x00);
     seer_writer_free(&w);
   }
 
