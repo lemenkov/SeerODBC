@@ -407,6 +407,26 @@ SeerStatus seer_transport_start_tls(SeerTransport *t, const char *sni_host, cons
   return SEER_OK;
 }
 
+SeerStatus seer_transport_restart_tls(SeerTransport *t, const char *sni_host, const char *ca_file,
+                                      int verify)
+{
+  if (t == NULL)
+    return SEER_EPARAM;
+  if (t->ssl != NULL) {
+    /* No SSL_shutdown: the listener has moved on from this session and wants
+     * a ClientHello next, not a close_notify. The socket BIO doesn't own the
+     * fd, so freeing it leaves the connection up. */
+    SSL_free(t->ssl);
+    t->ssl = NULL;
+  }
+  if (t->ctx != NULL) {
+    SSL_CTX_free(t->ctx);
+    t->ctx = NULL;
+  }
+  seer_log(SEER_LOG_DEBUG, "transport: renegotiating TLS on the same connection");
+  return seer_transport_start_tls(t, sni_host, ca_file, verify);
+}
+
 void seer_transport_close(SeerTransport *t)
 {
   if (t == NULL)

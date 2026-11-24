@@ -40,6 +40,10 @@ typedef enum {
   TNS_PT_CONTROL = 14,
 } TnsPacketType;
 
+/* Packet flags, header byte 5. On TCPS a RESEND with TLS_RENEG asks the client
+ * to run a new TLS handshake before it sends the CONNECT again (#405). */
+#define TNS_PACKET_FLAG_TLS_RENEG 0x08
+
 /* Frame `payload` as a TNS packet of `type` and write it. payload_len must
  * leave room for the 8-byte header within a 16-bit total length. */
 SeerStatus seer_packet_send(SeerTransport *t, uint8_t type, const void *payload,
@@ -50,5 +54,9 @@ SeerStatus seer_packet_send(SeerTransport *t, uint8_t type, const void *payload,
  * length *out_len. *out_body is NULL when the body is empty. Caller frees. */
 SeerStatus seer_packet_recv(SeerTransport *t, uint8_t *out_type, uint8_t **out_body,
                             size_t *out_len);
+
+/* As seer_packet_recv, with the header's packet flags (byte 5) in *out_flags. */
+SeerStatus seer_packet_recv_flags(SeerTransport *t, uint8_t *out_type, uint8_t *out_flags,
+                                  uint8_t **out_body, size_t *out_len);
 
 #endif /* SEER_TNS_PACKET_H */

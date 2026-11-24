@@ -371,9 +371,10 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
       goto fail;
 
     uint8_t type = 0;
+    uint8_t pflags = 0;
     uint8_t *rbody = NULL;
     size_t rlen = 0;
-    st = seer_packet_recv(conn->t, &type, &rbody, &rlen);
+    st = seer_packet_recv_flags(conn->t, &type, &pflags, &rbody, &rlen);
     if (st != SEER_OK)
       goto fail;
 
@@ -431,7 +432,21 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
         st = SEER_EPROTO;
         goto fail;
       }
-      seer_log(SEER_LOG_DEBUG, "TNS: RESEND (%d)", resends);
+      seer_log(SEER_LOG_DEBUG, "TNS: RESEND (%d)%s", resends,
+               (pflags & TNS_PACKET_FLAG_TLS_RENEG) ? ", TLS renegotiation" : "");
+      /* TCPS: the listener wants a new TLS handshake on this connection
+       * before the CONNECT comes again; resent over the old session, it
+       * fails (#405). */
+      if (params->use_tls && (pflags & TNS_PACKET_FLAG_TLS_RENEG)) {
+        st = seer_transport_restart_tls(conn->t, cur_host, params->tls_ca, params->tls_verify);
+        if (st != SEER_OK) {
+          char m[320];
+          snprintf(m, sizeof m, "TLS renegotiation with %s:%u failed", cur_host,
+                   (unsigned)cur_port);
+          set_conn_error(conn, m);
+          goto fail;
+        }
+      }
       continue;
     }
 

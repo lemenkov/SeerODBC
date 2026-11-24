@@ -239,8 +239,18 @@ for row in "${TIERS[@]}"; do
     elif (( release >= 10 )); then
         start_tls_proxy "$host" "$port"
     fi
-    SEER_TEST_SERVICE="$target" SEER_TLS_PROXY_PORT="$TLS_PORT" SEER_TLS_CA="$TLS_CA" \
-        SEER_WIRE_RECORD="$rec_odbc" "$BIN" >"$log" 2>/dev/null
+    # A real TCPS listener for the TLS check's second leg (#405), on one tier
+    # only (SEER_TCPS_TIER, default 23ai): it is the same listener whichever
+    # tier runs it. Left out of a recording, like the proxy leg.
+    # Blanked on every other tier, in case SEER_TCPS_HOST is exported.
+    tcps=("SEER_TCPS_HOST=")
+    if [[ -z "$RECORD_DIR" && -n "${SEER_TCPS_HOST:-}" && "$name" == "${SEER_TCPS_TIER:-23ai}" ]]; then
+        tcps=("SEER_TCPS_HOST=$SEER_TCPS_HOST" "SEER_TCPS_PORT=${SEER_TCPS_PORT:-}"
+              "SEER_TCPS_SERVICE=${SEER_TCPS_SERVICE:-}" "SEER_TCPS_CA=${SEER_TCPS_CA:-}"
+              "SEER_TCPS_USER=${SEER_TCPS_USER:-}" "SEER_TCPS_PASS=${SEER_TCPS_PASS:-}")
+    fi
+    env "${tcps[@]}" SEER_TEST_SERVICE="$target" SEER_TLS_PROXY_PORT="$TLS_PORT" \
+        SEER_TLS_CA="$TLS_CA" SEER_WIRE_RECORD="$rec_odbc" "$BIN" >"$log" 2>/dev/null
     [[ -n "$rec_odbc" ]] && record_tail "$rec_odbc" "$log"
     [[ -n "$TLS_PID" ]] && kill "$TLS_PID" 2>/dev/null && TLS_PID=""
     grep -vE '^(target|SUMMARY)' "$log" | sed 's/^/  /'
