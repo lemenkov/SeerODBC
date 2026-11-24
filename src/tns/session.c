@@ -339,13 +339,14 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
   int redirects = 0;
   int resends = 0;
   bool ano_gate = false; /* the accept advertised ANO; negotiate before PRO */
+  /* The connect / login time limit: 0 is the transport's default (30 s), and
+   * "no limit" is the largest bound. */
+  int limit_ms = params->connect_timeout_ms < 0 ? 0x7FFFFFFF : params->connect_timeout_ms;
 
   for (;;) {
     if (conn->t == NULL) {
       char why[320];
-      /* 0 is the transport's default; "no limit" as the largest bound. */
-      int to = params->connect_timeout_ms < 0 ? 0x7FFFFFFF : params->connect_timeout_ms;
-      st = seer_transport_connect_diag(cur_host, cur_port, to, &conn->t, why, sizeof why);
+      st = seer_transport_connect_diag(cur_host, cur_port, limit_ms, &conn->t, why, sizeof why);
       if (st != SEER_OK) {
         set_conn_error(conn, why[0] ? why : NULL);
         goto fail;
@@ -507,6 +508,17 @@ static SeerStatus connect_address(const SeerConnParams *params, SeerConn **out, 
 
 fail:
   seer_writer_free(&body);
+  /* A read or write that ran out of time: the login timeout expired, waiting
+   * for the server (#403). Said so, not as a bare I/O error, so the ODBC
+   * shim can report HYT00. */
+  if (st == SEER_EIO && conn->t != NULL && seer_transport_timed_out(conn->t)) {
+    char m[400];
+    int secs = (limit_ms > 0 ? limit_ms : SEER_TRANSPORT_DEFAULT_TIMEOUT_MS) / 1000;
+    snprintf(m, sizeof m, "login timed out after %d s waiting for %s:%u", secs, cur_host,
+             (unsigned)cur_port);
+    set_conn_error(conn, m);
+    st = SEER_ETIMEOUT;
+  }
   /* Hand back why, before the connection and its error go. */
   if (err != NULL && errlen > 0 && conn->last_error != NULL)
     snprintf(err, errlen, "%s", conn->last_error);
@@ -752,6 +764,8 @@ const char *seer_strerror(SeerStatus status)
     return "no more data";
   case SEER_EDB:
     return "database error";
+  case SEER_ETIMEOUT:
+    return "timed out";
   }
   return "unknown error";
 }

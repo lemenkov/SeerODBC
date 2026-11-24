@@ -43,6 +43,18 @@ static inline int seer_sock_errno(void)
   return WSAGetLastError();
 }
 
+/* A recv/send that SO_RCVTIMEO / SO_SNDTIMEO stopped: Winsock says so with
+ * WSAETIMEDOUT. */
+static inline int seer_sock_timed_out(int e)
+{
+  return e == WSAETIMEDOUT;
+}
+
+static inline void seer_sock_clear_errno(void)
+{
+  WSASetLastError(0);
+}
+
 #else /* POSIX */
 #include <errno.h>
 #include <fcntl.h>
@@ -69,6 +81,18 @@ typedef struct pollfd seer_pollfd;
 static inline int seer_sock_errno(void)
 {
   return errno;
+}
+
+/* A recv/send that SO_RCVTIMEO / SO_SNDTIMEO stopped: POSIX says so with
+ * EAGAIN (or EWOULDBLOCK, where that differs). */
+static inline int seer_sock_timed_out(int e)
+{
+  return e == EAGAIN || e == EWOULDBLOCK;
+}
+
+static inline void seer_sock_clear_errno(void)
+{
+  errno = 0;
 }
 #endif
 

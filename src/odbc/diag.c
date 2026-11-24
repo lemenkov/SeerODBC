@@ -32,6 +32,8 @@ const char *seer_odbc_sqlstate(SeerStatus st)
     return "02000"; /* no data                    */
   case SEER_ENOTIMPL:
     return "HYC00"; /* optional feature not impl. */
+  case SEER_ETIMEOUT:
+    return "HYT00"; /* timeout expired (login)    */
   }
   return "HY000";
 }

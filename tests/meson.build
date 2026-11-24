@@ -192,6 +192,14 @@ if host_machine.system() != 'windows'
     dependencies : [test_dep, seertns_dep],
   )
   test('exact-size final packet', test_fragment_wait, timeout : 60)
+
+  # The login timeout (#403): a listener that never answers fails the connect
+  # with SEER_ETIMEOUT once the limit runs out; a peer that closes is SEER_EIO.
+  test_login_timeout = executable('test_login_timeout',
+    'unit/test_login_timeout.c',
+    dependencies : [test_dep, seertns_dep, dependency('threads')],
+  )
+  test('login timeout', test_login_timeout, timeout : 60)
 endif
 
 # The core-API live suite: one set of checks for every tier, 8i to 26ai, with

@@ -33,6 +33,7 @@ typedef enum {
   SEER_EPARAM = -6,   /* bad argument from the caller */
   SEER_ENODATA = -7,  /* no more rows (end of fetch) */
   SEER_EDB = -8,      /* server returned an ORA-NNNNN error */
+  SEER_ETIMEOUT = -9, /* the connect / login time limit expired (#403) */
 } SeerStatus;
 
 /* Opaque handles - the core owns their layout. */
