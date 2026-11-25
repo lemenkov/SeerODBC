@@ -203,6 +203,7 @@ typedef struct {
   /* Data-at-execution sequence (SQLParamData/SQLPutData) between an execute
    * that returned SQL_NEED_DATA and the final SQLParamData that runs it. */
   int dae_active;     /* in a SQL_NEED_DATA sequence */
+  int bind_national;  /* 8i: national types bound in NCHAR form, the retry after ORA-12704 (#419) */
   int dae_current;    /* param index being filled, -1 before the first */
   int getdata_col;    /* last SQLGetData column, for fragment tracking */
   SQLLEN getdata_off; /* bytes already returned for getdata_col */

@@ -2219,6 +2219,17 @@ SeerStatus seer_stmt_bind_ntext(SeerStmt *stmt, int param, const char *str, int 
   if (stmt == NULL || str == NULL)
     return SEER_EPARAM;
   size_t n = (len < 0) ? strlen(str) : (size_t)len;
+  if (stmt->conn->is_8i) {
+    /* 8i has no AL16UTF16: the value goes as text does, in the session's
+     * national charset (WE8ISO8859P1, as the 8i DTY declares it), and only
+     * its form says national (o8i_bind_oac). Without that form, 8.1.7 won't
+     * mix it with an NCHAR value: ORA-12704 (#419). */
+    SeerStatus st = seer_stmt_bind_text(stmt, param, str, (int)n);
+    if (st == SEER_OK && param >= 1 && param <= stmt->npbinds &&
+        stmt->pbinds[param - 1].oac_type == ORA_TYPE_VARCHAR)
+      stmt->pbinds[param - 1].oac_charset = ORA_CHARSET_AL16UTF16; /* the national form */
+    return st;
+  }
   char *u16 = NULL;
   size_t u16len = 0;
   if (n > 0 && seer_iconv("UTF-8", "UTF-16BE", str, n, &u16, &u16len) != 0)
@@ -6284,10 +6295,6 @@ static bool o8i_bind_ok(const SeerBind *b, bool block, const char **why)
     *why = "array, object and LOB parameters";
     return false;
   }
-  if (b->oac_charset == 2000) {
-    *why = "national-character (NCHAR) parameters";
-    return false;
-  }
   switch (b->oac_type) {
   case 0: /* unbound: a NULL */
   case ORA_TYPE_VARCHAR:
@@ -6478,6 +6485,8 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
     type = ORA_TYPE_REFCURSOR, size = 1, charset = 0, csfrm = 0;
     break;
   default:
+    if (b->oac_charset == ORA_CHARSET_AL16UTF16)
+      csfrm = 2; /* national text (seer_stmt_bind_ntext), in the same charset */
     break;
   }
   if (size > 0xFFFF)

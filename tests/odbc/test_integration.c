@@ -6533,6 +6533,83 @@ static void check_national_params(SQLHDBC dbc)
     fail(name, m);
 }
 
+/* One SQL_WVARCHAR parameter (`n` sets of it, a parameter array when n > 1)
+ * in `sql`; the statement's diagnostic in err when it fails. */
+static SQLRETURN exec_wparam(SQLHDBC dbc, const char *sql, const char *v, int n, char *err,
+                             size_t esz)
+{
+  SQLHSTMT s;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &s);
+  char vals[3][16];
+  SQLLEN ind[3];
+  for (int k = 0; k < n && k < 3; k++) {
+    snprintf(vals[k], sizeof vals[k], "%s%d", v, k);
+    ind[k] = SQL_NTS;
+  }
+  if (n > 1)
+    SQLSetStmtAttr(s, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)n, 0);
+  SQLBindParameter(s, 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_WVARCHAR, 10, 0, vals, 16, ind);
+  SQLRETURN rc = SQLExecDirect(s, (SQLCHAR *)sql, SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, s, err, esz);
+  else if (rc == SQL_SUCCESS && strncmp(sql, "SELECT", 6) == 0 && SQL_SUCCEEDED(SQLFetch(s)))
+    SQLGetData(s, 1, SQL_C_CHAR, err, (SQLLEN)esz, NULL); /* a query: its cell */
+  SQLFreeHandle(SQL_HANDLE_STMT, s);
+  return rc;
+}
+
+/* SQL_WVARCHAR parameters reach a VARCHAR2 column, an NVARCHAR2 one, and an
+ * NCHAR comparison, alone and as a parameter array. 8.1.7 wants a text
+ * parameter's form to match its target (ORA-12704 either way): 8i sends CHAR
+ * form, and after ORA-12704 once more in NCHAR form (#419). Characters
+ * WE8ISO8859P1 has, the 8i bed's charsets. */
+static void check_wvarchar_targets(SQLHDBC dbc)
+{
+  const char *name = "SQL_WVARCHAR parameters reach VARCHAR2, NVARCHAR2 and NCHAR comparisons";
+  char m[400] = "", err[256] = "";
+  exec_do(dbc, "DROP TABLE seer_wtgt", err, sizeof err);
+  if (!SQL_SUCCEEDED(exec_do(dbc, "CREATE TABLE seer_wtgt (v VARCHAR2(10), n NVARCHAR2(10))", err,
+                             sizeof err))) {
+    fail(name, err);
+    return;
+  }
+  static const struct {
+    const char *sql;
+    int n;
+  } T[] = {{"INSERT INTO seer_wtgt (v) VALUES (?)", 1},
+           {"INSERT INTO seer_wtgt (n) VALUES (?)", 1},
+           {"INSERT INTO seer_wtgt (n) VALUES (?)", 3},
+           {"SELECT COUNT(*) FROM seer_wtgt WHERE n = ?", 1}};
+  for (size_t i = 0; i < sizeof T / sizeof T[0] && !m[0]; i++) {
+    err[0] = '\0';
+    SQLRETURN rc = exec_wparam(dbc, T[i].sql, "\xc3\xa9", T[i].n, err, sizeof err);
+    if (rc != SQL_SUCCESS)
+      snprintf(m, sizeof m, "%s (%d set(s)): rc=%d %s", T[i].sql, T[i].n, (int)rc, err);
+    else if (T[i].sql[0] == 'S' && strcmp(err, "2") != 0)
+      snprintf(m, sizeof m, "%s: '%s' (want 2: the single row and the array's first)", T[i].sql,
+               err);
+  }
+  char out[64] = "";
+  if (!m[0] &&
+      SQL_SUCCEEDED(exec_scalar(dbc,
+                                "SELECT COUNT(v) || ':' || COUNT(n) || ':' || MIN(v) || "
+                                "':' || TO_CHAR(MAX(n)) FROM seer_wtgt",
+                                out, sizeof out, err, sizeof err)) &&
+      strcmp(out, "1:4:\xc3\xa9"
+                  "0:\xc3\xa9"
+                  "2") != 0)
+    snprintf(m, sizeof m,
+             "read back '%s' (want '1:4:\xc3\xa9"
+             "0:\xc3\xa9"
+             "2')",
+             out);
+  exec_do(dbc, "DROP TABLE seer_wtgt", err, sizeof err);
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* A block cursor whose rows 1 and 3 overflow the bound buffer (#369): those
  * rows are SQL_ROW_SUCCESS_WITH_INFO and row 2 SQL_ROW_SUCCESS; there are two
  * 01004 records, with SQL_DIAG_ROW_NUMBER 1 and 3. Each record used to replace
@@ -8542,6 +8619,7 @@ int main(void)
   check_describe_no_markers(dbc);
   check_diag_text_trimmed(dbc);
   check_national_params(dbc);
+  check_wvarchar_targets(dbc);
   check_rowset_truncation(dbc);
   check_setpos_rowset_errors(dbc);
   check_attr_identifiers(dbc);
