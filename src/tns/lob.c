@@ -256,8 +256,9 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
   *loclen = 0;
   if (conn == NULL)
     return SEER_EPARAM;
-  if (conn->field_version < TTC_FIELD_VERSION_12_1)
-    return SEER_ENOTIMPL; /* 11g drops the connection on a CREATE_TEMP */
+  if (conn->field_version < TTC_FIELD_VERSION_10_2)
+    return SEER_ENOTIMPL; /* 9i makes its own (fv2_create_temp) */
+  bool pre12 = conn->field_version < TTC_FIELD_VERSION_12_1;
 
   /* CREATE_TEMP carries no locator; its body is a fixed field block with the
    * LOB kind and charset spliced in (PROTOCOL.md §14.2): the shared head, the
@@ -268,6 +269,12 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
    * the charset form (CLOB 1, BLOB none) in the source offset, the LOB type
    * in the destination offset, the charset after the locator. */
   static const uint8_t EMPTY[40] = {0};
+  /* 10g/11g (#415): the fields OCI 11.2's CREATE_TEMP carries, which 11g
+   * answers with a temporary locator (seerdb PROTOCOL.md §14.4): an empty
+   * 86-byte locator (`00 54` and zeros), the SCN pointer with one slot, the
+   * amount pointer, no null-LOB pointer; after the charset (0 for a BLOB),
+   * an SCN of 0 and the duration again as the amount. */
+  static const uint8_t EMPTY86[86] = {0x00, 0x54};
   SeerWriter req;
   if (!seer_writer_init(&req, 128))
     return SEER_ENOMEM;
@@ -285,6 +292,20 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
       .locator = {.p = EMPTY, .n = sizeof EMPTY},
       .charset = 873, /* AL32UTF8, for BLOB too */
   };
+  if (pre12) {
+    m.src_len = sizeof EMPTY86;
+    m.loc_len = sizeof EMPTY86;
+    m.locator = (SeerBytes){.p = EMPTY86, .n = sizeof EMPTY86};
+    m.null_lob_ptr = 0;
+    m.scn_ptr = 1;
+    m.scn_len = 1;
+    m.amount_ptr = 1;
+    m.charset = blob ? 0 : 873;
+    m.has_scn_value = 1;
+    m.scn_value = 0;
+    m.has_amount = 1;
+    m.amount = 10;
+  }
   SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
   seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, &m, &req);
   if (!seer_writer_ok(&req)) {
@@ -325,7 +346,8 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
 }
 
 SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
-                          const uint8_t *data, size_t n, uint8_t **resp, size_t *rlen)
+                          const uint8_t *data, size_t n, uint32_t amount, uint8_t **resp,
+                          size_t *rlen)
 {
   *resp = NULL;
   *rlen = 0;
@@ -337,12 +359,19 @@ SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
    * SEER_LOB_DATA_SCHEMA's content, chunked past 252 bytes in sb4-length
    * chunks of up to 0x7FFF (PROTOCOL.md §14.2; #398). */
   SeerWriter req;
-  SeerStatus st = build_lobop(conn, locator, loclen, LOB_OP_WRITE, true, 1, false, 0, &req);
+  /* 10g/11g carry the amount (#415), as OCI 11.2's WRITE does; 12c sends none. */
+  bool pre12 = conn->field_version < TTC_FIELD_VERSION_12_1;
+  SeerStatus st =
+      build_lobop(conn, locator, loclen, LOB_OP_WRITE, true, 1, pre12, pre12 ? amount : 0, &req);
   if (st != SEER_OK)
     return st;
   seer_writer_u8(&req, TTI_LOB);
   SeerLobDataMsg lm = {.data = {.p = data, .n = n}};
-  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  /* 10g/11g read a WRITE's data in ub1-length chunks, as their READ replies
+   * carry it; sb4 ones read short (ORA-22993, #415). The LOB data schema's
+   * 10g+ chunks are a bind value's, so take the 9i codec's widths here. */
+  SeerSchemaCtx cx = pre12 ? seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2)
+                           : seer_msg_ctx(0, conn->field_version, conn->server_field_version);
   seer_schema_encode(SEER_LOB_DATA_SCHEMA, &cx, &lm, &req);
   if (!seer_writer_ok(&req)) {
     seer_writer_free(&req);

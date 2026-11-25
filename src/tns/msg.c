@@ -1232,6 +1232,7 @@ const SeerField SEER_LOBOPS_SCHEMA[] = {
      .off = offsetof(SeerLobopMsg, locator),
      .arg = offsetof(SeerLobopMsg, loc_len)},
     IF_SET(SF_N4, SeerLobopMsg, charset, charset_ptr),
+    IF_SET(SF_N4, SeerLobopMsg, scn_value, has_scn_value),
     IF_SET(SF_N4, SeerLobopMsg, amount, has_amount),
     SEER_END,
 };

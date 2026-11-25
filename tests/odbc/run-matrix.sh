@@ -26,8 +26,8 @@
 #                    <tier>-odbc.wire and <tier>-core.wire, each with the
 #                    environment it ran with and its check lines in its header.
 #                    Needs a build configured with -Dwire_corpus=true; the run
-#                    is in TZ=UTC and leaves out the TLS-proxy leg, whose port
-#                    and certificate change from run to run.
+#                    is in TZ=UTC and leaves out the TLS legs, whose port and
+#                    certificate change from run to run, and the DBA login.
 #   SEER_TEST_DBA_USER/_PASS  a DBA login for every tier: the ODBC check of a
 #                         killed session (#340) uses it to kill its own
 #                         session, and proxy authentication to create its two
@@ -207,6 +207,9 @@ for row in "${TIERS[@]}"; do
     pass=$(override "$name" PASS "$DEF_PASS")
     dba_user=$(override "$name" DBA_USER "$DEF_DBA_USER")
     dba_pass=$(override "$name" DBA_PASS "$DEF_DBA_PASS")
+    # A recording leaves the DBA login out, as it does the TLS legs: its header
+    # would carry the password into the public corpus (#425).
+    [[ -n "${SEER_MATRIX_RECORD_DIR:-}" ]] && dba_user="" && dba_pass=""
 
     echo "============================================================"
     echo " $name  ($host:$port/$target as $user)"
@@ -232,10 +235,8 @@ for row in "${TIERS[@]}"; do
     rec_odbc=""; rec_core=""
     if [[ -n "$RECORD_DIR" ]]; then
         rec_odbc="$RECORD_DIR/$name-odbc.wire"; rec_core="$RECORD_DIR/$name-core.wire"
-        dba=()
-        [[ -n "$dba_user" ]] && dba=("SEER_TEST_DBA_USER=$dba_user" "SEER_TEST_DBA_PASS=$dba_pass")
         common=("SEER_TEST_HOST=$host" "SEER_TEST_PORT=$port" "SEER_TEST_USER=$user"
-                "SEER_TEST_PASS=$pass" "SEER_TEST_RELEASE=$release" "${dba[@]}")
+                "SEER_TEST_PASS=$pass" "SEER_TEST_RELEASE=$release")
         record_head "$rec_odbc" test_integration "${common[@]}" "SEER_TEST_SERVICE=$target"
         if [[ "$address" == "sid" ]]; then
             record_head "$rec_core" test_core "${common[@]}" "SEER_TEST_SID=$target"
