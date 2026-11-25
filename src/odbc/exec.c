@@ -359,13 +359,14 @@ static SQLSMALLINT param_c_type(const OdbcParam *p)
   return p->c_type == SQL_C_DEFAULT ? seer_odbc_default_c_type(p->sql_type) : p->c_type;
 }
 
-/* The server has no TIMESTAMP type: Oracle 8i (#318). */
+/* The server has no TIMESTAMP type: Oracle 8i (#318). 8i binds national
+ * types in CHAR form, but in NCHAR form when the server refused that (#419). */
 static unsigned bind_flags(const OdbcStmt *s)
 {
   if (s->dbc == NULL)
     return 0;
   if (seer_odbc_server_major(s->dbc) == 8)
-    return BIND_DATE_ONLY; /* 8i: no TIMESTAMP; no national-charset binds */
+    return BIND_DATE_ONLY | (s->bind_national ? BIND_NATIONAL : 0);
   return s->dbc->conn != NULL && !seer_db_charset_unicode(s->dbc->conn) ? BIND_NATIONAL : 0;
 }
 
@@ -667,6 +668,41 @@ static SQLRETURN exec_core(OdbcStmt *s, const char *sql)
   return exec_finish(s);
 }
 
+/* Whether an execute on 8i failed only because a text parameter's form
+ * didn't match its target (ORA-12704, character set mismatch) and a national
+ * type (SQL_WCHAR / SQL_WVARCHAR / SQL_WLONGVARCHAR) is among the parameters:
+ * 8.1.7 won't mix CHAR and NCHAR, either way (#419). The error is the parse's,
+ * so nothing ran - for an array, which 8i runs a row at a time, every row
+ * failed with it. */
+static bool nchar_mismatch(OdbcStmt *s, SeerStatus st)
+{
+  if (s->bind_national || seer_odbc_server_major(s->dbc) != 8)
+    return false;
+  bool national = false;
+  for (int i = 0; i < s->num_params; i++) {
+    SQLSMALLINT t = s->params[i].sql_type;
+    national |=
+        s->params[i].bound && (t == SQL_WCHAR || t == SQL_WVARCHAR || t == SQL_WLONGVARCHAR);
+  }
+  if (!national)
+    return false;
+  if (st == SEER_EDB) {
+    const char *e = seer_last_error(s->dbc->conn);
+    return e != NULL && strncmp(e, "ORA-12704", 9) == 0;
+  }
+  size_t nbe = st == SEER_OK ? seer_stmt_batch_error_count(s->core) : 0;
+  if (nbe == 0 || nbe != s->n_param_rows)
+    return false;
+  for (size_t i = 0; i < nbe; i++) {
+    unsigned row = 0, code = 0;
+    const char *msg = NULL;
+    seer_stmt_batch_error(s->core, i, &row, &code, &msg);
+    if (code != 12704)
+      return false;
+  }
+  return true;
+}
+
 static SQLRETURN exec_finish(OdbcStmt *s)
 {
   SQLRETURN pr = apply_params(s);
@@ -684,6 +720,17 @@ static SQLRETURN exec_finish(OdbcStmt *s)
   seer_odbc_arm_timeout(s);
   seer_stmt_set_max_rows(s->core, (size_t)s->max_rows);
   SeerStatus st = seer_stmt_execute(s->core);
+  if (nchar_mismatch(s, st)) { /* once more, the national types in NCHAR form */
+    s->bind_national = 1;
+    pr = apply_params(s);
+    if (pr == SQL_SUCCESS) {
+      seer_odbc_arm_timeout(s);
+      st = seer_stmt_execute(s->core);
+    }
+    s->bind_national = 0;
+    if (pr != SQL_SUCCESS)
+      return pr;
+  }
   if (st != SEER_OK)
     return seer_odbc_exec_error(s, st);
   /* Created, but compiled with errors: success with a warning, as Oracle's own

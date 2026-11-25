@@ -1023,6 +1023,73 @@ static void check_array_returning(void)
   }
 }
 
+/* One national-text bind (seer_stmt_bind_ntext) in `sql`; the first cell as
+ * text, or "status N: error". */
+static void ntext_scalar(const char *sql, const char *v, char *out, size_t osz)
+{
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, sql, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_ntext(s, 1, v, -1);
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  const char *cell = NULL;
+  int is_null = 0;
+  if (st == SEER_OK && seer_stmt_fetch(s) == SEER_OK)
+    seer_stmt_get_string(s, 0, &cell, &is_null);
+  if (st == SEER_OK)
+    snprintf(out, osz, "%s", cell ? cell : (is_null ? "NULL" : ""));
+  else
+    snprintf(out, osz, "status %d: %s", (int)st, seer_last_error(C) ? seer_last_error(C) : "");
+  seer_stmt_close(s);
+}
+
+/* National text binds meet NCHAR values: 8.1.7 won't mix a plain text bind
+ * with one (ORA-12704), so a national bind goes with the national form there
+ * too (#419). One INSERT binds a VARCHAR2 column as text and an NVARCHAR2 one
+ * as national text: 8.1.7 wants each form to match its target, both ways.
+ * Only characters WE8ISO8859P1 has, the 8i bed's national charset. */
+static void check_national_bind(void)
+{
+  const char *name = "national text bind meets NCHAR values and fills an NVARCHAR2";
+  char m[400] = "", got[96];
+  ntext_scalar("SELECT COUNT(*) FROM dual WHERE N'ab\xc3\xa9' = :1", "ab\xc3\xa9", got, sizeof got);
+  if (strcmp(got, "1") != 0)
+    snprintf(m, sizeof m, "N'...' = :1: '%s' (want 1)", got);
+  if (m[0] == '\0') {
+    ntext_scalar("SELECT N'ab' || :1 FROM dual", "c\xc3\xa9", got, sizeof got);
+    if (strcmp(got, "abc\xc3\xa9") != 0)
+      snprintf(m, sizeof m, "N'ab' || :1: '%s' (want 'abc\xc3\xa9')", got);
+  }
+  if (m[0] == '\0') {
+    run("DROP TABLE seer9n");
+    run("CREATE TABLE seer9n (v VARCHAR2(10), n NVARCHAR2(10))");
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(C, "INSERT INTO seer9n VALUES (:1, :2)", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_text(s, 1, "v\xc3\xa9", -1);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_ntext(s, 2, "n\xc3\xa9", -1);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    if (st != SEER_OK)
+      snprintf(m, sizeof m, "INSERT: status %d: %s", (int)st,
+               seer_last_error(C) ? seer_last_error(C) : "");
+    seer_stmt_close(s);
+    seer_commit(C);
+    if (m[0] == '\0') {
+      scalar("SELECT v || '/' || TO_CHAR(n) FROM seer9n", got, sizeof got);
+      if (strcmp(got, "v\xc3\xa9/n\xc3\xa9") != 0)
+        snprintf(m, sizeof m, "read back '%s' (want 'v\xc3\xa9/n\xc3\xa9')", got);
+    }
+    run("DROP TABLE seer9n");
+  }
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* A query with an array of parameter sets is refused on every tier
  * (SEER_ENOTIMPL, with the reason as the last error) rather than answering
  * one set's rows (#430); the connection goes on. */
@@ -2759,6 +2826,7 @@ int main(void)
   check_array_returning();
   check_array_long_batch_errors();
   check_array_query_refused();
+  check_national_bind();
   check_long_text_bind();
   check_long_raw_bind();
   check_cursor_hygiene();
