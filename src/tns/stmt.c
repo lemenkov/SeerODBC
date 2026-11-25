@@ -6491,10 +6491,7 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
  * one: SEER_ENOTIMPL, the reason logged. */
 static SeerStatus o8i_check_binds(SeerStmt *stmt, bool query, bool block)
 {
-  if (query && stmt->npbinds > 0 && stmt->n_iters > 1) {
-    seer_log(SEER_LOG_WARNING, "stmt: Oracle 8i: an array execute of a query is not supported");
-    return SEER_ENOTIMPL;
-  }
+  (void)query; /* an array query is refused on every tier (execute_now) */
   for (int i = 0; i < stmt->npbinds; i++) {
     const char *why = NULL;
     if (!o8i_bind_ok(&stmt->pbinds[i], block, &why)) {
@@ -8971,6 +8968,16 @@ static SeerStatus execute_now(SeerStmt *stmt)
   free(stmt->conn->last_error);
   stmt->conn->last_error = NULL;
   stmt->conn->last_error_offset = 0;
+  /* A query with an array of parameter sets is refused on every tier, as
+   * SQL_PARAM_ARRAY_SELECTS (SQL_PAS_NO_SELECT) says: 10g+ sent the first
+   * set and 9i the last, and either returned that set's rows alone (#430). */
+  if (stmt->n_iters > 1 && stmt->npbinds > 0 && classify_sql(stmt->sql) == STMT_SELECT) {
+    stmt->conn->last_error =
+        strdup("a query can't run with an array of parameter sets: run it once "
+               "per set");
+    seer_log(SEER_LOG_WARNING, "stmt: an array execute of a query is not supported");
+    return SEER_ENOTIMPL;
+  }
   if (stmt->conn->is_8i) {
     /* Oracle 8i: its own 9.2-era OALL8 dialect (seerdb §19.9-19.12):
      * queries, DML, DDL and transaction control. PL/SQL blocks are not

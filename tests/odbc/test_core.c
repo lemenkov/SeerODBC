@@ -1023,6 +1023,38 @@ static void check_array_returning(void)
   }
 }
 
+/* A query with an array of parameter sets is refused on every tier
+ * (SEER_ENOTIMPL, with the reason as the last error) rather than answering
+ * one set's rows (#430); the connection goes on. */
+static void check_array_query_refused(void)
+{
+  const char *name = "array execute of a query: refused, the connection usable";
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, "SELECT :1 * 10 FROM dual", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_set_array_size(s, 3);
+  for (int row = 0; row < 3 && st == SEER_OK; row++) {
+    st = seer_stmt_bind_row(s, row);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 1, row + 1);
+  }
+  SeerStatus ex = st == SEER_OK ? seer_stmt_execute(s) : st;
+  char why[160] = "";
+  snprintf(why, sizeof why, "%s", seer_last_error(C) ? seer_last_error(C) : "");
+  seer_stmt_close(s);
+  char out[16] = "";
+  scalar("SELECT 7 * 6 FROM dual", out, sizeof out);
+  if (ex == SEER_ENOTIMPL && strstr(why, "array of parameter sets") != NULL &&
+      strcmp(out, "42") == 0)
+    pass(name);
+  else {
+    char m[260];
+    snprintf(m, sizeof m, "status %d '%s', then '%s' (want %d, then 42)", (int)ex, why, out,
+             (int)SEER_ENOTIMPL);
+    fail(name, m);
+  }
+}
+
 /* Batch errors on an array that 9i runs a row at a time (text past 4000
  * bytes goes in a PL/SQL block, #418): the failing row is recorded at its
  * offset with its error and the other rows go in. */
@@ -2726,6 +2758,7 @@ int main(void)
   check_returning();
   check_array_returning();
   check_array_long_batch_errors();
+  check_array_query_refused();
   check_long_text_bind();
   check_long_raw_bind();
   check_cursor_hygiene();
