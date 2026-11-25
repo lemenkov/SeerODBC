@@ -356,8 +356,8 @@ SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
 
   /* The READ field block with the WRITE op, the temp locator ub2-prefixed, no
    * amount, then the data as a LOB data message: TTI_LOB and
-   * SEER_LOB_DATA_SCHEMA's content, chunked past 252 bytes in sb4-length
-   * chunks of up to 0x7FFF (PROTOCOL.md §14.2; #398). */
+   * SEER_LOB_DATA_SCHEMA's content, chunked past 252 bytes (PROTOCOL.md
+   * §14.2; #398). */
   SeerWriter req;
   /* 10g/11g carry the amount (#415), as OCI 11.2's WRITE does; 12c sends none. */
   bool pre12 = conn->field_version < TTC_FIELD_VERSION_12_1;
@@ -367,11 +367,9 @@ SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
     return st;
   seer_writer_u8(&req, TTI_LOB);
   SeerLobDataMsg lm = {.data = {.p = data, .n = n}};
-  /* 10g/11g read a WRITE's data in ub1-length chunks, as their READ replies
-   * carry it; sb4 ones read short (ORA-22993, #415). The LOB data schema's
-   * 10g+ chunks are a bind value's, so take the 9i codec's widths here. */
-  SeerSchemaCtx cx = pre12 ? seer_msg_ctx(0, TTC_FIELD_VERSION_9_2, TTC_FIELD_VERSION_9_2)
-                           : seer_msg_ctx(0, conn->field_version, conn->server_field_version);
+  /* The data's chunks as READ replies carry them: ub1 lengths before 12.1,
+   * sb4 from it (SF_LOB, #427). */
+  SeerSchemaCtx cx = seer_msg_ctx(0, conn->field_version, conn->server_field_version);
   seer_schema_encode(SEER_LOB_DATA_SCHEMA, &cx, &lm, &req);
   if (!seer_writer_ok(&req)) {
     seer_writer_free(&req);
