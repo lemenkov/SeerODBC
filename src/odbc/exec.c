@@ -70,6 +70,7 @@ static size_t ctype_stride(SQLSMALLINT c_type, SQLLEN buflen)
 /* bind_one_value's flags. */
 #define BIND_DATE_ONLY 0x01 /* no TIMESTAMP on the server (8i, #318) */
 #define BIND_NATIONAL 0x02  /* national types in the national charset (#367) */
+#define BIND_LOB 0x04       /* long types for a LOB target (8i, #424) */
 
 /* Whether SQL type `t` is a number: character data bound as one is an ODBC
  * numeric literal, '.' the decimal point (#354). */
@@ -127,6 +128,10 @@ static SeerStatus bind_char_value(SeerStmt *core, int param, SQLSMALLINT sql_typ
    * lacks (#367). On a Unicode database the plain bind loses nothing, and an
    * NVARCHAR2 bind would make the server convert VARCHAR2 columns it meets
    * (no index). */
+  /* A long type for a LOB target: 8.1.7 converts no text to a LOB parameter,
+   * so there it goes as a temporary LOB (#424). */
+  if ((flags & BIND_LOB) && (sql_type == SQL_LONGVARCHAR || sql_type == SQL_WLONGVARCHAR))
+    return seer_stmt_bind_clob(core, param, txt, len);
   if ((flags & BIND_NATIONAL) &&
       (sql_type == SQL_WVARCHAR || sql_type == SQL_WCHAR || sql_type == SQL_WLONGVARCHAR))
     return seer_stmt_bind_ntext(core, param, txt, len);
@@ -198,6 +203,8 @@ static SeerStatus bind_one_value(SeerStmt *core, int param, SQLSMALLINT c_type,
       return seer_stmt_bind_bool(core, param, *(const unsigned char *)valptr != 0);
     return seer_stmt_bind_int64(core, param, *(const unsigned char *)valptr != 0);
   case SQL_C_BINARY:
+    if ((flags & BIND_LOB) && sql_type == SQL_LONGVARBINARY) /* 8i: a LOB target (#424) */
+      return seer_stmt_bind_blob(core, param, valptr, (ind >= 0) ? (int)ind : 0);
     return seer_stmt_bind_raw(core, param, valptr, (ind >= 0) ? (int)ind : 0);
   case SQL_C_TYPE_TIMESTAMP:
   case SQL_C_TIMESTAMP: {
@@ -366,7 +373,8 @@ static unsigned bind_flags(const OdbcStmt *s)
   if (s->dbc == NULL)
     return 0;
   if (seer_odbc_server_major(s->dbc) == 8)
-    return BIND_DATE_ONLY | (s->bind_national ? BIND_NATIONAL : 0);
+    return BIND_DATE_ONLY | (s->bind_national ? BIND_NATIONAL : 0) |
+           (s->bind_as_lob ? BIND_LOB : 0);
   return s->dbc->conn != NULL && !seer_db_charset_unicode(s->dbc->conn) ? BIND_NATIONAL : 0;
 }
 
@@ -703,6 +711,27 @@ static bool nchar_mismatch(OdbcStmt *s, SeerStatus st)
   return true;
 }
 
+/* Whether a PL/SQL block on 8i failed only because a long type went to a
+ * LOB parameter as text / RAW (PLS-00306, wrong types of arguments), which
+ * 8.1.7 doesn't convert, and a SQL_LONGVARCHAR / SQL_WLONGVARCHAR /
+ * SQL_LONGVARBINARY parameter is bound: they go once more as LOBs (#424).
+ * The error is the block's compile, so nothing ran. */
+static bool lob_mismatch(OdbcStmt *s, SeerStatus st)
+{
+  if (s->bind_as_lob || st != SEER_EDB || seer_odbc_server_major(s->dbc) != 8)
+    return false;
+  const char *e = seer_last_error(s->dbc->conn);
+  if (e == NULL || strstr(e, "PLS-00306") == NULL)
+    return false;
+  for (int i = 0; i < s->num_params; i++) {
+    SQLSMALLINT t = s->params[i].sql_type;
+    if (s->params[i].bound && s->params[i].io_type == SQL_PARAM_INPUT &&
+        (t == SQL_LONGVARCHAR || t == SQL_WLONGVARCHAR || t == SQL_LONGVARBINARY))
+      return true;
+  }
+  return false;
+}
+
 static SQLRETURN exec_finish(OdbcStmt *s)
 {
   SQLRETURN pr = apply_params(s);
@@ -720,17 +749,25 @@ static SQLRETURN exec_finish(OdbcStmt *s)
   seer_odbc_arm_timeout(s);
   seer_stmt_set_max_rows(s->core, (size_t)s->max_rows);
   SeerStatus st = seer_stmt_execute(s->core);
-  if (nchar_mismatch(s, st)) { /* once more, the national types in NCHAR form */
-    s->bind_national = 1;
+  /* 8i: once more after a mismatch 8.1.7 doesn't convert - the national
+   * types in NCHAR form (#419), the long types as LOBs (#424) - each once. */
+  for (;;) {
+    if (nchar_mismatch(s, st))
+      s->bind_national = 1;
+    else if (lob_mismatch(s, st))
+      s->bind_as_lob = 1;
+    else
+      break;
     pr = apply_params(s);
-    if (pr == SQL_SUCCESS) {
-      seer_odbc_arm_timeout(s);
-      st = seer_stmt_execute(s->core);
-    }
-    s->bind_national = 0;
     if (pr != SQL_SUCCESS)
-      return pr;
+      break;
+    seer_odbc_arm_timeout(s);
+    st = seer_stmt_execute(s->core);
   }
+  s->bind_national = 0;
+  s->bind_as_lob = 0;
+  if (pr != SQL_SUCCESS)
+    return pr;
   if (st != SEER_OK)
     return seer_odbc_exec_error(s, st);
   /* Created, but compiled with errors: success with a warning, as Oracle's own
