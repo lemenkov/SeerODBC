@@ -53,10 +53,10 @@ static const Gate GATES[] = {
     {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 8, GATE_SERVER,
      "8.1.7 has no UNISTR, and its national charset is WE8ISO8859P1"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
-    {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 11, GATE_SERVER,
-     "no temporary LOB carries a PL/SQL bind over 32 KB before 12c"},
-    {"temporary LOBs of large PL/SQL binds are freed", 8, 11, GATE_SERVER,
-     "a large PL/SQL bind isn't promoted to a temporary LOB before 12c"},
+    {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 8, GATE_TODO,
+     "8i: the value goes as a LONG, which a PL/SQL CLOB parameter refuses (#424)"},
+    {"temporary LOBs of large PL/SQL binds are freed", 8, 8, GATE_TODO,
+     "8i: a large PL/SQL bind has no temporary LOB yet (#424)"},
     {"VECTOR column dimensions / format (SQLColAttribute)", 8, 21, GATE_SERVER,
      "no VECTOR type before 23ai"},
     {"large CLOB OUT parameter", 8, 8, GATE_SERVER,
@@ -1621,8 +1621,8 @@ static void check_max_identifier_len(SQLHDBC dbc)
 
 /* A value over 32767 bytes bound to a PL/SQL CLOB / BLOB parameter: a LONG
  * (the form a large text bind takes) can't reach a PL/SQL LOB parameter that
- * big (ORA-01460); it has to go as a temporary LOB. 11g has no CREATE_TEMP,
- * so there the ORA-01460 stands and the check is skipped. */
+ * big (ORA-01460); it has to go as a temporary LOB: 12c's CREATE_TEMP, OCI
+ * 11.2's on 10g/11g (#415), 9i's own. 8i has none yet (#424). */
 static void check_plsql_large_lob_param(SQLHDBC dbc)
 {
   const char *name = "PL/SQL CLOB / BLOB parameter over 32 KB";

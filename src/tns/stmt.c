@@ -2041,11 +2041,11 @@ static void emit_lob_oac(SeerWriter *w, int fv, uint8_t lob_type);
 /* Whether a text / raw value of `n` bytes goes in as a temporary LOB: past the
  * PL/SQL VARCHAR2 / RAW limit a block's CLOB / BLOB parameter rejects it
  * (ORA-01460), whereas a plain DML statement takes it as a streamed LONG. Not
- * for an array execute (one temp LOB per row is not implemented), and 12.1+
- * only - 11g has no CREATE_TEMP. */
+ * for an array execute (one temp LOB per row is not implemented). 10g+: 9i
+ * has its own (fv2_temp_lobs_begin), 10g/11g OCI 11.2's CREATE_TEMP (#415). */
 static bool wants_temp_lob(const SeerStmt *s, size_t n)
 {
-  return n > PLSQL_MAX_STR && s->n_iters <= 1 && s->conn->field_version >= TTC_FIELD_VERSION_12_1 &&
+  return n > PLSQL_MAX_STR && s->n_iters <= 1 && s->conn->field_version >= TTC_FIELD_VERSION_10_2 &&
          sql_is_block(s->sql);
 }
 
@@ -2123,7 +2123,8 @@ static SeerStatus bind_temp_lob(SeerStmt *stmt, int param, bool blob, const uint
   if (st == SEER_OK) {
     uint8_t *resp = NULL;
     size_t rlen = 0;
-    st = seer_lob_write(c, loc, loclen, data, n, &resp, &rlen);
+    /* the amount in the LOB's units: UTF-16 code units for a CLOB */
+    st = seer_lob_write(c, loc, loclen, data, n, (uint32_t)(blob ? n : n / 2), &resp, &rlen);
     if (st == SEER_OK)
       st = lobops_status(c, resp, rlen);
     free(resp);

@@ -190,6 +190,9 @@ typedef struct {
   int64_t loc_prefixed, loc_len;        /* thin: a ub2-prefixed locator */
   SeerBytes locator;
   int64_t charset, has_amount, amount;
+  /* 10g/11g's CREATE_TEMP: an SCN value of 0 between the charset and the
+   * amount (seerdb _OCI11_LOBOPS_CREATE_TEMP, #415) */
+  int64_t has_scn_value, scn_value;
   /* 9i's CREATE_TEMP: the short offsets each with its length byte, `01 00`
    * for a 0 (ojdbc14) */
   int64_t explicit_short;

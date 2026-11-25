@@ -40,6 +40,7 @@ SeerStatus seer_lob_create_temp(SeerConn *conn, bool blob, uint8_t **locator, si
  * SEER_OK *resp is the server's raw reply - an RPA and the call's OER - for the
  * caller to check (caller frees). */
 SeerStatus seer_lob_write(SeerConn *conn, const uint8_t *locator, size_t loclen,
-                          const uint8_t *data, size_t n, uint8_t **resp, size_t *rlen);
+                          const uint8_t *data, size_t n, uint32_t amount, uint8_t **resp,
+                          size_t *rlen);
 
 #endif /* SEER_TNS_LOB_H */
