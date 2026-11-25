@@ -174,6 +174,34 @@ int main(void)
     assert(seer_reader_ok(&r) && seer_reader_remaining(&r) == 1 && r.buf[r.pos] == 0x99);
   }
 
+  /* A LOB WRITE's data (SEER_LOB_DATA_SCHEMA, SF_LOB) is chunked as READ
+   * replies carry it (#427): 300 bytes go as a 252-byte and a 48-byte chunk
+   * with ub1 lengths at 11.2 (10g and 11g read sb4 ones short, ORA-22993),
+   * and as one chunk with an sb4 length from 12.1. */
+  {
+    static uint8_t data[300];
+    memset(data, 'L', sizeof data);
+    SeerLobDataMsg m = {.data = {.p = data, .n = sizeof data}};
+    for (int wide = 0; wide < 2; wide++) {
+      uint8_t fv = wide ? TTC_FIELD_VERSION_12_1 : TTC_FIELD_VERSION_11_2;
+      SeerSchemaCtx cx = seer_msg_ctx(0, fv, fv);
+      SeerWriter w;
+      assert(seer_writer_init(&w, 400));
+      seer_schema_encode(SEER_LOB_DATA_SCHEMA, &cx, &m, &w);
+      assert(seer_writer_ok(&w));
+      assert(w.buf[0] == 0xFE);
+      if (wide) { /* FE, sb4 300 (02 01 2C), the bytes, 00 */
+        assert(w.len == 1 + 3 + 300 + 1);
+        assert(w.buf[1] == 0x02 && w.buf[2] == 0x01 && w.buf[3] == 0x2C);
+      } else { /* FE, FC, 252 bytes, 30, 48 bytes, 00 */
+        assert(w.len == 1 + 1 + 252 + 1 + 48 + 1);
+        assert(w.buf[1] == 0xFC && w.buf[2 + 252] == 0x30);
+      }
+      assert(w.buf[w.len - 1] == 0x00);
+      seer_writer_free(&w);
+    }
+  }
+
   printf("test_marshal: all assertions passed\n");
   return 0;
 }

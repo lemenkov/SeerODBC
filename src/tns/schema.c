@@ -96,9 +96,10 @@ static void put_chr(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
   seer_writer_u8(w, 0);
 }
 
-/* SF_LOB: a LOB write's content. From 10.2 thin's chunks run to 0x7FFF
- * bytes, each length an sb4 - at every field version, unlike a value's;
- * 9i's are of 252 with a ub1 length, as are 8i's (no 8i LOB write is sent). */
+/* SF_LOB: a LOB write's content, chunked as the server's READ replies carry
+ * it (#427): from 12.1 on thin, chunks of up to 0x7FFF bytes, each length an
+ * sb4; before - 10g and 11g as 9i and 8i - chunks of 252 with a ub1 length.
+ * 10g read sb4 lengths short (ORA-22993, #415). */
 static void put_lob(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
 {
   if (b->n <= 252) {
@@ -107,7 +108,7 @@ static void put_lob(SeerWriter *w, const SeerSchemaCtx *cx, const SeerBytes *b)
       seer_writer_bytes(w, b->p, b->n);
     return;
   }
-  bool wide = cx->codec == SEER_CODEC_THIN && cx->fv >= TTC_FIELD_VERSION_10_2;
+  bool wide = cx->codec == SEER_CODEC_THIN && cx->wide_chunks;
   size_t cmax = wide ? 0x7FFF : 252;
   seer_writer_u8(w, 0xFE);
   for (size_t off = 0; off < b->n; off += cmax) {

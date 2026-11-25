@@ -61,9 +61,9 @@ typedef enum {
                * versions and banner); read in place */
   SF_LOB      /* a SeerBytes of LOB content as a LOB write sends it: a ub1
                * length and the bytes up to 252 bytes, else 0xFE, chunks to a
-               * 0 - on thin from 10.2 of up to 0x7FFF bytes each with an sb4
-               * length (PROTOCOL.md §14.2), before of 252 with a ub1. Read as
-               * SF_VALUE */
+               * 0 - on thin from 12.1 (wide_chunks) of up to 0x7FFF bytes each
+               * with an sb4 length (PROTOCOL.md §14.2), before of 252 with a
+               * ub1, as READ replies carry it (#427). Read as SF_VALUE */
 } SeerFieldKind;
 
 /* Guards: which codecs carry the field (0 = all); the field-version range it
