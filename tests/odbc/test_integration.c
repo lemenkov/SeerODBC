@@ -50,8 +50,6 @@ static const Gate GATES[] = {
      "8.1.7 has no session time zone"},
     {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 8, 8, GATE_SERVER,
      "8.1.7 has no TIMESTAMP type"},
-    {"zero-fraction TIMESTAMP bind matches trunc(LTZ)", 9, 9, GATE_SERVER,
-     "9i's TRUNC takes no TIMESTAMP WITH LOCAL TIME ZONE (ORA-00932)"},
     {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 8, GATE_SERVER,
      "8.1.7 has no UNISTR, and its national charset is WE8ISO8859P1"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
@@ -522,10 +520,14 @@ static void check_timestamp_zero_fraction_bind(SQLHDBC dbc)
   }
   exec_do(dbc, "INSERT INTO seer_tsz VALUES (1, TIMESTAMP '2026-09-25 13:45:06.123456')", err,
           sizeof err);
-  char lit[16];
-  if (!SQL_SUCCEEDED(exec_scalar(
-          dbc, "SELECT COUNT(*) FROM seer_tsz WHERE TRUNC(l) = TIMESTAMP '2026-09-25 00:00:00'",
-          lit, sizeof lit, err, sizeof err))) {
+  /* 9i's TRUNC takes no LTZ (ORA-00932): it truncates the value as a DATE,
+   * which is what TRUNC(ltz) gives on 10g+, so the bind meets the same DATE
+   * comparison (#420). */
+  const char *day = g_release == 9 ? "TRUNC(CAST(l AS DATE))" : "TRUNC(l)";
+  char lit[16], q[160];
+  snprintf(q, sizeof q, "SELECT COUNT(*) FROM seer_tsz WHERE %s = TIMESTAMP '2026-09-25 00:00:00'",
+           day);
+  if (!SQL_SUCCEEDED(exec_scalar(dbc, q, lit, sizeof lit, err, sizeof err))) {
     fail(name, err);
     exec_do(dbc, "DROP TABLE seer_tsz", err, sizeof err);
     return;
@@ -537,8 +539,10 @@ static void check_timestamp_zero_fraction_bind(SQLHDBC dbc)
   char cnt[16] = "";
   SQLRETURN rc = SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP,
                                   26, 6, &ts, 0, &ind);
-  if (SQL_SUCCEEDED(rc))
-    rc = SQLExecDirect(st, (SQLCHAR *)"SELECT COUNT(*) FROM seer_tsz WHERE TRUNC(l) = ?", SQL_NTS);
+  if (SQL_SUCCEEDED(rc)) {
+    snprintf(q, sizeof q, "SELECT COUNT(*) FROM seer_tsz WHERE %s = ?", day);
+    rc = SQLExecDirect(st, (SQLCHAR *)q, SQL_NTS);
+  }
   if (SQL_SUCCEEDED(rc) && SQL_SUCCEEDED(SQLFetch(st)))
     SQLGetData(st, 1, SQL_C_CHAR, cnt, sizeof cnt, &ind);
   else
