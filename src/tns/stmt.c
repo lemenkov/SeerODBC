@@ -4014,6 +4014,11 @@ static SeerStatus decode_object_image(SeerConn *conn, const uint8_t *img, size_t
       ast = SEER_OK;
     } else
       ast = decode_image_scalar(types[a], img + pos, (size_t)len, &tmp);
+    if (ast == SEER_EDB) { /* binary XML on 11g: the object's read fails with it (#416) */
+      free(tmp.data);
+      seer_writer_free(&w);
+      return SEER_EDB;
+    }
     if (ast == SEER_OK && tmp.data != NULL)
       seer_writer_bytes(&w, tmp.data, tmp.len);
     free(tmp.data);
@@ -4108,7 +4113,10 @@ static SeerStatus decode_collection_image(const uint8_t *img, size_t imglen, uin
 #define XML_FLAG_LOB 0x00000001    /* content is a CLOB locator      */
 #define XML_FLAG_STRING 0x00000004 /* content is an inline string    */
 #define XML_FLAG_SKIP_NEXT_4 0x00100000
-#define XML_FLAG_LEGACY_STORAGE 0x01000000 /* 11g CLOB-stored (unsupported)  */
+/* The locator holds binary XML (CSX), 11g's default XMLType storage: 12c+
+ * servers render such a document as text for a thin client, 11g sends the
+ * CSX bytes, whose token tables live in the server's XDB repository (#416). */
+#define XML_FLAG_BINARY_XML 0x01000000
 
 /* Decode an XMLType image (type 109, type_name XMLTYPE) into XML text. After the
  * shared object header: a 1-byte XML version, a ub4 flag, an optional 4-byte
@@ -4139,6 +4147,7 @@ static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_
     return SEER_EPROTO;
   const uint8_t *content = img + pos;
   size_t clen = imglen - pos;
+  seer_log(SEER_LOG_DEBUG, "stmt: XMLType image: flag 0x%08x, %zu content bytes", xflag, clen);
 
   if (xflag & XML_FLAG_STRING) /* inline UTF-8 document */
     return cell_set_bytes(cell, content, clen, false);
@@ -4148,8 +4157,17 @@ static SeerStatus decode_xmltype_image(SeerConn *conn, const uint8_t *img, size_
      * (#168); the 10g+ read they answer with nothing usable. */
     if (conn->field_version < TTC_FIELD_VERSION_10_2)
       return decode_lob_attr_legacy(conn, ORA_TYPE_CLOB, content, clen, cell);
-    if (xflag & XML_FLAG_LEGACY_STORAGE)
-      return SEER_ENOTIMPL; /* 11g CLOB-stored XMLType */
+    if (xflag & XML_FLAG_BINARY_XML) {
+      /* No client decodes CSX without XDB's token tables, and no reference
+       * client reads it from 11g (python-oracledb needs 12.1): the cell's
+       * read says so and names the SQL that reads it, rather than reading
+       * NULL (#416). */
+      free(conn->last_error);
+      conn->last_error = strdup("this XMLType value is stored as binary XML, which Oracle 11g "
+                                "sends undecoded: select XMLSERIALIZE(DOCUMENT col AS CLOB) or "
+                                "col.getClobVal() to read it");
+      return SEER_EDB;
+    }
     uint8_t *raw = NULL;
     size_t rawlen = 0;
     SeerStatus st = seer_lob_read(conn, content, clen, &raw, &rawlen);
@@ -4198,12 +4216,18 @@ static SeerStatus decode_typed_image(SeerConn *conn, SeerColumn *col, const uint
   return SEER_ENOTIMPL; /* layout unavailable */
 }
 
+static void record_cell_error(SeerStmt *stmt, size_t row, int col);
+
 static void resolve_pending_objs(SeerStmt *stmt)
 {
   for (size_t k = 0; k < stmt->npobjs; k++) {
     SeerPendingObj *p = &stmt->pobjs[k];
     SeerStatus st = decode_typed_image(stmt->conn, &stmt->cols[p->col], p->image, p->imagelen,
                                        &stmt->rows[p->row][p->col]);
+    if (st == SEER_EDB) { /* the value's own error, read with the cell (#416) */
+      record_cell_error(stmt, p->row, p->col);
+      continue;
+    }
     if (st != SEER_OK && st != SEER_ENOTIMPL)
       seer_log(SEER_LOG_WARNING, "stmt: OBJECT/collection decode failed (row %zu col %d)", p->row,
                p->col);
@@ -4287,8 +4311,6 @@ static SeerStatus fetch_all_rows(SeerStmt *stmt)
   }
   return SEER_OK;
 }
-
-static void record_cell_error(SeerStmt *stmt, size_t row, int col);
 
 /* Resolve every captured LOB cell into its content (CLOB -> UTF-8 text, BLOB ->
  * raw bytes). A per-cell read failure is logged and skipped, not fatal. */
