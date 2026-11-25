@@ -937,6 +937,37 @@ static void check_array_block(SQLHDBC dbc)
                         "BEGIN INSERT INTO seer_arrlong VALUES (?, ?); END;", len);
 }
 
+/* A query with a parameter array is refused, as SQL_PARAM_ARRAY_SELECTS
+ * (SQL_PAS_NO_SELECT) says, on every tier: 9i and 10g+ used to answer one
+ * parameter set's rows and report all three processed (#430). */
+static void check_array_query_refused(SQLHDBC dbc)
+{
+  const char *name = "query with a parameter array: refused (SQL_PAS_NO_SELECT)";
+  SQLUINTEGER pas = 0;
+  SQLGetInfo(dbc, SQL_PARAM_ARRAY_SELECTS, &pas, sizeof pas, NULL);
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLINTEGER ids[3] = {1, 2, 3};
+  SQLSetStmtAttr(st, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)3, 0);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, ids, 0, NULL);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)"SELECT :1 * 10 FROM dual", SQL_NTS);
+  SQLCHAR state[6] = "";
+  SQLCHAR msg[256] = "";
+  SQLINTEGER native = 0;
+  SQLSMALLINT ml = 0;
+  SQLGetDiagRec(SQL_HANDLE_STMT, st, 1, state, &native, msg, sizeof msg, &ml);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  if (pas == SQL_PAS_NO_SELECT && rc == SQL_ERROR && strcmp((char *)state, "HYC00") == 0 &&
+      strstr((char *)msg, "array of parameter sets") != NULL)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "SQL_PARAM_ARRAY_SELECTS %u, rc %d, %s '%s' (want SQL_ERROR, HYC00)",
+             (unsigned)pas, (int)rc, state, msg);
+    fail(name, m);
+  }
+}
+
 /* A NULL parameter declared as SQL_INTEGER / SQL_TYPE_DATE is typed as such,
  * so it can meet a NUMBER or DATE in COALESCE (a VARCHAR NULL gets
  * ORA-00932: inconsistent datatypes). 8.1.7 has no COALESCE; its CASE is as
@@ -8416,6 +8447,7 @@ int main(void)
     check_array_long_text(dbc);
     check_array_huge_text(dbc);
     check_array_block(dbc);
+    check_array_query_refused(dbc);
     check_returning_failure_recovers(dbc);
     check_inout_param(dbc);
     check_returning_only_binds(dbc);

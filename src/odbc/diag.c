@@ -217,6 +217,11 @@ SQLRETURN seer_odbc_exec_error(OdbcStmt *s, SeerStatus st)
    * its own status, not by whatever ORA text came last. */
   const char *ora =
       st == SEER_EDB || (st == SEER_EIO && seer_call_timed_out(c)) ? seer_last_error(c) : NULL;
+  /* A feature the driver refuses can say which, in the driver's own words
+   * (never a server's ORA text, which a refusal doesn't set). */
+  const char *why = st == SEER_ENOTIMPL ? seer_last_error(c) : NULL;
+  if (why != NULL && strncmp(why, "ORA-", 4) != 0)
+    ora = why;
   /* The native error is the ORA number, as SQLGetDiagRec callers expect. */
   SQLINTEGER native = (ora != NULL && strncmp(ora, "ORA-", 4) == 0) ? (SQLINTEGER)atoi(ora + 4) : 0;
   /* Stopped by SQL_ATTR_QUERY_TIMEOUT: HYT00, the timeout's state, where
