@@ -5204,20 +5204,41 @@ static void check_lob_inline(const char *drv, const char *host, const char *port
   SQLFreeHandle(SQL_HANDLE_ENV, e);
 }
 
+static SQLHDBC open_conn(SQLHENV e, const char *drv, const char *host, const char *port,
+                         const char *svc, const char *user, const char *pwd, char *why, size_t n);
+
 /* Proxy authentication: a `proxy_user[schema]` connect authenticates as the
  * proxy but operates in the target schema's context. Needs DBA to set up the
- * GRANT CONNECT THROUGH; skips gracefully when the test login isn't a DBA. */
-static void check_proxy_auth(SQLHDBC dbc, const char *drv, const char *host, const char *port,
+ * GRANT CONNECT THROUGH: the DBA login from SEER_TEST_DBA_USER / _PASS when
+ * set (#409), else the test login; skips when neither may CREATE USER. */
+static void check_proxy_auth(SQLHDBC test_dbc, const char *drv, const char *host, const char *port,
                              const char *svc)
 {
   const char *name = "proxy authentication";
   char err[256];
+  const char *du = getenv("SEER_TEST_DBA_USER"), *dp = getenv("SEER_TEST_DBA_PASS");
+  SQLHENV dba_env = SQL_NULL_HANDLE;
+  SQLHDBC dba = SQL_NULL_HANDLE, dbc = test_dbc;
+  if (du != NULL && du[0] && dp != NULL) {
+    char why[256] = "";
+    SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &dba_env);
+    SQLSetEnvAttr(dba_env, SQL_ATTR_ODBC_VERSION, (void *)SQL_OV_ODBC3, 0);
+    dba = open_conn(dba_env, drv, host, port, svc, du, dp, why, sizeof why);
+    if (dba == NULL) {
+      char r[300];
+      snprintf(r, sizeof r, "DBA login failed: %s", why);
+      skip(name, r);
+      SQLFreeHandle(SQL_HANDLE_ENV, dba_env);
+      return;
+    }
+    dbc = dba;
+  }
   exec_do(dbc, "DROP USER seerprx CASCADE", err, sizeof err);
   exec_do(dbc, "DROP USER seerproxy_p CASCADE", err, sizeof err);
   if (!SQL_SUCCEEDED(
           exec_do(dbc, "CREATE USER seerprx IDENTIFIED BY seerprx123", err, sizeof err))) {
     skip(name, "needs DBA (CREATE USER / GRANT CONNECT THROUGH)");
-    return;
+    goto out;
   }
   exec_do(dbc, "GRANT CREATE SESSION TO seerprx", err, sizeof err);
   exec_do(dbc, "CREATE USER seerproxy_p IDENTIFIED BY seerproxy123", err, sizeof err);
@@ -5259,6 +5280,12 @@ static void check_proxy_auth(SQLHDBC dbc, const char *drv, const char *host, con
 
   exec_do(dbc, "DROP USER seerprx CASCADE", err, sizeof err);
   exec_do(dbc, "DROP USER seerproxy_p CASCADE", err, sizeof err);
+out:
+  if (dba != SQL_NULL_HANDLE) {
+    SQLDisconnect(dba);
+    SQLFreeHandle(SQL_HANDLE_DBC, dba);
+    SQLFreeHandle(SQL_HANDLE_ENV, dba_env);
+  }
 }
 
 /* A connect that fails says why, as the server put it: a wrong password is the
