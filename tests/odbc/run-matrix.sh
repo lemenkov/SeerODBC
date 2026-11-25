@@ -28,13 +28,15 @@
 #                    Needs a build configured with -Dwire_corpus=true; the run
 #                    is in TZ=UTC and leaves out the TLS-proxy leg, whose port
 #                    and certificate change from run to run.
-#   SEER_TEST_DBA_USER/_PASS  a DBA login, passed to every tier: the ODBC check
-#                         of a killed session (#340) uses it to kill its own
-#                         session, and skips without it or where it fails
+#   SEER_TEST_DBA_USER/_PASS  a DBA login for every tier: the ODBC check of a
+#                         killed session (#340) uses it to kill its own
+#                         session, and proxy authentication to create its two
+#                         users; both skip without it
 #
 # Any field of one tier can be overridden with SEER_<TIER>_HOST, _PORT, _TARGET,
-# _USER or _PASS, where <TIER> is the tier name in upper case (11G, 18C, 21C,
-# 23AI, 26AI, 10G, 9I, 8I) - e.g. SEER_23AI_USER=system SEER_23AI_PASS=secret.
+# _USER, _PASS, _DBA_USER or _DBA_PASS, where <TIER> is the tier name in upper
+# case (11G, 18C, 21C, 23AI, 26AI, 10G, 9I, 8I) - e.g. SEER_23AI_USER=system
+# SEER_23AI_PASS=secret, or SEER_8I_DBA_USER=system SEER_8I_DBA_PASS=manager.
 #
 # Settings can live in a file instead of the shell: the script sources
 # $SEER_MATRIX_ENV, or tests/odbc/matrix.env if that exists (it is gitignored;
@@ -65,7 +67,7 @@ while [[ $# -gt 0 ]]; do
         --only=*) ONLY="${1#*=}"; shift ;;
         --skip) SKIP="$2"; shift 2 ;;
         --skip=*) SKIP="${1#*=}"; shift ;;
-        -h|--help) sed -n '7,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '7,/^set -u/{/^set -u/!p}' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) BUILD="$1"; shift ;;
     esac
 done
@@ -84,6 +86,8 @@ NINE_HOST="${SEER_9I_HOST:-}"
 EIGHT_HOST="${SEER_8I_HOST:-}"
 DEF_USER="${SEER_MATRIX_USER:-pyo}"
 DEF_PASS="${SEER_MATRIX_PASS:-pyo123}"
+DEF_DBA_USER="${SEER_TEST_DBA_USER:-}"
+DEF_DBA_PASS="${SEER_TEST_DBA_PASS:-}"
 
 # ---- tiers ---------------------------------------------------------------------
 # Row: name|group|host|port|target|address|release
@@ -201,6 +205,8 @@ for row in "${TIERS[@]}"; do
     target=$(override "$name" TARGET "$target")
     user=$(override "$name" USER "$DEF_USER")
     pass=$(override "$name" PASS "$DEF_PASS")
+    dba_user=$(override "$name" DBA_USER "$DEF_DBA_USER")
+    dba_pass=$(override "$name" DBA_PASS "$DEF_DBA_PASS")
 
     echo "============================================================"
     echo " $name  ($host:$port/$target as $user)"
@@ -218,16 +224,16 @@ for row in "${TIERS[@]}"; do
     : >"$xlog"
 
     export SEER_TEST_HOST="$host" SEER_TEST_PORT="$port" \
-           SEER_TEST_USER="$user" SEER_TEST_PASS="$pass" SEER_TEST_RELEASE="$release"
+           SEER_TEST_USER="$user" SEER_TEST_PASS="$pass" SEER_TEST_RELEASE="$release" \
+           SEER_TEST_DBA_USER="$dba_user" SEER_TEST_DBA_PASS="$dba_pass"
     # The ODBC integration test, service-name addressed (9i's listener takes the
-    # SID as a service name too), with an optional TLS-proxy leg from 10g.
+    # SID as a service name too), with an optional TLS-proxy leg from 9i.
     TLS_PORT=""; TLS_CA=""; TLS_PID=""
     rec_odbc=""; rec_core=""
     if [[ -n "$RECORD_DIR" ]]; then
         rec_odbc="$RECORD_DIR/$name-odbc.wire"; rec_core="$RECORD_DIR/$name-core.wire"
         dba=()
-        [[ -n "${SEER_TEST_DBA_USER:-}" ]] && dba=("SEER_TEST_DBA_USER=$SEER_TEST_DBA_USER" \
-                                                   "SEER_TEST_DBA_PASS=${SEER_TEST_DBA_PASS:-}")
+        [[ -n "$dba_user" ]] && dba=("SEER_TEST_DBA_USER=$dba_user" "SEER_TEST_DBA_PASS=$dba_pass")
         common=("SEER_TEST_HOST=$host" "SEER_TEST_PORT=$port" "SEER_TEST_USER=$user"
                 "SEER_TEST_PASS=$pass" "SEER_TEST_RELEASE=$release" "${dba[@]}")
         record_head "$rec_odbc" test_integration "${common[@]}" "SEER_TEST_SERVICE=$target"
@@ -236,7 +242,9 @@ for row in "${TIERS[@]}"; do
         else
             record_head "$rec_core" test_core "${common[@]}" "SEER_TEST_SERVICE=$target"
         fi
-    elif (( release >= 10 )); then
+    elif (( release >= 9 )); then
+        # Not on 8i: its Windows listener redirects to a dedicated port, around
+        # the proxy (#412).
         start_tls_proxy "$host" "$port"
     fi
     # A real TCPS listener for the TLS check's second leg (#405), on one tier
@@ -261,7 +269,8 @@ for row in "${TIERS[@]}"; do
         SEER_TEST_SERVICE="$target" SEER_WIRE_RECORD="$rec_core" "$CORE_BIN" 2>/dev/null
     fi | grep -v '^SUMMARY' | tee -a "$xlog" | sed 's/^/  /'
     [[ -n "$rec_core" ]] && record_tail "$rec_core" "$xlog"
-    unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS SEER_TEST_RELEASE
+    unset SEER_TEST_HOST SEER_TEST_PORT SEER_TEST_USER SEER_TEST_PASS SEER_TEST_RELEASE \
+          SEER_TEST_DBA_USER SEER_TEST_DBA_PASS
 
     # The tier's main suite must have finished (its SUMMARY line); the totals
     # count every PASS / FAIL / SKIP line, the ODBC suite's and the core API's.
