@@ -969,6 +969,111 @@ static void check_returning(void)
   }
 }
 
+/* An array UPDATE ... RETURNING: 8i and 9i run it a row at a time (#418),
+ * so the row counts add up and the OUT bind keeps the last matching row's
+ * value, as the last RXD of a 10g+ array RETURNING does. Ids 1, 9, 3: the
+ * middle row matches nothing. */
+static void check_array_returning(void)
+{
+  const char *name = "array DML RETURNING ... INTO (row count, last row's value)";
+  run("DROP TABLE seer9ra");
+  run("CREATE TABLE seer9ra (id NUMBER, v VARCHAR2(20))");
+  run("INSERT INTO seer9ra VALUES (1, 'a')");
+  run("INSERT INTO seer9ra VALUES (3, 'c')");
+  seer_commit(C);
+  static const int ids[3] = {1, 9, 3};
+  SeerStmt *s = NULL;
+  SeerStatus st =
+      seer_stmt_prepare(C, "UPDATE seer9ra SET v = v || '!' WHERE id = :1 RETURNING v INTO :2", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_set_array_size(s, 3);
+  for (int row = 0; row < 3 && st == SEER_OK; row++) {
+    st = seer_stmt_bind_row(s, row);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 1, ids[row]);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_out(s, 2, 1, 20);
+  }
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  long rows = -1;
+  char got[32] = "";
+  if (st == SEER_OK) {
+    rows = seer_stmt_row_count(s);
+    const void *v = NULL;
+    size_t vl = 0;
+    int vn = 0, vb = 0;
+    seer_stmt_out_data(s, 2, &v, &vl, &vn, &vb);
+    snprintf(got, sizeof got, "%.*s", vn ? 4 : (int)vl, vn ? "NULL" : (const char *)v);
+  }
+  char err[160] = "";
+  snprintf(err, sizeof err, "%s", seer_last_error(C) ? seer_last_error(C) : "");
+  seer_stmt_close(s);
+  seer_commit(C);
+  char out[32] = "";
+  scalar("SELECT MIN(v) || ':' || MAX(v) FROM seer9ra", out, sizeof out);
+  run("DROP TABLE seer9ra");
+  if (st == SEER_OK && rows == 2 && strcmp(got, "c!") == 0 && strcmp(out, "a!:c!") == 0)
+    pass(name);
+  else {
+    char m[320];
+    snprintf(m, sizeof m, "status %d, %ld row(s), OUT '%s', table '%s' (want 2, 'c!', 'a!:c!') %s",
+             (int)st, rows, got, out, err);
+    fail(name, m);
+  }
+}
+
+/* Batch errors on an array that 9i runs a row at a time (text past 4000
+ * bytes goes in a PL/SQL block, #418): the failing row is recorded at its
+ * offset with its error and the other rows go in. */
+static void check_array_long_batch_errors(void)
+{
+  const char *name = "array DML batch errors with text over 4000 bytes";
+  run("DROP TABLE seer9el");
+  run("CREATE TABLE seer9el (n NUMBER PRIMARY KEY, c CLOB)");
+  static const int vals[4] = {1, 2, 1, 4};
+  static char big[5001];
+  memset(big, 'y', sizeof big - 1);
+  SeerStmt *s = NULL;
+  SeerStatus st = seer_stmt_prepare(C, "INSERT INTO seer9el VALUES (:1, :2)", &s);
+  if (st == SEER_OK)
+    st = seer_stmt_set_array_size(s, 4);
+  if (st == SEER_OK)
+    st = seer_stmt_set_batch_errors(s, 1);
+  for (int row = 0; row < 4 && st == SEER_OK; row++) {
+    st = seer_stmt_bind_row(s, row);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_int64(s, 1, vals[row]);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_text(s, 2, big, 5000);
+  }
+  if (st == SEER_OK)
+    st = seer_stmt_execute(s);
+  size_t n = seer_stmt_batch_error_count(s);
+  unsigned erow = 99, ecode = 0;
+  const char *emsg = NULL;
+  if (n > 0)
+    seer_stmt_batch_error(s, 0, &erow, &ecode, &emsg);
+  char msg[64] = "";
+  snprintf(msg, sizeof msg, "%s", emsg ? emsg : "");
+  seer_stmt_close(s);
+  seer_commit(C);
+  char out[32] = "";
+  scalar("SELECT COUNT(*) || ':' || SUM(n) || ':' || SUM(DBMS_LOB.GETLENGTH(c)) FROM seer9el", out,
+         sizeof out);
+  run("DROP TABLE seer9el");
+  int msg_ok = strncmp(msg, "ORA-00001", 9) == 0;
+  if (st == SEER_OK && n == 1 && erow == 2 && ecode == 1 && msg_ok && strcmp(out, "3:7:15000") == 0)
+    pass(name);
+  else {
+    char m[240];
+    snprintf(m, sizeof m,
+             "status %d, %zu error(s), first row %u code %u '%.40s', table '%s' (want 3:7:15000)",
+             (int)st, n, erow, ecode, msg, out);
+    fail(name, m);
+  }
+}
+
 /* Text binds past 4000 bytes: 9.2 has no form for one in a plain statement,
  * and takes it in a PL/SQL block, declared VARCHAR 32767 (seerdb PROTOCOL.md
  * §19.3.1), so such a DML runs as a block; past 32512 bytes, as a temporary
@@ -2619,6 +2724,8 @@ int main(void)
   check_batch_errors();
   check_describe_before_execute();
   check_returning();
+  check_array_returning();
+  check_array_long_batch_errors();
   check_long_text_bind();
   check_long_raw_bind();
   check_cursor_hygiene();

@@ -8844,6 +8844,122 @@ static SeerStatus describe_now(SeerStmt *stmt)
   return SEER_OK;
 }
 
+/* Swap iteration `row`'s values into iteration 0, where the single-row paths
+ * read them (and back: the swap is its own inverse). */
+static void swap_row(SeerStmt *stmt, int row)
+{
+  for (int i = 0; i < stmt->npbinds; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    if (b->rxd == NULL || row == 0)
+      continue;
+    uint8_t *v = b->rxd[0];
+    size_t n = b->rxd_len[0];
+    b->rxd[0] = b->rxd[row];
+    b->rxd_len[0] = b->rxd_len[row];
+    b->rxd[row] = v;
+    b->rxd_len[row] = n;
+  }
+}
+
+/* An array execute that only a single-row path takes - a PL/SQL block on
+ * any tier (#428); on 8i / 9i a DML in one (RETURNING, text past 4000 bytes)
+ * or with a temporary LOB (#418): run `one` a row at a time, as an array execute
+ * reports it. The row counts add up; an OUT bind keeps the last row's value,
+ * as the last RXD of a 10g+ array RETURNING does; a failing row stops the
+ * rest, or with batch errors armed is recorded at its offset and the rest
+ * run. Autocommit commits once, after the last row, as one execute would. */
+static SeerStatus by_row(SeerStmt *stmt, SeerStatus (*one)(SeerStmt *))
+{
+  SeerConn *c = stmt->conn;
+  int rows = stmt->n_iters;
+  bool keep_going = stmt->batch_errors, autocommit = c->autocommit;
+  SeerBatchError *berrs = NULL;
+  size_t nberrs = 0;
+  long affected = 0;
+  SeerStatus st = SEER_OK;
+  free_batch_errors(stmt);
+  stmt->n_iters = 1;
+  stmt->batch_errors = false; /* one row: its error is the row's own */
+  c->autocommit = false;
+  for (int row = 0; row < rows && st == SEER_OK; row++) {
+    swap_row(stmt, row);
+    SeerStatus rs = one(stmt);
+    swap_row(stmt, row);
+    if (rs == SEER_OK) {
+      affected += stmt->affected;
+    } else if (rs == SEER_EDB && keep_going) {
+      SeerBatchError *nb = realloc(berrs, (nberrs + 1) * sizeof *nb);
+      if (nb == NULL) {
+        st = SEER_ENOMEM;
+        break;
+      }
+      berrs = nb;
+      unsigned code = 0;
+      if (c->last_error != NULL)
+        sscanf(c->last_error, "ORA-%u", &code);
+      nb[nberrs].row = (uint32_t)row;
+      nb[nberrs].code = code;
+      nb[nberrs].message = c->last_error;
+      c->last_error = NULL;
+      nberrs++;
+    } else {
+      st = rs;
+    }
+  }
+  stmt->n_iters = rows;
+  stmt->batch_errors = keep_going;
+  c->autocommit = autocommit;
+  free_batch_errors(stmt); /* a row's own run may have left some */
+  stmt->berrs = berrs;
+  stmt->nberrs = nberrs;
+  stmt->affected = affected;
+  if (st != SEER_OK)
+    return st;
+  stmt->executed = true;
+  if (autocommit)
+    return seer_commit(c); /* its failure is the statement's (#347) */
+  return SEER_OK;
+}
+
+/* 8i: a PL/SQL block, or a DML run in one (RETURNING ... INTO). */
+static SeerStatus o8i_execute_in_block_kind(SeerStmt *stmt)
+{
+  return classify_sql(stmt->sql) == STMT_BLOCK ? o8i_execute_block(stmt)
+                                               : fv2_execute_in_block(stmt);
+}
+
+/* 9i: one execute, its values past what 9.2 takes inline as temporary LOBs
+ * for it (#169). */
+static SeerStatus fv2_execute_one(SeerStmt *stmt)
+{
+  Fv2TempLob *tl = NULL;
+  int ntl = 0;
+  SeerStatus st = fv2_temp_lobs_begin(stmt, classify_sql(stmt->sql) == STMT_SELECT, &tl, &ntl);
+  if (st == SEER_OK)
+    st = fv2_execute_kind(stmt);
+  fv2_temp_lobs_done(stmt, tl, ntl);
+  return st;
+}
+
+/* Whether a 9i array execute needs a single-row path: a block, or a DML that
+ * goes in one or with a temporary LOB. */
+static bool fv2_array_by_row(const SeerStmt *stmt)
+{
+  if (stmt->n_iters <= 1 || stmt->npbinds == 0)
+    return false;
+  StmtKind kind = classify_sql(stmt->sql);
+  if (kind == STMT_BLOCK)
+    return true;
+  if (kind != STMT_CHANGE)
+    return false;
+  for (int i = 0; i < stmt->npbinds; i++)
+    if (stmt->pbinds[i].is_out || fv2_needs_temp_lob(stmt, &stmt->pbinds[i], false))
+      return true;
+  return fv2_long_binds(stmt) == FV2_BINDS_BLOCK;
+}
+
+static SeerStatus thin_execute(SeerStmt *stmt);
+
 static SeerStatus execute_now(SeerStmt *stmt)
 {
   if (stmt == NULL)
@@ -8869,28 +8985,30 @@ static SeerStatus execute_now(SeerStmt *stmt)
     SeerStatus bst = o8i_check_binds(stmt, kind == STMT_SELECT, in_block);
     if (bst != SEER_OK)
       return bst;
-    if (kind == STMT_BLOCK)
-      return o8i_execute_block(stmt);
-    if (in_block)
-      return fv2_execute_in_block(stmt);
+    if (in_block) /* a single-row path: an array goes a row at a time */
+      return stmt->n_iters > 1 && stmt->npbinds > 0 ? by_row(stmt, o8i_execute_in_block_kind)
+                                                    : o8i_execute_in_block_kind(stmt);
     return kind == STMT_SELECT ? o8i_execute_select(stmt) : o8i_execute_dml(stmt);
   }
 
   /* Oracle 9i (fv2) speaks the TTI_ALL7 dialect, not TTI_ALL8: SELECT is a
-   * four-call fetch sequence, DML/DDL a single parse-execute. PL/SQL blocks are
-   * the next fv2 slice. */
-  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2) {
-    /* Values past what 9.2 takes inline go as temporary LOBs for this
-     * execute (#169), then the statement runs as any other. */
-    Fv2TempLob *tl = NULL;
-    int ntl = 0;
-    SeerStatus st = fv2_temp_lobs_begin(stmt, classify_sql(stmt->sql) == STMT_SELECT, &tl, &ntl);
-    if (st == SEER_OK)
-      st = fv2_execute_kind(stmt);
-    fv2_temp_lobs_done(stmt, tl, ntl);
-    return st;
-  }
+   * four-call fetch sequence, DML/DDL a single parse-execute. Values past
+   * what 9.2 takes inline go as temporary LOBs for the execute (#169). An
+   * array that only a single-row path takes goes a row at a time. */
+  if (stmt->conn->field_version < TTC_FIELD_VERSION_10_2)
+    return fv2_array_by_row(stmt) ? by_row(stmt, fv2_execute_one) : fv2_execute_one(stmt);
 
+  /* 10g+ sends a PL/SQL block as one iteration (build_exec): an array of
+   * them goes a row at a time, as python-oracledb's executemany runs a block
+   * whose binds it doesn't know yet (#428). */
+  if (stmt->n_iters > 1 && stmt->npbinds > 0 && classify_sql(stmt->sql) == STMT_BLOCK)
+    return by_row(stmt, thin_execute);
+  return thin_execute(stmt);
+}
+
+/* One 10g+ execute over TTI_ALL8. */
+static SeerStatus thin_execute(SeerStmt *stmt)
+{
   if (stmt->described_only) { /* the execute parses and describes afresh */
     free_columns(stmt->cols, stmt->ncols);
     stmt->cols = NULL;

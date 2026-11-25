@@ -856,6 +856,87 @@ static void check_array_null_last_row(SQLHDBC dbc)
   }
 }
 
+/* An array execute of rows whose text takes a path other than plain array DML
+ * on 8i / 9i: past 4000 bytes (a PL/SQL block on 9i), past 32512 (a temporary
+ * LOB on 9i), or a PL/SQL block itself. Every row goes in with its own value:
+ * the count, the total length and the length weighted by the id tell (#418). */
+static void check_array_text_rows(SQLHDBC dbc, const char *name, const char *sql,
+                                  const size_t len[3])
+{
+  char err[256] = "", out[64] = "", want[64];
+  exec_do(dbc, "DROP TABLE seer_arrlong", err, sizeof err);
+  if (!SQL_SUCCEEDED(
+          exec_do(dbc, "CREATE TABLE seer_arrlong (id NUMBER, c CLOB)", err, sizeof err))) {
+    skip(name, err);
+    return;
+  }
+  size_t width = 0, total = 0, weighted = 0;
+  for (int k = 0; k < 3; k++) {
+    width = len[k] > width ? len[k] : width;
+    total += len[k];
+    weighted += (size_t)(k + 1) * len[k];
+  }
+  width++;
+  SQLINTEGER ids[3] = {1, 2, 3};
+  SQLLEN ind[3];
+  char *buf = malloc(3 * width);
+  if (buf == NULL) {
+    fail(name, "out of memory");
+    return;
+  }
+  for (int k = 0; k < 3; k++) {
+    memset(buf + (size_t)k * width, 'a' + k, len[k]);
+    buf[(size_t)k * width + len[k]] = '\0';
+    ind[k] = (SQLLEN)len[k];
+  }
+  SQLHSTMT st;
+  SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st);
+  SQLSetStmtAttr(st, SQL_ATTR_PARAMSET_SIZE, (SQLPOINTER)(SQLULEN)3, 0);
+  SQLBindParameter(st, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, ids, 0, NULL);
+  SQLBindParameter(st, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, width - 1, 0, buf,
+                   (SQLLEN)width, ind);
+  SQLRETURN rc = SQLExecDirect(st, (SQLCHAR *)sql, SQL_NTS);
+  if (!SQL_SUCCEEDED(rc))
+    diag_text(SQL_HANDLE_STMT, st, err, sizeof err);
+  SQLFreeHandle(SQL_HANDLE_STMT, st);
+  free(buf);
+  if (SQL_SUCCEEDED(rc))
+    exec_scalar(dbc,
+                "SELECT COUNT(*) || ':' || SUM(DBMS_LOB.GETLENGTH(c)) || ':' || "
+                "SUM(id * DBMS_LOB.GETLENGTH(c)) FROM seer_arrlong",
+                out, sizeof out, err, sizeof err);
+  exec_do(dbc, "DROP TABLE seer_arrlong", err, sizeof err);
+  snprintf(want, sizeof want, "3:%zu:%zu", total, weighted);
+  if (strcmp(out, want) == 0)
+    pass(name);
+  else {
+    char m[400];
+    snprintf(m, sizeof m, "got '%s' want '%s' %s", out, want, SQL_SUCCEEDED(rc) ? "" : err);
+    fail(name, m);
+  }
+}
+
+static void check_array_long_text(SQLHDBC dbc)
+{
+  static const size_t len[3] = {5000, 6000, 7000};
+  check_array_text_rows(dbc, "array DML with text over 4000 bytes",
+                        "INSERT INTO seer_arrlong VALUES (?, ?)", len);
+}
+
+static void check_array_huge_text(SQLHDBC dbc)
+{
+  static const size_t len[3] = {33000, 40000, 35000};
+  check_array_text_rows(dbc, "array DML with text over 32 KB",
+                        "INSERT INTO seer_arrlong VALUES (?, ?)", len);
+}
+
+static void check_array_block(SQLHDBC dbc)
+{
+  static const size_t len[3] = {10, 20, 30};
+  check_array_text_rows(dbc, "array execute of a PL/SQL block",
+                        "BEGIN INSERT INTO seer_arrlong VALUES (?, ?); END;", len);
+}
+
 /* A NULL parameter declared as SQL_INTEGER / SQL_TYPE_DATE is typed as such,
  * so it can meet a NUMBER or DATE in COALESCE (a VARCHAR NULL gets
  * ORA-00932: inconsistent datatypes). 8.1.7 has no COALESCE; its CASE is as
@@ -8332,6 +8413,9 @@ int main(void)
     check_urowid_physical(dbc);
     check_long_bind_order(dbc);
     check_array_null_last_row(dbc);
+    check_array_long_text(dbc);
+    check_array_huge_text(dbc);
+    check_array_block(dbc);
     check_returning_failure_recovers(dbc);
     check_inout_param(dbc);
     check_returning_only_binds(dbc);
