@@ -79,9 +79,6 @@ static const Gate GATES[] = {
     {"DRCP (pooled session)", 11, 11, GATE_SERVER, "11g's pool takes only OCI clients (ORA-56606)"},
     {"XMLType fetch (LOB-backed)", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
     {"XMLType fetch", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
-    {"XMLType fetch", 11, 11, GATE_SERVER,
-     "11g keeps XMLType as binary XML, which the server doesn't render to text: "
-     "XMLSERIALIZE reads it"},
     {"BINARY_FLOAT bind", 8, 9, GATE_SERVER, "no BINARY_FLOAT before 10g"},
     {"BOOLEAN bind (23ai)", 8, 21, GATE_SERVER, "no BOOLEAN type before 23ai"},
 };
@@ -158,8 +155,13 @@ static SQLRETURN exec_scalar(SQLHDBC dbc, const char *sql, char *out, int outn, 
   rc = SQLFetch(st);
   if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
     SQLLEN ind = 0;
-    if (!SQL_SUCCEEDED(SQLGetData(st, 1, SQL_C_CHAR, out, outn, &ind)))
-      snprintf(err, errn, "getdata failed");
+    SQLRETURN gr = SQLGetData(st, 1, SQL_C_CHAR, out, outn, &ind);
+    if (!SQL_SUCCEEDED(gr)) { /* the value's own error (#158, #416) */
+      diag_text(SQL_HANDLE_STMT, st, err, errn);
+      if (err[0] == '\0')
+        snprintf(err, errn, "getdata failed");
+      rc = gr;
+    }
   } else if (rc == SQL_NO_DATA) {
     snprintf(err, errn, "no rows");
   } else {
@@ -8027,7 +8029,26 @@ static void check_xmltype(SQLHDBC dbc)
   }
   out[0] = '\0';
   SQLRETURN rc = exec_scalar(dbc, "SELECT doc FROM seer_xml", out, sizeof out, err, sizeof err);
-  if (SQL_SUCCEEDED(rc) && strstr(out, "<a>") != NULL && strstr(out, "hi") != NULL)
+  int read = SQL_SUCCEEDED(rc) && strstr(out, "<a>") != NULL && strstr(out, "hi") != NULL;
+  if (g_release == 11 && !read) {
+    /* 11g sends binary XML - its default storage where XML DB has it - as
+     * CSX, which no reference client reads: the cell's read says so and
+     * names the SQL that reads it, which then does (#416). It used to read
+     * as NULL. An 11g that stores the column as a CLOB reads it as text. */
+    char named[256] = "";
+    snprintf(named, sizeof named, "%s", err);
+    SQLRETURN xr = exec_scalar(dbc, "SELECT XMLSERIALIZE(DOCUMENT doc AS CLOB) FROM seer_xml", out,
+                               sizeof out, err, sizeof err);
+    if (!SQL_SUCCEEDED(rc) && strstr(named, "XMLSERIALIZE") != NULL && SQL_SUCCEEDED(xr) &&
+        strstr(out, "<a>") != NULL)
+      pass(name);
+    else {
+      char m[700];
+      snprintf(m, sizeof m, "11g: read rc=%d '%s', XMLSERIALIZE rc=%d '%s'", (int)rc, named,
+               (int)xr, out);
+      fail(name, m);
+    }
+  } else if (read)
     pass(name);
   else {
     char m[600];
