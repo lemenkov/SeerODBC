@@ -344,6 +344,13 @@ SeerStatus seer_stmt_bind_raw(SeerStmt *stmt, int param, const void *data, int l
  * national character set. */
 SeerStatus seer_stmt_bind_ntext(SeerStmt *stmt, int param, const char *str, int len);
 
+/* Bind text (UTF-8) / bytes for a CLOB / BLOB target, such as a PL/SQL CLOB /
+ * BLOB parameter. 9i and later take a text / RAW bind there as it is (the
+ * same as seer_stmt_bind_text / _raw); Oracle 8i converts no text or RAW to a
+ * LOB parameter, so there the value goes as a temporary LOB. */
+SeerStatus seer_stmt_bind_clob(SeerStmt *stmt, int param, const char *str, int len);
+SeerStatus seer_stmt_bind_blob(SeerStmt *stmt, int param, const void *data, int len);
+
 /* Bind an XML document to an XMLType target (e.g. INSERT ... VALUES (:1) into an
  * XMLType column). The UTF-8 text is bound and the server parses it to XMLType;
  * handles documents of any size (VARCHAR2 or streamed LONG). */

@@ -53,10 +53,6 @@ static const Gate GATES[] = {
     {"SQL OBJECT / VARRAY with NVARCHAR2 attributes", 8, 8, GATE_SERVER,
      "8.1.7 has no UNISTR, and its national charset is WE8ISO8859P1"},
     {"SQL OBJECT with an XMLType attribute", 8, 8, GATE_SERVER, "8.1.7 has no XMLType"},
-    {"PL/SQL CLOB / BLOB parameter over 32 KB", 8, 8, GATE_TODO,
-     "8i: the value goes as a LONG, which a PL/SQL CLOB parameter refuses (#424)"},
-    {"temporary LOBs of large PL/SQL binds are freed", 8, 8, GATE_TODO,
-     "8i: a large PL/SQL bind has no temporary LOB yet (#424)"},
     {"VECTOR column dimensions / format (SQLColAttribute)", 8, 21, GATE_SERVER,
      "no VECTOR type before 23ai"},
     {"large CLOB OUT parameter", 8, 8, GATE_SERVER,
@@ -1736,7 +1732,9 @@ static void check_max_identifier_len(SQLHDBC dbc)
 /* A value over 32767 bytes bound to a PL/SQL CLOB / BLOB parameter: a LONG
  * (the form a large text bind takes) can't reach a PL/SQL LOB parameter that
  * big (ORA-01460); it has to go as a temporary LOB: 12c's CREATE_TEMP, OCI
- * 11.2's on 10g/11g (#415), 9i's own. 8i has none yet (#424). */
+ * 11.2's on 10g/11g (#415), 9i's own. 8.1.7 takes no text or RAW for a LOB
+ * parameter at all (PLS-00306): there the long types go once more as
+ * temporary LOBs the server makes in PL/SQL (#424). */
 static void check_plsql_large_lob_param(SQLHDBC dbc)
 {
   const char *name = "PL/SQL CLOB / BLOB parameter over 32 KB";
@@ -1903,8 +1901,11 @@ static void check_temp_lobs_freed(SQLHDBC dbc)
 {
   const char *name = "temporary LOBs of large PL/SQL binds are freed";
   GATE(name);
-  const char *count_sql = "SELECT cache_lobs + nocache_lobs FROM v$temporary_lobs "
-                          "WHERE sid = SYS_CONTEXT('USERENV', 'SID')";
+  /* 8.1.7's USERENV has no SID (ORA-02003); V$MYSTAT has the session's. */
+  const char *count_sql = g_release == 8 ? "SELECT cache_lobs + nocache_lobs FROM v$temporary_lobs "
+                                           "WHERE sid = (SELECT sid FROM v$mystat WHERE ROWNUM = 1)"
+                                         : "SELECT cache_lobs + nocache_lobs FROM v$temporary_lobs "
+                                           "WHERE sid = SYS_CONTEXT('USERENV', 'SID')";
   char before[32], err[256];
   if (!SQL_SUCCEEDED(exec_scalar(dbc, count_sql, before, sizeof before, err, sizeof err))) {
     skip(name, "V$TEMPORARY_LOBS not readable");

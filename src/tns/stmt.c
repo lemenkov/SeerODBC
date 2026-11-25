@@ -132,6 +132,7 @@ typedef struct {
   int64_t out_full_len; /* RETURNING value the server truncated: its real length, else 0 */
   uint8_t ret_lob;      /* RETURNING target declared as this LOB type (CLOB/BLOB), else 0 */
   uint8_t fv2_lob;      /* 9i: bound for this execute as a temporary LOB of this type (#169) */
+  bool as_lob;          /* seer_stmt_bind_clob / _blob: meant for a LOB target (#424) */
   uint8_t lob_out;      /* bound OUT as a CLOB / BLOB (seer_stmt_bind_out), else 0 (#214) */
   uint8_t *ret_locator; /* its returned locator, resolved after the response */
   size_t ret_loclen;
@@ -256,6 +257,8 @@ struct SeerStmt {
   /* DML RETURNING ... INTO: set when the statement is a DML with OUT binds;
    * those binds are server-filled and their values arrive in a return RXD. */
   bool returning;
+  /* 8i: a LOB OUT bind keeps its locator rather than being read (#424). */
+  bool keep_lob_locators;
 };
 
 /* The OER outcome of one response. */
@@ -2243,6 +2246,27 @@ SeerStatus seer_stmt_bind_ntext(SeerStmt *stmt, int param, const char *str, int 
     return st;
   return store_bind(stmt, param, ORA_TYPE_VARCHAR, (uint32_t)(u16len ? u16len : 1), 2000, 16, false,
                     rxd, rl);
+}
+
+/* Text / bytes for a CLOB / BLOB target, a PL/SQL LOB parameter among them
+ * (#424): bound as text and RAW are, and marked. 9i and later convert a text
+ * or RAW value to a LOB (past the bind limits it goes as a temporary LOB
+ * anyway); 8.1.7 converts nothing to a LOB parameter (PLS-00306), so there
+ * the value goes as a temporary LOB. */
+SeerStatus seer_stmt_bind_clob(SeerStmt *stmt, int param, const char *str, int len)
+{
+  SeerStatus st = seer_stmt_bind_text(stmt, param, str, len);
+  if (st == SEER_OK && param >= 1 && param <= stmt->npbinds)
+    stmt->pbinds[param - 1].as_lob = true;
+  return st;
+}
+
+SeerStatus seer_stmt_bind_blob(SeerStmt *stmt, int param, const void *data, int len)
+{
+  SeerStatus st = seer_stmt_bind_raw(stmt, param, data, len);
+  if (st == SEER_OK && param >= 1 && param <= stmt->npbinds)
+    stmt->pbinds[param - 1].as_lob = true;
+  return st;
 }
 
 /* Bind an XML document to an XMLType target. XMLType is transmitted as text - the
@@ -6404,6 +6428,11 @@ static SeerStatus o8i_bind_value(const SeerBind *b, int row, SeerWriter *val, ui
     *size = b->oac_size ? b->oac_size : 1;
     return SEER_OK;
   }
+  if (b->fv2_lob != 0) { /* a temporary LOB's locator, as o8i_temp_lobs_begin built it */
+    seer_writer_bytes(val, v, vn);
+    *size = 32;
+    return SEER_OK;
+  }
   if (b->ret_lob != 0) {
     /* A LOB sends a locator even as a pure OUT: an empty one, a LE ub4 86,
      * the ub1 length 86, 00 54 and 84 zeros. With the OUT placeholder fd 01,
@@ -6479,12 +6508,13 @@ static void o8i_bind_oac(SeerWriter *w, const SeerBind *b, uint32_t size)
   }
   uint8_t type = ORA_TYPE_VARCHAR, csfrm = 1, flag = 0x03;
   uint32_t charset = 31;
-  if (b->ret_lob != 0) {
+  if (b->ret_lob != 0 || b->fv2_lob != 0) {
     /* A RETURNING target that is a CLOB / BLOB: flag 0x01, size 32, a CLOB
      * with its charset and form, a BLOB with neither (§19.17b, sqlplus 9.2
      * against 8.1.7; #167). */
-    bool clob = b->ret_lob == ORA_TYPE_CLOB;
-    SeerOacMsg m = {.data_type = b->ret_lob,
+    uint8_t lob = b->ret_lob != 0 ? b->ret_lob : b->fv2_lob;
+    bool clob = lob == ORA_TYPE_CLOB;
+    SeerOacMsg m = {.data_type = lob,
                     .flags = 0x01,
                     .max_length = 32,
                     .charset = clob ? 31 : 0,
@@ -6863,6 +6893,38 @@ static SeerStatus o8i_lob_read(SeerConn *c, const uint8_t *loc, size_t loclen, S
 {
   SeerStatus st = o8i_lobop_send(c, loc, loclen, LOB_OP_READ, 1, true, 0x40000000u);
   return st == SEER_OK ? o8i_lobop_reply(c, true, content, NULL, NULL, NULL) : st;
+}
+
+/* One 8i TTI_LOBOPS call of any shape: `m` at 8i's widths with the locator
+ * `loc` as its source, then `tail` (a WRITE's content), and its reply - the
+ * locator the server now has into *out when asked for (#424). */
+static SeerStatus o8i_lobop_call(SeerConn *c, SeerLobopMsg *m, const uint8_t *loc, size_t loclen,
+                                 const uint8_t *tail, size_t taillen, uint8_t **out, size_t *outlen)
+{
+  SeerWriter w;
+  if (!seer_writer_init(&w, 64 + loclen + taillen))
+    return SEER_ENOMEM;
+  o8i_closing(c, &w);
+  seer_ttc_fun_header(c, &w, TTI_LOBOPS);
+  m->src_ptr = 1;
+  m->src_len = (int64_t)loclen;
+  m->loc_len = (int64_t)loclen;
+  m->locator = (SeerBytes){.p = loc, .n = loclen};
+  SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+  seer_schema_encode(SEER_LOBOPS_SCHEMA, &cx, m, &w);
+  if (taillen > 0)
+    seer_writer_bytes(&w, tail, taillen);
+  SeerStatus st = seer_writer_ok(&w) ? seer_ttc_send(c, w.buf, w.len) : SEER_ENOMEM;
+  seer_writer_free(&w);
+  return st == SEER_OK ? o8i_lobop_reply(c, m->has_amount != 0, NULL, out, outlen, NULL) : st;
+}
+
+/* FREE_TEMP, the locator alone (#424). */
+static void o8i_free_temp(SeerConn *c, const uint8_t *loc, size_t loclen)
+{
+  SeerLobopMsg m = {.op = LOB_OP_FREE_TEMP};
+  if (o8i_lobop_call(c, &m, loc, loclen, NULL, 0, NULL, NULL) != SEER_OK)
+    seer_log(SEER_LOG_WARNING, "stmt: 8i: a temporary LOB was not freed");
 }
 
 /* A BFILE's content (§19.17): FILE_OPEN (mode 0x0b, read-only), whose reply
@@ -7303,7 +7365,7 @@ static SeerStatus o8i_execute_block(SeerStmt *stmt)
    * (§19.15's single READ; #167): CLOB text in WE8ISO8859P1, BLOB bytes. */
   for (int k = 0; k < stmt->npbinds; k++) {
     SeerBind *b = &stmt->pbinds[k];
-    if (b->ret_locator == NULL)
+    if (b->ret_locator == NULL || stmt->keep_lob_locators)
       continue;
     SeerWriter content;
     if (!seer_writer_init(&content, 4096))
@@ -8949,11 +9011,182 @@ static SeerStatus by_row(SeerStmt *stmt, SeerStatus (*one)(SeerStmt *))
   return SEER_OK;
 }
 
-/* 8i: a PL/SQL block, or a DML run in one (RETURNING ... INTO). */
+/* 8i: the binds marked for a LOB target (seer_stmt_bind_clob / _blob) as
+ * temporary LOBs for one execute (#424). 8.1.7's PL/SQL takes no text or RAW
+ * for a LOB parameter (PLS-00306, whatever its length): each value goes into
+ * a temporary LOB - a CLOB's text in WE8ISO8859P1, the session's charset -
+ * and the bind sends its locator. o8i_temp_lobs_done puts the values back and
+ * frees the LOBs. */
+typedef struct {
+  int bind;
+  uint8_t *loc;
+  size_t loclen;
+  uint8_t *saved;
+  size_t saved_len;
+} O8iTempLob;
+
+/* A temporary LOB holding `data` (a CLOB's UTF-8 text, a BLOB's bytes), made
+ * by the server: 8.1.7 refuses 9.2's CREATE_TEMP call (ORA-22275, its empty
+ * source locator), so one PL/SQL block creates it, appends the value in
+ * chunks each bind takes inline (4000 bytes of text, 2000 of RAW) and hands
+ * the locator back through a LOB OUT bind, kept rather than read (#424). */
+static SeerStatus o8i_server_temp_lob(SeerConn *c, bool blob, const uint8_t *data, size_t n,
+                                      uint8_t **loc, size_t *loclen)
+{
+  const size_t piece = blob ? 2000 : 4000;
+  size_t chunks = n == 0 ? 0 : (n + piece - 1) / piece + 1; /* text splits at a character */
+  SeerWriter sql;
+  if (!seer_writer_init(&sql, 128 + chunks * 48))
+    return SEER_ENOMEM;
+  char line[96];
+  snprintf(line, sizeof line, "DECLARE l %s; BEGIN DBMS_LOB.CREATETEMPORARY(l, TRUE); ",
+           blob ? "BLOB" : "CLOB");
+  seer_writer_bytes(&sql, line, strlen(line));
+  size_t *cut = calloc(chunks + 1, sizeof *cut); /* chunk k is data[cut[k] .. cut[k + 1]) */
+  uint32_t *amount = calloc(chunks + 1, sizeof *amount);
+  int nchunks = 0;
+  SeerStatus st = cut == NULL || amount == NULL ? SEER_ENOMEM : SEER_OK;
+  for (size_t at = 0; st == SEER_OK && at < n; nchunks++) {
+    size_t end = at + piece < n ? at + piece : n;
+    while (!blob && end < n && (data[end] & 0xC0) == 0x80)
+      end--; /* not inside a UTF-8 sequence */
+    uint32_t chars = 0;
+    for (size_t i = at; i < end; i++)
+      chars += blob || (data[i] & 0xC0) != 0x80;
+    cut[nchunks] = at;
+    amount[nchunks] = chars;
+    snprintf(line, sizeof line, "DBMS_LOB.WRITEAPPEND(l, %u, :%d); ", (unsigned)chars, nchunks + 1);
+    seer_writer_bytes(&sql, line, strlen(line));
+    at = end;
+  }
+  if (cut != NULL)
+    cut[nchunks] = n;
+  /* Binds go by appearance (#146): the chunks, then the locator. */
+  snprintf(line, sizeof line, ":%d := l; END;", nchunks + 1);
+  seer_writer_bytes(&sql, line, strlen(line) + 1); /* with its NUL */
+  if (st == SEER_OK && !seer_writer_ok(&sql))
+    st = SEER_ENOMEM;
+  SeerStmt *s = NULL;
+  if (st == SEER_OK)
+    st = seer_stmt_prepare(c, (const char *)sql.buf, &s);
+  if (st == SEER_OK)
+    st = seer_stmt_bind_out(s, nchunks + 1, blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB, 0);
+  for (int k = 0; st == SEER_OK && k < nchunks; k++) {
+    const uint8_t *p = data + cut[k];
+    int len = (int)(cut[k + 1] - cut[k]);
+    st = blob ? seer_stmt_bind_raw(s, k + 1, p, len)
+              : seer_stmt_bind_text(s, k + 1, (const char *)p, len);
+  }
+  if (st == SEER_OK) {
+    s->keep_lob_locators = true;
+    st = seer_stmt_execute(s);
+  }
+  SeerBind *ob = s != NULL && s->npbinds > nchunks ? &s->pbinds[nchunks] : NULL;
+  if (st == SEER_OK && (ob == NULL || ob->ret_locator == NULL))
+    st = SEER_EPROTO;
+  if (st == SEER_OK) {
+    *loc = ob->ret_locator;
+    *loclen = ob->ret_loclen;
+    ob->ret_locator = NULL;
+    ob->ret_loclen = 0;
+  }
+  seer_stmt_close(s);
+  seer_writer_free(&sql);
+  free(cut);
+  free(amount);
+  return st;
+}
+
+static void o8i_temp_lobs_done(SeerStmt *stmt, O8iTempLob *t, int n)
+{
+  for (int k = 0; k < n; k++) {
+    SeerBind *b = &stmt->pbinds[t[k].bind];
+    if (t[k].saved != NULL) {
+      free(b->rxd[0]);
+      b->rxd[0] = t[k].saved;
+      b->rxd_len[0] = t[k].saved_len;
+    }
+    b->fv2_lob = 0;
+    if (stmt->conn->t != NULL && t[k].loc != NULL)
+      o8i_free_temp(stmt->conn, t[k].loc, t[k].loclen);
+    free(t[k].loc);
+  }
+  free(t);
+}
+
+static SeerStatus o8i_temp_lobs_begin(SeerStmt *stmt, O8iTempLob **out, int *n)
+{
+  *out = NULL;
+  *n = 0;
+  for (int i = 0; i < stmt->npbinds; i++) {
+    SeerBind *b = &stmt->pbinds[i];
+    if (!b->as_lob || b->is_out || b->rxd == NULL || b->rxd[0] == NULL)
+      continue;
+    bool blob = b->oac_type == ORA_TYPE_RAW || b->oac_type == ORA_TYPE_LONGRAW;
+    SeerWriter v;
+    if (!seer_writer_init(&v, b->rxd_len[0] + 1))
+      return SEER_ENOMEM;
+    SeerStatus st = o8i_unchunk(b->rxd[0], b->rxd_len[0], &v);
+    if (st == SEER_OK && !seer_writer_ok(&v))
+      st = SEER_ENOMEM;
+    uint8_t *data = NULL; /* a CLOB's UTF-8 text, a BLOB's bytes */
+    size_t dlen = 0;
+    if (st == SEER_OK)
+      data = v.buf, dlen = v.len, v.buf = NULL;
+    seer_writer_free(&v);
+    O8iTempLob *t = st == SEER_OK ? realloc(*out, (size_t)(*n + 1) * sizeof *t) : NULL;
+    if (st == SEER_OK && t == NULL)
+      st = SEER_ENOMEM;
+    if (st == SEER_OK) {
+      *out = t;
+      t = &t[*n];
+      *t = (O8iTempLob){.bind = i};
+      st = o8i_server_temp_lob(stmt->conn, blob, data, dlen, &t->loc, &t->loclen);
+      if (st == SEER_OK)
+        (*n)++; /* made: o8i_temp_lobs_done frees it */
+      if (st == SEER_OK) {
+        SeerWriter bv;
+        if (!seer_writer_init(&bv, t->loclen + 8)) {
+          st = SEER_ENOMEM;
+        } else {
+          SeerLegacyLobBindMsg lm = {.loc_len = (int64_t)t->loclen,
+                                     .locator = {.p = t->loc, .n = t->loclen}};
+          SeerSchemaCtx cx = seer_msg_ctx(1, 0, 0);
+          seer_schema_encode(SEER_LEGACY_LOB_BIND_SCHEMA, &cx, &lm, &bv);
+          if (!seer_writer_ok(&bv)) {
+            seer_writer_free(&bv);
+            st = SEER_ENOMEM;
+          } else {
+            t->saved = b->rxd[0];
+            t->saved_len = b->rxd_len[0];
+            b->rxd[0] = bv.buf;
+            b->rxd_len[0] = bv.len;
+            b->fv2_lob = blob ? ORA_TYPE_BLOB : ORA_TYPE_CLOB;
+          }
+        }
+      }
+    }
+    free(data);
+    if (st != SEER_OK)
+      return st;
+    seer_log(SEER_LOG_DEBUG, "stmt: 8i bind %d: %zu bytes as a temporary %s", i + 1, dlen,
+             blob ? "BLOB" : "CLOB");
+  }
+  return SEER_OK;
+}
+
+/* 8i: a PL/SQL block, or a DML run in one (RETURNING ... INTO), its LOB-bound
+ * values as temporary LOBs (#424). */
 static SeerStatus o8i_execute_in_block_kind(SeerStmt *stmt)
 {
-  return classify_sql(stmt->sql) == STMT_BLOCK ? o8i_execute_block(stmt)
+  O8iTempLob *tl = NULL;
+  int ntl = 0;
+  SeerStatus st = o8i_temp_lobs_begin(stmt, &tl, &ntl);
+  if (st == SEER_OK)
+    st = classify_sql(stmt->sql) == STMT_BLOCK ? o8i_execute_block(stmt)
                                                : fv2_execute_in_block(stmt);
+  o8i_temp_lobs_done(stmt, tl, ntl);
+  return st;
 }
 
 /* 9i: one execute, its values past what 9.2 takes inline as temporary LOBs

@@ -1023,6 +1023,53 @@ static void check_array_returning(void)
   }
 }
 
+/* seer_stmt_bind_clob / _blob reach PL/SQL CLOB / BLOB parameters, 10 bytes
+ * and 40000 (#424). 8.1.7 converts no text or RAW to a LOB parameter
+ * (PLS-00306, whatever the length): there the value goes as a temporary LOB.
+ * Elsewhere the two binds are text and RAW binds. */
+static void check_lob_target_binds(void)
+{
+  const char *name = "CLOB / BLOB binds reach PL/SQL LOB parameters (10 and 40000 bytes)";
+  run("CREATE OR REPLACE PROCEDURE seer9lp (c IN CLOB, b IN BLOB, n OUT VARCHAR2) AS BEGIN "
+      "n := DBMS_LOB.GETLENGTH(c) || ':' || DBMS_LOB.GETLENGTH(b); END;");
+  static char text[40001];
+  static unsigned char bin[40000];
+  memset(text, 'q', 40000);
+  memset(bin, 0x5A, sizeof bin);
+  char m[300] = "";
+  static const int sizes[2] = {10, 40000};
+  for (int k = 0; k < 2 && m[0] == '\0'; k++) {
+    SeerStmt *s = NULL;
+    SeerStatus st = seer_stmt_prepare(C, "BEGIN seer9lp(:1, :2, :3); END;", &s);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_clob(s, 1, text, sizes[k]);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_blob(s, 2, bin, sizes[k]);
+    if (st == SEER_OK)
+      st = seer_stmt_bind_out(s, 3, 1, 40);
+    if (st == SEER_OK)
+      st = seer_stmt_execute(s);
+    char got[48] = "", want[48];
+    if (st == SEER_OK) {
+      const void *o = NULL;
+      size_t ol = 0;
+      int on = 0, ob = 0;
+      seer_stmt_out_data(s, 3, &o, &ol, &on, &ob);
+      snprintf(got, sizeof got, "%.*s", (int)ol, o ? (const char *)o : "");
+    }
+    snprintf(want, sizeof want, "%d:%d", sizes[k], sizes[k]);
+    if (st != SEER_OK || strcmp(got, want) != 0)
+      snprintf(m, sizeof m, "%d bytes: status %d, '%s' (want %s) %.160s", sizes[k], (int)st, got,
+               want, st != SEER_OK && seer_last_error(C) ? seer_last_error(C) : "");
+    seer_stmt_close(s);
+  }
+  run("DROP PROCEDURE seer9lp");
+  if (m[0] == '\0')
+    pass(name);
+  else
+    fail(name, m);
+}
+
 /* One national-text bind (seer_stmt_bind_ntext) in `sql`; the first cell as
  * text, or "status N: error". */
 static void ntext_scalar(const char *sql, const char *v, char *out, size_t osz)
@@ -2827,6 +2874,7 @@ int main(void)
   check_array_long_batch_errors();
   check_array_query_refused();
   check_national_bind();
+  check_lob_target_binds();
   check_long_text_bind();
   check_long_raw_bind();
   check_cursor_hygiene();
