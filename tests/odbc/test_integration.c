@@ -5239,6 +5239,7 @@ static void check_lob_inline(const char *drv, const char *host, const char *port
   SQLFreeHandle(SQL_HANDLE_ENV, e);
 }
 
+static void diag_state(SQLSMALLINT type, SQLHANDLE h, char st[6]);
 static SQLHDBC open_conn(SQLHENV e, const char *drv, const char *host, const char *port,
                          const char *svc, const char *user, const char *pwd, char *why, size_t n);
 
@@ -5293,7 +5294,22 @@ static void check_proxy_auth(SQLHDBC test_dbc, const char *drv, const char *host
   SQLSMALLINT ol;
   SQLRETURN rc =
       SQLDriverConnect(d, NULL, (SQLCHAR *)cs, SQL_NTS, o, sizeof o, &ol, SQL_DRIVER_NOPROMPT);
-  if (SQL_SUCCEEDED(rc)) {
+  if (g_release > 0 && g_release < 10) {
+    /* 8i / 9i: no known thin form names the client user, and 8.1.7 ignores
+     * 10g's, so the driver refuses rather than log in as the proxy (#411). */
+    char st[6] = "", m[300] = "";
+    if (SQL_SUCCEEDED(rc)) {
+      SQLDisconnect(d);
+      fail(name, "a proxy[schema] login below 10g connected (want HYC00, refused)");
+    } else {
+      diag_state(SQL_HANDLE_DBC, d, st);
+      diag_text(SQL_HANDLE_DBC, d, m, sizeof m);
+      if (strcmp(st, "HYC00") == 0 && strstr(m, "needs Oracle 10g") != NULL)
+        pass(name);
+      else
+        fail(name, m[0] ? m : "proxy connect failed without the reason");
+    }
+  } else if (SQL_SUCCEEDED(rc)) {
     char su[64];
     if (SQL_SUCCEEDED(exec_scalar(d, "SELECT SYS_CONTEXT('USERENV','SESSION_USER') FROM dual", su,
                                   sizeof su, err, sizeof err)) &&

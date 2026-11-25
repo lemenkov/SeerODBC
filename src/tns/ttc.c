@@ -1360,6 +1360,21 @@ SeerStatus seer_ttc_login(SeerConn *conn, const SeerConnParams *params,
   free(resp);
   seer_log(SEER_LOG_DEBUG, "TTC: data types negotiated");
 
+  /* Proxy auth below 10g (#411): a thin 8i / 9i login has no known way to
+   * name the client user. 8.1.7 takes the 10g PROXY_CLIENT_NAME pair and
+   * ignores it, so the session would run as the proxy, not the client. Refuse
+   * a `proxy[schema]` name there rather than log in as the wrong user. */
+  if (conn->field_version < TTC_FIELD_VERSION_10_2 && params->username != NULL) {
+    char ubuf[256];
+    size_t schema_len;
+    if (proxy_split(params->username, ubuf, sizeof ubuf, &schema_len) != NULL) {
+      free(conn->last_error);
+      conn->last_error = strdup("proxy authentication (user[schema]) needs Oracle 10g or later: "
+                                "an Oracle 8i / 9i login has no way to name the client user");
+      return SEER_ENOTIMPL;
+    }
+  }
+
   /* Oracle 9i (fv2): the pre-10g O3LOGON DES flow, not the O5LOGON TTI_SESS
    * challenge. o3logon_login authenticates the connection in place. */
   if (conn->is_8i)
