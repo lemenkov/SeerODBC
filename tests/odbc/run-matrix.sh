@@ -230,7 +230,7 @@ for row in "${TIERS[@]}"; do
            SEER_TEST_USER="$user" SEER_TEST_PASS="$pass" SEER_TEST_RELEASE="$release" \
            SEER_TEST_DBA_USER="$dba_user" SEER_TEST_DBA_PASS="$dba_pass"
     # The ODBC integration test, service-name addressed (9i's listener takes the
-    # SID as a service name too), with an optional TLS-proxy leg from 9i.
+    # SID as a service name too), with an optional TLS-proxy leg.
     TLS_PORT=""; TLS_CA=""; TLS_PID=""
     rec_odbc=""; rec_core=""
     if [[ -n "$RECORD_DIR" ]]; then
@@ -243,9 +243,9 @@ for row in "${TIERS[@]}"; do
         else
             record_head "$rec_core" test_core "${common[@]}" "SEER_TEST_SERVICE=$target"
         fi
-    elif (( release >= 9 )); then
-        # Not on 8i: its Windows listener redirects to a dedicated port, around
-        # the proxy (#412).
+    else
+        # On 8i the listener redirects to a dedicated port; the proxy rewrites
+        # the REDIRECT to a second TLS port of its own (#412).
         start_tls_proxy "$host" "$port"
     fi
     # A real TCPS listener for the TLS check's second leg (#405), on one tier
